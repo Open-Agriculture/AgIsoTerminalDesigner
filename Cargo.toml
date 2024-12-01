@@ -7,21 +7,24 @@ authors = ["Daan Steenbergen <d.steenbergen@student.tue.nl>"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-eframe = "0.27.2"
+eframe = "0.29.1"
 # ag-iso-stack = { path = "../AgIsoStack-rs" }
 ag-iso-stack = { git = "https://github.com/Open-Agriculture/AgIsoStack-rs", branch = "daan/terminal-designer-changes" }
 rfd = "0.13"
 image = "0.25.1"
 getrandom = { version = "0.2.11", features = ["js"] }
+log = "0.4"
 
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tracing-subscriber = "0.3"
 futures = "0.3.28"
+env_logger = "0.11"
 
 # web:
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen-futures = "0.4"
+web-sys = "0.3.70"           # to access the DOM (to hide the loading text)
 
 [profile.release]
 opt-level = 2 # fast and small wasm
