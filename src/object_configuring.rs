@@ -8,14 +8,7 @@ use crate::possible_events::PossibleEvents;
 use crate::EditorProject;
 
 use ag_iso_stack::object_pool::object::*;
-use ag_iso_stack::object_pool::object_attributes::DataCodeType;
-use ag_iso_stack::object_pool::object_attributes::Event;
-use ag_iso_stack::object_pool::object_attributes::FormatType;
-use ag_iso_stack::object_pool::object_attributes::HorizontalAlignment;
-use ag_iso_stack::object_pool::object_attributes::MacroRef;
-use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
-use ag_iso_stack::object_pool::object_attributes::Point;
-use ag_iso_stack::object_pool::object_attributes::VerticalAlignment;
+use ag_iso_stack::object_pool::object_attributes::*;
 use ag_iso_stack::object_pool::vt_version::VtVersion;
 use ag_iso_stack::object_pool::NullableObjectId;
 use ag_iso_stack::object_pool::ObjectId;
@@ -54,28 +47,32 @@ impl ConfigurableObject for Object {
             Object::InputList(o) => o.render_parameters(ui, design, navigation_selected),
             Object::OutputString(o) => o.render_parameters(ui, design, navigation_selected),
             Object::OutputNumber(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputList(o) => (),
-            Object::OutputLine(o) => (),
-            Object::OutputRectangle(o) => (),
-            Object::OutputEllipse(o) => (),
-            Object::OutputPolygon(o) => (),
-            Object::OutputMeter(o) => (),
-            Object::OutputLinearBarGraph(o) => (),
-            Object::OutputArchedBarGraph(o) => (),
+            Object::OutputList(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::OutputLine(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::OutputRectangle(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::OutputEllipse(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::OutputPolygon(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::OutputMeter(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::OutputLinearBarGraph(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::OutputArchedBarGraph(o) => o.render_parameters(ui, design, navigation_selected),
             Object::PictureGraphic(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::NumberVariable(o) => (),
-            Object::StringVariable(o) => (),
-            Object::FontAttributes(o) => (),
-            Object::LineAttributes(o) => (),
-            Object::FillAttributes(o) => (),
-            Object::InputAttributes(o) => (),
+            Object::NumberVariable(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::StringVariable(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::FontAttributes(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::LineAttributes(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::FillAttributes(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::InputAttributes(o) => o.render_parameters(ui, design, navigation_selected),
             Object::ObjectPointer(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::Macro(o) => (),
+            Object::Macro(o) => o.render_parameters(ui, design, navigation_selected),
             Object::AuxiliaryFunctionType1(o) => (),
             Object::AuxiliaryInputType1(o) => (),
-            Object::AuxiliaryFunctionType2(o) => (),
-            Object::AuxiliaryInputType2(o) => (),
-            Object::AuxiliaryControlDesignatorType2(o) => (),
+            Object::AuxiliaryFunctionType2(o) => {
+                o.render_parameters(ui, design, navigation_selected)
+            }
+            Object::AuxiliaryInputType2(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::AuxiliaryControlDesignatorType2(o) => {
+                o.render_parameters(ui, design, navigation_selected)
+            }
             Object::WindowMask(o) => (),
             Object::KeyGroup(o) => (),
             Object::GraphicsContext(o) => (),
@@ -108,7 +105,8 @@ fn render_object_id(
         let resp = ui.add(
             egui::DragValue::new(&mut temp_id)
                 .speed(1.0)
-                .clamp_range(0..=65534),
+                .update_while_editing(false)
+                .range(0..=65534),
         );
 
         let new_id = ObjectId::new(temp_id).unwrap();
@@ -1592,6 +1590,7 @@ impl ConfigurableObject for OutputNumber {
                     }
                 });
         });
+
         ui.checkbox(&mut self.options.transparent, "Transparent Background");
         ui.checkbox(
             &mut self.options.display_leading_zeros,
@@ -1635,17 +1634,18 @@ impl ConfigurableObject for OutputNumber {
             ui.label("Initial value:");
             ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
         }
-        ui.add(
-            egui::DragValue::new(&mut self.offset)
-                .speed(1.0)
-                .prefix("Offset: "),
-        );
-        ui.add(egui::DragValue::new(&mut self.scale).prefix("Scale: "));
-        ui.add(
-            egui::DragValue::new(&mut self.nr_of_decimals)
-                .speed(1.0)
-                .prefix("Number of Decimals: "),
-        );
+        ui.horizontal(|ui| {
+            ui.label("Offset:");
+            ui.add(egui::DragValue::new(&mut self.offset).speed(1.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Scale:");
+            ui.add(egui::DragValue::new(&mut self.scale).speed(1.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Number of Decimals:");
+            ui.add(egui::DragValue::new(&mut self.nr_of_decimals).speed(1.0));
+        });
         ui.horizontal(|ui| {
             ui.label("Format:");
             ui.radio_value(&mut self.format, FormatType::Decimal, "Decimal");
@@ -1699,6 +1699,1070 @@ impl ConfigurableObject for OutputNumber {
         //         "Reserved",
         //     );
         // });
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for OutputList {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.add(
+            egui::Slider::new(&mut self.width, 0..=design.mask_size)
+                .text("Width")
+                .drag_value_speed(1.0),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.height, 0..=design.mask_size)
+                .text("Height")
+                .drag_value_speed(1.0),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Variable reference:");
+            egui::ComboBox::from_id_source("variable_reference")
+                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    ui.selectable_value(
+                        &mut self.variable_reference,
+                        NullableObjectId::NULL,
+                        "None",
+                    );
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::NumberVariable)
+                    {
+                        ui.selectable_value(
+                            &mut self.variable_reference,
+                            potential_child.id().into(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+        });
+
+        if self.variable_reference.0.is_none() {
+            ui.label("Initial value:");
+            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
+        }
+
+        ui.separator();
+        ui.label("List items:");
+        render_nullable_object_id_list(
+            ui,
+            design.get_pool(),
+            &mut self.list_items,
+            &Self::get_allowed_child_refs(VtVersion::Version3),
+            navigation_selected,
+        );
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for OutputLine {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.horizontal(|ui| {
+            ui.label("Line Attributes:");
+            egui::ComboBox::from_id_source("line_attributes")
+                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::LineAttributes)
+                    {
+                        ui.selectable_value(
+                            &mut self.line_attributes,
+                            potential_child.id(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+
+            // If a valid line_attributes object is selected, provide a link to navigate there
+            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
+                if ui.link("(view)").clicked() {
+                    *navigation_selected = self.line_attributes.into();
+                }
+            } else {
+                ui.colored_label(egui::Color32::RED, "Missing object");
+            }
+        });
+
+        ui.add(
+            egui::Slider::new(&mut self.width, 0..=design.mask_size)
+                .text("Width")
+                .drag_value_speed(1.0),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.height, 0..=design.mask_size)
+                .text("Height")
+                .drag_value_speed(1.0),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Line Direction:");
+            ui.radio_value(
+                &mut self.line_direction,
+                LineDirection::TopLeftToBottomRight,
+                "Top-left to bottom-right",
+            );
+            ui.radio_value(
+                &mut self.line_direction,
+                LineDirection::BottomLeftToTopRight,
+                "Bottom-left to top-right",
+            );
+        });
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for OutputRectangle {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.horizontal(|ui| {
+            ui.label("Line Attributes:");
+            egui::ComboBox::from_id_source("line_attributes_selector")
+                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::LineAttributes)
+                    {
+                        ui.selectable_value(
+                            &mut self.line_attributes,
+                            potential_child.id(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+
+            // Link to view the selected line attributes object
+            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
+                if ui.link("(view)").clicked() {
+                    *navigation_selected = self.line_attributes.into();
+                }
+            } else {
+                ui.colored_label(egui::Color32::RED, "Missing object");
+            }
+        });
+
+        ui.add(
+            egui::Slider::new(&mut self.width, 0..=design.mask_size)
+                .text("Width")
+                .drag_value_speed(1.0),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.height, 0..=design.mask_size)
+                .text("Height")
+                .drag_value_speed(1.0),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Line Suppression:");
+            ui.add(egui::DragValue::new(&mut self.line_suppression).speed(1.0));
+        });
+
+        // Fill Attributes Selection
+        ui.horizontal(|ui| {
+            ui.label("Fill Attributes:");
+            egui::ComboBox::from_id_source("fill_attributes_selector")
+                .selected_text(
+                    self.fill_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::FillAttributes)
+                    {
+                        ui.selectable_value(
+                            &mut self.fill_attributes,
+                            potential_child.id().into(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+
+            // Link to view the selected fill attributes object if present
+            if let Some(id) = self.fill_attributes.into() {
+                if let Some(obj) = design.get_pool().object_by_id(id) {
+                    if ui.link("(view)").clicked() {
+                        *navigation_selected = id.into();
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::RED, "Missing object");
+                }
+            }
+        });
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for OutputEllipse {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.horizontal(|ui| {
+            ui.label("Line Attributes:");
+            egui::ComboBox::from_id_source("line_attributes_selector")
+                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::LineAttributes)
+                    {
+                        ui.selectable_value(
+                            &mut self.line_attributes,
+                            potential_child.id(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+
+            // Link to navigate to the chosen line attributes object
+            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
+                if ui.link("(view)").clicked() {
+                    *navigation_selected = self.line_attributes.into();
+                }
+            } else {
+                ui.colored_label(egui::Color32::RED, "Missing object");
+            }
+        });
+
+        ui.add(
+            egui::Slider::new(&mut self.width, 0..=design.mask_size)
+                .text("Width")
+                .drag_value_speed(1.0),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.height, 0..=design.mask_size)
+                .text("Height")
+                .drag_value_speed(1.0),
+        );
+
+        ui.label("Ellipse Type:");
+        ui.radio_value(&mut self.ellipse_type, 0, "Closed Ellipse");
+        ui.radio_value(&mut self.ellipse_type, 1, "Open Ellipse");
+        ui.radio_value(&mut self.ellipse_type, 2, "Closed Ellipse Segment");
+        ui.radio_value(&mut self.ellipse_type, 3, "Closed Ellipse Section");
+
+        ui.horizontal(|ui| {
+            ui.label("Start Angle:");
+            ui.add(
+                egui::DragValue::new(&mut self.start_angle)
+                    .speed(1.0)
+                    .range(0..=180),
+            );
+            ui.label("End Angle:");
+            ui.add(
+                egui::DragValue::new(&mut self.end_angle)
+                    .speed(1.0)
+                    .range(0..=180),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Fill Attributes:");
+            egui::ComboBox::from_id_source("fill_attributes_selector")
+                .selected_text(
+                    self.fill_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::FillAttributes)
+                    {
+                        ui.selectable_value(
+                            &mut self.fill_attributes,
+                            potential_child.id().into(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+
+            // Link to view the chosen fill attributes object, if any
+            if let Some(id) = self.fill_attributes.into() {
+                if let Some(obj) = design.get_pool().object_by_id(id) {
+                    if ui.link("(view)").clicked() {
+                        *navigation_selected = id.into();
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::RED, "Missing object");
+                }
+            }
+        });
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for OutputPolygon {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.add(
+            egui::Slider::new(&mut self.width, 0..=design.mask_size)
+                .text("Width")
+                .drag_value_speed(1.0),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.height, 0..=design.mask_size)
+                .text("Height")
+                .drag_value_speed(1.0),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Line Attributes:");
+            egui::ComboBox::from_id_source("line_attributes_selector")
+                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::LineAttributes)
+                    {
+                        ui.selectable_value(
+                            &mut self.line_attributes,
+                            potential_child.id(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+
+            // Link to navigate to the chosen line attributes object
+            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
+                if ui.link("(view)").clicked() {
+                    *navigation_selected = self.line_attributes.into();
+                }
+            } else {
+                ui.colored_label(egui::Color32::RED, "Missing object");
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Fill Attributes:");
+            egui::ComboBox::from_id_source("fill_attributes_selector")
+                .selected_text(
+                    self.fill_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::FillAttributes)
+                    {
+                        ui.selectable_value(
+                            &mut self.fill_attributes,
+                            potential_child.id().into(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+
+            // Link to view the chosen fill attributes object
+            if let Some(id) = self.fill_attributes.into() {
+                if let Some(obj) = design.get_pool().object_by_id(id) {
+                    if ui.link("(view)").clicked() {
+                        *navigation_selected = id.into();
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::RED, "Missing object");
+                }
+            }
+        });
+
+        ui.label("Polygon Type:");
+        ui.radio_value(&mut self.polygon_type, 0, "Convex");
+        ui.radio_value(&mut self.polygon_type, 1, "Non-Convex");
+        ui.radio_value(&mut self.polygon_type, 2, "Complex");
+        ui.radio_value(&mut self.polygon_type, 3, "Open");
+
+        ui.separator();
+        ui.label("Points:");
+        egui::Grid::new("points_grid")
+            .striped(true)
+            .min_col_width(0.0)
+            .show(ui, |ui| {
+                let mut idx = 0;
+                while idx < self.points.len() {
+                    ui.label(format!("Point {}", idx));
+                    ui.add(egui::DragValue::new(&mut self.points[idx].x).speed(1.0));
+                    ui.add(egui::DragValue::new(&mut self.points[idx].y).speed(1.0));
+
+                    if ui
+                        .add_enabled(idx > 0, egui::Button::new("\u{23F6}"))
+                        .on_hover_text("Move Up")
+                        .clicked()
+                    {
+                        self.points.swap(idx, idx - 1);
+                    }
+
+                    if ui
+                        .add_enabled(idx < self.points.len() - 1, egui::Button::new("\u{23F7}"))
+                        .on_hover_text("Move Down")
+                        .clicked()
+                    {
+                        self.points.swap(idx, idx + 1);
+                    }
+                    if self.points.len() > 3 {
+                        if ui
+                            .add(egui::Button::new("\u{1F5D9}"))
+                            .on_hover_text("Remove")
+                            .clicked()
+                        {
+                            self.points.remove(idx);
+                            continue; // Skip incrementing idx since we removed this item
+                        }
+                    }
+
+                    idx += 1;
+                    ui.end_row();
+                }
+            });
+
+        if ui.button("Add Point").clicked() {
+            self.points.push(Point { x: 0, y: 0 });
+        }
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for OutputMeter {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.add(
+            egui::Slider::new(&mut self.width, 0..=design.mask_size)
+                .text("Width")
+                .drag_value_speed(1.0),
+        );
+
+        ui.add(
+            egui::Slider::new(&mut self.needle_colour, 0..=255)
+                .text("Needle Colour")
+                .drag_value_speed(1.0),
+        );
+
+        ui.add(
+            egui::Slider::new(&mut self.border_colour, 0..=255)
+                .text("Border Colour")
+                .drag_value_speed(1.0),
+        );
+
+        ui.add(
+            egui::Slider::new(&mut self.arc_and_tick_colour, 0..=255)
+                .text("Arc & Tick Colour")
+                .drag_value_speed(1.0),
+        );
+
+        ui.checkbox(&mut self.options.draw_arc, "Draw Arc");
+        ui.checkbox(&mut self.options.draw_border, "Draw Border");
+        ui.checkbox(&mut self.options.draw_ticks, "Draw Ticks");
+
+        ui.horizontal(|ui| {
+            ui.label("Deflection Direction:");
+            ui.radio_value(
+                &mut self.options.deflection_direction,
+                DeflectionDirection::AntiClockwise,
+                "Anti-clockwise",
+            );
+            ui.radio_value(
+                &mut self.options.deflection_direction,
+                DeflectionDirection::Clockwise,
+                "Clockwise",
+            );
+        });
+
+        ui.add(
+            egui::DragValue::new(&mut self.nr_of_ticks)
+                .speed(1.0)
+                .prefix("Number of Ticks: "),
+        );
+        ui.add(
+            egui::DragValue::new(&mut self.start_angle)
+                .speed(1.0)
+                .prefix("Start Angle: ")
+                .range(0..=180),
+        );
+        ui.add(
+            egui::DragValue::new(&mut self.end_angle)
+                .speed(1.0)
+                .prefix("End Angle: ")
+                .range(0..=180),
+        );
+        ui.add(
+            egui::DragValue::new(&mut self.min_value)
+                .speed(1.0)
+                .prefix("Min Value: "),
+        );
+        ui.add(
+            egui::DragValue::new(&mut self.max_value)
+                .speed(1.0)
+                .prefix("Max Value: "),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Variable reference:");
+            egui::ComboBox::from_id_source("variable_reference")
+                .selected_text(
+                    self.variable_reference
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.variable_reference,
+                        NullableObjectId::NULL,
+                        "None",
+                    );
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::NumberVariable)
+                    {
+                        ui.selectable_value(
+                            &mut self.variable_reference,
+                            potential_child.id().into(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+        });
+
+        // If there's no variable reference, allow editing the initial value
+        if self.variable_reference.0.is_none() {
+            ui.label("Initial value:");
+            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
+        }
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for OutputLinearBarGraph {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.add(
+            egui::Slider::new(&mut self.width, 0..=design.mask_size)
+                .text("Width")
+                .drag_value_speed(1.0),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.height, 0..=design.mask_size)
+                .text("Height")
+                .drag_value_speed(1.0),
+        );
+
+        ui.add(
+            egui::Slider::new(&mut self.colour, 0..=255)
+                .text("Bar Colour")
+                .drag_value_speed(1.0),
+        );
+        if self.options.draw_target_line {
+            ui.add(
+                egui::Slider::new(&mut self.target_line_colour, 0..=255)
+                    .text("Target Line Colour")
+                    .drag_value_speed(1.0),
+            );
+        }
+
+        ui.checkbox(&mut self.options.draw_border, "Draw Border");
+        ui.checkbox(&mut self.options.draw_target_line, "Draw Target Line");
+        ui.checkbox(&mut self.options.draw_ticks, "Draw Ticks");
+        ui.horizontal(|ui| {
+            ui.label("Bar Graph Type:");
+            ui.radio_value(
+                &mut self.options.bar_graph_type,
+                BarGraphType::Filled,
+                "Filled",
+            );
+            ui.radio_value(
+                &mut self.options.bar_graph_type,
+                BarGraphType::NotFilled,
+                "Not Filled",
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Axis Orientation:");
+            ui.radio_value(
+                &mut self.options.axis_orientation,
+                AxisOrientation::Vertical,
+                "Vertical",
+            );
+            ui.radio_value(
+                &mut self.options.axis_orientation,
+                AxisOrientation::Horizontal,
+                "Horizontal",
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Grow Direction:");
+            ui.radio_value(
+                &mut self.options.grow_direction,
+                GrowDirection::GrowLeftDown,
+                "Left/Down",
+            );
+            ui.radio_value(
+                &mut self.options.grow_direction,
+                GrowDirection::GrowRightUp,
+                "Right/Up",
+            );
+        });
+
+        if self.options.draw_ticks {
+            ui.add(
+                egui::DragValue::new(&mut self.nr_of_ticks)
+                    .speed(1.0)
+                    .prefix("Number of Ticks: "),
+            );
+        }
+        ui.add(
+            egui::DragValue::new(&mut self.min_value)
+                .speed(1.0)
+                .prefix("Min Value: "),
+        );
+        ui.add(
+            egui::DragValue::new(&mut self.max_value)
+                .speed(1.0)
+                .prefix("Max Value: "),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Variable Reference:");
+            egui::ComboBox::from_id_source("variable_reference")
+                .selected_text(
+                    self.variable_reference
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.variable_reference,
+                        NullableObjectId::NULL,
+                        "None",
+                    );
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::NumberVariable)
+                    {
+                        ui.selectable_value(
+                            &mut self.variable_reference,
+                            potential_child.id().into(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+        });
+
+        // If no variable reference, allow setting initial value manually
+        if self.variable_reference.0.is_none() {
+            ui.label("Initial Value:");
+            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Target Value Variable Reference:");
+            egui::ComboBox::from_id_source("target_value_variable_reference")
+                .selected_text(
+                    self.target_value_variable_reference
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.target_value_variable_reference,
+                        NullableObjectId::NULL,
+                        "None",
+                    );
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::NumberVariable)
+                    {
+                        ui.selectable_value(
+                            &mut self.target_value_variable_reference,
+                            potential_child.id().into(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+        });
+
+        // If no target value variable reference, allow setting target value manually
+        if self.target_value_variable_reference.0.is_none() {
+            ui.label("Target Value:");
+            ui.add(egui::DragValue::new(&mut self.target_value).speed(1.0));
+        }
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for OutputArchedBarGraph {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.add(
+            egui::Slider::new(&mut self.width, 0..=design.mask_size)
+                .text("Width")
+                .drag_value_speed(1.0),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.height, 0..=design.mask_size)
+                .text("Height")
+                .drag_value_speed(1.0),
+        );
+
+        ui.add(
+            egui::Slider::new(&mut self.colour, 0..=255)
+                .text("Bar Colour")
+                .drag_value_speed(1.0),
+        );
+        if self.options.draw_target_line {
+            ui.add(
+                egui::Slider::new(&mut self.target_line_colour, 0..=255)
+                    .text("Target Line Colour")
+                    .drag_value_speed(1.0),
+            );
+        }
+
+        ui.checkbox(&mut self.options.draw_border, "Draw Border");
+        ui.checkbox(&mut self.options.draw_target_line, "Draw Target Line");
+
+        ui.horizontal(|ui| {
+            ui.label("Bar Graph Type:");
+            ui.radio_value(
+                &mut self.options.bar_graph_type,
+                BarGraphType::Filled,
+                "Filled",
+            );
+            ui.radio_value(
+                &mut self.options.bar_graph_type,
+                BarGraphType::NotFilled,
+                "Not Filled",
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Axis Orientation:");
+            ui.radio_value(
+                &mut self.options.axis_orientation,
+                AxisOrientation::Vertical,
+                "Vertical",
+            );
+            ui.radio_value(
+                &mut self.options.axis_orientation,
+                AxisOrientation::Horizontal,
+                "Horizontal",
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Grow Direction:");
+            ui.radio_value(
+                &mut self.options.grow_direction,
+                GrowDirection::GrowLeftDown,
+                "Left/Down",
+            );
+            ui.radio_value(
+                &mut self.options.grow_direction,
+                GrowDirection::GrowRightUp,
+                "Right/Up",
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Deflection Direction:");
+            ui.radio_value(
+                &mut self.options.deflection_direction,
+                DeflectionDirection::AntiClockwise,
+                "Anti-clockwise",
+            );
+            ui.radio_value(
+                &mut self.options.deflection_direction,
+                DeflectionDirection::Clockwise,
+                "Clockwise",
+            );
+        });
+
+        ui.add(
+            egui::DragValue::new(&mut self.start_angle)
+                .speed(1.0)
+                .prefix("Start Angle: "),
+        );
+        ui.add(
+            egui::DragValue::new(&mut self.end_angle)
+                .speed(1.0)
+                .prefix("End Angle: "),
+        );
+        ui.add(
+            egui::DragValue::new(&mut self.bar_graph_width)
+                .speed(1.0)
+                .prefix("Bar Graph Width: "),
+        );
+        ui.add(
+            egui::DragValue::new(&mut self.min_value)
+                .speed(1.0)
+                .prefix("Min Value: "),
+        );
+        ui.add(
+            egui::DragValue::new(&mut self.max_value)
+                .speed(1.0)
+                .prefix("Max Value: "),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Variable Reference:");
+            egui::ComboBox::from_id_source("variable_reference")
+                .selected_text(
+                    self.variable_reference
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.variable_reference,
+                        NullableObjectId::NULL,
+                        "None",
+                    );
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::NumberVariable)
+                    {
+                        ui.selectable_value(
+                            &mut self.variable_reference,
+                            potential_child.id().into(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+        });
+
+        // If no variable reference, set initial value
+        if self.variable_reference.0.is_none() {
+            ui.label("Initial Value:");
+            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Target Value Variable Reference:");
+            egui::ComboBox::from_id_source("target_value_variable_reference")
+                .selected_text(
+                    self.target_value_variable_reference
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.target_value_variable_reference,
+                        NullableObjectId::NULL,
+                        "None",
+                    );
+                    for potential_child in design
+                        .get_pool()
+                        .objects_by_type(ObjectType::NumberVariable)
+                    {
+                        ui.selectable_value(
+                            &mut self.target_value_variable_reference,
+                            potential_child.id().into(),
+                            format!(
+                                "{:?}: {:?}",
+                                u16::from(potential_child.id()),
+                                potential_child.object_type()
+                            ),
+                        );
+                    }
+                });
+        });
+
+        // If no target value variable reference, set target value
+        if self.target_value_variable_reference.0.is_none() {
+            ui.label("Target Value:");
+            ui.add(egui::DragValue::new(&mut self.target_value).speed(1.0));
+        }
 
         ui.separator();
         ui.label("Macros:");
@@ -1916,6 +2980,380 @@ impl ConfigurableObject for PictureGraphic {
     }
 }
 
+impl ConfigurableObject for NumberVariable {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.horizontal(|ui| {
+            ui.label("Initial Value:");
+            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
+        });
+    }
+}
+
+impl ConfigurableObject for StringVariable {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.horizontal(|ui| {
+            ui.label("Initial Value:");
+            ui.text_edit_singleline(&mut self.value);
+        });
+    }
+}
+
+impl ConfigurableObject for FontAttributes {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.add(
+            egui::Slider::new(&mut self.font_colour, 0..=255)
+                .text("Font Colour")
+                .drag_value_speed(1.0),
+        );
+
+        ui.separator();
+        ui.label("Font Size:");
+
+        // let is_proportional = self.font_style.proportional; // TODO: check if we have VT version 4 or later
+        let is_proportional = false;
+
+        // If proportional bit is set, font_size is proportional, otherwise non-proportional.
+        if is_proportional {
+            // Proportional font: we have a pixel height
+            let mut height = match self.font_size {
+                FontSize::Proportional(h) => h,
+                FontSize::NonProportional(_) => 8, // default to minimal proportional height if needed
+            };
+            ui.horizontal(|ui| {
+                ui.label("Proportional Font Height (≥ 8):");
+                if ui.add(egui::DragValue::new(&mut height)).changed() {
+                    self.font_size = FontSize::Proportional(height);
+                }
+            });
+        } else {
+            // Non-proportional font sizes: combo box
+            let current_size = match &self.font_size {
+                FontSize::NonProportional(s) => *s,
+                FontSize::Proportional(_) => NonProportionalFontSize::Px6x8,
+            };
+
+            egui::ComboBox::from_label("Non-Proportional Font Size")
+                .selected_text(format!("{:?}", current_size))
+                .show_ui(ui, |ui| {
+                    for value in [
+                        NonProportionalFontSize::Px6x8,
+                        NonProportionalFontSize::Px8x8,
+                        NonProportionalFontSize::Px8x12,
+                        NonProportionalFontSize::Px12x16,
+                        NonProportionalFontSize::Px16x16,
+                        NonProportionalFontSize::Px16x24,
+                        NonProportionalFontSize::Px24x32,
+                        NonProportionalFontSize::Px32x32,
+                        NonProportionalFontSize::Px32x48,
+                        NonProportionalFontSize::Px48x64,
+                        NonProportionalFontSize::Px64x64,
+                        NonProportionalFontSize::Px64x96,
+                        NonProportionalFontSize::Px96x128,
+                        NonProportionalFontSize::Px128x128,
+                        NonProportionalFontSize::Px128x192,
+                    ] {
+                        ui.selectable_value(
+                            &mut self.font_size,
+                            FontSize::NonProportional(value),
+                            format!("{:?}", value),
+                        );
+                    }
+                });
+        }
+
+        ui.separator();
+        ui.label("Font Type:");
+        let current_font_type = &self.font_type;
+        let known_types = [
+            (FontType::Latin1, "Latin1"),
+            (FontType::Latin9, "Latin9"),
+            // TODO: check if we have VT version 4 or later
+            // (FontType::Latin2, "Latin2"),
+            // (FontType::Latin4, "Latin4"),
+            // (FontType::Cyrillic, "Cyrillic"),
+            // (FontType::Greek, "Greek"),
+        ];
+
+        // Determine if current type matches one of the known variants
+        let mut is_known_type = false;
+        let mut selected_text = String::new();
+        for (t, name) in &known_types {
+            if current_font_type == t {
+                is_known_type = true;
+                selected_text = name.to_string();
+                break;
+            }
+        }
+
+        if !is_known_type {
+            selected_text = match current_font_type {
+                FontType::Reserved(v) => format!("Reserved({})", v),
+                FontType::Proprietary(v) => format!("Proprietary({})", v),
+                _ => "Unknown".to_string(),
+            };
+        }
+
+        const PROPRIETARY_RANGE_V3_AND_PRIOR: std::ops::RangeInclusive<u8> = 255..=255;
+        const PROPRIETARY_RANGE_V4_AND_LATER: std::ops::RangeInclusive<u8> = 240..=255;
+
+        egui::ComboBox::from_label("Select Font Type")
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                // Known fonts
+                for (t, name) in &known_types {
+                    if ui.selectable_label(&self.font_type == t, *name).clicked() {
+                        self.font_type = t.clone();
+                    }
+                }
+
+                ui.separator();
+                ui.label("Reserved/Proprietary:");
+                // For these, we allow specifying a raw value
+                let mut raw_value = match self.font_type {
+                    FontType::Reserved(v) | FontType::Proprietary(v) => v,
+                    _ => 255, // default to something in the proprietary range
+                };
+
+                ui.horizontal(|ui| {
+                    ui.label("Value:");
+                    if ui
+                        .add(egui::DragValue::new(&mut raw_value).speed(1))
+                        .changed()
+                    {
+                        // Determine if it's proprietary or reserved
+                        // TODO: check if we have VT version 4 or later
+                        if PROPRIETARY_RANGE_V3_AND_PRIOR.contains(&raw_value) {
+                            self.font_type = FontType::Proprietary(raw_value);
+                        } else {
+                            self.font_type = FontType::Reserved(raw_value);
+                        }
+                    }
+                });
+            });
+
+        ui.separator();
+        ui.label("Font Style:");
+        ui.checkbox(&mut self.font_style.bold, "Bold");
+        ui.checkbox(&mut self.font_style.crossed_out, "Crossed Out");
+        ui.checkbox(&mut self.font_style.underlined, "Underlined");
+        ui.checkbox(&mut self.font_style.italic, "Italic");
+        ui.checkbox(&mut self.font_style.inverted, "Inverted");
+        ui.checkbox(&mut self.font_style.flashing_inverted, "Flashing Inverted");
+        ui.checkbox(&mut self.font_style.flashing_hidden, "Flashing Hidden");
+        // ui.checkbox(&mut self.font_style.proportional, "Proportional"); // TODO: check if we have VT version 4 or later
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for LineAttributes {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.add(
+            egui::Slider::new(&mut self.line_colour, 0..=255)
+                .text("Line Colour")
+                .drag_value_speed(1.0),
+        );
+
+        ui.add(
+            egui::Slider::new(&mut self.line_width, 0..=255)
+                .text("Line Width")
+                .drag_value_speed(1.0),
+        );
+
+        ui.label("Line Art Pattern (16 bits):")
+            .on_hover_text("Each bit in this 16-bit pattern represents a 'paintbrush spot' along the line. ")
+            .on_hover_text("A '1' bit means that spot is drawn in the line color, while a '0' bit means that spot is skipped (shows background).");
+
+        ui.horizontal(|ui| {
+            for i in (0..16).rev() {
+                let bit_mask = 1 << i;
+                let mut bit_is_set = (self.line_art & bit_mask) != 0;
+                let check = ui.checkbox(&mut bit_is_set, "");
+                if check.changed() {
+                    if bit_is_set {
+                        self.line_art |= bit_mask;
+                    } else {
+                        self.line_art &= !bit_mask;
+                    }
+                }
+                check.on_hover_text(format!(
+                    "Bit {}: {} ({}). Click to toggle.\n1 = Draw line colour\n0 = Skip (background)",
+                    i,
+                    if bit_is_set { "Currently: Draw" } else { "Currently: Skip" },
+                    if bit_is_set { "One (1)" } else { "Zero (0)" }
+                ));
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Current Binary Pattern:");
+            ui.label(format!("{:016b}", self.line_art))
+                .on_hover_text("This shows the full 16-bit pattern of the line art. '1' bits represent drawn spots; '0' bits represent skipped spots.");
+        });
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for FillAttributes {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+        ui.label("Fill Type:").on_hover_text(
+            "Select how this area should be filled:\n\
+                            0 = No fill\n\
+                            1 = Fill with line colour\n\
+                            2 = Fill with specified fill colour\n\
+                            3 = Fill with a specified pattern (PictureGraphic)",
+        );
+
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.fill_type, 0, "No fill")
+                .on_hover_text("No fill will be drawn, the background will be visible.");
+            ui.radio_value(&mut self.fill_type, 1, "Fill with line colour")
+                .on_hover_text("The area will be filled using the currently set line colour of the parent shape.");
+            ui.radio_value(&mut self.fill_type, 2, "Fill with specified colour")
+                .on_hover_text("The area will be filled using the 'fill_colour' attribute specified below.");
+            ui.radio_value(&mut self.fill_type, 3, "Fill with pattern")
+                .on_hover_text("The area will be filled using a pattern defined by a PictureGraphic object referenced below.");
+        });
+
+        if self.fill_type == 2 {
+            ui.label("Fill Colour:")
+                .on_hover_text("Select the colour index (0-255) to use for filling the area.");
+            ui.add(
+                egui::Slider::new(&mut self.fill_colour, 0..=255)
+                    .text("Fill Colour")
+                    .drag_value_speed(1.0),
+            );
+        } else if self.fill_type == 3 {
+            ui.label("Fill Pattern (PictureGraphic Object):")
+                .on_hover_text("Select a PictureGraphic object to use as a pattern.\n\
+                                Make sure the PictureGraphic width and format match the restrictions.");
+            // Render a nullable object selector restricted to PictureGraphic objects
+            ui.horizontal(|ui| {
+                render_nullable_object_id_selector(
+                    ui,
+                    0,
+                    design.get_pool(),
+                    &mut self.fill_pattern,
+                    &[ObjectType::PictureGraphic],
+                );
+
+                if let Some(pattern_id) = self.fill_pattern.0 {
+                    if let Some(obj) = design.get_pool().object_by_id(pattern_id) {
+                        if ui.link("(view)").clicked() {
+                            *navigation_selected = pattern_id.into();
+                        }
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "Missing pattern object");
+                    }
+                } else {
+                    ui.label("None");
+                }
+            });
+        }
+
+        ui.separator();
+        ui.label("Macros:")
+            .on_hover_text("Define macros that could be triggered by events associated with this object.\n\
+                            Currently, FillAttributes does not trigger events, but this is included for consistency.");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for InputAttributes {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.horizontal(|ui| {
+            ui.label("Validation Type:");
+            ui.radio_value(
+                &mut self.validation_type,
+                ValidationType::ValidCharacters,
+                "Valid Characters",
+            );
+            ui.radio_value(
+                &mut self.validation_type,
+                ValidationType::InvalidCharacters,
+                "Invalid Characters",
+            );
+        });
+
+        ui.label("Validation String:");
+        ui.text_edit_singleline(&mut self.validation_string);
+
+        ui.separator();
+        ui.label("Macros:");
+        render_macro_references(
+            ui,
+            design.get_pool(),
+            &mut self.macro_refs,
+            &Self::get_possible_events(),
+            navigation_selected,
+        );
+    }
+}
+
 impl ConfigurableObject for ObjectPointer {
     fn render_parameters(
         &mut self,
@@ -1963,5 +3401,338 @@ impl ConfigurableObject for ObjectPointer {
                 }
             }
         });
+    }
+}
+
+const ALLOWED_MACRO_COMMANDS: &[(u8, &str, VtVersion)] = &[
+    (0xA0, "Hide/Show Object command", VtVersion::Version2),
+    (0xA1, "Enable/Disable Object command", VtVersion::Version2),
+    (0xA2, "Select Input Object command", VtVersion::Version2),
+    (0x92, "ESC command", VtVersion::Version2),
+    (0xA3, "Control Audio Signal command", VtVersion::Version2),
+    (0xA4, "Set Audio Volume command", VtVersion::Version2),
+    (0xA5, "Change Child Location command", VtVersion::Version2),
+    (0xB4, "Change Child Position command", VtVersion::Version2),
+    (0xA6, "Change Size command", VtVersion::Version2),
+    (
+        0xA7,
+        "Change Background Colour command",
+        VtVersion::Version2,
+    ),
+    (0xA8, "Change Numeric Value command", VtVersion::Version2),
+    (0xB3, "Change String Value command", VtVersion::Version2),
+    (0xA9, "Change End Point command", VtVersion::Version2),
+    (0xAA, "Change Font Attributes command", VtVersion::Version2),
+    (0xAB, "Change Line Attributes command", VtVersion::Version2),
+    (0xAC, "Change Fill Attributes command", VtVersion::Version2),
+    (0xAD, "Change Active Mask command", VtVersion::Version2),
+    (0xAE, "Change Soft Key Mask command", VtVersion::Version2),
+    (0xAF, "Change Attribute command", VtVersion::Version2),
+    (0xB0, "Change priority command", VtVersion::Version2),
+    (0xB1, "Change List item command", VtVersion::Version2),
+    (0xBD, "Lock/Unlock Mask command", VtVersion::Version4),
+    (0xBE, "Execute Macro command", VtVersion::Version4),
+    (0xB5, "Change Object Label command", VtVersion::Version4),
+    (0xB6, "Change Polygon Point command", VtVersion::Version4),
+    (0xB7, "Change Polygon Scale command", VtVersion::Version4),
+    (0xB8, "Graphics Context command", VtVersion::Version4),
+    (
+        0xBA,
+        "Select Colour Map or Palette command",
+        VtVersion::Version4,
+    ),
+    (0xBC, "Execute Extended Macro command", VtVersion::Version5),
+    (
+        0x90,
+        "Select Active Working Set command",
+        VtVersion::Version6,
+    ),
+];
+
+impl ConfigurableObject for Macro {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.label("Macro Commands:");
+        egui::Grid::new("macro_commands_grid")
+            .striped(true)
+            .min_col_width(0.0)
+            .show(ui, |ui| {
+                let mut idx = 0;
+                while idx < self.commands.len() {
+                    let code = self.commands[idx];
+                    let command_name = ALLOWED_MACRO_COMMANDS
+                        .iter()
+                        .find(|&&(c, _, __)| c == code)
+                        .map(|&(_, name, __)| name)
+                        .unwrap_or("Unknown");
+
+                    ui.label(format!("0x{:02X}", code));
+                    ui.label(command_name);
+                    render_index_modifiers(ui, idx, &mut self.commands);
+                    ui.end_row();
+
+                    idx += 1;
+                }
+            });
+
+        ui.horizontal(|ui| {
+            ui.label("Add command:");
+            egui::ComboBox::from_id_source("add_macro_command")
+                .selected_text("Select command")
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    for &(code, name, version) in ALLOWED_MACRO_COMMANDS {
+                        if version > VtVersion::Version3 {
+                            continue; // TODO: check which version pool we have
+                        }
+
+                        if ui
+                            .selectable_label(false, format!("0x{:02X} {}", code, name))
+                            .clicked()
+                        {
+                            self.commands.push(code);
+                        }
+                    }
+                });
+        });
+    }
+}
+
+impl ConfigurableObject for AuxiliaryFunctionType2 {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.add(
+            egui::Slider::new(&mut self.background_colour, 0..=255)
+                .text("Background Colour")
+                .drag_value_speed(1.0),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Function Type:");
+            egui::ComboBox::from_id_source("function_type")
+                .selected_text(format!("{:?}", self.function_attributes.function_type))
+                .width(0.0)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+
+                    let selectable_types = &[
+                        AuxiliaryFunctionType::BooleanLatching,
+                        AuxiliaryFunctionType::AnalogueMaintains,
+                        AuxiliaryFunctionType::BooleanNonLatching,
+                        AuxiliaryFunctionType::AnalogueReturnToCenter,
+                        AuxiliaryFunctionType::AnalogueReturnToZero,
+                        AuxiliaryFunctionType::DualBooleanLatching,
+                        AuxiliaryFunctionType::DualBooleanNonLatching,
+                        AuxiliaryFunctionType::DualBooleanLatchingUp,
+                        AuxiliaryFunctionType::DualBooleanLatchingDown,
+                        AuxiliaryFunctionType::CombinedAnalogueReturnWithLatch,
+                        AuxiliaryFunctionType::CombinedAnalogueMaintainsWithLatch,
+                        AuxiliaryFunctionType::QuadratureBooleanNonLatching,
+                        AuxiliaryFunctionType::QuadratureAnalogueMaintains,
+                        AuxiliaryFunctionType::QuadratureAnalogueReturnToCenter,
+                        AuxiliaryFunctionType::BidirectionalEncoder,
+                    ];
+
+                    for ft in selectable_types {
+                        ui.selectable_value(
+                            &mut self.function_attributes.function_type,
+                            *ft,
+                            format!("{:?}", ft),
+                        );
+                    }
+                });
+        });
+
+        ui.checkbox(&mut self.function_attributes.critical, "Critical");
+        ui.checkbox(&mut self.function_attributes.restricted, "Restricted");
+        ui.checkbox(
+            &mut self.function_attributes.single_assignment,
+            "Single-assignment",
+        );
+
+        ui.separator();
+        ui.label("Objects:");
+        render_object_references_list(
+            ui,
+            design.get_pool(),
+            design.mask_size,
+            design.mask_size,
+            &mut self.object_refs,
+            &Self::get_allowed_child_refs(VtVersion::Version3),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for AuxiliaryInputType2 {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.add(
+            egui::Slider::new(&mut self.background_colour, 0..=255)
+                .text("Background Colour")
+                .drag_value_speed(1.0),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Function Type:");
+            egui::ComboBox::from_id_source("input_function_type")
+                .selected_text(format!("{:?}", self.function_attributes.function_type))
+                .width(200.0)
+                .show_ui(ui, |ui| {
+                    ui.style_mut().wrap = Some(false);
+                    let selectable_types = &[
+                        AuxiliaryFunctionType::BooleanLatching,
+                        AuxiliaryFunctionType::AnalogueMaintains,
+                        AuxiliaryFunctionType::BooleanNonLatching,
+                        AuxiliaryFunctionType::AnalogueReturnToCenter,
+                        AuxiliaryFunctionType::AnalogueReturnToZero,
+                        AuxiliaryFunctionType::DualBooleanLatching,
+                        AuxiliaryFunctionType::DualBooleanNonLatching,
+                        AuxiliaryFunctionType::DualBooleanLatchingUp,
+                        AuxiliaryFunctionType::DualBooleanLatchingDown,
+                        AuxiliaryFunctionType::CombinedAnalogueReturnWithLatch,
+                        AuxiliaryFunctionType::CombinedAnalogueMaintainsWithLatch,
+                        AuxiliaryFunctionType::QuadratureBooleanNonLatching,
+                        AuxiliaryFunctionType::QuadratureAnalogueMaintains,
+                        AuxiliaryFunctionType::QuadratureAnalogueReturnToCenter,
+                        AuxiliaryFunctionType::BidirectionalEncoder,
+                    ];
+
+                    for ft in selectable_types {
+                        ui.selectable_value(
+                            &mut self.function_attributes.function_type,
+                            *ft,
+                            format!("{:?}", ft),
+                        );
+                    }
+                });
+        });
+
+        ui.checkbox(&mut self.function_attributes.critical, "Critical");
+        ui.checkbox(
+            &mut self.function_attributes.single_assignment,
+            "Single-assignment",
+        );
+
+        ui.separator();
+        ui.label("Objects:");
+        render_object_references_list(
+            ui,
+            design.get_pool(),
+            design.mask_size,
+            design.mask_size,
+            &mut self.object_refs,
+            &Self::get_allowed_child_refs(VtVersion::Version3),
+            navigation_selected,
+        );
+    }
+}
+
+impl ConfigurableObject for AuxiliaryControlDesignatorType2 {
+    fn render_parameters(
+        &mut self,
+        ui: &mut egui::Ui,
+        design: &EditorProject,
+        navigation_selected: &mut NullableObjectId,
+    ) {
+        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+
+        ui.horizontal(|ui| {
+            ui.label("Pointer Type:");
+            egui::ComboBox::from_id_source("aux_control_pointer_type")
+                .selected_text(format!("{}", self.pointer_type))
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.pointer_type,
+                        0,
+                        "0 (Points to Auxiliary Object)",
+                    );
+                    ui.selectable_value(
+                        &mut self.pointer_type,
+                        1,
+                        "1 (Points to Assigned Aux Objects)",
+                    );
+                    ui.selectable_value(
+                        &mut self.pointer_type,
+                        2,
+                        "2 (Points to WS Object of this Pool)",
+                    );
+                    ui.selectable_value(
+                        &mut self.pointer_type,
+                        3,
+                        "3 (Points to WS Object of Assigned)",
+                    );
+                });
+        });
+
+        // According to Table J.6 and J.7, when pointer_type = 2, auxiliary_object_id should be NULL (0xFFFF).
+        let must_be_null = self.pointer_type == 2;
+        if must_be_null {
+            self.auxiliary_object_id = NullableObjectId::NULL;
+        } else {
+            // Allow user to select an Auxiliary Input or Auxiliary Function object.
+            ui.horizontal(|ui| {
+                ui.label("Auxiliary Object ID:");
+                egui::ComboBox::from_id_source("aux_object_id_selector")
+                    .selected_text(format!("{:?}", u16::from(self.auxiliary_object_id)))
+                    .width(200.0)
+                    .show_ui(ui, |ui| {
+                        ui.style_mut().wrap = Some(false);
+
+                        // Let’s consider that we might assign Auxiliary Function Type 2 (31) or Auxiliary Input Type 2 (32) objects.
+                        let allowed_types = &[
+                            ObjectType::AuxiliaryFunctionType2,
+                            ObjectType::AuxiliaryInputType2,
+                        ];
+
+                        for potential_child in design.get_pool().objects_by_types(allowed_types) {
+                            if ui
+                                .selectable_label(
+                                    NullableObjectId::from(potential_child.id())
+                                        == self.auxiliary_object_id,
+                                    format!(
+                                        "{:?}: {:?}",
+                                        u16::from(potential_child.id()),
+                                        potential_child.object_type()
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                self.auxiliary_object_id = potential_child.id().into();
+                            }
+                        }
+                    });
+
+                // Provide a link to navigate to the selected object
+                if let Some(ref_id) = self.auxiliary_object_id.into() {
+                    if let Some(obj) = design.get_pool().object_by_id(ref_id) {
+                        if ui.link(format!("{:?}", obj.object_type())).clicked() {
+                            *navigation_selected = ref_id.into();
+                        }
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "Missing object in pool");
+                    }
+                }
+            });
+        }
     }
 }

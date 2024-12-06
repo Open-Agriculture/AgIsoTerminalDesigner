@@ -354,7 +354,11 @@ fn default_output_polygon() -> OutputPolygon {
         line_attributes: ObjectId::new(0).unwrap(),
         fill_attributes: NullableObjectId::NULL,
         polygon_type: 0,
-        points: vec![],
+        points: vec![
+            Point { x: 0, y: 0 },
+            Point { x: 0, y: 0 },
+            Point { x: 0, y: 0 },
+        ],
         macro_refs: vec![],
     }
 }
@@ -473,9 +477,18 @@ fn default_font_attributes() -> FontAttributes {
     FontAttributes {
         id: ObjectId::new(0).unwrap(),
         font_colour: 0,
-        font_size: 0,
-        font_type: 0,
-        font_style: 0,
+        font_size: FontSize::NonProportional(NonProportionalFontSize::Px6x8),
+        font_type: FontType::Latin1,
+        font_style: FontStyle {
+            bold: false,
+            crossed_out: false,
+            underlined: false,
+            italic: false,
+            inverted: false,
+            flashing_inverted: false,
+            flashing_hidden: false,
+            proportional: false,
+        },
         macro_refs: vec![],
     }
 }
@@ -503,7 +516,7 @@ fn default_fill_attributes() -> FillAttributes {
 fn default_input_attributes() -> InputAttributes {
     InputAttributes {
         id: ObjectId::new(0).unwrap(),
-        validation_type: 0,
+        validation_type: ValidationType::ValidCharacters,
         validation_string: "".to_string(),
         macro_refs: vec![],
     }
@@ -546,7 +559,12 @@ fn default_auxiliary_function_type2() -> AuxiliaryFunctionType2 {
     AuxiliaryFunctionType2 {
         id: ObjectId::new(0).unwrap(),
         background_colour: 0,
-        function_attributes: 0,
+        function_attributes: FunctionAttributes {
+            function_type: AuxiliaryFunctionType::BooleanLatching,
+            critical: false,
+            restricted: false,
+            single_assignment: false,
+        },
         object_refs: vec![],
     }
 }
@@ -555,7 +573,12 @@ fn default_auxiliary_input_type2() -> AuxiliaryInputType2 {
     AuxiliaryInputType2 {
         id: ObjectId::new(0).unwrap(),
         background_colour: 0,
-        function_attributes: 0,
+        function_attributes: FunctionAttributes {
+            function_type: AuxiliaryFunctionType::BooleanLatching,
+            critical: false,
+            restricted: false,
+            single_assignment: false,
+        },
         object_refs: vec![],
     }
 }
@@ -564,7 +587,7 @@ fn default_auxiliary_control_designator_type2() -> AuxiliaryControlDesignatorTyp
     AuxiliaryControlDesignatorType2 {
         id: ObjectId::new(0).unwrap(),
         pointer_type: 0,
-        auxiliary_object_id: ObjectId::new(0).unwrap(),
+        auxiliary_object_id: NullableObjectId::NULL,
     }
 }
 

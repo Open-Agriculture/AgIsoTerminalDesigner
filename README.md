@@ -76,27 +76,26 @@ The lists below only apply to version 3 of the VT specification. There are 3 sta
 - :green_circle: InputList
 - :green_circle: OutputString
 - :green_circle: OutputNumber
-- :white_circle: OutputList
-- :white_circle: OutputLine
-- :white_circle: OutputRectangle
-- :white_circle: OutputEllipse
-- :white_circle: OutputPolygon
-- :white_circle: OutputMeter
-- :white_circle: OutputLinearBarGraph
-- :white_circle: OutputCircularBarGraph
+- :orange_circle: OutputList
+- :orange_circle: OutputLine
+- :orange_circle: OutputRectangle
+- :orange_circle: OutputEllipse
+- :orange_circle: OutputPolygon
+- :orange_circle: OutputMeter
+- :orange_circle: OutputLinearBarGraph
+- :orange_circle: OutputArchedBarGraph
 - :yellow_circle: PictureGraphic (missing loading images from file)
-- :white_circle: NumberVariable
-- :white_circle: StringVariable
-- :white_circle: FontAttributes
-- :white_circle: LineAttributes
-- :white_circle: FillAttributes
-- :white_circle: InputAttributes
-- :white_circle: ExtendedInputAttributes
+- :orange_circle: NumberVariable
+- :orange_circle: StringVariable
+- :orange_circle: FontAttributes
+- :orange_circle: LineAttributes
+- :orange_circle: FillAttributes
+- :orange_circle: InputAttributes
 - :green_circle: ObjectPointer
-- :white_circle: Macro
-- :white_circle: Auxiliary Function Type 2
-- :white_circle: Auxiliary Input Type 2
-- :white_circle: Auxiliary Control Designator Type 2 Object Pointer
+- :orange_circle: Macro
+- :orange_circle: Auxiliary Function Type 2
+- :orange_circle: Auxiliary Input Type 2
+- :orange_circle: Auxiliary Control Designator Type 2 Object Pointer
 
 #### Renderable Types
 
@@ -120,7 +119,7 @@ The lists below only apply to version 3 of the VT specification. There are 3 sta
 - :white_circle: OutputPolygon
 - :white_circle: OutputMeter
 - :white_circle: OutputLinearBarGraph
-- :white_circle: OutputCircularBarGraph
+- :white_circle: OutputArchedBarGraph
 - :green_circle: PictureGraphic
 - :green_circle: ObjectPointer
 - :white_circle: Auxiliary Function Type 2
