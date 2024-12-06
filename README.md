@@ -59,43 +59,43 @@ If you have any suggestions or would like to contribute, feel free to open an is
 
 ### Supported Objects
 
-The lists below only apply to version 3 of the VT specification. There are 3 stages of development for each object: **Not Started** [ :white_circle: ], **In Progress** [ :orange_circle: ], and **Completed** [ :green_circle: ]. Open an issue if you would like to prioritize a specific object, or even better, submit a pull request to help implement it!
+The lists below only apply to version 3 of the VT specification. There are 3 stages of development for each object: **Not Started** [ :white_circle: ], **In Progress** [ :yellow_circle: ], and **Completed** [ :green_circle: ]. Open an issue if you would like to prioritize a specific object, or even better, submit a pull request to help implement it!
 
 #### Configurable Types
 
-- :orange_circle: WorkingSet (missing language codes)
+- :yellow_circle: WorkingSet (missing language codes)
 - :green_circle: DataMask
 - :green_circle: AlarmMask
 - :green_circle: Container
 - :green_circle: SoftKeyMask
 - :green_circle: Key
-- :orange_circle: Button (missing options, keycode, border colour)
+- :yellow_circle: Button (missing options, keycode, border colour)
 - :green_circle: InputBoolean
 - :green_circle: InputString
 - :green_circle: InputNumber
 - :green_circle: InputList
 - :green_circle: OutputString
 - :green_circle: OutputNumber
-- :orange_circle: OutputList
-- :orange_circle: OutputLine
-- :orange_circle: OutputRectangle
-- :orange_circle: OutputEllipse
-- :orange_circle: OutputPolygon
-- :orange_circle: OutputMeter
-- :orange_circle: OutputLinearBarGraph
-- :orange_circle: OutputArchedBarGraph
+- :yellow_circle: OutputList
+- :yellow_circle: OutputLine
+- :yellow_circle: OutputRectangle
+- :yellow_circle: OutputEllipse
+- :yellow_circle: OutputPolygon
+- :yellow_circle: OutputMeter
+- :yellow_circle: OutputLinearBarGraph
+- :yellow_circle: OutputArchedBarGraph
 - :yellow_circle: PictureGraphic (missing loading images from file)
-- :orange_circle: NumberVariable
-- :orange_circle: StringVariable
-- :orange_circle: FontAttributes
-- :orange_circle: LineAttributes
-- :orange_circle: FillAttributes
-- :orange_circle: InputAttributes
+- :yellow_circle: NumberVariable
+- :yellow_circle: StringVariable
+- :yellow_circle: FontAttributes
+- :yellow_circle: LineAttributes
+- :yellow_circle: FillAttributes
+- :yellow_circle: InputAttributes
 - :green_circle: ObjectPointer
-- :orange_circle: Macro
-- :orange_circle: Auxiliary Function Type 2
-- :orange_circle: Auxiliary Input Type 2
-- :orange_circle: Auxiliary Control Designator Type 2 Object Pointer
+- :yellow_circle: Macro
+- :yellow_circle: Auxiliary Function Type 2
+- :yellow_circle: Auxiliary Input Type 2
+- :yellow_circle: Auxiliary Control Designator Type 2 Object Pointer
 
 #### Renderable Types
 

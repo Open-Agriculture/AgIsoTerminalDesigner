@@ -16,6 +16,7 @@ use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectRef;
 use ag_iso_stack::object_pool::ObjectType;
 use eframe::egui;
+use eframe::egui::TextWrapMode;
 
 pub trait ConfigurableObject {
     fn render_parameters(
@@ -33,6 +34,12 @@ impl ConfigurableObject for Object {
         design: &EditorProject,
         navigation_selected: &mut NullableObjectId,
     ) {
+        // Specific UI settings that are applied to all configuration screens
+
+        // The combination below makes the comboboxes used throughout the configuration UI have minimal width, yet still be able to show the full text
+        ui.style_mut().wrap_mode = Some(TextWrapMode::Extend);
+        ui.style_mut().spacing.combo_width = 0.0;
+
         match self {
             Object::WorkingSet(o) => o.render_parameters(ui, design, navigation_selected),
             Object::DataMask(o) => o.render_parameters(ui, design, navigation_selected),
@@ -97,19 +104,17 @@ fn render_object_id(
     pool: &ObjectPool,
     navigation_selected: &mut NullableObjectId,
 ) {
-    let mut temp_id = u16::from(*id);
+    let mut current_id = u16::from(*id);
 
     ui.horizontal(|ui| {
         ui.label("Object ID:");
 
-        let resp = ui.add(
-            egui::DragValue::new(&mut temp_id)
-                .speed(1.0)
-                .update_while_editing(false)
-                .range(0..=65534),
-        );
+        let widget = egui::DragValue::new(&mut current_id)
+            .speed(1.0)
+            .range(0..=65534);
+        let resp = ui.add(widget);
 
-        let new_id = ObjectId::new(temp_id).unwrap();
+        let new_id = ObjectId::new(current_id).unwrap();
 
         // Check if the new ID is already used by another object (excluding the current object)
         let conflict = pool.object_by_id(new_id).is_some() && new_id != *id;
@@ -117,14 +122,14 @@ fn render_object_id(
         let conflict_storage = ui.id().with("conflict");
         let was_conflict = ui.data(|data| data.get_temp::<u16>(conflict_storage));
 
-        if conflict || was_conflict.is_some_and(|id| id == temp_id) {
+        if conflict || was_conflict.is_some_and(|id| id == current_id) {
             ui.colored_label(egui::Color32::RED, "ID already in use!");
 
             // Save the conflict in storage so it is still displayed next frame
             ui.data_mut(|data| {
                 data.insert_temp(conflict_storage, u16::from(*id));
             });
-        } else if resp.changed() || was_conflict.is_some_and(|id| id != temp_id) {
+        } else if resp.changed() || was_conflict.is_some_and(|id| id != current_id) {
             // Remove the conflict from storage if we are actively changing the ID,
             // or if the ID has changed (most likely another object is selected)
             ui.data_mut(|data| {
@@ -132,8 +137,7 @@ fn render_object_id(
             });
         }
 
-        // Update the ID when editing is finished and there's no conflict
-        if !conflict && (resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+        if !conflict && resp.changed() {
             *id = new_id;
             navigation_selected.0 = Some(*id);
         }
@@ -147,11 +151,9 @@ fn render_object_id_selector(
     object_id: &mut ObjectId,
     allowed_child_objects: &[ObjectType],
 ) {
-    egui::ComboBox::from_id_source(format!("object_id_selector_{}", idx))
+    egui::ComboBox::from_id_salt(format!("object_id_selector_{}", idx))
         .selected_text(format!("{:?}", object_id.value()))
-        .width(0.0)
         .show_ui(ui, |ui| {
-            ui.style_mut().wrap = Some(false);
             for potential_child in pool.objects_by_types(allowed_child_objects) {
                 ui.selectable_value(
                     object_id,
@@ -173,15 +175,13 @@ fn render_nullable_object_id_selector(
     object_id: &mut NullableObjectId,
     allowed_child_objects: &[ObjectType],
 ) {
-    egui::ComboBox::from_id_source(format!("nullable_object_id_selector_{}", idx))
+    egui::ComboBox::from_id_salt(format!("nullable_object_id_selector_{}", idx))
         .selected_text(
             object_id
                 .0
                 .map_or("None".to_string(), |id| format!("{:?}", id.value())),
         )
-        .width(0.0)
         .show_ui(ui, |ui| {
-            ui.style_mut().wrap = Some(false);
             ui.selectable_value(object_id, NullableObjectId::NULL, "None");
             for potential_child in pool.objects_by_types(allowed_child_objects) {
                 ui.selectable_value(
@@ -376,10 +376,9 @@ fn render_add_object_id(
     let mut result = (None, false);
     ui.horizontal(|ui| {
         ui.label("Add object:");
-        egui::ComboBox::from_id_source("New Object Type")
+        egui::ComboBox::from_id_salt("New Object Type")
             .selected_text("Select existing object")
             .show_ui(ui, |ui| {
-                ui.style_mut().wrap = Some(false);
                 if allow_none {
                     if ui.selectable_label(false, "None").clicked() {
                         result = (None, true);
@@ -427,11 +426,9 @@ fn render_macro_references(
                 {
                     ui.label(" - ");
                     ui.push_id(idx, |ui| {
-                        egui::ComboBox::from_id_source("event_id")
+                        egui::ComboBox::from_id_salt("event_id")
                             .selected_text(format!("{:?}", macro_ref.event_id))
-                            .width(0.0)
                             .show_ui(ui, |ui| {
-                                ui.style_mut().wrap = Some(false);
                                 for event in possible_events {
                                     ui.selectable_value(
                                         &mut macro_ref.event_id,
@@ -445,11 +442,9 @@ fn render_macro_references(
                             *navigation_selected = macro_obj.id().into();
                         }
 
-                        egui::ComboBox::from_id_source("macro_id")
+                        egui::ComboBox::from_id_salt("macro_id")
                             .selected_text(format!("{:?}", macro_ref.macro_id))
-                            .width(0.0)
                             .show_ui(ui, |ui| {
-                                ui.style_mut().wrap = Some(false);
                                 for potential_macro in pool.objects_by_type(ObjectType::Macro) {
                                     ui.selectable_value(
                                         &mut macro_ref.macro_id,
@@ -488,15 +483,13 @@ fn render_add_macro_reference(
                 data.get_temp(egui::Id::new("selected_event"))
                     .unwrap_or(Event::Reserved)
             });
-            egui::ComboBox::from_id_source("New Event Type")
+            egui::ComboBox::from_id_salt("New Event Type")
                 .selected_text(if selected_event == Event::Reserved {
                     "Select event".to_string()
                 } else {
                     format!("{:?}", selected_event)
                 })
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     for event in possible_events {
                         if ui
                             .selectable_value(&mut selected_event, *event, format!("{:?}", event))
@@ -510,11 +503,9 @@ fn render_add_macro_reference(
                 });
 
             if selected_event != Event::Reserved {
-                egui::ComboBox::from_id_source("New Macro")
+                egui::ComboBox::from_id_salt("New Macro")
                     .selected_text("Select macro")
-                    .width(0.0)
                     .show_ui(ui, |ui| {
-                        ui.style_mut().wrap = Some(false);
                         for potential_macro in pool.objects_by_type(ObjectType::Macro) {
                             if ui
                                 .selectable_label(
@@ -861,12 +852,7 @@ impl ConfigurableObject for Button {
         navigation_selected: &mut NullableObjectId,
     ) {
         render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
-        ui.checkbox(&mut self.options.no_border, "No Border");
-        ui.checkbox(
-            &mut self.options.transparent_background,
-            "Transparent Background",
-        );
-        ui.checkbox(&mut self.options.suppress_border, "Suppress Border");
+
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
                 .text("Width")
@@ -877,11 +863,42 @@ impl ConfigurableObject for Button {
                 .text("Height")
                 .drag_value_speed(1.0),
         );
+
         ui.add(
             egui::Slider::new(&mut self.background_colour, 0..=255)
                 .text("Background Colour")
                 .drag_value_speed(1.0),
         );
+        ui.add(
+            egui::Slider::new(&mut self.border_colour, 0..=255)
+                .text("Border Colour")
+                .drag_value_speed(1.0),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Key code:");
+            ui.add(egui::DragValue::new(&mut self.key_code).speed(1.0));
+        });
+
+        ui.separator();
+        ui.checkbox(&mut self.options.latchable, "Latchable");
+        if self.options.latchable {
+            ui.horizontal(|ui| {
+                ui.label("Initial State:");
+                ui.radio_value(&mut self.options.state, ButtonState::Released, "Released");
+                ui.radio_value(&mut self.options.state, ButtonState::Latched, "Latched");
+            });
+        }
+
+        // TODO: check if we have VT version 4 or later
+        // ui.checkbox(&mut self.options.suppress_border, "Suppress Border");
+        // ui.checkbox(
+        //     &mut self.options.transparent_background,
+        //     "Transparent Background",
+        // );
+        // ui.checkbox(&mut self.options.disabled, "Disabled");
+        // ui.checkbox(&mut self.options.no_border, "No Border");
+
         ui.separator();
         ui.label("Objects:");
         render_object_references_list(
@@ -924,11 +941,9 @@ impl ConfigurableObject for InputBoolean {
                 .text("Width")
                 .drag_value_speed(1.0),
         );
-        egui::ComboBox::from_id_source("foreground_colour")
+        egui::ComboBox::from_id_salt("foreground_colour")
             .selected_text(format!("{:?}", u16::from(self.foreground_colour)))
-            .width(0.0)
             .show_ui(ui, |ui| {
-                ui.style_mut().wrap = Some(false);
                 for potential_child in design
                     .get_pool()
                     .objects_by_type(ObjectType::FontAttributes)
@@ -946,11 +961,9 @@ impl ConfigurableObject for InputBoolean {
             });
         ui.horizontal(|ui| {
             ui.label("Variable reference:");
-            egui::ComboBox::from_id_source("variable_reference")
+            egui::ComboBox::from_id_salt("variable_reference")
                 .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(
                         &mut self.variable_reference,
                         NullableObjectId::NULL,
@@ -974,11 +987,9 @@ impl ConfigurableObject for InputBoolean {
         });
         if self.variable_reference.0.is_none() {
             ui.label("Initial value:");
-            egui::ComboBox::from_id_source("initial_value")
+            egui::ComboBox::from_id_salt("initial_value")
                 .selected_text(format!("{:?}", self.value))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(&mut self.value, false, "False");
                     ui.selectable_value(&mut self.value, true, "True");
                 });
@@ -1021,11 +1032,9 @@ impl ConfigurableObject for InputString {
         );
         ui.horizontal(|ui| {
             ui.label("Font attributes:");
-            egui::ComboBox::from_id_source("font_attributes")
+            egui::ComboBox::from_id_salt("font_attributes")
                 .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::FontAttributes)
@@ -1040,11 +1049,9 @@ impl ConfigurableObject for InputString {
         });
         ui.horizontal(|ui| {
             ui.label("Input attributes:");
-            egui::ComboBox::from_id_source("input_attributes")
+            egui::ComboBox::from_id_salt("input_attributes")
                 .selected_text(format!("{:?}", u16::from(self.input_attributes)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(&mut self.input_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
@@ -1066,11 +1073,9 @@ impl ConfigurableObject for InputString {
         // }
         ui.horizontal(|ui| {
             ui.label("Variable reference:");
-            egui::ComboBox::from_id_source("variable_reference")
+            egui::ComboBox::from_id_salt("variable_reference")
                 .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(
                         &mut self.variable_reference,
                         NullableObjectId::NULL,
@@ -1181,11 +1186,9 @@ impl ConfigurableObject for InputNumber {
         );
         ui.horizontal(|ui| {
             ui.label("Font attributes:");
-            egui::ComboBox::from_id_source("font_attributes")
+            egui::ComboBox::from_id_salt("font_attributes")
                 .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::FontAttributes)
@@ -1211,11 +1214,9 @@ impl ConfigurableObject for InputNumber {
         // ui.checkbox(&mut self.options.truncate, "Truncate");
         ui.horizontal(|ui| {
             ui.label("Variable reference:");
-            egui::ComboBox::from_id_source("variable_reference")
+            egui::ComboBox::from_id_salt("variable_reference")
                 .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(
                         &mut self.variable_reference,
                         NullableObjectId::NULL,
@@ -1352,11 +1353,9 @@ impl ConfigurableObject for InputList {
         );
         ui.horizontal(|ui| {
             ui.label("Variable reference:");
-            egui::ComboBox::from_id_source("variable_reference")
+            egui::ComboBox::from_id_salt("variable_reference")
                 .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(
                         &mut self.variable_reference,
                         NullableObjectId::NULL,
@@ -1434,11 +1433,9 @@ impl ConfigurableObject for OutputString {
         );
         ui.horizontal(|ui| {
             ui.label("Font attributes:");
-            egui::ComboBox::from_id_source("font_attributes")
+            egui::ComboBox::from_id_salt("font_attributes")
                 .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::FontAttributes)
@@ -1459,11 +1456,9 @@ impl ConfigurableObject for OutputString {
         // }
         ui.horizontal(|ui| {
             ui.label("Variable reference:");
-            egui::ComboBox::from_id_source("variable_reference")
+            egui::ComboBox::from_id_salt("variable_reference")
                 .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(
                         &mut self.variable_reference,
                         NullableObjectId::NULL,
@@ -1573,11 +1568,9 @@ impl ConfigurableObject for OutputNumber {
         );
         ui.horizontal(|ui| {
             ui.label("Font attributes:");
-            egui::ComboBox::from_id_source("font_attributes")
+            egui::ComboBox::from_id_salt("font_attributes")
                 .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::FontAttributes)
@@ -1604,11 +1597,9 @@ impl ConfigurableObject for OutputNumber {
         // ui.checkbox(&mut self.options.truncate, "Truncate");
         ui.horizontal(|ui| {
             ui.label("Variable reference:");
-            egui::ComboBox::from_id_source("variable_reference")
+            egui::ComboBox::from_id_salt("variable_reference")
                 .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(
                         &mut self.variable_reference,
                         NullableObjectId::NULL,
@@ -1734,11 +1725,9 @@ impl ConfigurableObject for OutputList {
 
         ui.horizontal(|ui| {
             ui.label("Variable reference:");
-            egui::ComboBox::from_id_source("variable_reference")
+            egui::ComboBox::from_id_salt("variable_reference")
                 .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(
                         &mut self.variable_reference,
                         NullableObjectId::NULL,
@@ -1799,11 +1788,9 @@ impl ConfigurableObject for OutputLine {
 
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
-            egui::ComboBox::from_id_source("line_attributes")
+            egui::ComboBox::from_id_salt("line_attributes")
                 .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::LineAttributes)
@@ -1878,11 +1865,9 @@ impl ConfigurableObject for OutputRectangle {
 
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
-            egui::ComboBox::from_id_source("line_attributes_selector")
+            egui::ComboBox::from_id_salt("line_attributes_selector")
                 .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::LineAttributes)
@@ -1928,15 +1913,13 @@ impl ConfigurableObject for OutputRectangle {
         // Fill Attributes Selection
         ui.horizontal(|ui| {
             ui.label("Fill Attributes:");
-            egui::ComboBox::from_id_source("fill_attributes_selector")
+            egui::ComboBox::from_id_salt("fill_attributes_selector")
                 .selected_text(
                     self.fill_attributes
                         .0
                         .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
                 )
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
@@ -1989,11 +1972,9 @@ impl ConfigurableObject for OutputEllipse {
 
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
-            egui::ComboBox::from_id_source("line_attributes_selector")
+            egui::ComboBox::from_id_salt("line_attributes_selector")
                 .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::LineAttributes)
@@ -2054,15 +2035,13 @@ impl ConfigurableObject for OutputEllipse {
 
         ui.horizontal(|ui| {
             ui.label("Fill Attributes:");
-            egui::ComboBox::from_id_source("fill_attributes_selector")
+            egui::ComboBox::from_id_salt("fill_attributes_selector")
                 .selected_text(
                     self.fill_attributes
                         .0
                         .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
                 )
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
@@ -2126,11 +2105,9 @@ impl ConfigurableObject for OutputPolygon {
 
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
-            egui::ComboBox::from_id_source("line_attributes_selector")
+            egui::ComboBox::from_id_salt("line_attributes_selector")
                 .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::LineAttributes)
@@ -2159,15 +2136,13 @@ impl ConfigurableObject for OutputPolygon {
 
         ui.horizontal(|ui| {
             ui.label("Fill Attributes:");
-            egui::ComboBox::from_id_source("fill_attributes_selector")
+            egui::ComboBox::from_id_salt("fill_attributes_selector")
                 .selected_text(
                     self.fill_attributes
                         .0
                         .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
                 )
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
@@ -2343,7 +2318,7 @@ impl ConfigurableObject for OutputMeter {
 
         ui.horizontal(|ui| {
             ui.label("Variable reference:");
-            egui::ComboBox::from_id_source("variable_reference")
+            egui::ComboBox::from_id_salt("variable_reference")
                 .selected_text(
                     self.variable_reference
                         .0
@@ -2488,7 +2463,7 @@ impl ConfigurableObject for OutputLinearBarGraph {
 
         ui.horizontal(|ui| {
             ui.label("Variable Reference:");
-            egui::ComboBox::from_id_source("variable_reference")
+            egui::ComboBox::from_id_salt("variable_reference")
                 .selected_text(
                     self.variable_reference
                         .0
@@ -2525,7 +2500,7 @@ impl ConfigurableObject for OutputLinearBarGraph {
 
         ui.horizontal(|ui| {
             ui.label("Target Value Variable Reference:");
-            egui::ComboBox::from_id_source("target_value_variable_reference")
+            egui::ComboBox::from_id_salt("target_value_variable_reference")
                 .selected_text(
                     self.target_value_variable_reference
                         .0
@@ -2692,7 +2667,7 @@ impl ConfigurableObject for OutputArchedBarGraph {
 
         ui.horizontal(|ui| {
             ui.label("Variable Reference:");
-            egui::ComboBox::from_id_source("variable_reference")
+            egui::ComboBox::from_id_salt("variable_reference")
                 .selected_text(
                     self.variable_reference
                         .0
@@ -2729,7 +2704,7 @@ impl ConfigurableObject for OutputArchedBarGraph {
 
         ui.horizontal(|ui| {
             ui.label("Target Value Variable Reference:");
-            egui::ComboBox::from_id_source("target_value_variable_reference")
+            egui::ComboBox::from_id_salt("target_value_variable_reference")
                 .selected_text(
                     self.target_value_variable_reference
                         .0
@@ -3364,11 +3339,9 @@ impl ConfigurableObject for ObjectPointer {
         render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
         ui.horizontal(|ui| {
             ui.label("Object reference:");
-            egui::ComboBox::from_id_source("object_reference")
+            egui::ComboBox::from_id_salt("object_reference")
                 .selected_text(format!("{:?}", u16::from(self.value)))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     ui.selectable_value(&mut self.value, NullableObjectId::NULL, "None");
                     let object_types: Vec<ObjectType> = design
                         .get_pool()
@@ -3483,10 +3456,9 @@ impl ConfigurableObject for Macro {
 
         ui.horizontal(|ui| {
             ui.label("Add command:");
-            egui::ComboBox::from_id_source("add_macro_command")
+            egui::ComboBox::from_id_salt("add_macro_command")
                 .selected_text("Select command")
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     for &(code, name, version) in ALLOWED_MACRO_COMMANDS {
                         if version > VtVersion::Version3 {
                             continue; // TODO: check which version pool we have
@@ -3521,12 +3493,9 @@ impl ConfigurableObject for AuxiliaryFunctionType2 {
 
         ui.horizontal(|ui| {
             ui.label("Function Type:");
-            egui::ComboBox::from_id_source("function_type")
+            egui::ComboBox::from_id_salt("function_type")
                 .selected_text(format!("{:?}", self.function_attributes.function_type))
-                .width(0.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
-
                     let selectable_types = &[
                         AuxiliaryFunctionType::BooleanLatching,
                         AuxiliaryFunctionType::AnalogueMaintains,
@@ -3593,11 +3562,9 @@ impl ConfigurableObject for AuxiliaryInputType2 {
 
         ui.horizontal(|ui| {
             ui.label("Function Type:");
-            egui::ComboBox::from_id_source("input_function_type")
+            egui::ComboBox::from_id_salt("input_function_type")
                 .selected_text(format!("{:?}", self.function_attributes.function_type))
-                .width(200.0)
                 .show_ui(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
                     let selectable_types = &[
                         AuxiliaryFunctionType::BooleanLatching,
                         AuxiliaryFunctionType::AnalogueMaintains,
@@ -3657,9 +3624,8 @@ impl ConfigurableObject for AuxiliaryControlDesignatorType2 {
 
         ui.horizontal(|ui| {
             ui.label("Pointer Type:");
-            egui::ComboBox::from_id_source("aux_control_pointer_type")
+            egui::ComboBox::from_id_salt("aux_control_pointer_type")
                 .selected_text(format!("{}", self.pointer_type))
-                .width(150.0)
                 .show_ui(ui, |ui| {
                     ui.selectable_value(
                         &mut self.pointer_type,
@@ -3692,12 +3658,9 @@ impl ConfigurableObject for AuxiliaryControlDesignatorType2 {
             // Allow user to select an Auxiliary Input or Auxiliary Function object.
             ui.horizontal(|ui| {
                 ui.label("Auxiliary Object ID:");
-                egui::ComboBox::from_id_source("aux_object_id_selector")
+                egui::ComboBox::from_id_salt("aux_object_id_selector")
                     .selected_text(format!("{:?}", u16::from(self.auxiliary_object_id)))
-                    .width(200.0)
                     .show_ui(ui, |ui| {
-                        ui.style_mut().wrap = Some(false);
-
                         // Let’s consider that we might assign Auxiliary Function Type 2 (31) or Auxiliary Input Type 2 (32) objects.
                         let allowed_types = &[
                             ObjectType::AuxiliaryFunctionType2,

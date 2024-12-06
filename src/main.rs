@@ -218,7 +218,7 @@ impl eframe::App for DesignerApp {
 
         egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                egui::widgets::global_dark_light_mode_buttons(ui);
+                egui::widgets::global_theme_preference_buttons(ui);
                 ui.separator();
 
                 // Undo/redo buttons
@@ -254,7 +254,6 @@ impl eframe::App for DesignerApp {
                 }
 
                 ui.menu_button("File", |ui| {
-                    ui.style_mut().wrap = Some(false);
                     if ui.button("Load pool").clicked() {
                         self.open_file_dialog(FileDialogReason::LoadPool, ctx);
                         ui.close_menu();
@@ -268,7 +267,6 @@ impl eframe::App for DesignerApp {
                 if self.project.is_some() {
                     // Add a new object
                     ui.menu_button("Add object", |ui| {
-                        ui.style_mut().wrap = Some(false);
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for object_type in ObjectType::values() {
                                 if ui.button(format!("{:?}", object_type)).clicked() {
@@ -319,7 +317,7 @@ impl eframe::App for DesignerApp {
             // Object selector panel
             egui::SidePanel::left("left_panel").show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.style_mut().wrap = Some(false);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                     if let Some(working_set) = pool.get_pool().working_set_object() {
                         render_object_hierarchy(
                             ui,

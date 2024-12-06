@@ -73,7 +73,10 @@ impl EditorProject {
         if self.mut_pool.borrow().to_owned() != self.pool {
             self.redo_pool_history.clear();
             self.undo_pool_history.push(self.pool.clone());
-            self.undo_pool_history.truncate(MAX_UNDO_REDO_POOL);
+            if self.undo_pool_history.len() > MAX_UNDO_REDO_POOL {
+                self.undo_pool_history
+                    .drain(..self.undo_pool_history.len() - MAX_UNDO_REDO_POOL);
+            }
             self.pool = self.mut_pool.borrow().clone();
             return true;
         }
@@ -85,8 +88,7 @@ impl EditorProject {
         if let Some(pool) = self.undo_pool_history.pop() {
             self.redo_pool_history.push(self.pool.clone());
 
-            // We need to replace both here because otherwise it will be added to the undo history
-            // again when we call update_pool
+            // Both need to be replaced here because otherwise it will be added to the undo history
             self.pool = pool.clone();
             self.mut_pool.replace(pool);
         }
@@ -100,6 +102,9 @@ impl EditorProject {
     /// Redo the last undone action
     pub fn redo(&mut self) {
         if let Some(pool) = self.redo_pool_history.pop() {
+            self.undo_pool_history.push(self.pool.clone());
+            // Both need to be replaced here because otherwise the redo history will be cleared
+            self.pool = pool.clone();
             self.mut_pool.replace(pool);
         }
     }
@@ -116,7 +121,10 @@ impl EditorProject {
             self.redo_selected_history.clear();
             if self.mut_selected_object.borrow().to_owned() != NullableObjectId::NULL {
                 self.undo_selected_history.push(self.selected_object);
-                self.undo_selected_history.truncate(MAX_UNDO_REDO_SELECTED);
+                if self.undo_selected_history.len() > MAX_UNDO_REDO_SELECTED {
+                    self.undo_selected_history
+                        .drain(..self.undo_selected_history.len() - MAX_UNDO_REDO_SELECTED);
+                }
             }
             self.selected_object = self.mut_selected_object.borrow().clone();
             return true;
@@ -128,6 +136,8 @@ impl EditorProject {
     pub fn set_previous_selected(&mut self) {
         if let Some(selected) = self.undo_selected_history.pop() {
             self.redo_selected_history.push(self.selected_object);
+            // Both need to be replaced here because otherwise it will be added to the undo history
+            self.selected_object = selected.clone();
             self.mut_selected_object.replace(selected);
         }
     }
@@ -136,6 +146,8 @@ impl EditorProject {
     pub fn set_next_selected(&mut self) {
         if let Some(selected) = self.redo_selected_history.pop() {
             self.undo_selected_history.push(self.selected_object);
+            // Both need to be replaced here because otherwise the redo history will be cleared
+            self.selected_object = selected.clone();
             self.mut_selected_object.replace(selected);
         }
     }
