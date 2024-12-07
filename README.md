@@ -105,7 +105,7 @@ The lists below only apply to version 3 of the VT specification. There are 3 sta
 - :green_circle: Container
 - :white_circle: SoftKeyMask
 - :yellow_circle: Key
-- :yellow_circle: Button
+- :green_circle: Button
 - :white_circle: InputBoolean
 - :white_circle: InputString
 - :white_circle: InputNumber

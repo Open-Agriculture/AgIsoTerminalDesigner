@@ -7,8 +7,10 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 use ag_iso_stack::object_pool::object::*;
+use ag_iso_stack::object_pool::object_attributes::ButtonState;
 use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
 use ag_iso_stack::object_pool::object_attributes::Point;
+use ag_iso_stack::object_pool::vt_version::VtVersion;
 use ag_iso_stack::object_pool::Colour;
 use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectRef;
@@ -17,6 +19,7 @@ use eframe::egui::Color32;
 use eframe::egui::ColorImage;
 use eframe::egui::TextureHandle;
 use eframe::egui::TextureId;
+use eframe::egui::UiBuilder;
 
 pub trait RenderableObject {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>);
@@ -88,6 +91,22 @@ impl Colorable for Colour {
     }
 }
 
+// Helper function to lighten a color by a certain amount
+fn lighten_color(color: egui::Color32, amount: f32) -> egui::Color32 {
+    let r = (color.r() as f32 + 255.0 * amount).min(255.0) as u8;
+    let g = (color.g() as f32 + 255.0 * amount).min(255.0) as u8;
+    let b = (color.b() as f32 + 255.0 * amount).min(255.0) as u8;
+    egui::Color32::from_rgb(r, g, b)
+}
+
+// Helper function to darken a color by a certain amount
+fn darken_color(color: egui::Color32, amount: f32) -> egui::Color32 {
+    let r = (color.r() as f32 * (1.0 - amount)).max(0.0) as u8;
+    let g = (color.g() as f32 * (1.0 - amount)).max(0.0) as u8;
+    let b = (color.b() as f32 * (1.0 - amount)).max(0.0) as u8;
+    egui::Color32::from_rgb(r, g, b)
+}
+
 fn create_relative_rect(ui: &mut egui::Ui, position: Point<i16>, size: egui::Vec2) -> egui::Rect {
     egui::Rect::from_min_size(
         ui.max_rect().min + egui::Vec2::new(position.x as f32, position.y as f32),
@@ -155,7 +174,7 @@ impl RenderableObject for Container {
             egui::Vec2::new(self.width as f32, self.height as f32),
         );
 
-        ui.allocate_ui_at_rect(rect, |ui| {
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
             render_object_refs(ui, pool, &self.object_refs);
         });
     }
@@ -163,7 +182,7 @@ impl RenderableObject for Container {
 
 impl RenderableObject for Button {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        const BUTTON_BORDER_WIDTH: f32 = 4.0;
+        let vt_version = VtVersion::Version3;
 
         let rect = create_relative_rect(
             ui,
@@ -171,33 +190,104 @@ impl RenderableObject for Button {
             egui::Vec2::new(self.width as f32, self.height as f32),
         );
 
-        let button_face = if self.options.no_border {
+        let mut no_border = false;
+        let mut suppress_border = false;
+        let mut transparent_background = false;
+        let mut disabled = false;
+
+        if vt_version >= VtVersion::Version4 {
+            // The following attributes are only available in VT version 4 and later.
+            no_border = self.options.no_border;
+            suppress_border = self.options.suppress_border;
+            transparent_background = self.options.transparent_background;
+            disabled = self.options.disabled;
+        }
+
+        // Determine if button is latchable and currently latched (pressed).
+        let latchable = self.options.latchable;
+        let latched = if latchable {
+            self.options.state == ButtonState::Latched
+        } else {
+            false
+        };
+
+        // Compute the face rectangle based on border settings
+        // According to the standard:
+        // - If no_border = true: Face area = entire area (no border space).
+        // - If no_border = false: Face is 8 pixels smaller in width and height.
+        //
+        // The border is a VT proprietary 8-pixel area, but we must reduce face size accordingly.
+        // Let's assume a uniform distribution of that 8-pixel shrinkage (4 pixels on each side).
+        const BORDER_WIDTH: f32 = 4.0;
+        let face_rect = if no_border {
             rect
         } else {
-            rect.shrink(BUTTON_BORDER_WIDTH)
+            // Face is area minus 8 pixels in width and height.
+            // We'll just evenly shrink by 4 pixels on each side.
+            rect.shrink(BORDER_WIDTH)
         };
 
-        let mut button = egui::Button::new("").fill(egui::Color32::TRANSPARENT);
-        if !self.options.transparent_background {
-            button = button.fill(pool.color_by_index(self.background_colour).convert());
-        };
+        let response = ui.interact(
+            face_rect,
+            ui.id().with(self.id.value()),
+            egui::Sense::click(),
+        );
 
-        ui.visuals_mut().selection.stroke.width = if self.options.suppress_border {
-            0.0
+        // Determine the current visual state
+        // Priority: latched > pressed > hovered > normal
+        let is_pressed_state = latched || (response.is_pointer_button_down_on() && !latchable);
+        let is_hovered_state = response.hovered();
+        // TODO: better visuals for latched states
+
+        let background_color = if transparent_background {
+            egui::Color32::TRANSPARENT
         } else {
-            BUTTON_BORDER_WIDTH
+            let color = pool.color_by_index(self.background_colour).convert();
+            if is_pressed_state {
+                darken_color(color, 0.2)
+            } else if is_hovered_state {
+                lighten_color(color, 0.1)
+            } else {
+                color
+            }
         };
-        ui.visuals_mut().widgets.hovered.bg_stroke.width = if self.options.suppress_border {
-            0.0
+
+        let border_color = if suppress_border {
+            egui::Color32::TRANSPARENT
         } else {
-            BUTTON_BORDER_WIDTH
+            let color = pool.color_by_index(self.border_colour).convert();
+            if is_pressed_state {
+                lighten_color(color, 0.1)
+            } else if is_hovered_state {
+                darken_color(color, 0.05)
+            } else {
+                color
+            }
         };
 
-        ui.put(button_face, button);
+        if !no_border {
+            ui.painter().rect_stroke(
+                face_rect,
+                0.0,
+                egui::Stroke::new(BORDER_WIDTH, border_color),
+            );
+        }
 
-        ui.allocate_ui_at_rect(button_face, |ui| {
+        ui.painter().rect_filled(face_rect, 0.0, background_color);
+
+        // Child objects are clipped to the face area
+        ui.allocate_new_ui(UiBuilder::new().max_rect(face_rect), |ui| {
             render_object_refs(ui, pool, &self.object_refs);
         });
+
+        // If disabled, we overlay a semi-transparent gray:
+        if disabled {
+            ui.painter().rect_filled(
+                face_rect,
+                0.0,
+                egui::Color32::from_rgba_premultiplied(128, 128, 128, 100),
+            );
+        }
     }
 }
 
@@ -205,7 +295,7 @@ impl RenderableObject for Key {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
         let rect = create_relative_rect(ui, position, egui::Vec2::new(100.0, 100.0));
 
-        ui.allocate_ui_at_rect(rect, |ui| {
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
             render_object_refs(ui, pool, &self.object_refs);
         });
     }
@@ -265,7 +355,7 @@ impl RenderableObject for OutputString {
         // TODO: Implement text justification
         // TODO: implement text size
 
-        ui.allocate_ui_at_rect(rect, |ui| {
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
             ui.colored_label(
                 pool.color_by_index(font_attributes.font_colour).convert(),
                 text,
@@ -423,7 +513,7 @@ impl RenderableObject for PictureGraphic {
             });
         }
 
-        ui.allocate_ui_at_rect(rect, |ui| {
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
             if let Some(texture_id) = texture_id {
                 ui.image((texture_id, rect.size()));
             } else {
