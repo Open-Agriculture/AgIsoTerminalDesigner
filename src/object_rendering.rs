@@ -8,8 +8,11 @@ use std::hash::Hasher;
 
 use ag_iso_stack::object_pool::object::*;
 use ag_iso_stack::object_pool::object_attributes::ButtonState;
+use ag_iso_stack::object_pool::object_attributes::FontSize;
+use ag_iso_stack::object_pool::object_attributes::HorizontalAlignment;
 use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
 use ag_iso_stack::object_pool::object_attributes::Point;
+use ag_iso_stack::object_pool::object_attributes::VerticalAlignment;
 use ag_iso_stack::object_pool::vt_version::VtVersion;
 use ag_iso_stack::object_pool::Colour;
 use ag_iso_stack::object_pool::ObjectPool;
@@ -17,6 +20,7 @@ use ag_iso_stack::object_pool::ObjectRef;
 use eframe::egui;
 use eframe::egui::Color32;
 use eframe::egui::ColorImage;
+use eframe::egui::FontId;
 use eframe::egui::TextureHandle;
 use eframe::egui::TextureId;
 use eframe::egui::UiBuilder;
@@ -327,9 +331,6 @@ impl RenderableObject for OutputString {
             egui::Vec2::new(self.width as f32, self.height as f32),
         );
 
-        let is_transparent = self.options.transparent;
-        let is_auto_wrap = self.options.auto_wrap;
-        let is_wrap_on_hyphen = self.options.wrap_on_hyphen;
         let font_attributes = match pool.object_by_id(self.font_attributes) {
             Some(Object::FontAttributes(f)) => f,
             _ => {
@@ -340,7 +341,20 @@ impl RenderableObject for OutputString {
                 return;
             }
         };
-        let text = if let Some(variable_reference_id) = self.variable_reference.into() {
+        let background_colour = pool.color_by_index(self.background_colour).convert();
+
+        let transparent = self.options.transparent;
+        let auto_wrap = self.options.auto_wrap;
+
+        // TODO: check if VT version is 4 or later, if so implement wrap_on_hyphen
+        // let wrap_on_hyphen = self.options.wrap_on_hyphen;
+        // Note: wrap_on_hyphen behavior is complex. For simplicity here, we rely on normal word-wrapping
+        // from egui and do not implement special hyphenation logic. A more thorough implementation
+        // would detect hyphens and possibly treat them as break opportunities.
+
+        // According to the specification, we need to handle control characters (CR, LF) as line breaks.
+        // We'll normalize all line endings to '\n'.
+        let mut text_value = if let Some(variable_reference_id) = self.variable_reference.into() {
             match pool.object_by_id(variable_reference_id) {
                 Some(Object::StringVariable(s)) => s.value.clone(),
                 _ => self.value.clone(),
@@ -348,19 +362,114 @@ impl RenderableObject for OutputString {
         } else {
             self.value.clone()
         };
-        let horizontal_justification = self.justification.horizontal;
-        let vertical_justification = self.justification.vertical;
+        text_value = text_value
+            .replace("\r\n", "\n")
+            .replace("\n\r", "\n")
+            .replace('\r', "\n")
+            .replace('\x0a', "\n");
 
-        // TODO: Implement text wrap on hyphen
-        // TODO: Implement text justification
-        // TODO: implement text size
+        // Apply space trimming rules based on horizontal justification:
+        // - Left justification: no trimming of leading spaces (for the first line), trailing spaces remain as is.
+        // - Middle justification: remove leading and trailing spaces on each line.
+        // - Right justification: remove trailing spaces on each line.
+        let mut lines: Vec<&str> = text_value.split('\n').collect();
+        for (line_number, line) in lines.iter_mut().enumerate() {
+            match self.justification.horizontal {
+                HorizontalAlignment::Left => {
+                    // Per ISO rules, if auto-wrapping is enabled, leading spaces on wrapped lines might be removed.
+                    if auto_wrap && line_number > 0 {
+                        // Remove leading spaces
+                        *line = line.trim_start();
+                    }
+                }
+                HorizontalAlignment::Middle => {
+                    // Remove both leading and trailing spaces
+                    *line = line.trim();
+                }
+                HorizontalAlignment::Right => {
+                    // Remove trailing spaces only
+                    *line = line.trim_end();
+                }
+                HorizontalAlignment::Reserved => todo!(),
+            }
+        }
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(
-                pool.color_by_index(font_attributes.font_colour).convert(),
-                text,
-            );
-        });
+        let processed_text = lines.join("\n");
+
+        let font_colour = pool.color_by_index(font_attributes.font_colour).convert();
+        let fonts = ui.fonts(|fonts| fonts.clone());
+        let font_height;
+        let font_family;
+        match font_attributes.font_size {
+            FontSize::NonProportional(size) => {
+                font_family = egui::FontFamily::Monospace;
+
+                // We need to calculate the font height based on the width of a letter in the monospace font.
+                let font_size = fonts
+                    .layout_no_wrap(
+                        "a".into(),
+                        FontId::new(size.height() as f32, egui::FontFamily::Monospace),
+                        font_colour,
+                    )
+                    .size();
+
+                font_height = size.height() as f32 * (font_size.x / size.width() as f32);
+            }
+            FontSize::Proportional(height) => {
+                font_height = height as f32;
+                font_family = egui::FontFamily::Proportional;
+            }
+        }
+
+        let wrap_width = if auto_wrap {
+            self.width as f32
+        } else {
+            f32::INFINITY
+        };
+
+        let galley = fonts.layout(
+            processed_text,
+            FontId::new(font_height, font_family.clone()),
+            font_colour,
+            wrap_width,
+        );
+
+        let text_size = galley.size();
+
+        let mut paint_pos = rect.min;
+
+        match self.justification.horizontal {
+            HorizontalAlignment::Left => {
+                paint_pos.x = rect.min.x;
+            }
+            HorizontalAlignment::Middle => {
+                paint_pos.x = rect.center().x - (text_size.x * 0.5);
+            }
+            HorizontalAlignment::Right => {
+                paint_pos.x = rect.max.x - text_size.x;
+            }
+            HorizontalAlignment::Reserved => todo!(),
+        }
+
+        match self.justification.vertical {
+            VerticalAlignment::Top => {
+                paint_pos.y = rect.min.y;
+            }
+            VerticalAlignment::Middle => {
+                paint_pos.y = rect.center().y - (text_size.y * 0.5);
+            }
+            VerticalAlignment::Bottom => {
+                paint_pos.y = rect.max.y - text_size.y;
+            }
+            VerticalAlignment::Reserved => todo!(),
+        }
+
+        if !transparent {
+            let painter = ui.painter();
+            painter.rect_filled(rect, 0.0, background_colour);
+        }
+
+        ui.painter().galley(paint_pos, galley, font_colour);
     }
 }
 

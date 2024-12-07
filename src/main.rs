@@ -31,9 +31,78 @@ pub struct DesignerApp {
     show_development_popup: bool,
 }
 
-impl Default for DesignerApp {
-    fn default() -> Self {
-        DesignerApp {
+impl DesignerApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut fonts = egui::FontDefinitions::default();
+
+        // TODO: Create font files and load them here
+        //// Install ISO 8859-1 (ISO Latin 1) font
+        // fonts.font_data.insert(
+        //     "iso_latin_1".to_owned(),
+        //     egui::FontData::from_static(include_bytes!("assets/fonts/iso-latin1.ttf")),
+        // );
+        // fonts
+        //     .families
+        //     .get_mut(&egui::FontFamily::Name("ISO Latin 1".into()))
+        //     .unwrap()
+        //     .insert(0, "iso_latin_1".to_owned());
+
+        // // Install ISO 8859-15 (ISO Latin 9) font
+        // fonts.font_data.insert(
+        //     "iso_latin_9".to_owned(),
+        //     egui::FontData::from_static(include_bytes!("assets/fonts/iso-latin9.ttf")),
+        // );
+        // fonts
+        //     .families
+        //     .get_mut(&egui::FontFamily::Name("ISO Latin 9".into()))
+        //     .unwrap()
+        //     .insert(0, "iso_latin_9".to_owned());
+
+        // // Install ISO 8859-2 (ISO Latin 2) font
+        // fonts.font_data.insert(
+        //     "iso_latin_2".to_owned(),
+        //     egui::FontData::from_static(include_bytes!("assets/fonts/iso-latin2.ttf")),
+        // );
+        // fonts
+        //     .families
+        //     .get_mut(&egui::FontFamily::Name("ISO Latin 2".into()))
+        //     .unwrap()
+        //     .insert(0, "iso_latin_2".to_owned());
+
+        // // Install ISO 8859-4 (ISO Latin 4) font
+        // fonts.font_data.insert(
+        //     "iso_latin_4".to_owned(),
+        //     egui::FontData::from_static(include_bytes!("assets/fonts/iso-latin4.ttf")),
+        // );
+        // fonts
+        //     .families
+        //     .get_mut(&egui::FontFamily::Name("ISO Latin 4".into()))
+        //     .unwrap()
+        //     .insert(0, "iso_latin_4".to_owned());
+
+        // // Install ISO 8859-5 (Cyrillic) font
+        // fonts.font_data.insert(
+        //     "iso_cyrillic".to_owned(),
+        //     egui::FontData::from_static(include_bytes!("assets/fonts/iso-cyrillic.ttf")),
+        // );
+        // fonts
+        //     .families
+        //     .get_mut(&egui::FontFamily::Name("ISO Cyrillic".into()))
+        //     .unwrap()
+        //     .insert(0, "iso_cyrillic".to_owned());
+
+        // // Install ISO 8859-7 (Greek) font
+        // fonts.font_data.insert(
+        //     "iso_greek".to_owned(),
+        //     egui::FontData::from_static(include_bytes!("assets/fonts/iso-greek.ttf")),
+        // );
+        // fonts
+        //     .families
+        //     .get_mut(&egui::FontFamily::Name("ISO Greek".into()))
+        //     .unwrap()
+        //     .insert(0, "iso_greek".to_owned());
+
+        Self {
             project: None,
             file_dialog_reason: None,
             file_channel: std::sync::mpsc::channel(),
@@ -482,7 +551,7 @@ fn main() {
     eframe::run_native(
         "AgIsoTerminalDesigner",
         native_options,
-        Box::new(|_| Ok(Box::<DesignerApp>::default())),
+        Box::new(|cc| Ok(Box::new(DesignerApp::new(cc)))),
     )
     .ok();
 }
@@ -513,7 +582,7 @@ fn main() {
             .start(
                 canvas,
                 web_options,
-                Box::new(|_| Ok(Box::new(DesignerApp::default()))),
+                Box::new(|cc| Ok(Box::new(DesignerApp::new(cc)))),
             )
             .await;
 
