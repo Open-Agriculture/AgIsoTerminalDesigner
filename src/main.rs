@@ -28,6 +28,7 @@ pub struct DesignerApp {
     project: Option<EditorProject>,
     file_dialog_reason: Option<FileDialogReason>,
     file_channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
+    show_development_popup: bool,
 }
 
 impl Default for DesignerApp {
@@ -36,6 +37,7 @@ impl Default for DesignerApp {
             project: None,
             file_dialog_reason: None,
             file_channel: std::sync::mpsc::channel(),
+            show_development_popup: true,
         }
     }
 }
@@ -215,6 +217,32 @@ impl eframe::App for DesignerApp {
 
         // Handle file dialog
         self.handle_file_loaded();
+
+        if self.show_development_popup {
+            egui::Window::new("🚧 Under Active Development")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.add_space(10.0);
+                    ui.label("This application is still under active development. Some features may be missing or broken. We appreciate your patience and feedback!");
+
+                    ui.add_space(10.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("If you encounter issues, please report them at:");
+                        ui.hyperlink("https://github.com/Open-Agriculture/AgIsoTerminalDesigner/issues");
+                    });
+
+                    ui.add_space(20.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui.available_width() - 60.0);
+                        if ui.button("OK").clicked() {
+                            self.show_development_popup = false;
+                        }
+                    });
+                });
+            return;
+        }
 
         egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
