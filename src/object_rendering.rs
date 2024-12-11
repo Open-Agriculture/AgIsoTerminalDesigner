@@ -21,6 +21,7 @@ use eframe::egui;
 use eframe::egui::Color32;
 use eframe::egui::ColorImage;
 use eframe::egui::FontId;
+use eframe::egui::TextWrapMode;
 use eframe::egui::TextureHandle;
 use eframe::egui::TextureId;
 use eframe::egui::UiBuilder;
@@ -31,6 +32,9 @@ pub trait RenderableObject {
 
 impl RenderableObject for Object {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        // Make sure text is truncated if it doesn't fit for all object renderings (useful for error labels)
+        ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+
         match self {
             Object::WorkingSet(o) => o.render(ui, pool, position),
             Object::DataMask(o) => o.render(ui, pool, position),
@@ -39,20 +43,20 @@ impl RenderableObject for Object {
             Object::SoftKeyMask(o) => (),
             Object::Key(o) => o.render(ui, pool, position),
             Object::Button(o) => o.render(ui, pool, position),
-            Object::InputBoolean(o) => (),
-            Object::InputString(o) => (),
-            Object::InputNumber(o) => (),
-            Object::InputList(o) => (),
+            Object::InputBoolean(o) => o.render(ui, pool, position),
+            Object::InputString(o) => o.render(ui, pool, position),
+            Object::InputNumber(o) => o.render(ui, pool, position),
+            Object::InputList(o) => o.render(ui, pool, position),
             Object::OutputString(o) => o.render(ui, pool, position),
-            Object::OutputNumber(o) => (),
-            Object::OutputList(o) => (),
-            Object::OutputLine(o) => (),
+            Object::OutputNumber(o) => o.render(ui, pool, position),
+            Object::OutputList(o) => o.render(ui, pool, position),
+            Object::OutputLine(o) => o.render(ui, pool, position),
             Object::OutputRectangle(o) => o.render(ui, pool, position),
-            Object::OutputEllipse(o) => (),
-            Object::OutputPolygon(o) => (),
-            Object::OutputMeter(o) => (),
-            Object::OutputLinearBarGraph(o) => (),
-            Object::OutputArchedBarGraph(o) => (),
+            Object::OutputEllipse(o) => o.render(ui, pool, position),
+            Object::OutputPolygon(o) => o.render(ui, pool, position),
+            Object::OutputMeter(o) => o.render(ui, pool, position),
+            Object::OutputLinearBarGraph(o) => o.render(ui, pool, position),
+            Object::OutputArchedBarGraph(o) => o.render(ui, pool, position),
             Object::PictureGraphic(o) => o.render(ui, pool, position),
             Object::NumberVariable(o) => (),
             Object::StringVariable(o) => (),
@@ -64,9 +68,9 @@ impl RenderableObject for Object {
             Object::Macro(o) => (),
             Object::AuxiliaryFunctionType1(o) => (),
             Object::AuxiliaryInputType1(o) => (),
-            Object::AuxiliaryFunctionType2(o) => (),
-            Object::AuxiliaryInputType2(o) => (),
-            Object::AuxiliaryControlDesignatorType2(o) => (),
+            Object::AuxiliaryFunctionType2(o) => o.render(ui, pool, position),
+            Object::AuxiliaryInputType2(o) => o.render(ui, pool, position),
+            Object::AuxiliaryControlDesignatorType2(o) => o.render(ui, pool, position),
             Object::WindowMask(o) => (),
             Object::KeyGroup(o) => (),
             Object::GraphicsContext(o) => (),
@@ -125,7 +129,7 @@ fn render_object_refs(ui: &mut egui::Ui, pool: &ObjectPool, object_refs: &Vec<Ob
                 obj.render(ui, pool, object.offset);
             }
             None => {
-                ui.label(format!("Missing object: {:?}", object));
+                ui.colored_label(Color32::RED, format!("Missing object: {:?}", object));
             }
         }
     }
@@ -175,7 +179,7 @@ impl RenderableObject for Container {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width as f32, self.height as f32),
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
         ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
@@ -191,7 +195,7 @@ impl RenderableObject for Button {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width as f32, self.height as f32),
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
         let mut no_border = false;
@@ -295,6 +299,62 @@ impl RenderableObject for Button {
     }
 }
 
+impl RenderableObject for InputBoolean {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "InputBoolean not implemented");
+        });
+    }
+}
+
+impl RenderableObject for InputString {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "InputString not implemented");
+        });
+    }
+}
+
+impl RenderableObject for InputNumber {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "InputNumber not implemented");
+        });
+    }
+}
+
+impl RenderableObject for InputList {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "InputList not implemented");
+        });
+    }
+}
+
 impl RenderableObject for Key {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
         let rect = create_relative_rect(ui, position, egui::Vec2::new(100.0, 100.0));
@@ -317,7 +377,7 @@ impl RenderableObject for ObjectPointer {
                 obj.render(ui, pool, position);
             }
             None => {
-                ui.label(format!("Missing object: {:?}", self));
+                ui.colored_label(Color32::RED, format!("Missing object: {:?}", self));
             }
         }
     }
@@ -328,16 +388,16 @@ impl RenderableObject for OutputString {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width as f32, self.height as f32),
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
         let font_attributes = match pool.object_by_id(self.font_attributes) {
             Some(Object::FontAttributes(f)) => f,
             _ => {
-                ui.label(format!(
-                    "Missing font attributes: {:?}",
-                    self.font_attributes
-                ));
+                ui.colored_label(
+                    Color32::RED,
+                    format!("Missing font attributes: {:?}", self.font_attributes),
+                );
                 return;
             }
         };
@@ -428,7 +488,7 @@ impl RenderableObject for OutputString {
         }
 
         let wrap_width = if auto_wrap {
-            self.width as f32
+            self.width() as f32
         } else {
             f32::INFINITY
         };
@@ -491,22 +551,64 @@ impl RenderableObject for OutputString {
     }
 }
 
+impl RenderableObject for OutputNumber {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "OutputNumber not implemented");
+        });
+    }
+}
+
+impl RenderableObject for OutputList {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "OutputList not implemented");
+        });
+    }
+}
+
+impl RenderableObject for OutputLine {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "OutputLine not implemented");
+        });
+    }
+}
+
 impl RenderableObject for OutputRectangle {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width as f32, self.height as f32),
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
         // Paint the border of the rectangle
         let line_attributes = match pool.object_by_id(self.line_attributes) {
             Some(Object::LineAttributes(l)) => l,
             _ => {
-                ui.label(format!(
-                    "Missing line attributes: {:?}",
-                    self.line_attributes
-                ));
+                ui.colored_label(
+                    Color32::RED,
+                    format!("Missing line attributes: {:?}", self.line_attributes),
+                );
                 return;
             }
         };
@@ -525,7 +627,7 @@ impl RenderableObject for OutputRectangle {
             let fill_attributes = match pool.object_by_id(fill) {
                 Some(Object::FillAttributes(f)) => f,
                 _ => {
-                    ui.label(format!("Missing fill attributes: {:?}", fill));
+                    ui.colored_label(Color32::RED, format!("Missing fill attributes: {:?}", fill));
                     return;
                 }
             };
@@ -537,6 +639,76 @@ impl RenderableObject for OutputRectangle {
             // TODO: implement fill type for infill
             // TODO: implement fill pattern for infill
         }
+    }
+}
+
+impl RenderableObject for OutputEllipse {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "OutputEllipse not implemented");
+        });
+    }
+}
+
+impl RenderableObject for OutputPolygon {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "OutputPolygon not implemented");
+        });
+    }
+}
+
+impl RenderableObject for OutputMeter {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "OutputMeter not implemented");
+        });
+    }
+}
+
+impl RenderableObject for OutputLinearBarGraph {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "OutputLinearBarGraph not implemented");
+        });
+    }
+}
+
+impl RenderableObject for OutputArchedBarGraph {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        );
+
+        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+            ui.colored_label(Color32::RED, "OutputArchedBarGraph not implemented");
+        });
     }
 }
 
@@ -644,8 +816,29 @@ impl RenderableObject for PictureGraphic {
             if let Some(texture_id) = texture_id {
                 ui.image((texture_id, rect.size()));
             } else {
-                ui.label("Failed to load image");
+                ui.colored_label(Color32::RED, "Failed to load image");
             }
         });
+    }
+}
+
+impl RenderableObject for AuxiliaryFunctionType2 {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        ui.colored_label(Color32::RED, "AuxiliaryFunctionType2 not implemented");
+    }
+}
+
+impl RenderableObject for AuxiliaryInputType2 {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        ui.colored_label(Color32::RED, "AuxiliaryInputType2 not implemented");
+    }
+}
+
+impl RenderableObject for AuxiliaryControlDesignatorType2 {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        ui.colored_label(
+            Color32::RED,
+            "AuxiliaryControlDesignatorType2 not implemented",
+        );
     }
 }
