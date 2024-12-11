@@ -1114,11 +1114,6 @@ impl ConfigurableObject for InputString {
                 HorizontalAlignment::Right,
                 "Right",
             );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Reserved,
-                "Reserved",
-            );
         });
         // TODO: check if we have VT version 4 or later
         // ui.horizontal(|ui| {
@@ -1137,11 +1132,6 @@ impl ConfigurableObject for InputString {
         //         &mut self.justification.vertical,
         //         VerticalAlignment::Bottom,
         //         "Bottom",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Reserved,
-        //         "Reserved",
         //     );
         // });
         if self.variable_reference.0.is_none() {
@@ -1286,11 +1276,6 @@ impl ConfigurableObject for InputNumber {
                 HorizontalAlignment::Right,
                 "Right",
             );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Reserved,
-                "Reserved",
-            );
         });
         // TODO: check if we have VT version 4 or later
         // ui.horizontal(|ui| {
@@ -1309,11 +1294,6 @@ impl ConfigurableObject for InputNumber {
         //         &mut self.justification.vertical,
         //         VerticalAlignment::Bottom,
         //         "Bottom",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Reserved,
-        //         "Reserved",
         //     );
         // });
 
@@ -1497,11 +1477,6 @@ impl ConfigurableObject for OutputString {
                 HorizontalAlignment::Right,
                 "Right",
             );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Reserved,
-                "Reserved",
-            );
         });
         // TODO: check if we have VT version 4 or later
         // ui.horizontal(|ui| {
@@ -1520,11 +1495,6 @@ impl ConfigurableObject for OutputString {
         //         &mut self.justification.vertical,
         //         VerticalAlignment::Bottom,
         //         "Bottom",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Reserved,
-        //         "Reserved",
         //     );
         // });
         if self.variable_reference.0.is_none() {
@@ -1660,11 +1630,6 @@ impl ConfigurableObject for OutputNumber {
                 HorizontalAlignment::Right,
                 "Right",
             );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Reserved,
-                "Reserved",
-            );
         });
         // TODO: check if we have VT version 4 or later
         // ui.horizontal(|ui| {
@@ -1683,11 +1648,6 @@ impl ConfigurableObject for OutputNumber {
         //         &mut self.justification.vertical,
         //         VerticalAlignment::Bottom,
         //         "Bottom",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Reserved,
-        //         "Reserved",
         //     );
         // });
 
@@ -3002,9 +2962,6 @@ impl ConfigurableObject for FontAttributes {
                 .drag_value_speed(1.0),
         );
 
-        ui.separator();
-        ui.label("Font Size:");
-
         // let is_proportional = self.font_style.proportional; // TODO: check if we have VT version 4 or later
         let is_proportional = false;
 
@@ -3058,74 +3015,62 @@ impl ConfigurableObject for FontAttributes {
         }
 
         ui.separator();
-        ui.label("Font Type:");
-        let current_font_type = &self.font_type;
-        let known_types = [
-            (FontType::Latin1, "Latin1"),
-            (FontType::Latin9, "Latin9"),
-            // TODO: check if we have VT version 4 or later
-            // (FontType::Latin2, "Latin2"),
-            // (FontType::Latin4, "Latin4"),
-            // (FontType::Cyrillic, "Cyrillic"),
-            // (FontType::Greek, "Greek"),
-        ];
+        let mut is_proprietary = if let FontType::Proprietary(_) = self.font_type {
+            true
+        } else {
+            false
+        };
+        ui.checkbox(&mut is_proprietary, "Proprietary Font");
 
-        // Determine if current type matches one of the known variants
-        let mut is_known_type = false;
-        let mut selected_text = String::new();
-        for (t, name) in &known_types {
-            if current_font_type == t {
-                is_known_type = true;
-                selected_text = name.to_string();
-                break;
-            }
-        }
+        if is_proprietary {
+            const PROPRIETARY_RANGE_V3_AND_PRIOR: std::ops::RangeInclusive<u8> = 255..=255;
+            const PROPRIETARY_RANGE_V4_AND_LATER: std::ops::RangeInclusive<u8> = 240..=255;
 
-        if !is_known_type {
-            selected_text = match current_font_type {
-                FontType::Reserved(v) => format!("Reserved({})", v),
-                FontType::Proprietary(v) => format!("Proprietary({})", v),
-                _ => "Unknown".to_string(),
+            let range = PROPRIETARY_RANGE_V3_AND_PRIOR; // TODO: check if we have VT version 4 or later
+
+            let mut raw_value = match self.font_type {
+                FontType::Proprietary(v) => v,
+                _ => range.clone().last().unwrap(),
             };
-        }
-
-        const PROPRIETARY_RANGE_V3_AND_PRIOR: std::ops::RangeInclusive<u8> = 255..=255;
-        const PROPRIETARY_RANGE_V4_AND_LATER: std::ops::RangeInclusive<u8> = 240..=255;
-
-        egui::ComboBox::from_label("Select Font Type")
-            .selected_text(selected_text)
-            .show_ui(ui, |ui| {
-                // Known fonts
-                for (t, name) in &known_types {
-                    if ui.selectable_label(&self.font_type == t, *name).clicked() {
-                        self.font_type = t.clone();
-                    }
-                }
-
-                ui.separator();
-                ui.label("Reserved/Proprietary:");
-                // For these, we allow specifying a raw value
-                let mut raw_value = match self.font_type {
-                    FontType::Reserved(v) | FontType::Proprietary(v) => v,
-                    _ => 255, // default to something in the proprietary range
-                };
-
-                ui.horizontal(|ui| {
-                    ui.label("Value:");
-                    if ui
-                        .add(egui::DragValue::new(&mut raw_value).speed(1))
-                        .changed()
-                    {
-                        // Determine if it's proprietary or reserved
-                        // TODO: check if we have VT version 4 or later
-                        if PROPRIETARY_RANGE_V3_AND_PRIOR.contains(&raw_value) {
-                            self.font_type = FontType::Proprietary(raw_value);
-                        } else {
-                            self.font_type = FontType::Reserved(raw_value);
-                        }
-                    }
-                });
+            ui.horizontal(|ui| {
+                ui.label("Proprietary Font Value:");
+                ui.add(egui::DragValue::new(&mut raw_value).range(range).speed(1.0));
             });
+            self.font_type = FontType::Proprietary(raw_value);
+        } else {
+            // Reset to Latin1 if we were proprietary or reserved
+            match self.font_type {
+                FontType::Proprietary(_) | FontType::Reserved(_) => {
+                    self.font_type = FontType::Latin1;
+                }
+                _ => {}
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("Font Type:");
+                egui::ComboBox::from_id_salt("font_type")
+                    .selected_text(format!("{:?}", self.font_type))
+                    .show_ui(ui, |ui| {
+                        // Known fonts
+                        for value in &[
+                            FontType::Latin1,
+                            FontType::Latin9,
+                            // TODO: check if we have VT version 4 or later
+                            // FontType::Latin2,
+                            // FontType::Latin4,
+                            // FontType::Cyrillic,
+                            // FontType::Greek,
+                        ] {
+                            if ui
+                                .selectable_label(&self.font_type == value, format!("{:?}", value))
+                                .clicked()
+                            {
+                                self.font_type = value.clone();
+                            }
+                        }
+                    });
+            });
+        }
 
         ui.separator();
         ui.label("Font Style:");
