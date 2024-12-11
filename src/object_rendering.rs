@@ -390,7 +390,13 @@ impl RenderableObject for OutputString {
                     // Remove trailing spaces only
                     *line = line.trim_end();
                 }
-                HorizontalAlignment::Reserved => todo!(),
+                HorizontalAlignment::Reserved => {
+                    ui.colored_label(
+                        Color32::RED,
+                        "Configuration incorrect: horizontal alignment is set to Reserved",
+                    );
+                    return;
+                }
             }
         }
 
@@ -448,8 +454,14 @@ impl RenderableObject for OutputString {
             HorizontalAlignment::Right => {
                 paint_pos.x = rect.max.x - text_size.x;
             }
-            HorizontalAlignment::Reserved => todo!(),
-        }
+            HorizontalAlignment::Reserved => {
+                ui.colored_label(
+                    Color32::RED,
+                    "Configuration incorrect: horizontal alignment is set to Reserved",
+                );
+                return;
+            }
+        };
 
         match self.justification.vertical {
             VerticalAlignment::Top => {
@@ -461,8 +473,14 @@ impl RenderableObject for OutputString {
             VerticalAlignment::Bottom => {
                 paint_pos.y = rect.max.y - text_size.y;
             }
-            VerticalAlignment::Reserved => todo!(),
-        }
+            VerticalAlignment::Reserved => {
+                ui.colored_label(
+                    Color32::RED,
+                    "Configuration incorrect: vertical alignment is set to Reserved",
+                );
+                return;
+            }
+        };
 
         if !transparent {
             let painter = ui.painter();
