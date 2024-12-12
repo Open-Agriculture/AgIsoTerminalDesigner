@@ -142,31 +142,37 @@ impl RenderableObject for WorkingSet {
             return;
         }
 
-        egui::Frame::none()
-            .fill(pool.color_by_index(self.background_colour).convert())
-            .show(ui, |ui| {
-                render_object_refs(ui, pool, &self.object_refs);
-            });
+        ui.painter().rect_filled(
+            ui.available_rect_before_wrap(),
+            0.0,
+            pool.color_by_index(self.background_colour).convert(),
+        );
+
+        render_object_refs(ui, pool, &self.object_refs);
     }
 }
 
 impl RenderableObject for DataMask {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, _: Point<i16>) {
-        egui::Frame::none()
-            .fill(pool.color_by_index(self.background_colour).convert())
-            .show(ui, |ui| {
-                render_object_refs(ui, pool, &self.object_refs);
-            });
+        ui.painter().rect_filled(
+            ui.available_rect_before_wrap(),
+            0.0,
+            pool.color_by_index(self.background_colour).convert(),
+        );
+
+        render_object_refs(ui, pool, &self.object_refs);
     }
 }
 
 impl RenderableObject for AlarmMask {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, _: Point<i16>) {
-        egui::Frame::none()
-            .fill(pool.color_by_index(self.background_colour).convert())
-            .show(ui, |ui| {
-                render_object_refs(ui, pool, &self.object_refs);
-            });
+        ui.painter().rect_filled(
+            ui.available_rect_before_wrap(),
+            0.0,
+            pool.color_by_index(self.background_colour).convert(),
+        );
+
+        render_object_refs(ui, pool, &self.object_refs);
     }
 }
 
