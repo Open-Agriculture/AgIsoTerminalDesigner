@@ -192,9 +192,9 @@ impl<'a> egui::Widget for ObjectWrapper<'a> {
 }
 
 fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &EditorProject) {
-    let name: String = format!("{:?}: {:?}", u16::from(object.id()), object.object_type());
+    let name = project.get_object_info(object).get_name(object);
     let is_selected = project.get_selected() == object.id().into();
-    let response = ui.selectable_label(is_selected, name.clone());
+    let response = ui.selectable_label(is_selected, name);
 
     if response.clicked() {
         project
@@ -221,7 +221,7 @@ fn render_object_hierarchy(
             render_selectable_object(ui, object, project);
         });
     } else {
-        let id = parent_id.with(object.id().value());
+        let id = parent_id.with(project.get_object_info(object).get_unique_id());
         egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
             .show_header(ui, |ui| {
                 render_selectable_object(ui, object, project);
@@ -491,7 +491,7 @@ impl eframe::App for DesignerApp {
             egui::SidePanel::right("right_panel").show(ctx, |ui: &mut egui::Ui| {
                 if let Some(id) = pool.get_selected().into() {
                     if let Some(obj) = pool.get_mut_pool().borrow_mut().object_mut_by_id(id) {
-                        obj.render_parameters(ui, pool, &mut pool.get_mut_selected().borrow_mut());
+                        obj.render_parameters(ui, pool);
                         let (width, height) = pool.get_pool().content_size(obj);
                         ui.separator();
                         let desired_size = egui::Vec2::new(width as f32, height as f32);

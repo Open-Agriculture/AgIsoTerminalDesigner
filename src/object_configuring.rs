@@ -19,21 +19,11 @@ use eframe::egui;
 use eframe::egui::TextWrapMode;
 
 pub trait ConfigurableObject {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    );
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject);
 }
 
 impl ConfigurableObject for Object {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
         // Specific UI settings that are applied to all configuration screens
 
         // The combination below makes the comboboxes used throughout the configuration UI have minimal width, yet still be able to show the full text
@@ -41,45 +31,41 @@ impl ConfigurableObject for Object {
         ui.style_mut().spacing.combo_width = 0.0;
 
         match self {
-            Object::WorkingSet(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::DataMask(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::AlarmMask(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::Container(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::SoftKeyMask(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::Key(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::Button(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::InputBoolean(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::InputString(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::InputNumber(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::InputList(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputString(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputNumber(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputList(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputLine(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputRectangle(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputEllipse(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputPolygon(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputMeter(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputLinearBarGraph(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::OutputArchedBarGraph(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::PictureGraphic(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::NumberVariable(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::StringVariable(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::FontAttributes(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::LineAttributes(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::FillAttributes(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::InputAttributes(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::ObjectPointer(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::Macro(o) => o.render_parameters(ui, design, navigation_selected),
+            Object::WorkingSet(o) => o.render_parameters(ui, design),
+            Object::DataMask(o) => o.render_parameters(ui, design),
+            Object::AlarmMask(o) => o.render_parameters(ui, design),
+            Object::Container(o) => o.render_parameters(ui, design),
+            Object::SoftKeyMask(o) => o.render_parameters(ui, design),
+            Object::Key(o) => o.render_parameters(ui, design),
+            Object::Button(o) => o.render_parameters(ui, design),
+            Object::InputBoolean(o) => o.render_parameters(ui, design),
+            Object::InputString(o) => o.render_parameters(ui, design),
+            Object::InputNumber(o) => o.render_parameters(ui, design),
+            Object::InputList(o) => o.render_parameters(ui, design),
+            Object::OutputString(o) => o.render_parameters(ui, design),
+            Object::OutputNumber(o) => o.render_parameters(ui, design),
+            Object::OutputList(o) => o.render_parameters(ui, design),
+            Object::OutputLine(o) => o.render_parameters(ui, design),
+            Object::OutputRectangle(o) => o.render_parameters(ui, design),
+            Object::OutputEllipse(o) => o.render_parameters(ui, design),
+            Object::OutputPolygon(o) => o.render_parameters(ui, design),
+            Object::OutputMeter(o) => o.render_parameters(ui, design),
+            Object::OutputLinearBarGraph(o) => o.render_parameters(ui, design),
+            Object::OutputArchedBarGraph(o) => o.render_parameters(ui, design),
+            Object::PictureGraphic(o) => o.render_parameters(ui, design),
+            Object::NumberVariable(o) => o.render_parameters(ui, design),
+            Object::StringVariable(o) => o.render_parameters(ui, design),
+            Object::FontAttributes(o) => o.render_parameters(ui, design),
+            Object::LineAttributes(o) => o.render_parameters(ui, design),
+            Object::FillAttributes(o) => o.render_parameters(ui, design),
+            Object::InputAttributes(o) => o.render_parameters(ui, design),
+            Object::ObjectPointer(o) => o.render_parameters(ui, design),
+            Object::Macro(o) => o.render_parameters(ui, design),
             Object::AuxiliaryFunctionType1(o) => (),
             Object::AuxiliaryInputType1(o) => (),
-            Object::AuxiliaryFunctionType2(o) => {
-                o.render_parameters(ui, design, navigation_selected)
-            }
-            Object::AuxiliaryInputType2(o) => o.render_parameters(ui, design, navigation_selected),
-            Object::AuxiliaryControlDesignatorType2(o) => {
-                o.render_parameters(ui, design, navigation_selected)
-            }
+            Object::AuxiliaryFunctionType2(o) => o.render_parameters(ui, design),
+            Object::AuxiliaryInputType2(o) => o.render_parameters(ui, design),
+            Object::AuxiliaryControlDesignatorType2(o) => o.render_parameters(ui, design),
             Object::WindowMask(o) => (),
             Object::KeyGroup(o) => (),
             Object::GraphicsContext(o) => (),
@@ -98,12 +84,7 @@ impl ConfigurableObject for Object {
     }
 }
 
-fn render_object_id(
-    ui: &mut egui::Ui,
-    id: &mut ObjectId,
-    pool: &ObjectPool,
-    navigation_selected: &mut NullableObjectId,
-) {
+fn render_object_id(ui: &mut egui::Ui, id: &mut ObjectId, design: &EditorProject) {
     let mut current_id = u16::from(*id);
 
     ui.horizontal(|ui| {
@@ -117,7 +98,7 @@ fn render_object_id(
         let new_id = ObjectId::new(current_id).unwrap();
 
         // Check if the new ID is already used by another object (excluding the current object)
-        let conflict = pool.object_by_id(new_id).is_some() && new_id != *id;
+        let conflict = design.get_pool().object_by_id(new_id).is_some() && new_id != *id;
 
         let conflict_storage = ui.id().with("conflict");
         let was_conflict = ui.data(|data| data.get_temp::<u16>(conflict_storage));
@@ -138,8 +119,9 @@ fn render_object_id(
         }
 
         if !conflict && resp.changed() {
+            design.update_object_id_for_info(*id, new_id);
             *id = new_id;
-            navigation_selected.0 = Some(*id);
+            design.get_mut_selected().borrow_mut().0 = Some(*id);
         }
     });
 }
@@ -219,12 +201,11 @@ fn render_index_modifiers<T>(ui: &mut egui::Ui, idx: usize, list: &mut Vec<T>) {
 
 fn render_object_references_list(
     ui: &mut egui::Ui,
-    pool: &ObjectPool,
+    design: &EditorProject,
     width: u16,
     height: u16,
     object_refs: &mut Vec<ObjectRef>,
     allowed_child_objects: &[ObjectType],
-    navigation_selected: &mut NullableObjectId,
 ) {
     egui::Grid::new("object_ref_grid")
         .striped(true)
@@ -233,10 +214,16 @@ fn render_object_references_list(
             let mut idx = 0;
             while idx < object_refs.len() {
                 let obj_ref = &mut object_refs[idx];
-                let obj = pool.object_by_id(obj_ref.id);
+                let obj = design.get_pool().object_by_id(obj_ref.id);
 
                 ui.label(" - ");
-                render_object_id_selector(ui, idx, pool, &mut obj_ref.id, allowed_child_objects);
+                render_object_id_selector(
+                    ui,
+                    idx,
+                    design.get_pool(),
+                    &mut obj_ref.id,
+                    allowed_child_objects,
+                );
 
                 if let Some(obj) = obj {
                     let mut max_x = width as i16;
@@ -246,7 +233,7 @@ fn render_object_references_list(
                         max_y -= sized_obj.height() as i16;
                     }
                     if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                        *navigation_selected = obj.id().into();
+                        *design.get_mut_selected().borrow_mut() = obj.id().into();
                     }
 
                     ui.add(
@@ -269,7 +256,8 @@ fn render_object_references_list(
             }
         });
 
-    let (new_object_id, _) = render_add_object_id(ui, pool, allowed_child_objects, false);
+    let (new_object_id, _) =
+        render_add_object_id(ui, design.get_pool(), allowed_child_objects, false);
     if let Some(id) = new_object_id {
         object_refs.push(ObjectRef {
             id,
@@ -280,10 +268,9 @@ fn render_object_references_list(
 
 fn render_object_id_list(
     ui: &mut egui::Ui,
-    pool: &ObjectPool,
+    design: &EditorProject,
     object_ids: &mut Vec<ObjectId>,
     allowed_child_objects: &[ObjectType],
-    navigation_selected: &mut NullableObjectId,
 ) {
     egui::Grid::new("object_id_grid")
         .striped(true)
@@ -291,20 +278,20 @@ fn render_object_id_list(
         .show(ui, |ui| {
             let mut idx = 0;
             while idx < object_ids.len() {
-                let obj: Option<&Object> = pool.object_by_id(object_ids[idx]);
+                let obj: Option<&Object> = design.get_pool().object_by_id(object_ids[idx]);
 
                 ui.label(" - ");
                 render_object_id_selector(
                     ui,
                     idx,
-                    pool,
+                    design.get_pool(),
                     &mut object_ids[idx],
                     allowed_child_objects,
                 );
 
                 if let Some(obj) = obj {
                     if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                        *navigation_selected = obj.id().into();
+                        *design.get_mut_selected().borrow_mut() = obj.id().into();
                     }
                 } else {
                     ui.colored_label(egui::Color32::RED, "Missing object");
@@ -315,7 +302,8 @@ fn render_object_id_list(
                 ui.end_row();
             }
         });
-    let (new_object_id, _) = render_add_object_id(ui, pool, allowed_child_objects, false);
+    let (new_object_id, _) =
+        render_add_object_id(ui, design.get_pool(), allowed_child_objects, false);
     if let Some(id) = new_object_id {
         object_ids.push(id);
     }
@@ -323,10 +311,9 @@ fn render_object_id_list(
 
 fn render_nullable_object_id_list(
     ui: &mut egui::Ui,
-    pool: &ObjectPool,
+    design: &EditorProject,
     nullable_object_ids: &mut Vec<NullableObjectId>,
     allowed_child_objects: &[ObjectType],
-    navigation_selected: &mut NullableObjectId,
 ) {
     egui::Grid::new("object_id_grid")
         .striped(true)
@@ -338,16 +325,16 @@ fn render_nullable_object_id_list(
                 render_nullable_object_id_selector(
                     ui,
                     idx,
-                    pool,
+                    design.get_pool(),
                     &mut nullable_object_ids[idx],
                     allowed_child_objects,
                 );
                 if let Some(object_id) = &mut nullable_object_ids[idx].0 {
-                    let obj: Option<&Object> = pool.object_by_id(*object_id);
+                    let obj: Option<&Object> = design.get_pool().object_by_id(*object_id);
 
                     if let Some(obj) = obj {
                         if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                            *navigation_selected = obj.id().into();
+                            *design.get_mut_selected().borrow_mut() = obj.id().into();
                         }
                     } else {
                         ui.colored_label(egui::Color32::RED, "Missing object");
@@ -361,7 +348,8 @@ fn render_nullable_object_id_list(
             }
         });
 
-    let (new_object_id, success) = render_add_object_id(ui, pool, allowed_child_objects, true);
+    let (new_object_id, success) =
+        render_add_object_id(ui, design.get_pool(), allowed_child_objects, true);
     if success {
         nullable_object_ids.push(NullableObjectId(new_object_id));
     }
@@ -406,10 +394,9 @@ fn render_add_object_id(
 
 fn render_macro_references(
     ui: &mut egui::Ui,
-    pool: &ObjectPool,
+    design: &EditorProject,
     macro_refs: &mut Vec<MacroRef>,
     possible_events: &[Event],
-    navigation_selected: &mut NullableObjectId,
 ) {
     egui::Grid::new("macro_grid")
         .striped(true)
@@ -419,7 +406,8 @@ fn render_macro_references(
             while idx < macro_refs.len() {
                 let macro_ref = &mut macro_refs[idx];
 
-                if let Some(macro_obj) = pool
+                if let Some(macro_obj) = design
+                    .get_pool()
                     .objects_by_type(ObjectType::Macro)
                     .iter()
                     .find(|o| u16::from(o.id()) == macro_ref.macro_id as u16)
@@ -439,13 +427,15 @@ fn render_macro_references(
                             });
 
                         if ui.link(" Macro ").clicked() {
-                            *navigation_selected = macro_obj.id().into();
+                            *design.get_mut_selected().borrow_mut() = macro_obj.id().into();
                         }
 
                         egui::ComboBox::from_id_salt("macro_id")
                             .selected_text(format!("{:?}", macro_ref.macro_id))
                             .show_ui(ui, |ui| {
-                                for potential_macro in pool.objects_by_type(ObjectType::Macro) {
+                                for potential_macro in
+                                    design.get_pool().objects_by_type(ObjectType::Macro)
+                                {
                                     ui.selectable_value(
                                         &mut macro_ref.macro_id,
                                         u16::from(potential_macro.id()) as u8,
@@ -467,7 +457,7 @@ fn render_macro_references(
             }
         });
 
-    render_add_macro_reference(ui, pool, macro_refs, possible_events);
+    render_add_macro_reference(ui, design.get_pool(), macro_refs, possible_events);
 }
 
 fn render_add_macro_reference(
@@ -527,13 +517,8 @@ fn render_add_macro_reference(
 }
 
 impl ConfigurableObject for WorkingSet {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.background_colour, 0..=255)
                 .text("Background Colour")
@@ -556,41 +541,34 @@ impl ConfigurableObject for WorkingSet {
                     }
                 });
             if ui.link("(view)").clicked() {
-                *navigation_selected = self.active_mask.into();
+                *design.get_mut_selected().borrow_mut() = self.active_mask.into();
             }
         });
         ui.separator();
         ui.label("Objects:");
         render_object_references_list(
             ui,
-            design.get_pool(),
+            design,
             design.mask_size,
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
 
         ui.separator();
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for DataMask {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.background_colour, 0..=255)
                 .text("Background Colour")
@@ -619,7 +597,7 @@ impl ConfigurableObject for DataMask {
                 });
             if let Some(mask) = self.soft_key_mask.0 {
                 if ui.link("(view)").clicked() {
-                    *navigation_selected = mask.into();
+                    *design.get_mut_selected().borrow_mut() = mask.into();
                 }
             }
         });
@@ -627,34 +605,27 @@ impl ConfigurableObject for DataMask {
         ui.label("Objects:");
         render_object_references_list(
             ui,
-            design.get_pool(),
+            design,
             design.mask_size,
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
 
         ui.separator();
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for AlarmMask {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.background_colour, 0..=255)
                 .text("Background Colour")
@@ -683,7 +654,7 @@ impl ConfigurableObject for AlarmMask {
                 });
             if let Some(mask) = self.soft_key_mask.0 {
                 if ui.link("(view)").clicked() {
-                    *navigation_selected = mask.into();
+                    *design.get_mut_selected().borrow_mut() = mask.into();
                 }
             }
         });
@@ -704,34 +675,27 @@ impl ConfigurableObject for AlarmMask {
         ui.label("Objects:");
         render_object_references_list(
             ui,
-            design.get_pool(),
+            design,
             design.mask_size,
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
 
         ui.separator();
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for Container {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.checkbox(&mut self.hidden, "Hidden");
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
@@ -747,34 +711,27 @@ impl ConfigurableObject for Container {
         ui.label("Objects:");
         render_object_references_list(
             ui,
-            design.get_pool(),
+            design,
             self.width,
             self.height,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
 
         ui.separator();
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for SoftKeyMask {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.background_colour, 0..=255)
                 .text("Background Colour")
@@ -784,32 +741,25 @@ impl ConfigurableObject for SoftKeyMask {
         ui.label("Objects:");
         render_object_id_list(
             ui,
-            design.get_pool(),
+            design,
             &mut self.objects,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
 
         ui.separator();
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for Key {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.background_colour, 0..=255)
                 .text("Background Colour")
@@ -824,34 +774,27 @@ impl ConfigurableObject for Key {
         ui.label("Objects:");
         render_object_references_list(
             ui,
-            design.get_pool(),
+            design,
             design.mask_size,
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
 
         ui.separator();
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for Button {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
@@ -903,34 +846,27 @@ impl ConfigurableObject for Button {
         ui.label("Objects:");
         render_object_references_list(
             ui,
-            design.get_pool(),
+            design,
             self.width,
             self.height,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
 
         ui.separator();
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for InputBoolean {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.background_colour, 0..=255)
                 .text("Background Colour")
@@ -999,22 +935,16 @@ impl ConfigurableObject for InputBoolean {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for InputString {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
                 .text("Width")
@@ -1143,22 +1073,16 @@ impl ConfigurableObject for InputString {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for InputNumber {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
                 .text("Width")
@@ -1305,22 +1229,16 @@ impl ConfigurableObject for InputNumber {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for InputList {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
                 .text("Width")
@@ -1370,32 +1288,25 @@ impl ConfigurableObject for InputList {
         ui.label("List items:");
         render_nullable_object_id_list(
             ui,
-            design.get_pool(),
+            design,
             &mut self.list_items,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
 
         ui.separator();
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for OutputString {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
                 .text("Width")
@@ -1505,22 +1416,16 @@ impl ConfigurableObject for OutputString {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for OutputNumber {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
                 .text("Width")
@@ -1655,22 +1560,16 @@ impl ConfigurableObject for OutputNumber {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for OutputList {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
@@ -1719,32 +1618,25 @@ impl ConfigurableObject for OutputList {
         ui.label("List items:");
         render_nullable_object_id_list(
             ui,
-            design.get_pool(),
+            design,
             &mut self.list_items,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
 
         ui.separator();
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for OutputLine {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
@@ -1770,7 +1662,7 @@ impl ConfigurableObject for OutputLine {
             // If a valid line_attributes object is selected, provide a link to navigate there
             if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
                 if ui.link("(view)").clicked() {
-                    *navigation_selected = self.line_attributes.into();
+                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
                 }
             } else {
                 ui.colored_label(egui::Color32::RED, "Missing object");
@@ -1806,22 +1698,16 @@ impl ConfigurableObject for OutputLine {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for OutputRectangle {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
@@ -1847,7 +1733,7 @@ impl ConfigurableObject for OutputRectangle {
             // Link to view the selected line attributes object
             if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
                 if ui.link("(view)").clicked() {
-                    *navigation_selected = self.line_attributes.into();
+                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
                 }
             } else {
                 ui.colored_label(egui::Color32::RED, "Missing object");
@@ -1901,7 +1787,7 @@ impl ConfigurableObject for OutputRectangle {
             if let Some(id) = self.fill_attributes.into() {
                 if let Some(obj) = design.get_pool().object_by_id(id) {
                     if ui.link("(view)").clicked() {
-                        *navigation_selected = id.into();
+                        *design.get_mut_selected().borrow_mut() = id.into();
                     }
                 } else {
                     ui.colored_label(egui::Color32::RED, "Missing object");
@@ -1913,22 +1799,16 @@ impl ConfigurableObject for OutputRectangle {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for OutputEllipse {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
@@ -1954,7 +1834,7 @@ impl ConfigurableObject for OutputEllipse {
             // Link to navigate to the chosen line attributes object
             if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
                 if ui.link("(view)").clicked() {
-                    *navigation_selected = self.line_attributes.into();
+                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
                 }
             } else {
                 ui.colored_label(egui::Color32::RED, "Missing object");
@@ -2023,7 +1903,7 @@ impl ConfigurableObject for OutputEllipse {
             if let Some(id) = self.fill_attributes.into() {
                 if let Some(obj) = design.get_pool().object_by_id(id) {
                     if ui.link("(view)").clicked() {
-                        *navigation_selected = id.into();
+                        *design.get_mut_selected().borrow_mut() = id.into();
                     }
                 } else {
                     ui.colored_label(egui::Color32::RED, "Missing object");
@@ -2035,22 +1915,16 @@ impl ConfigurableObject for OutputEllipse {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for OutputPolygon {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
@@ -2087,7 +1961,7 @@ impl ConfigurableObject for OutputPolygon {
             // Link to navigate to the chosen line attributes object
             if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
                 if ui.link("(view)").clicked() {
-                    *navigation_selected = self.line_attributes.into();
+                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
                 }
             } else {
                 ui.colored_label(egui::Color32::RED, "Missing object");
@@ -2124,7 +1998,7 @@ impl ConfigurableObject for OutputPolygon {
             if let Some(id) = self.fill_attributes.into() {
                 if let Some(obj) = design.get_pool().object_by_id(id) {
                     if ui.link("(view)").clicked() {
-                        *navigation_selected = id.into();
+                        *design.get_mut_selected().borrow_mut() = id.into();
                     }
                 } else {
                     ui.colored_label(egui::Color32::RED, "Missing object");
@@ -2189,22 +2063,16 @@ impl ConfigurableObject for OutputPolygon {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for OutputMeter {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
@@ -2317,22 +2185,16 @@ impl ConfigurableObject for OutputMeter {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for OutputLinearBarGraph {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
@@ -2499,22 +2361,16 @@ impl ConfigurableObject for OutputLinearBarGraph {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for OutputArchedBarGraph {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
@@ -2703,22 +2559,16 @@ impl ConfigurableObject for OutputArchedBarGraph {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for PictureGraphic {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.add(
             egui::Slider::new(&mut self.width, 0..=design.mask_size)
                 .text("Width")
@@ -2907,22 +2757,16 @@ impl ConfigurableObject for PictureGraphic {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for NumberVariable {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.horizontal(|ui| {
             ui.label("Initial Value:");
@@ -2932,13 +2776,8 @@ impl ConfigurableObject for NumberVariable {
 }
 
 impl ConfigurableObject for StringVariable {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.horizontal(|ui| {
             ui.label("Initial Value:");
@@ -2948,13 +2787,8 @@ impl ConfigurableObject for StringVariable {
 }
 
 impl ConfigurableObject for FontAttributes {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.add(
             egui::Slider::new(&mut self.font_colour, 0..=255)
@@ -3087,22 +2921,16 @@ impl ConfigurableObject for FontAttributes {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for LineAttributes {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.add(
             egui::Slider::new(&mut self.line_colour, 0..=255)
@@ -3151,22 +2979,16 @@ impl ConfigurableObject for LineAttributes {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for FillAttributes {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.label("Fill Type:").on_hover_text(
             "Select how this area should be filled:\n\
                             0 = No fill\n\
@@ -3211,7 +3033,7 @@ impl ConfigurableObject for FillAttributes {
                 if let Some(pattern_id) = self.fill_pattern.0 {
                     if let Some(obj) = design.get_pool().object_by_id(pattern_id) {
                         if ui.link("(view)").clicked() {
-                            *navigation_selected = pattern_id.into();
+                            *design.get_mut_selected().borrow_mut() = pattern_id.into();
                         }
                     } else {
                         ui.colored_label(egui::Color32::RED, "Missing pattern object");
@@ -3228,22 +3050,16 @@ impl ConfigurableObject for FillAttributes {
                             Currently, FillAttributes does not trigger events, but this is included for consistency.");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for InputAttributes {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.horizontal(|ui| {
             ui.label("Validation Type:");
@@ -3266,22 +3082,16 @@ impl ConfigurableObject for InputAttributes {
         ui.label("Macros:");
         render_macro_references(
             ui,
-            design.get_pool(),
+            design,
             &mut self.macro_refs,
             &Self::get_possible_events(),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for ObjectPointer {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
         ui.horizontal(|ui| {
             ui.label("Object reference:");
             egui::ComboBox::from_id_salt("object_reference")
@@ -3312,7 +3122,7 @@ impl ConfigurableObject for ObjectPointer {
             if let Some(id) = self.value.into() {
                 if let Some(object) = design.get_pool().object_by_id(id) {
                     if ui.link(format!("{:?}", object.object_type())).clicked() {
-                        *navigation_selected = id.into();
+                        *design.get_mut_selected().borrow_mut() = id.into();
                     }
                 } else {
                     ui.colored_label(egui::Color32::RED, "Missing object in pool");
@@ -3368,13 +3178,8 @@ const ALLOWED_MACRO_COMMANDS: &[(u8, &str, VtVersion)] = &[
 ];
 
 impl ConfigurableObject for Macro {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.label("Macro Commands:");
         egui::Grid::new("macro_commands_grid")
@@ -3422,13 +3227,8 @@ impl ConfigurableObject for Macro {
 }
 
 impl ConfigurableObject for AuxiliaryFunctionType2 {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.add(
             egui::Slider::new(&mut self.background_colour, 0..=255)
@@ -3480,24 +3280,18 @@ impl ConfigurableObject for AuxiliaryFunctionType2 {
         ui.label("Objects:");
         render_object_references_list(
             ui,
-            design.get_pool(),
+            design,
             design.mask_size,
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for AuxiliaryInputType2 {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.add(
             egui::Slider::new(&mut self.background_colour, 0..=255)
@@ -3548,24 +3342,18 @@ impl ConfigurableObject for AuxiliaryInputType2 {
         ui.label("Objects:");
         render_object_references_list(
             ui,
-            design.get_pool(),
+            design,
             design.mask_size,
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
-            navigation_selected,
         );
     }
 }
 
 impl ConfigurableObject for AuxiliaryControlDesignatorType2 {
-    fn render_parameters(
-        &mut self,
-        ui: &mut egui::Ui,
-        design: &EditorProject,
-        navigation_selected: &mut NullableObjectId,
-    ) {
-        render_object_id(ui, &mut self.id, design.get_pool(), navigation_selected);
+    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
+        render_object_id(ui, &mut self.id, design);
 
         ui.horizontal(|ui| {
             ui.label("Pointer Type:");
@@ -3634,7 +3422,7 @@ impl ConfigurableObject for AuxiliaryControlDesignatorType2 {
                 if let Some(ref_id) = self.auxiliary_object_id.into() {
                     if let Some(obj) = design.get_pool().object_by_id(ref_id) {
                         if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                            *navigation_selected = ref_id.into();
+                            *design.get_mut_selected().borrow_mut() = ref_id.into();
                         }
                     } else {
                         ui.colored_label(egui::Color32::RED, "Missing object in pool");

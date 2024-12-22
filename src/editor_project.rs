@@ -2,9 +2,11 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::HashMap};
 
-use ag_iso_stack::object_pool::{NullableObjectId, ObjectPool};
+use ag_iso_stack::object_pool::{object::Object, NullableObjectId, ObjectId, ObjectPool};
+
+use crate::ObjectInfo;
 
 const MAX_UNDO_REDO_POOL: usize = 10;
 const MAX_UNDO_REDO_SELECTED: usize = 20;
@@ -21,6 +23,7 @@ pub struct EditorProject {
     redo_selected_history: Vec<NullableObjectId>,
     pub mask_size: u16,
     soft_key_size: (u16, u16),
+    object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
 }
 
 impl From<ObjectPool> for EditorProject {
@@ -37,6 +40,7 @@ impl From<ObjectPool> for EditorProject {
             redo_selected_history: Default::default(),
             mask_size,
             soft_key_size,
+            object_info: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -150,5 +154,26 @@ impl EditorProject {
             self.selected_object = selected.clone();
             self.mut_selected_object.replace(selected);
         }
+    }
+
+    /// Change an object id in the object info hashmap
+    pub fn update_object_id_for_info(&self, old_id: ObjectId, new_id: ObjectId) {
+        let mut object_info = self.object_info.borrow_mut();
+        if let Some(info) = object_info.remove(&old_id) {
+            object_info.insert(new_id, info);
+        }
+    }
+
+    /// Get the object info for an object id
+    /// If the object id is not mapped, we insert the default object info
+    pub fn get_object_info(&self, object: &Object) -> ObjectInfo {
+        if let Some(info) = self.object_info.borrow().get(&object.id()) {
+            return info.clone();
+        }
+        let info = ObjectInfo::new(object);
+        self.object_info
+            .borrow_mut()
+            .insert(object.id(), info.clone());
+        info
     }
 }
