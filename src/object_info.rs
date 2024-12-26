@@ -35,6 +35,13 @@ impl ObjectInfo {
         }
     }
 
+    /// Set the name of the object.
+    pub fn set_name(&mut self, name: String) {
+        if !name.is_empty() {
+            self.name = Some(name);
+        }
+    }
+
     pub fn get_unique_id(&self) -> Uuid {
         self.unique_id
     }

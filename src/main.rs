@@ -192,20 +192,48 @@ impl<'a> egui::Widget for ObjectWrapper<'a> {
 }
 
 fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &EditorProject) {
-    let name = project.get_object_info(object).get_name(object);
-    let is_selected = project.get_selected() == object.id().into();
-    let response = ui.selectable_label(is_selected, name);
+    let this_ui_id = ui.id();
+    let object_info = project.get_object_info(object);
 
-    if response.clicked() {
-        project
-            .get_mut_selected()
-            .replace(NullableObjectId(Some(object.id())));
-    }
-    response.context_menu(|ui| {
-        if ui.button("Delete").on_hover_text("Delete object").clicked() {
-            project.get_mut_pool().borrow_mut().remove(object.id());
+    let renaming_object = project.get_renaming_object();
+    if renaming_object
+        .clone()
+        .is_some_and(|(ui_id, id, _)| id == object.id() && ui_id == this_ui_id)
+    {
+        let mut name = renaming_object.unwrap().2;
+        let response = ui.text_edit_singleline(&mut name);
+        project.set_renaming_object(this_ui_id, object.id(), name); // Update the name in the project
+        let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        if response.lost_focus() {
+            project.finish_renaming_object(!cancelled);
+        } else if !response.has_focus() {
+            // We need to focus the text edit when we start renaming
+            response.request_focus();
         }
-    });
+    } else {
+        let is_selected = project.get_selected() == object.id().into();
+        let response = ui.selectable_label(is_selected, object_info.get_name(object));
+
+        if response.clicked() {
+            project
+                .get_mut_selected()
+                .replace(NullableObjectId(Some(object.id())));
+        }
+        if response.double_clicked() {
+            project.set_renaming_object(this_ui_id, object.id(), object_info.get_name(object));
+        }
+
+        response.context_menu(|ui| {
+            if ui.button("Rename").on_hover_text("Rename object").clicked() {
+                project.set_renaming_object(this_ui_id, object.id(), object_info.get_name(object));
+                ui.close_menu();
+            }
+            if ui.button("Delete").on_hover_text("Delete object").clicked() {
+                project.get_mut_pool().borrow_mut().remove(object.id());
+                ui.close_menu();
+            }
+        });
+    }
 }
 
 fn render_object_hierarchy(
