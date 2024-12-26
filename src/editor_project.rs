@@ -24,6 +24,9 @@ pub struct EditorProject {
     pub mask_size: u16,
     soft_key_size: (u16, u16),
     object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
+
+    /// Used to keep track of the object that is being renamed
+    renaming_object: RefCell<Option<(eframe::egui::Id, ObjectId, String)>>,
 }
 
 impl From<ObjectPool> for EditorProject {
@@ -41,6 +44,7 @@ impl From<ObjectPool> for EditorProject {
             mask_size,
             soft_key_size,
             object_info: RefCell::new(HashMap::new()),
+            renaming_object: RefCell::new(None),
         }
     }
 }
@@ -167,13 +171,35 @@ impl EditorProject {
     /// Get the object info for an object id
     /// If the object id is not mapped, we insert the default object info
     pub fn get_object_info(&self, object: &Object) -> ObjectInfo {
-        if let Some(info) = self.object_info.borrow().get(&object.id()) {
-            return info.clone();
+        let mut object_info = self.object_info.borrow_mut();
+        object_info
+            .entry(object.id())
+            .or_insert_with(|| ObjectInfo::new(object))
+            .clone()
+    }
+
+    /// Start renaming an object
+    pub fn set_renaming_object(&self, ui_id: eframe::egui::Id, object_id: ObjectId, name: String) {
+        self.renaming_object.replace(Some((ui_id, object_id, name)));
+    }
+
+    /// Get the current name of the object that is being renamed
+    /// Returns None if no object is being renamed
+    pub fn get_renaming_object(&self) -> Option<(eframe::egui::Id, ObjectId, String)> {
+        self.renaming_object.borrow().clone()
+    }
+
+    /// Finish renaming an object
+    /// If store is true, we store the new name in the object info hashmap
+    pub fn finish_renaming_object(&self, store: bool) {
+        if store {
+            if let Some(renaming_object) = self.renaming_object.borrow().as_ref() {
+                let mut object_info = self.object_info.borrow_mut();
+                if let Some(info) = object_info.get_mut(&renaming_object.1) {
+                    info.set_name(renaming_object.2.clone());
+                }
+            }
         }
-        let info = ObjectInfo::new(object);
-        self.object_info
-            .borrow_mut()
-            .insert(object.id(), info.clone());
-        info
+        self.renaming_object.replace(None);
     }
 }
