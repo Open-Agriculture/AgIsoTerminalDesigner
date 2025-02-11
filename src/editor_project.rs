@@ -202,4 +202,11 @@ impl EditorProject {
         }
         self.renaming_object.replace(None);
     }
+
+    pub fn sort_objects_by<F>(&mut self, cmp: F)
+    where
+        F: Fn(&Object, &Object) -> std::cmp::Ordering,
+    {
+        self.mut_pool.borrow_mut().objects_mut().sort_by(cmp);
+    }
 }

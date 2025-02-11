@@ -5,11 +5,14 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::ops::Sub;
 
 use ag_iso_stack::object_pool::object::*;
 use ag_iso_stack::object_pool::object_attributes::ButtonState;
 use ag_iso_stack::object_pool::object_attributes::FontSize;
+use ag_iso_stack::object_pool::object_attributes::FormatType;
 use ag_iso_stack::object_pool::object_attributes::HorizontalAlignment;
+use ag_iso_stack::object_pool::object_attributes::LineDirection;
 use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
 use ag_iso_stack::object_pool::object_attributes::Point;
 use ag_iso_stack::object_pool::object_attributes::VerticalAlignment;
@@ -116,9 +119,12 @@ fn darken_color(color: egui::Color32, amount: f32) -> egui::Color32 {
 }
 
 fn create_relative_rect(ui: &mut egui::Ui, position: Point<i16>, size: egui::Vec2) -> egui::Rect {
+    let width = ui.max_rect().width().sub(position.x as f32).min(size.x);
+    let height = ui.max_rect().height().sub(position.y as f32).min(size.y);
+
     egui::Rect::from_min_size(
-        ui.max_rect().min + egui::Vec2::new(position.x as f32, position.y as f32),
-        size,
+        ui.max_rect().min + egui::vec2(position.x as f32, position.y as f32),
+        egui::vec2(width, height),
     )
 }
 
@@ -307,14 +313,50 @@ impl RenderableObject for Button {
 
 impl RenderableObject for InputBoolean {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
-            ui,
-            position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
-        );
+        let is_true = if let Some(var_id) = self.variable_reference.0 {
+            match pool.object_by_id(var_id) {
+                Some(Object::NumberVariable(num_var)) => num_var.value > 0,
+                _ => self.value,
+            }
+        } else {
+            self.value
+        };
+
+        let side = self.width as f32;
+        let rect = create_relative_rect(ui, position, egui::Vec2::new(side, side));
 
         ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "InputBoolean not implemented");
+            let background_color = pool.color_by_index(self.background_colour).convert();
+            ui.painter().rect_filled(rect, 0.0, background_color);
+
+            // If the boolean is true, we display a checkmark in the center
+            if is_true {
+                let fg_color = match pool.object_by_id(self.foreground_colour) {
+                    Some(Object::FontAttributes(font_attr)) => {
+                        pool.color_by_index(font_attr.font_colour).convert()
+                    }
+                    // Fall back if missing or the ID is invalid.
+                    _ => egui::Color32::BLACK,
+                };
+
+                let font_id = egui::FontId::new(side, egui::FontFamily::Proportional);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "\u{2714}",
+                    font_id,
+                    fg_color,
+                );
+            }
+
+            // If disabled, overlay a semi-transparent layer
+            if !self.enabled {
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_premultiplied(128, 128, 128, 100),
+                );
+            }
         });
     }
 }
@@ -338,11 +380,172 @@ impl RenderableObject for InputNumber {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::Vec2::new(self.width as f32, self.height as f32),
         );
 
         ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "InputNumber not implemented");
+            // Look up the font attributes. If missing, show an error.
+            let font_attributes = match pool.object_by_id(self.font_attributes) {
+                Some(Object::FontAttributes(fa)) => fa,
+                _ => {
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        format!(
+                            "Missing FontAttributes for InputNumber ID {:?}",
+                            self.id.value()
+                        ),
+                    );
+                    return;
+                }
+            };
+
+            // Get the background colour from the pool.
+            let background_colour = pool.color_by_index(self.background_colour).convert();
+            // Fill the background if the NumberOptions do not specify transparency.
+            if !self.options.transparent {
+                ui.painter().rect_filled(rect, 0.0, background_colour);
+            }
+
+            // Determine the “raw” number value to use: if a variable_reference exists, use the referenced
+            // NumberVariable’s value; otherwise use our own value.
+            let raw_value: u32 = if let Some(var_id) = self.variable_reference.0 {
+                match pool.object_by_id(var_id) {
+                    Some(Object::NumberVariable(num_var)) => num_var.value,
+                    _ => self.value,
+                }
+            } else {
+                self.value
+            };
+
+            // Compute the displayed value using double precision:
+            //   displayed_value = (raw_value + offset) * scale
+            let mut displayed_value = {
+                let float_raw = raw_value as f64;
+                let float_offset = self.offset as f64;
+                let float_scale = self.scale as f64;
+                (float_raw + float_offset) * float_scale
+            };
+
+            // Use the number of decimals (up to 7) and the "truncate" flag from NumberOptions
+            let decimals = self.nr_of_decimals.min(7);
+            let power_of_ten = 10f64.powi(decimals as i32);
+            if self.options.truncate {
+                displayed_value = (displayed_value * power_of_ten).trunc() / power_of_ten;
+            } else {
+                displayed_value = (displayed_value * power_of_ten).round() / power_of_ten;
+            }
+
+            // If the "display_zero_as_blank" option is set and the computed value is exactly zero, show nothing.
+            if self.options.display_zero_as_blank && displayed_value == 0.0 {
+                return;
+            }
+
+            // Format the number to a string. Use exponential formatting if requested.
+            let mut number_string = if self.format == FormatType::Exponential {
+                format!("{:.*e}", decimals as usize, displayed_value)
+            } else {
+                format!("{:.*}", decimals as usize, displayed_value)
+            };
+
+            // If the "display_leading_zeros" option is set, try to pad the text on the left with zeros
+            // so that it fills (or exceeds) the available field width.
+            if self.options.display_leading_zeros {
+                let fonts = ui.fonts(|f| f.clone());
+                let font_height = match font_attributes.font_size {
+                    FontSize::NonProportional(size) => size.height() as f32,
+                    FontSize::Proportional(h) => h as f32,
+                };
+                let font_id = egui::FontId::new(font_height, egui::FontFamily::Proportional);
+                let mut zero_padded = number_string.clone();
+                let max_loop = 1000; // safety to avoid an infinite loop
+                for _ in 0..max_loop {
+                    let galley = fonts.layout_no_wrap(
+                        zero_padded.clone(),
+                        font_id.clone(),
+                        pool.color_by_index(font_attributes.font_colour).convert(),
+                    );
+                    if galley.size().x >= rect.width() {
+                        number_string = zero_padded;
+                        break;
+                    } else {
+                        zero_padded.insert(0, '0');
+                    }
+                }
+            }
+
+            // Get the font colour.
+            let font_colour = pool.color_by_index(font_attributes.font_colour).convert();
+
+            // Choose the font family and height according to the font size:
+            let (font_family, font_height) = match font_attributes.font_size {
+                FontSize::NonProportional(npsize) => {
+                    (egui::FontFamily::Monospace, npsize.height() as f32)
+                }
+                FontSize::Proportional(h) => (egui::FontFamily::Proportional, h as f32),
+            };
+            let font_id = egui::FontId::new(font_height, font_family);
+
+            // Lay out the text.
+            let fonts = ui.fonts(|f| f.clone());
+            let galley = fonts.layout(
+                number_string.clone(),
+                font_id.clone(),
+                font_colour,
+                f32::INFINITY,
+            );
+            let text_size = galley.size();
+
+            // Compute the text’s paint position according to the horizontal and vertical justification.
+            let mut paint_pos = rect.min;
+            match self.justification.horizontal {
+                HorizontalAlignment::Left => {
+                    paint_pos.x = rect.min.x;
+                }
+                HorizontalAlignment::Middle => {
+                    paint_pos.x = rect.center().x - text_size.x * 0.5;
+                }
+                HorizontalAlignment::Right => {
+                    paint_pos.x = rect.max.x - text_size.x;
+                }
+                HorizontalAlignment::Reserved => {
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "Invalid horizontal alignment for InputNumber",
+                    );
+                    return;
+                }
+            }
+            match self.justification.vertical {
+                VerticalAlignment::Top => {
+                    paint_pos.y = rect.min.y;
+                }
+                VerticalAlignment::Middle => {
+                    paint_pos.y = rect.center().y - text_size.y * 0.5;
+                }
+                VerticalAlignment::Bottom => {
+                    paint_pos.y = rect.max.y - text_size.y;
+                }
+                VerticalAlignment::Reserved => {
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "Invalid vertical alignment for InputNumber",
+                    );
+                    return;
+                }
+            }
+
+            // Draw the number string.
+            ui.painter().galley(paint_pos, galley, font_colour);
+
+            // If the InputNumber object is not enabled (according to its InputNumberOptions),
+            // overlay a semi‐transparent gray rectangle.
+            if !self.options2.enabled {
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_premultiplied(128, 128, 128, 100),
+                );
+            }
         });
     }
 }
@@ -566,7 +769,175 @@ impl RenderableObject for OutputNumber {
         );
 
         ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "OutputNumber not implemented");
+            // 1. Get the font attributes
+            let font_attributes = match pool.object_by_id(self.font_attributes) {
+                Some(Object::FontAttributes(fa)) => fa,
+                _ => {
+                    ui.colored_label(
+                        Color32::RED,
+                        format!(
+                            "Missing FontAttributes for OutputNumber ID {:?}",
+                            self.id.value()
+                        ),
+                    );
+                    return;
+                }
+            };
+
+            // 2. Convert the pool color indices to `egui::Color32`
+            let background_colour = pool.color_by_index(self.background_colour).convert();
+            let font_colour = pool.color_by_index(font_attributes.font_colour).convert();
+
+            // 3. Determine if we need to fill the background or remain transparent
+            if !self.options.transparent {
+                ui.painter().rect_filled(rect, 0.0, background_colour);
+            }
+
+            // 4. Retrieve the raw value (either from variable_reference or this object’s own `value`)
+            let raw_value = if let Some(var_id) = self.variable_reference.into() {
+                // If we have a referenced NumberVariable, use it
+                match pool.object_by_id(var_id) {
+                    Some(Object::NumberVariable(num_var)) => num_var.value,
+                    _ => self.value,
+                }
+            } else {
+                self.value
+            };
+
+            // 5. Compute the displayed value using double precision to reduce rounding errors
+            let mut displayed_value = {
+                let float_raw = raw_value as f64;
+                let float_offset = self.offset as f64;
+                let float_scale = self.scale as f64;
+                (float_raw + float_offset) * float_scale
+            };
+
+            // 6. Apply truncation or rounding to the number of decimals
+            let decimals = self.nr_of_decimals.min(7); // standard says 0–7 decimals
+            let power_of_ten = 10f64.powi(decimals as i32);
+
+            if self.options.truncate {
+                // Truncate
+                displayed_value = (displayed_value * power_of_ten).trunc() / power_of_ten;
+            } else {
+                // Round
+                displayed_value = (displayed_value * power_of_ten).round() / power_of_ten;
+            }
+
+            // 7. If "display_zero_as_blank" and the final number is exactly zero, display blank
+            //    We interpret "exactly zero" after the rounding/truncation step
+            if self.options.display_zero_as_blank && displayed_value == 0.0 {
+                return;
+            }
+
+            // 8. Convert the (possibly truncated/rounded) displayed_value to string
+            //    Depending on the "format" attribute, use decimal or exponential
+            let mut number_string = if self.format == FormatType::Exponential {
+                format!("{:.*e}", decimals as usize, displayed_value)
+            } else {
+                format!("{:.*}", decimals as usize, displayed_value)
+            };
+
+            // 9. The standard states that we must always display at least one digit
+            //    before the decimal point (i.e., "0.xxxx" if the absolute value < 1)
+            //    Normal Rust formatting already ensures e.g. "0.12" for 0.12,
+            //    so we usually don't need a special patch here. But we keep the note.
+            //
+            // 10. If display_leading_zeros is set, we *attempt* to fill the entire width
+            //     with zeros to the left before applying alignment. (ISO 11783 says
+            //     "fill left to width of field with zeros, then apply justification.")
+            //     Below is a best-effort approach: we measure the text in a loop,
+            //     and keep prepending '0' until it meets or exceeds the available width.
+            //     We also place a reasonable safety limit to avoid infinite loops.
+            //
+            if self.options.display_leading_zeros {
+                let fonts = ui.fonts(|f| f.clone());
+                let font_height = match font_attributes.font_size {
+                    FontSize::NonProportional(s) => s.height() as f32,
+                    FontSize::Proportional(h) => h as f32,
+                };
+                let font_id = egui::FontId::new(font_height, egui::FontFamily::Proportional);
+                let mut zero_padded = number_string.clone();
+                let max_loop = 1000; // safety net to avoid infinite loops
+                for _ in 0..max_loop {
+                    // Measure the current galley
+                    let galley = fonts.layout(
+                        zero_padded.as_str().to_owned(),
+                        font_id.clone(),
+                        font_colour,
+                        f32::INFINITY, // no wrap
+                    );
+                    if galley.size().x >= rect.width() {
+                        // Enough zeros to fill or exceed the field width
+                        number_string = zero_padded;
+                        break;
+                    } else {
+                        zero_padded.insert(0, '0');
+                    }
+                }
+            }
+
+            // 11. We have the final text we want to display in `number_string`.
+            //     Next, figure out the font size and alignment. This is similar
+            //     to the `OutputString` example.
+            let fonts = ui.fonts(|fonts| fonts.clone());
+            let (font_family, font_height) = match font_attributes.font_size {
+                FontSize::NonProportional(npsize) => {
+                    // For simplicity, treat it as monospace
+                    (egui::FontFamily::Monospace, npsize.height() as f32)
+                }
+                FontSize::Proportional(h) => (egui::FontFamily::Proportional, h as f32),
+            };
+            let font_id = egui::FontId::new(font_height, font_family);
+            let galley = fonts.layout(
+                number_string.clone(),
+                font_id.clone(),
+                font_colour,
+                f32::INFINITY, // no wrapping
+            );
+            let text_size = galley.size();
+
+            // 12. Determine text anchor point based on the justification bits
+            let mut paint_pos = rect.min;
+            match self.justification.horizontal {
+                HorizontalAlignment::Left => {
+                    paint_pos.x = rect.min.x;
+                }
+                HorizontalAlignment::Middle => {
+                    paint_pos.x = rect.center().x - (text_size.x * 0.5);
+                }
+                HorizontalAlignment::Right => {
+                    paint_pos.x = rect.max.x - text_size.x;
+                }
+                HorizontalAlignment::Reserved => {
+                    ui.colored_label(
+                        Color32::RED,
+                        "Configuration incorrect: horizontal alignment is set to Reserved",
+                    );
+                    return;
+                }
+            }
+            match self.justification.vertical {
+                VerticalAlignment::Top => {
+                    paint_pos.y = rect.min.y;
+                }
+                VerticalAlignment::Middle => {
+                    paint_pos.y = rect.center().y - (text_size.y * 0.5);
+                }
+                VerticalAlignment::Bottom => {
+                    paint_pos.y = rect.max.y - text_size.y;
+                }
+                VerticalAlignment::Reserved => {
+                    ui.colored_label(
+                        Color32::RED,
+                        "Configuration incorrect: vertical alignment is set to Reserved",
+                    );
+                    return;
+                }
+            }
+
+            // 13. Finally, paint the text
+            ui.painter().galley(paint_pos, galley, font_colour);
         });
     }
 }
@@ -594,7 +965,62 @@ impl RenderableObject for OutputLine {
         );
 
         ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "OutputLine not implemented");
+            let line_attributes = match pool.object_by_id(self.line_attributes) {
+                Some(Object::LineAttributes(attr)) => attr,
+                _ => {
+                    // If we don't have valid line attributes, just show an error and return
+                    ui.colored_label(
+                        Color32::RED,
+                        format!(
+                            "Missing or invalid LineAttributes ID: {:?}",
+                            self.line_attributes
+                        ),
+                    );
+                    return;
+                }
+            };
+
+            if line_attributes.line_width == 0 {
+                return;
+            }
+
+            let colour = pool.color_by_index(line_attributes.line_colour).convert();
+            let stroke_width = line_attributes.line_width as f32;
+            let stroke = egui::Stroke::new(stroke_width, colour);
+            // TODO: implement line art
+
+            let (start, end) = match self.line_direction {
+                LineDirection::TopLeftToBottomRight => {
+                    let start = rect.min;
+                    let mut end = rect.max - egui::vec2(stroke_width, stroke_width);
+
+                    // Clamp end to start
+                    if end.x < start.x {
+                        end.x = start.x;
+                    }
+                    if end.y < start.y {
+                        end.y = start.y;
+                    }
+
+                    (start, end)
+                }
+                LineDirection::BottomLeftToTopRight => {
+                    let mut start = egui::pos2(rect.left(), rect.bottom() + stroke_width);
+                    let mut end = egui::pos2(rect.right() - stroke_width, rect.top());
+
+                    // Clamping start and end
+                    if end.x < start.x {
+                        end.x = start.x;
+                    }
+                    if start.y < end.y {
+                        start.y = end.y;
+                    }
+
+                    (start, end)
+                }
+            };
+
+            ui.painter().line_segment([start, end], stroke);
         });
     }
 }
@@ -618,16 +1044,6 @@ impl RenderableObject for OutputRectangle {
                 return;
             }
         };
-        ui.painter().rect_stroke(
-            rect,
-            0.0,
-            egui::Stroke::new(
-                line_attributes.line_width,
-                pool.color_by_index(line_attributes.line_colour).convert(),
-            ),
-        );
-        // TODO: implement line art for border
-
         // Paint the fill of the rectangle
         if let Some(fill) = self.fill_attributes.into() {
             let fill_attributes = match pool.object_by_id(fill) {
@@ -638,13 +1054,23 @@ impl RenderableObject for OutputRectangle {
                 }
             };
             ui.painter().rect_filled(
-                rect.shrink(line_attributes.line_width as f32),
+                rect,
                 0.0,
                 pool.color_by_index(fill_attributes.fill_colour).convert(),
             );
             // TODO: implement fill type for infill
             // TODO: implement fill pattern for infill
         }
+
+        ui.painter().rect_stroke(
+            rect.shrink(line_attributes.line_width as f32),
+            0.0,
+            egui::Stroke::new(
+                line_attributes.line_width,
+                pool.color_by_index(line_attributes.line_colour).convert(),
+            ),
+        );
+        // TODO: implement line art for border
     }
 }
 

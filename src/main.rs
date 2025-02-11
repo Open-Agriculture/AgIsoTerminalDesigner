@@ -469,9 +469,79 @@ impl eframe::App for DesignerApp {
                         }
                     }
                     ui.separator();
+
+                    // Filter objects in the pool by name
+                    let filter_id = ui.id().with("filter_text");
+                    let mut filter_text = ui
+                        .data(|data| data.get_temp::<String>(filter_id))
+                        .unwrap_or_default();
+
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(ui.spacing().scroll.bar_width);
+                            ui.menu_button("\u{2195}", |ui| {
+                                if ui.button("Sort by type").clicked() {
+                                    pool.sort_objects_by(|a, b| {
+                                        u8::from(a.object_type()).cmp(&u8::from(b.object_type()))
+                                    });
+                                    ui.close_menu();
+                                }
+                                if ui.button("Sort by name").clicked() {
+                                    let pool_copy = pool.clone();
+                                    pool.sort_objects_by(|a, b| {
+                                        pool_copy
+                                            .get_object_info(a)
+                                            .get_name(a)
+                                            .cmp(&pool_copy.get_object_info(b).get_name(b))
+                                    });
+                                    ui.close_menu();
+                                }
+                                if ui.button("Sort by id").clicked() {
+                                    pool.sort_objects_by(|a, b| {
+                                        u16::from(a.id()).cmp(&u16::from(b.id()))
+                                    });
+                                    ui.close_menu();
+                                }
+                            })
+                            .response
+                            .on_hover_text("Sort objects");
+
+                            let filter_shortcut =
+                                egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F);
+
+                            let response = ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut filter_text)
+                                        .hint_text("Filter object by name...")
+                                        .desired_width(ui.available_width()),
+                                )
+                                .on_hover_text(format!(
+                                    "Search shortcut ({})",
+                                    ctx.format_shortcut(&filter_shortcut)
+                                ));
+                            if response.changed() {
+                                ui.data_mut(|data| {
+                                    data.insert_temp(filter_id, filter_text.clone())
+                                });
+                            } else if ctx.input_mut(|i| i.consume_shortcut(&filter_shortcut)) {
+                                response.request_focus();
+                            }
+                        });
+                    });
+
+                    let filter_text = filter_text.to_lowercase();
                     for object in pool.get_pool().objects() {
-                        render_selectable_object(ui, object, pool);
+                        if filter_text.is_empty()
+                            || pool
+                                .get_object_info(object)
+                                .get_name(object)
+                                .to_lowercase()
+                                .contains(&filter_text)
+                        {
+                            render_selectable_object(ui, object, pool);
+                        }
                     }
+
                     ui.allocate_space(ui.available_size());
                 });
             });
