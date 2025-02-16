@@ -287,9 +287,10 @@ impl RenderableObject for Button {
 
         if !no_border {
             ui.painter().rect_stroke(
-                face_rect,
+                rect,
                 0.0,
                 egui::Stroke::new(BORDER_WIDTH, border_color),
+                egui::StrokeKind::Inside,
             );
         }
 
@@ -1063,12 +1064,13 @@ impl RenderableObject for OutputRectangle {
         }
 
         ui.painter().rect_stroke(
-            rect.shrink(line_attributes.line_width as f32),
+            rect,
             0.0,
             egui::Stroke::new(
                 line_attributes.line_width,
                 pool.color_by_index(line_attributes.line_colour).convert(),
             ),
+            egui::StrokeKind::Inside,
         );
         // TODO: implement line art for border
     }

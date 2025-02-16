@@ -7,18 +7,23 @@ authors = ["Daan Steenbergen <d.steenbergen@student.tue.nl>"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-eframe = "0.29.1"
+eframe = "0.31.0"
 # ag-iso-stack = { path = "../AgIsoStack-rs" }
 ag-iso-stack = { git = "https://github.com/Open-Agriculture/AgIsoStack-rs", branch = "daan/terminal-designer-changes" }
 rfd = "0.13"
 image = "0.25.1"
-getrandom = { version = "0.2.11", features = ["js"] }
 log = "0.4"
-uuid = { version = "1.11.0", features = [
-    "v4",                # Lets you generate random UUIDs
-    "fast-rng",          # Use a faster (but still sufficiently random) RNG
-    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
-] }
+uuid = { version = "1.13", features = ["v4", "rng-getrandom"] }
+
+[dependencies.getrandom_v03]
+package = "getrandom"
+version = "0.3"
+features = ["wasm_js"]
+
+[dependencies.getrandom_v02]
+package = "getrandom"
+version = "0.2"
+features = ["js"]
 
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
