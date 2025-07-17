@@ -399,8 +399,12 @@ impl eframe::App for DesignerApp {
                                         ag_iso_terminal_designer::default_object(object_type);
                                     let pool = self.project.as_mut().unwrap();
 
-                                    // Find first available id
-                                    let mut id = 0;
+                                    // Find first available id starting at either 0 or 256 depending on object type
+                                    // (0 for macros, 256 for all other objects) This is because macros are limited to 0-255 in 
+                                    // VT Version 3.
+                                    // TODO: Add in support for extended macros in VT Version 4+
+                                    let start_id = if object_type == ObjectType::Macro { 0 } else { 256 };
+                                    let mut id = start_id;
                                     while pool
                                         .get_pool()
                                         .object_by_id(ObjectId::new(id).unwrap_or_default())

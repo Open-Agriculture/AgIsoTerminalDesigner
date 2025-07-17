@@ -91,10 +91,10 @@ pub fn default_object(obj_type: ObjectType) -> Object {
 
 fn default_working_set() -> WorkingSet {
     WorkingSet {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         background_colour: 0,
         selectable: true,
-        active_mask: ObjectId::new(0).unwrap(),
+        active_mask: ObjectId::new(256).unwrap(),
         object_refs: vec![],
         macro_refs: vec![],
         language_codes: vec![],
@@ -103,7 +103,7 @@ fn default_working_set() -> WorkingSet {
 
 fn default_data_mask() -> DataMask {
     DataMask {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         background_colour: 0,
         soft_key_mask: NullableObjectId::NULL,
         object_refs: vec![],
@@ -113,7 +113,7 @@ fn default_data_mask() -> DataMask {
 
 fn default_alarm_mask() -> AlarmMask {
     AlarmMask {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         background_colour: 0,
         soft_key_mask: NullableObjectId::NULL,
         priority: 0,
@@ -125,7 +125,7 @@ fn default_alarm_mask() -> AlarmMask {
 
 fn default_container() -> Container {
     Container {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         hidden: false,
@@ -136,7 +136,7 @@ fn default_container() -> Container {
 
 fn default_soft_key_mask() -> SoftKeyMask {
     SoftKeyMask {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         background_colour: 0,
         objects: vec![],
         macro_refs: vec![],
@@ -145,7 +145,7 @@ fn default_soft_key_mask() -> SoftKeyMask {
 
 fn default_key() -> Key {
     Key {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         background_colour: 0,
         key_code: 0,
         object_refs: vec![],
@@ -155,7 +155,7 @@ fn default_key() -> Key {
 
 fn default_button() -> Button {
     Button {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         background_colour: 0,
@@ -176,10 +176,10 @@ fn default_button() -> Button {
 
 fn default_input_boolean() -> InputBoolean {
     InputBoolean {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         background_colour: 0,
         width: 0,
-        foreground_colour: ObjectId::new(0).unwrap(),
+        foreground_colour: ObjectId::new(256).unwrap(),
         variable_reference: NullableObjectId::NULL,
         value: false,
         enabled: true,
@@ -189,11 +189,11 @@ fn default_input_boolean() -> InputBoolean {
 
 fn default_input_string() -> InputString {
     InputString {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: ObjectId::new(256).unwrap(),
         input_attributes: NullableObjectId::NULL,
         options: InputStringOptions {
             transparent: false,
@@ -213,11 +213,11 @@ fn default_input_string() -> InputString {
 
 fn default_input_number() -> InputNumber {
     InputNumber {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: ObjectId::new(256).unwrap(),
         options: NumberOptions {
             transparent: false,
             display_leading_zeros: false,
@@ -246,7 +246,7 @@ fn default_input_number() -> InputNumber {
 
 fn default_input_list() -> InputList {
     InputList {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         variable_reference: NullableObjectId::NULL,
@@ -262,11 +262,11 @@ fn default_input_list() -> InputList {
 
 fn default_output_string() -> OutputString {
     OutputString {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: ObjectId::new(256).unwrap(),
         options: OutputStringOptions {
             transparent: false,
             auto_wrap: false,
@@ -284,11 +284,11 @@ fn default_output_string() -> OutputString {
 
 fn default_output_number() -> OutputNumber {
     OutputNumber {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: ObjectId::new(256).unwrap(),
         options: NumberOptions {
             transparent: false,
             display_leading_zeros: false,
@@ -311,8 +311,8 @@ fn default_output_number() -> OutputNumber {
 
 fn default_output_line() -> OutputLine {
     OutputLine {
-        id: ObjectId::new(0).unwrap(),
-        line_attributes: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
+        line_attributes: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         line_direction: LineDirection::TopLeftToBottomRight,
@@ -322,8 +322,8 @@ fn default_output_line() -> OutputLine {
 
 fn default_output_rectangle() -> OutputRectangle {
     OutputRectangle {
-        id: ObjectId::new(0).unwrap(),
-        line_attributes: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
+        line_attributes: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         line_suppression: 0,
@@ -334,8 +334,8 @@ fn default_output_rectangle() -> OutputRectangle {
 
 fn default_output_ellipse() -> OutputEllipse {
     OutputEllipse {
-        id: ObjectId::new(0).unwrap(),
-        line_attributes: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
+        line_attributes: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         ellipse_type: 0,
@@ -348,10 +348,10 @@ fn default_output_ellipse() -> OutputEllipse {
 
 fn default_output_polygon() -> OutputPolygon {
     OutputPolygon {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
-        line_attributes: ObjectId::new(0).unwrap(),
+        line_attributes: ObjectId::new(256).unwrap(),
         fill_attributes: NullableObjectId::NULL,
         polygon_type: 0,
         points: vec![
@@ -365,7 +365,7 @@ fn default_output_polygon() -> OutputPolygon {
 
 fn default_output_meter() -> OutputMeter {
     OutputMeter {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         needle_colour: 0,
         border_colour: 0,
@@ -389,7 +389,7 @@ fn default_output_meter() -> OutputMeter {
 
 fn default_output_linear_bar_graph() -> OutputLinearBarGraph {
     OutputLinearBarGraph {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         colour: 0,
@@ -415,7 +415,7 @@ fn default_output_linear_bar_graph() -> OutputLinearBarGraph {
 
 fn default_output_arched_bar_graph() -> OutputArchedBarGraph {
     OutputArchedBarGraph {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         colour: 0,
@@ -443,7 +443,7 @@ fn default_output_arched_bar_graph() -> OutputArchedBarGraph {
 
 fn default_picture_graphic() -> PictureGraphic {
     PictureGraphic {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         actual_width: 0,
         actual_height: 0,
@@ -461,21 +461,21 @@ fn default_picture_graphic() -> PictureGraphic {
 
 fn default_number_variable() -> NumberVariable {
     NumberVariable {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         value: 0,
     }
 }
 
 fn default_string_variable() -> StringVariable {
     StringVariable {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         value: "".to_string(),
     }
 }
 
 fn default_font_attributes() -> FontAttributes {
     FontAttributes {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         font_colour: 0,
         font_size: FontSize::NonProportional(NonProportionalFontSize::Px6x8),
         font_type: FontType::Latin1,
@@ -495,7 +495,7 @@ fn default_font_attributes() -> FontAttributes {
 
 fn default_line_attributes() -> LineAttributes {
     LineAttributes {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         line_colour: 0,
         line_width: 0,
         line_art: 0,
@@ -505,7 +505,7 @@ fn default_line_attributes() -> LineAttributes {
 
 fn default_fill_attributes() -> FillAttributes {
     FillAttributes {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         fill_type: 0,
         fill_colour: 0,
         fill_pattern: NullableObjectId::NULL,
@@ -515,7 +515,7 @@ fn default_fill_attributes() -> FillAttributes {
 
 fn default_input_attributes() -> InputAttributes {
     InputAttributes {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         validation_type: ValidationType::ValidCharacters,
         validation_string: "".to_string(),
         macro_refs: vec![],
@@ -524,7 +524,7 @@ fn default_input_attributes() -> InputAttributes {
 
 fn default_object_pointer() -> ObjectPointer {
     ObjectPointer {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         value: NullableObjectId::NULL,
     }
 }
@@ -538,7 +538,7 @@ fn default_macro() -> Macro {
 
 fn default_auxiliary_function_type1() -> AuxiliaryFunctionType1 {
     AuxiliaryFunctionType1 {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         background_colour: 0,
         function_type: 0,
         object_refs: vec![],
@@ -547,7 +547,7 @@ fn default_auxiliary_function_type1() -> AuxiliaryFunctionType1 {
 
 fn default_auxiliary_input_type1() -> AuxiliaryInputType1 {
     AuxiliaryInputType1 {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         background_colour: 0,
         function_type: 0,
         input_id: 0,
@@ -557,7 +557,7 @@ fn default_auxiliary_input_type1() -> AuxiliaryInputType1 {
 
 fn default_auxiliary_function_type2() -> AuxiliaryFunctionType2 {
     AuxiliaryFunctionType2 {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         background_colour: 0,
         function_attributes: FunctionAttributes {
             function_type: AuxiliaryFunctionType::BooleanLatching,
@@ -571,7 +571,7 @@ fn default_auxiliary_function_type2() -> AuxiliaryFunctionType2 {
 
 fn default_auxiliary_input_type2() -> AuxiliaryInputType2 {
     AuxiliaryInputType2 {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         background_colour: 0,
         function_attributes: FunctionAttributes {
             function_type: AuxiliaryFunctionType::BooleanLatching,
@@ -585,7 +585,7 @@ fn default_auxiliary_input_type2() -> AuxiliaryInputType2 {
 
 fn default_auxiliary_control_designator_type2() -> AuxiliaryControlDesignatorType2 {
     AuxiliaryControlDesignatorType2 {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         pointer_type: 0,
         auxiliary_object_id: NullableObjectId::NULL,
     }
@@ -593,7 +593,7 @@ fn default_auxiliary_control_designator_type2() -> AuxiliaryControlDesignatorTyp
 
 fn default_window_mask() -> WindowMask {
     WindowMask {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         cell_format: WindowMaskCellFormat::CF1x1,
         window_type: WindowType::FreeForm,
         background_colour: 0,
@@ -601,7 +601,7 @@ fn default_window_mask() -> WindowMask {
             available: true,
             transparent: false,
         },
-        name: ObjectId::new(0).unwrap(),
+        name: ObjectId::new(256).unwrap(),
         window_title: NullableObjectId::NULL,
         window_icon: NullableObjectId::NULL,
         objects: vec![],
@@ -612,12 +612,12 @@ fn default_window_mask() -> WindowMask {
 
 fn default_key_group() -> KeyGroup {
     KeyGroup {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         options: KeyGroupOptions {
             available: true,
             transparent: false,
         },
-        name: ObjectId::new(0).unwrap(),
+        name: ObjectId::new(256).unwrap(),
         key_group_icon: NullableObjectId::NULL,
         objects: vec![],
         macro_refs: vec![],
@@ -626,7 +626,7 @@ fn default_key_group() -> KeyGroup {
 
 fn default_graphics_context() -> GraphicsContext {
     GraphicsContext {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         viewport_width: 0,
         viewport_height: 0,
         viewport_x: 0,
@@ -652,7 +652,7 @@ fn default_graphics_context() -> GraphicsContext {
 
 fn default_output_list() -> OutputList {
     OutputList {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         variable_reference: NullableObjectId::NULL,
@@ -664,7 +664,7 @@ fn default_output_list() -> OutputList {
 
 fn default_extended_input_attributes() -> ExtendedInputAttributes {
     ExtendedInputAttributes {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         validation_type: ValidationType::ValidCharacters,
         code_planes: vec![],
     }
@@ -672,21 +672,21 @@ fn default_extended_input_attributes() -> ExtendedInputAttributes {
 
 fn default_colour_map() -> ColourMap {
     ColourMap {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         colour_map: vec![],
     }
 }
 
 fn default_object_label_reference_list() -> ObjectLabelReferenceList {
     ObjectLabelReferenceList {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         object_labels: vec![],
     }
 }
 
 fn default_external_object_definition() -> ExternalObjectDefinition {
     ExternalObjectDefinition {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         options: ExternalObjectDefinitionOptions { enabled: true },
         name: NAME::default(),
         objects: vec![],
@@ -695,7 +695,7 @@ fn default_external_object_definition() -> ExternalObjectDefinition {
 
 fn default_external_reference_name() -> ExternalReferenceName {
     ExternalReferenceName {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         options: ExternalReferenceNameOptions { enabled: true },
         name: NAME::default(),
     }
@@ -703,7 +703,7 @@ fn default_external_reference_name() -> ExternalReferenceName {
 
 fn default_external_object_pointer() -> ExternalObjectPointer {
     ExternalObjectPointer {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         default_object_id: NullableObjectId::NULL,
         external_reference_name_id: NullableObjectId::NULL,
         external_object_id: NullableObjectId::NULL,
@@ -712,7 +712,7 @@ fn default_external_object_pointer() -> ExternalObjectPointer {
 
 fn default_animation() -> Animation {
     Animation {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         refresh_interval: 0,
@@ -732,7 +732,7 @@ fn default_animation() -> Animation {
 
 fn default_colour_palette() -> ColourPalette {
     ColourPalette {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         options: ColourPaletteOptions {},
         colours: vec![],
     }
@@ -740,7 +740,7 @@ fn default_colour_palette() -> ColourPalette {
 
 fn default_graphic_data() -> GraphicData {
     GraphicData {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         format: 0,
         data: vec![],
     }
@@ -748,7 +748,7 @@ fn default_graphic_data() -> GraphicData {
 
 fn default_working_set_special_controls() -> WorkingSetSpecialControls {
     WorkingSetSpecialControls {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         id_of_colour_map: NullableObjectId::NULL,
         id_of_colour_palette: NullableObjectId::NULL,
         language_pairs: vec![],
@@ -757,7 +757,7 @@ fn default_working_set_special_controls() -> WorkingSetSpecialControls {
 
 fn default_scaled_graphic() -> ScaledGraphic {
     ScaledGraphic {
-        id: ObjectId::new(0).unwrap(),
+        id: ObjectId::new(256).unwrap(),
         width: 0,
         height: 0,
         scale_type: 0,
