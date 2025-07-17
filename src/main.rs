@@ -29,6 +29,7 @@ pub struct DesignerApp {
     file_dialog_reason: Option<FileDialogReason>,
     file_channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
     show_development_popup: bool,
+
 }
 
 impl DesignerApp {
@@ -389,6 +390,10 @@ impl eframe::App for DesignerApp {
                     }
                 });
 
+
+                // Macro Check
+                let mut show_macro_error_popup: bool = false;
+
                 if self.project.is_some() {
                     // Add a new object
                     ui.menu_button("Add object", |ui| {
@@ -412,16 +417,41 @@ impl eframe::App for DesignerApp {
                                     {
                                         id += 1;
                                     }
-                                    new_obj.mut_id().set_value(id).ok();
-
-                                    // Add object to pool and select it
-                                    pool.get_mut_pool().borrow_mut().add(new_obj);
-                                    pool.get_mut_selected().replace(NullableObjectId::new(id));
-                                    ui.close_menu();
+                                    
+                                    
+                                    // Check if Macro ID is within valid range
+                                    
+                                    if object_type == ObjectType::Macro && id > 255 {
+                                        show_macro_error_popup = true;
+                                    } else {
+                                        new_obj.mut_id().set_value(id).ok();
+                                        // Add object to pool and select it
+                                        pool.get_mut_pool().borrow_mut().add(new_obj);
+                                        pool.get_mut_selected().replace(NullableObjectId::new(id));
+                                        ui.close_menu();
+                                    }
                                 }
                             }
                         });
                     });
+
+                    // Replace the popup with a modal window
+                    if show_macro_error_popup {
+                        egui::Window::new("Macro ID Error")
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])  // Center the window
+                            .show(ctx, |ui| {
+                                ui.vertical_centered(|ui| {  // Center the content
+                                    ui.add_space(10.0);
+                                    ui.label("Macros can only have IDs: 0-255 in VT4 & less");
+                                    ui.add_space(10.0);
+                                    if ui.button("OK").clicked() {
+                                        show_macro_error_popup = false;
+                                    }
+                                });
+                            });
+                    }
                 }
 
                 if let Some(pool) = &mut self.project {
@@ -715,3 +745,5 @@ fn execute<F: Future<Output = ()> + Send + 'static>(f: F) {
 fn execute<F: Future<Output = ()> + 'static>(f: F) {
     wasm_bindgen_futures::spawn_local(f);
 }
+
+

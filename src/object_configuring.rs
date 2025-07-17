@@ -86,6 +86,7 @@ impl ConfigurableObject for Object {
 
 fn render_object_id(ui: &mut egui::Ui, id: &mut ObjectId, design: &EditorProject) {
     let mut current_id = u16::from(*id);
+    let object_type = design.get_pool().object_by_id(*id).map(|obj| obj.object_type());
 
     ui.horizontal(|ui| {
         ui.label("Object ID:");
@@ -97,22 +98,33 @@ fn render_object_id(ui: &mut egui::Ui, id: &mut ObjectId, design: &EditorProject
 
         let new_id = ObjectId::new(current_id).unwrap();
 
-        // Check if the new ID is already used by another object (excluding the current object)
-        let conflict = design.get_pool().object_by_id(new_id).is_some() && new_id != *id;
+        // TODO add in support for extended IDs in the future
 
+        // Check for ID conflicts
+        let is_macro = object_type == Some(ObjectType::Macro);
+        let macro_conflict = is_macro && current_id > 255;
+        let id_conflict = design.get_pool().object_by_id(new_id).is_some() && new_id != *id;
+        let conflict = macro_conflict || id_conflict;
+        
+        // Handling multiple conflict errors
+        // TODO: I dont know how to do this...
         let conflict_storage = ui.id().with("conflict");
         let was_conflict = ui.data(|data| data.get_temp::<u16>(conflict_storage));
 
         if conflict || was_conflict.is_some_and(|id| id == current_id) {
-            ui.colored_label(egui::Color32::RED, "ID already in use!");
+            let error_msg = if macro_conflict {
+                "Macro IDs must be 0-255!"
+            } else {
+                "ID already in use!"
+            };
+            ui.colored_label(egui::Color32::RED, error_msg);
 
             // Save the conflict in storage so it is still displayed next frame
             ui.data_mut(|data| {
                 data.insert_temp(conflict_storage, u16::from(*id));
             });
         } else if resp.changed() || was_conflict.is_some_and(|id| id != current_id) {
-            // Remove the conflict from storage if we are actively changing the ID,
-            // or if the ID has changed (most likely another object is selected)
+            // Remove the conflict from storage if actively changing ID
             ui.data_mut(|data| {
                 data.remove_temp::<u16>(conflict_storage);
             });
