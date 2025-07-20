@@ -15,6 +15,7 @@ rfd = "0.13"
 image = "0.25.1"
 log = "0.4.27"
 uuid = { version = "1.17.0", features = ["v4", "v7", "js"] }
+getrandom = { version = "0.2", features = ["js"] }
 
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
