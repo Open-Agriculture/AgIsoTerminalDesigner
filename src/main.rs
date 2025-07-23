@@ -29,7 +29,7 @@ pub struct DesignerApp {
     file_dialog_reason: Option<FileDialogReason>,
     file_channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
     show_development_popup: bool,
-
+    show_macro_error_popup: bool,
 }
 
 impl DesignerApp {
@@ -108,6 +108,7 @@ impl DesignerApp {
             file_dialog_reason: None,
             file_channel: std::sync::mpsc::channel(),
             show_development_popup: true,
+            show_macro_error_popup: false,
         }
     }
 }
@@ -391,8 +392,7 @@ impl eframe::App for DesignerApp {
                 });
 
 
-                // Macro Check
-                let mut show_macro_error_popup: bool = false;
+                
 
                 if self.project.is_some() {
                     // Add a new object
@@ -422,7 +422,7 @@ impl eframe::App for DesignerApp {
                                     // Check if Macro ID is within valid range
                                     
                                     if object_type == ObjectType::Macro && id > 255 {
-                                        show_macro_error_popup = true;
+                                        self.show_macro_error_popup = true;
                                     } else {
                                         new_obj.mut_id().set_value(id).ok();
                                         // Add object to pool and select it
@@ -436,7 +436,7 @@ impl eframe::App for DesignerApp {
                     });
 
                     // Replace the popup with a modal window
-                    if show_macro_error_popup {
+                    if self.show_macro_error_popup {
                         egui::Window::new("Macro ID Error")
                             .collapsible(false)
                             .resizable(false)
@@ -444,10 +444,10 @@ impl eframe::App for DesignerApp {
                             .show(ctx, |ui| {
                                 ui.vertical_centered(|ui| {  // Center the content
                                     ui.add_space(10.0);
-                                    ui.label("Macros can only have IDs: 0-255 in VT4 & less");
+                                    ui.label("Macros can only have IDs: 0-255 in VT Version 1-4");
                                     ui.add_space(10.0);
                                     if ui.button("OK").clicked() {
-                                        show_macro_error_popup = false;
+                                        self.show_macro_error_popup = false;
                                     }
                                 });
                             });
