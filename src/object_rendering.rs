@@ -325,6 +325,17 @@ impl RenderableObject for InputBoolean {
 
         let side = self.width as f32;
         let rect = create_relative_rect(ui, position, egui::Vec2::new(side, side));
+        let is_true = if let Some(var_id) = self.variable_reference.0 {
+            match pool.object_by_id(var_id) {
+                Some(Object::NumberVariable(num_var)) => num_var.value > 0,
+                _ => self.value,
+            }
+        } else {
+            self.value
+        };
+
+        let side = self.width as f32;
+        let rect = create_relative_rect(ui, position, egui::Vec2::new(side, side));
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             let background_color = pool.color_by_index(self.background_colour).convert();

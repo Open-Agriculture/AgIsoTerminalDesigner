@@ -29,6 +29,7 @@ pub struct DesignerApp {
     file_dialog_reason: Option<FileDialogReason>,
     file_channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
     show_development_popup: bool,
+    show_macro_error_popup: bool,
 }
 
 impl DesignerApp {
@@ -107,6 +108,7 @@ impl DesignerApp {
             file_dialog_reason: None,
             file_channel: std::sync::mpsc::channel(),
             show_development_popup: true,
+            show_macro_error_popup: false,
         }
     }
 }
@@ -389,6 +391,9 @@ impl eframe::App for DesignerApp {
                     }
                 });
 
+
+                
+
                 if self.project.is_some() {
                     // Add a new object
                     ui.menu_button("Add object", |ui| {
@@ -399,8 +404,12 @@ impl eframe::App for DesignerApp {
                                         ag_iso_terminal_designer::default_object(object_type);
                                     let pool = self.project.as_mut().unwrap();
 
-                                    // Find first available id
-                                    let mut id = 0;
+                                    // Find first available id starting at either 0 or 256 depending on object type
+                                    // (0 for macros, 256 for all other objects) This is because macros are limited to 0-255 in 
+                                    // VT Version 3.
+                                    // TODO: Add in support for extended macros in VT Version 4+
+                                    let start_id = if object_type == ObjectType::Macro { 0 } else { 256 };
+                                    let mut id = start_id;
                                     while pool
                                         .get_pool()
                                         .object_by_id(ObjectId::new(id).unwrap_or_default())
@@ -408,16 +417,41 @@ impl eframe::App for DesignerApp {
                                     {
                                         id += 1;
                                     }
-                                    new_obj.mut_id().set_value(id).ok();
-
-                                    // Add object to pool and select it
-                                    pool.get_mut_pool().borrow_mut().add(new_obj);
-                                    pool.get_mut_selected().replace(NullableObjectId::new(id));
-                                    ui.close();
+                                    
+                                    
+                                    // Check if Macro ID is within valid range
+                                    
+                                    if object_type == ObjectType::Macro && id > 255 {
+                                        self.show_macro_error_popup = true;
+                                    } else {
+                                        new_obj.mut_id().set_value(id).ok();
+                                        // Add object to pool and select it
+                                        pool.get_mut_pool().borrow_mut().add(new_obj);
+                                        pool.get_mut_selected().replace(NullableObjectId::new(id));
+                                        ui.close_menu();
+                                    }
                                 }
                             }
                         });
                     });
+
+                    // Replace the popup with a modal window
+                    if self.show_macro_error_popup {
+                        egui::Window::new("Macro ID Error")
+                            .collapsible(false)
+                            .resizable(false)
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])  // Center the window
+                            .show(ctx, |ui| {
+                                ui.vertical_centered(|ui| {  // Center the content
+                                    ui.add_space(10.0);
+                                    ui.label("Macros can only have IDs: 0-255 in VT Version 1-4");
+                                    ui.add_space(10.0);
+                                    if ui.button("OK").clicked() {
+                                        self.show_macro_error_popup = false;
+                                    }
+                                });
+                            });
+                    }
                 }
 
                 if let Some(pool) = &mut self.project {
@@ -484,7 +518,7 @@ impl eframe::App for DesignerApp {
                                     pool.sort_objects_by(|a, b| {
                                         u8::from(a.object_type()).cmp(&u8::from(b.object_type()))
                                     });
-                                    ui.close();
+                                    ui.close_menu();
                                 }
                                 if ui.button("Sort by name").clicked() {
                                     let pool_copy = pool.clone();
@@ -494,13 +528,13 @@ impl eframe::App for DesignerApp {
                                             .get_name(a)
                                             .cmp(&pool_copy.get_object_info(b).get_name(b))
                                     });
-                                    ui.close();
+                                    ui.close_menu();
                                 }
                                 if ui.button("Sort by id").clicked() {
                                     pool.sort_objects_by(|a, b| {
                                         u16::from(a.id()).cmp(&u16::from(b.id()))
                                     });
-                                    ui.close();
+                                    ui.close_menu();
                                 }
                             })
                             .response
@@ -540,7 +574,17 @@ impl eframe::App for DesignerApp {
                         {
                             render_selectable_object(ui, object, pool);
                         }
+                        if filter_text.is_empty()
+                            || pool
+                                .get_object_info(object)
+                                .get_name(object)
+                                .to_lowercase()
+                                .contains(&filter_text)
+                        {
+                            render_selectable_object(ui, object, pool);
+                        }
                     }
+
 
                     ui.allocate_space(ui.available_size());
                 });
@@ -711,3 +755,5 @@ fn execute<F: Future<Output = ()> + Send + 'static>(f: F) {
 fn execute<F: Future<Output = ()> + 'static>(f: F) {
     wasm_bindgen_futures::spawn_local(f);
 }
+
+
