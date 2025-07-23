@@ -228,11 +228,11 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
         response.context_menu(|ui| {
             if ui.button("Rename").on_hover_text("Rename object").clicked() {
                 project.set_renaming_object(this_ui_id, object.id(), object_info.get_name(object));
-                ui.close_menu();
+                ui.close();
             }
             if ui.button("Delete").on_hover_text("Delete object").clicked() {
                 project.get_mut_pool().borrow_mut().remove(object.id());
-                ui.close_menu();
+                ui.close();
             }
         });
     }
@@ -383,11 +383,11 @@ impl eframe::App for DesignerApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("Load pool").clicked() {
                         self.open_file_dialog(FileDialogReason::LoadPool, ctx);
-                        ui.close_menu();
+                        ui.close();
                     }
                     if self.project.is_some() && ui.button("Save pool").clicked() {
                         self.save_pool();
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
 
@@ -574,7 +574,17 @@ impl eframe::App for DesignerApp {
                         {
                             render_selectable_object(ui, object, pool);
                         }
+                        if filter_text.is_empty()
+                            || pool
+                                .get_object_info(object)
+                                .get_name(object)
+                                .to_lowercase()
+                                .contains(&filter_text)
+                        {
+                            render_selectable_object(ui, object, pool);
+                        }
                     }
+
 
                     ui.allocate_space(ui.available_size());
                 });

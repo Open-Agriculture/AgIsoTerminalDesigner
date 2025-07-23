@@ -6,12 +6,15 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::ops::Sub;
+use std::ops::Sub;
 
 use ag_iso_stack::object_pool::object::*;
 use ag_iso_stack::object_pool::object_attributes::ButtonState;
 use ag_iso_stack::object_pool::object_attributes::FontSize;
 use ag_iso_stack::object_pool::object_attributes::FormatType;
+use ag_iso_stack::object_pool::object_attributes::FormatType;
 use ag_iso_stack::object_pool::object_attributes::HorizontalAlignment;
+use ag_iso_stack::object_pool::object_attributes::LineDirection;
 use ag_iso_stack::object_pool::object_attributes::LineDirection;
 use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
 use ag_iso_stack::object_pool::object_attributes::Point;
@@ -194,7 +197,7 @@ impl RenderableObject for Container {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             render_object_refs(ui, pool, &self.object_refs);
         });
     }
@@ -297,7 +300,7 @@ impl RenderableObject for Button {
         ui.painter().rect_filled(face_rect, 0.0, background_color);
 
         // Child objects are clipped to the face area
-        ui.allocate_new_ui(UiBuilder::new().max_rect(face_rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(face_rect), |ui| {
             render_object_refs(ui, pool, &self.object_refs);
         });
 
@@ -325,8 +328,19 @@ impl RenderableObject for InputBoolean {
 
         let side = self.width as f32;
         let rect = create_relative_rect(ui, position, egui::Vec2::new(side, side));
+        let is_true = if let Some(var_id) = self.variable_reference.0 {
+            match pool.object_by_id(var_id) {
+                Some(Object::NumberVariable(num_var)) => num_var.value > 0,
+                _ => self.value,
+            }
+        } else {
+            self.value
+        };
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        let side = self.width as f32;
+        let rect = create_relative_rect(ui, position, egui::Vec2::new(side, side));
+
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             let background_color = pool.color_by_index(self.background_colour).convert();
             ui.painter().rect_filled(rect, 0.0, background_color);
 
@@ -370,7 +384,7 @@ impl RenderableObject for InputString {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             ui.colored_label(Color32::RED, "InputString not implemented");
         });
     }
@@ -384,7 +398,7 @@ impl RenderableObject for InputNumber {
             egui::Vec2::new(self.width as f32, self.height as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             // Look up the font attributes. If missing, show an error.
             let font_attributes = match pool.object_by_id(self.font_attributes) {
                 Some(Object::FontAttributes(fa)) => fa,
@@ -559,7 +573,7 @@ impl RenderableObject for InputList {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             ui.colored_label(Color32::RED, "InputList not implemented");
         });
     }
@@ -569,7 +583,7 @@ impl RenderableObject for Key {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
         let rect = create_relative_rect(ui, position, egui::Vec2::new(100.0, 100.0));
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             render_object_refs(ui, pool, &self.object_refs);
         });
     }
@@ -769,7 +783,7 @@ impl RenderableObject for OutputNumber {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             // 1. Get the font attributes
             let font_attributes = match pool.object_by_id(self.font_attributes) {
                 Some(Object::FontAttributes(fa)) => fa,
@@ -951,7 +965,7 @@ impl RenderableObject for OutputList {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             ui.colored_label(Color32::RED, "OutputList not implemented");
         });
     }
@@ -965,7 +979,7 @@ impl RenderableObject for OutputLine {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             let line_attributes = match pool.object_by_id(self.line_attributes) {
                 Some(Object::LineAttributes(attr)) => attr,
                 _ => {
@@ -1084,7 +1098,7 @@ impl RenderableObject for OutputEllipse {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             ui.colored_label(Color32::RED, "OutputEllipse not implemented");
         });
     }
@@ -1098,7 +1112,7 @@ impl RenderableObject for OutputPolygon {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             ui.colored_label(Color32::RED, "OutputPolygon not implemented");
         });
     }
@@ -1112,7 +1126,7 @@ impl RenderableObject for OutputMeter {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             ui.colored_label(Color32::RED, "OutputMeter not implemented");
         });
     }
@@ -1126,7 +1140,7 @@ impl RenderableObject for OutputLinearBarGraph {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             ui.colored_label(Color32::RED, "OutputLinearBarGraph not implemented");
         });
     }
@@ -1140,7 +1154,7 @@ impl RenderableObject for OutputArchedBarGraph {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             ui.colored_label(Color32::RED, "OutputArchedBarGraph not implemented");
         });
     }
@@ -1179,7 +1193,7 @@ impl RenderableObject for PictureGraphic {
             let mut x = 0;
             let mut y = 0;
 
-            let mut image = ColorImage::new(
+            let mut image = ColorImage::filled(
                 [self.actual_width.into(), self.actual_height.into()],
                 Color32::TRANSPARENT,
             );
@@ -1246,7 +1260,7 @@ impl RenderableObject for PictureGraphic {
             });
         }
 
-        ui.allocate_new_ui(UiBuilder::new().max_rect(rect), |ui| {
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             if let Some(texture_id) = texture_id {
                 ui.image((texture_id, rect.size()));
             } else {
