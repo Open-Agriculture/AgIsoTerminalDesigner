@@ -6,15 +6,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::ops::Sub;
-use std::ops::Sub;
 
 use ag_iso_stack::object_pool::object::*;
 use ag_iso_stack::object_pool::object_attributes::ButtonState;
 use ag_iso_stack::object_pool::object_attributes::FontSize;
 use ag_iso_stack::object_pool::object_attributes::FormatType;
-use ag_iso_stack::object_pool::object_attributes::FormatType;
 use ag_iso_stack::object_pool::object_attributes::HorizontalAlignment;
-use ag_iso_stack::object_pool::object_attributes::LineDirection;
 use ag_iso_stack::object_pool::object_attributes::LineDirection;
 use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
 use ag_iso_stack::object_pool::object_attributes::Point;
