@@ -123,27 +123,42 @@ fn render_object_id(ui: &mut egui::Ui, id: &mut ObjectId, design: &EditorProject
             *id = new_id;
             design.get_mut_selected().borrow_mut().0 = Some(*id);
         }
+
+        // Add the object name
+        if let Some(obj) = design.get_pool().object_by_id(*id) {
+            ui.separator();
+            ui.label("Type:");
+            ui.label(format!("{:?}", obj.object_type()));
+            ui.separator();
+            ui.label("Name:");
+            let object_info = design.get_object_info(&obj);
+            ui.label(object_info.get_name(&obj));
+        }
     });
 }
 
 fn render_object_id_selector(
     ui: &mut egui::Ui,
     idx: usize,
-    pool: &ObjectPool,
+    design: &EditorProject,
     object_id: &mut ObjectId,
     allowed_child_objects: &[ObjectType],
 ) {
+    let pool = design.get_pool();
     egui::ComboBox::from_id_salt(format!("object_id_selector_{}", idx))
         .selected_text(format!("{:?}", object_id.value()))
         .show_ui(ui, |ui| {
             for potential_child in pool.objects_by_types(allowed_child_objects) {
+                let object_info = design.get_object_info(potential_child);
+                let name = object_info.get_name(potential_child);
                 ui.selectable_value(
                     object_id,
                     potential_child.id(),
                     format!(
-                        "{:?}: {:?}",
+                        "{:?}: {:?} - {}",
                         u16::from(potential_child.id()),
-                        potential_child.object_type()
+                        potential_child.object_type(),
+                        name
                     ),
                 );
             }
@@ -153,10 +168,11 @@ fn render_object_id_selector(
 fn render_nullable_object_id_selector(
     ui: &mut egui::Ui,
     idx: usize,
-    pool: &ObjectPool,
+    design: &EditorProject,
     object_id: &mut NullableObjectId,
     allowed_child_objects: &[ObjectType],
 ) {
+    let pool = design.get_pool();
     egui::ComboBox::from_id_salt(format!("nullable_object_id_selector_{}", idx))
         .selected_text(
             object_id
@@ -166,13 +182,16 @@ fn render_nullable_object_id_selector(
         .show_ui(ui, |ui| {
             ui.selectable_value(object_id, NullableObjectId::NULL, "None");
             for potential_child in pool.objects_by_types(allowed_child_objects) {
+                let object_info = design.get_object_info(potential_child);
+                let name = object_info.get_name(potential_child);
                 ui.selectable_value(
                     object_id,
                     potential_child.id().into(),
                     format!(
-                        "{:?}: {:?}",
+                        "{:?}: {:?} - {}",
                         u16::from(potential_child.id()),
-                        potential_child.object_type()
+                        potential_child.object_type(),
+                        name
                     ),
                 );
             }
@@ -220,7 +239,7 @@ fn render_object_references_list(
                 render_object_id_selector(
                     ui,
                     idx,
-                    design.get_pool(),
+                    design,
                     &mut obj_ref.id,
                     allowed_child_objects,
                 );
@@ -235,6 +254,10 @@ fn render_object_references_list(
                     if ui.link(format!("{:?}", obj.object_type())).clicked() {
                         *design.get_mut_selected().borrow_mut() = obj.id().into();
                     }
+                    
+                    // Add name column
+                    let object_info = design.get_object_info(obj);
+                    ui.label(object_info.get_name(obj));
 
                     ui.add(
                         egui::Slider::new(&mut obj_ref.offset.x, 0..=max_x)
@@ -257,7 +280,7 @@ fn render_object_references_list(
         });
 
     let (new_object_id, _) =
-        render_add_object_id(ui, design.get_pool(), allowed_child_objects, false);
+        render_add_object_id(ui, design, allowed_child_objects, false);
     if let Some(id) = new_object_id {
         object_refs.push(ObjectRef {
             id,
@@ -284,7 +307,7 @@ fn render_object_id_list(
                 render_object_id_selector(
                     ui,
                     idx,
-                    design.get_pool(),
+                    design,
                     &mut object_ids[idx],
                     allowed_child_objects,
                 );
@@ -293,8 +316,13 @@ fn render_object_id_list(
                     if ui.link(format!("{:?}", obj.object_type())).clicked() {
                         *design.get_mut_selected().borrow_mut() = obj.id().into();
                     }
+                    
+                    // Add name column
+                    let object_info = design.get_object_info(obj);
+                    ui.label(object_info.get_name(obj));
                 } else {
                     ui.colored_label(egui::Color32::RED, "Missing object");
+                    ui.label(""); // Empty cell for name column
                 }
 
                 render_index_modifiers(ui, idx, object_ids);
@@ -303,7 +331,7 @@ fn render_object_id_list(
             }
         });
     let (new_object_id, _) =
-        render_add_object_id(ui, design.get_pool(), allowed_child_objects, false);
+        render_add_object_id(ui, design, allowed_child_objects, false);
     if let Some(id) = new_object_id {
         object_ids.push(id);
     }
@@ -325,7 +353,7 @@ fn render_nullable_object_id_list(
                 render_nullable_object_id_selector(
                     ui,
                     idx,
-                    design.get_pool(),
+                    design,
                     &mut nullable_object_ids[idx],
                     allowed_child_objects,
                 );
@@ -336,11 +364,17 @@ fn render_nullable_object_id_list(
                         if ui.link(format!("{:?}", obj.object_type())).clicked() {
                             *design.get_mut_selected().borrow_mut() = obj.id().into();
                         }
+                        
+                        // Add name column
+                        let object_info = design.get_object_info(obj);
+                        ui.label(object_info.get_name(obj));
                     } else {
                         ui.colored_label(egui::Color32::RED, "Missing object");
+                        ui.label(""); // Empty cell for name column
                     }
                 } else {
-                    ui.label(""); // Empty cell
+                    ui.label(""); // Empty cell for type
+                    ui.label(""); // Empty cell for name
                 }
                 render_index_modifiers(ui, idx, nullable_object_ids);
                 idx += 1;
@@ -349,7 +383,7 @@ fn render_nullable_object_id_list(
         });
 
     let (new_object_id, success) =
-        render_add_object_id(ui, design.get_pool(), allowed_child_objects, true);
+        render_add_object_id(ui, design, allowed_child_objects, true);
     if success {
         nullable_object_ids.push(NullableObjectId(new_object_id));
     }
@@ -357,10 +391,11 @@ fn render_nullable_object_id_list(
 
 fn render_add_object_id(
     ui: &mut egui::Ui,
-    pool: &ObjectPool,
+    design: &EditorProject,
     allowed_child_objects: &[ObjectType],
     allow_none: bool,
 ) -> (Option<ObjectId>, bool) {
+    let pool = design.get_pool();
     let mut result = (None, false);
     ui.horizontal(|ui| {
         ui.label("Add object:");
@@ -373,13 +408,16 @@ fn render_add_object_id(
                     }
                 }
                 for potential_child in pool.objects_by_types(allowed_child_objects) {
+                    let object_info = design.get_object_info(potential_child);
+                    let name = object_info.get_name(potential_child);
                     if ui
                         .selectable_label(
                             false,
                             format!(
-                                "{:?}: {:?}",
+                                "{:?}: {:?} - {}",
                                 u16::from(potential_child.id()),
-                                potential_child.object_type()
+                                potential_child.object_type(),
+                                name
                             ),
                         )
                         .clicked()
@@ -3025,7 +3063,7 @@ impl ConfigurableObject for FillAttributes {
                 render_nullable_object_id_selector(
                     ui,
                     0,
-                    design.get_pool(),
+                    design,
                     &mut self.fill_pattern,
                     &[ObjectType::PictureGraphic],
                 );
