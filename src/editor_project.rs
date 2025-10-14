@@ -4,9 +4,11 @@
 
 use std::{cell::RefCell, collections::HashMap};
 
-use ag_iso_stack::object_pool::{object::Object, NullableObjectId, ObjectId, ObjectPool, ObjectType};
+use ag_iso_stack::object_pool::{
+    object::Object, NullableObjectId, ObjectId, ObjectPool, ObjectType,
+};
 
-use crate::{ObjectInfo, smart_naming, project_file::ProjectFile};
+use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
 
 const MAX_UNDO_REDO_POOL: usize = 10;
 const MAX_UNDO_REDO_SELECTED: usize = 20;
@@ -27,10 +29,10 @@ pub struct EditorProject {
 
     /// Used to keep track of the object that is being renamed
     renaming_object: RefCell<Option<(eframe::egui::Id, ObjectId, String)>>,
-    
+
     /// Cached next available ID for efficient allocation
     next_available_id: RefCell<u16>,
-    
+
     /// Cached default object names for efficient lookup
     default_object_names: RefCell<HashMap<ObjectId, String>>,
 }
@@ -38,14 +40,15 @@ pub struct EditorProject {
 impl From<ObjectPool> for EditorProject {
     fn from(pool: ObjectPool) -> Self {
         let (mask_size, soft_key_size) = pool.get_minimum_mask_sizes();
-        
+
         // Find the highest ID in use to initialize next_available_id
-        let max_id = pool.objects()
+        let max_id = pool
+            .objects()
             .iter()
             .map(|obj| obj.id().value())
             .max()
             .unwrap_or(0);
-        
+
         EditorProject {
             mut_pool: RefCell::new(pool.clone()),
             pool,
@@ -70,21 +73,28 @@ impl EditorProject {
     pub fn get_pool(&self) -> &ObjectPool {
         &self.pool
     }
-    
+
     /// Allocate a new unique object ID efficiently
     pub fn allocate_object_id(&self) -> ObjectId {
         let mut next_id = self.next_available_id.borrow_mut();
-        
+
         // Find the next available ID starting from our cached value
-        while self.pool.object_by_id(ObjectId::new(*next_id).unwrap_or_default()).is_some() {
+        while self
+            .pool
+            .object_by_id(ObjectId::new(*next_id).unwrap_or_default())
+            .is_some()
+        {
             *next_id = next_id.saturating_add(1);
-            
-            // Handle wraparound at u16::MAX
-            if *next_id == 0 {
-                // If we've wrapped around, do a full scan to find any gaps
+
+            if *next_id == u16::MAX {
+                // If we've reached the "NULL" object ID, do a full scan to find any gaps
                 let mut found = false;
                 for id in 1..=u16::MAX {
-                    if self.pool.object_by_id(ObjectId::new(id).unwrap_or_default()).is_none() {
+                    if self
+                        .pool
+                        .object_by_id(ObjectId::new(id).unwrap_or_default())
+                        .is_none()
+                    {
                         *next_id = id;
                         found = true;
                         break;
@@ -96,15 +106,17 @@ impl EditorProject {
                 break;
             }
         }
-        
+
         let allocated_id = ObjectId::new(*next_id).unwrap_or_default();
         *next_id = next_id.saturating_add(1);
         allocated_id
     }
-    
+
     /// Update the next available ID cache based on the current pool
     fn update_next_available_id(&self) {
-        let max_id = self.pool.objects()
+        let max_id = self
+            .pool
+            .objects()
             .iter()
             .map(|obj| obj.id().value())
             .max()
@@ -158,10 +170,10 @@ impl EditorProject {
             // Both need to be replaced here because otherwise it will be added to the undo history
             self.pool = pool.clone();
             self.mut_pool.replace(pool);
-            
+
             // Update next_available_id based on the new pool state
             self.update_next_available_id();
-            
+
             // Clear the default names cache since objects may have changed
             self.default_object_names.borrow_mut().clear();
         }
@@ -179,10 +191,10 @@ impl EditorProject {
             // Both need to be replaced here because otherwise the redo history will be cleared
             self.pool = pool.clone();
             self.mut_pool.replace(pool);
-            
+
             // Update next_available_id based on the new pool state
             self.update_next_available_id();
-            
+
             // Clear the default names cache since objects may have changed
             self.default_object_names.borrow_mut().clear();
         }
@@ -283,21 +295,28 @@ impl EditorProject {
     }
 
     /// Get all existing object names for validation
-    pub fn get_all_object_names(&self) -> HashMap<String, usize> {
+    pub fn get_all_object_names(&self) -> HashMap<String, ObjectType> {
         let mut names = HashMap::new();
         let object_info = self.object_info.borrow();
         let mut default_names_cache = self.default_object_names.borrow_mut();
-        
+
         for object in self.pool.objects() {
             let name = if let Some(info) = object_info.get(&object.id()) {
                 info.get_name(object)
             } else {
                 // Use cached default name if available, otherwise generate and cache it
-                default_names_cache.entry(object.id()).or_insert_with(|| {
-                    format!("Object {} ({})", object.id().value(), smart_naming::get_object_type_name(object.object_type()))
-                }).clone()
+                default_names_cache
+                    .entry(object.id())
+                    .or_insert_with(|| {
+                        format!(
+                            "Object {} ({})",
+                            object.id().value(),
+                            smart_naming::get_object_type_name(object.object_type())
+                        )
+                    })
+                    .clone()
             };
-            *names.entry(name).or_insert(0) += 1;
+            names.entry(name).or_insert(object.object_type());
         }
         names
     }
@@ -305,102 +324,53 @@ impl EditorProject {
     /// Generate a smart default name for a new object
     pub fn generate_smart_name_for_new_object(&self, object_type: ObjectType) -> String {
         let existing_names = self.get_all_object_names();
-        smart_naming::generate_smart_default_name(object_type, &self.pool, &existing_names)
+        smart_naming::generate_smart_default_name(object_type, &existing_names)
     }
 
-    /// Generate a contextual name for an object based on its properties
-    pub fn generate_contextual_name(&self, object: &Object) -> Option<String> {
-        smart_naming::generate_contextual_name(object, &self.pool)
-    }
-
-    /// Apply smart naming to multiple objects efficiently
-    /// This is more efficient than calling apply_smart_naming_to_object repeatedly
-    pub fn apply_smart_naming_to_objects(&self, objects: &[&Object]) {
-        if objects.is_empty() {
-            return;
-        }
-        
+    /// Apply smart naming to all objects efficiently
+    pub fn apply_smart_naming_to_all_objects(&self) {
         let mut object_info = self.object_info.borrow_mut();
-        let mut objects_needing_names = Vec::new();
-        
-        // First pass: check which objects need naming and try contextual naming
-        for object in objects {
-            // Skip if already has a custom name
-            if let Some(info) = object_info.get(&object.id()) {
-                if info.name.is_some() {
-                    continue;
-                }
-            }
-            
-            // Try contextual naming first (cheap operation)
-            if let Some(contextual_name) = smart_naming::generate_contextual_name(object, &self.pool) {
-                let info = object_info
-                    .entry(object.id())
-                    .or_insert_with(|| ObjectInfo::new(object));
-                info.set_name(contextual_name);
-            } else {
-                objects_needing_names.push(*object);
-            }
-        }
-        
-        // If all objects got contextual names, we're done
-        if objects_needing_names.is_empty() {
-            return;
-        }
-        
+
         // Build existing names map once for all remaining objects
         let mut existing_names = HashMap::new();
-        let mut default_names_cache = self.default_object_names.borrow_mut();
-        for obj in self.pool.objects() {
-            let name = if let Some(info) = object_info.get(&obj.id()) {
-                info.get_name(obj)
-            } else {
-                default_names_cache.entry(obj.id()).or_insert_with(|| {
-                    format!("Object {} ({})", obj.id().value(), smart_naming::get_object_type_name(obj.object_type()))
-                }).clone()
-            };
-            *existing_names.entry(name).or_insert(0) += 1;
+        for (id, info) in object_info.iter() {
+            if let Some(name) = &info.name {
+                if let Some(object) = self.pool.object_by_id(*id) {
+                    existing_names
+                        .entry(name.clone())
+                        .or_insert(object.object_type());
+                }
+            }
         }
-        
+
         // Generate names for remaining objects
-        for object in objects_needing_names {
-            let new_name = smart_naming::generate_smart_default_name(
-                object.object_type(),
-                &self.pool,
-                &existing_names,
-            );
-            
+        for object in self.pool.objects() {
+            let new_name =
+                smart_naming::generate_smart_default_name(object.object_type(), &existing_names);
+
             // Update the count for the new name to ensure uniqueness
-            *existing_names.entry(new_name.clone()).or_insert(0) += 1;
-            
+            existing_names
+                .entry(new_name.clone())
+                .or_insert(object.object_type());
+
             let info = object_info
                 .entry(object.id())
                 .or_insert_with(|| ObjectInfo::new(object));
             info.set_name(new_name);
         }
     }
-    
+
     /// Apply smart naming to an existing object if it doesn't have a custom name
     pub fn apply_smart_naming_to_object(&self, object: &Object) {
         let mut object_info = self.object_info.borrow_mut();
-        
+
         // Check if the object already has a name
         if let Some(info) = object_info.get(&object.id()) {
             if info.name.is_some() {
                 return; // Already has a custom name
             }
         }
-        
-        // First try contextual naming which is cheap
-        if let Some(contextual_name) = smart_naming::generate_contextual_name(object, &self.pool) {
-            let info = object_info
-                .entry(object.id())
-                .or_insert_with(|| ObjectInfo::new(object));
-            info.set_name(contextual_name);
-            return;
-        }
-        
-        // Only build the expensive names map if contextual naming failed
+
         // Build names map inline to avoid extra iteration
         let mut existing_names = HashMap::new();
         let mut default_names_cache = self.default_object_names.borrow_mut();
@@ -410,19 +380,23 @@ impl EditorProject {
             } else if obj.id() == object.id() {
                 continue; // Skip the object we're naming
             } else {
-                default_names_cache.entry(obj.id()).or_insert_with(|| {
-                    format!("Object {} ({})", obj.id().value(), smart_naming::get_object_type_name(obj.object_type()))
-                }).clone()
+                default_names_cache
+                    .entry(obj.id())
+                    .or_insert_with(|| {
+                        format!(
+                            "Object {} ({})",
+                            obj.id().value(),
+                            smart_naming::get_object_type_name(obj.object_type())
+                        )
+                    })
+                    .clone()
             };
-            *existing_names.entry(name).or_insert(0) += 1;
+            existing_names.entry(name).or_insert(obj.object_type());
         }
-        
-        let new_name = smart_naming::generate_smart_default_name(
-            object.object_type(),
-            &self.pool,
-            &existing_names,
-        );
-        
+
+        let new_name =
+            smart_naming::generate_smart_default_name(object.object_type(), &existing_names);
+
         let info = object_info
             .entry(object.id())
             .or_insert_with(|| ObjectInfo::new(object));
@@ -438,13 +412,8 @@ impl EditorProject {
         } else {
             self.selected_object.0
         };
-        
-        let project = ProjectFile::new(
-            &self.pool,
-            &object_info,
-            self.mask_size,
-            selected,
-        );
+
+        let project = ProjectFile::new(&self.pool, &object_info, self.mask_size, selected);
         project.to_bytes()
     }
 
@@ -454,10 +423,10 @@ impl EditorProject {
             .map_err(|e| format!("Failed to parse project file: {}", e))?;
         let pool = project.load_pool()?;
         let settings = project.get_settings();
-        
+
         let mut editor_project = EditorProject::from(pool);
         editor_project.mask_size = settings.mask_size;
-        
+
         // Restore object metadata
         let metadata = project.get_metadata();
         let mut object_info = editor_project.object_info.borrow_mut();
@@ -472,20 +441,22 @@ impl EditorProject {
             }
         }
         drop(object_info);
-        
+
         // Apply smart naming to objects without custom names
         for object in editor_project.pool.objects() {
             editor_project.apply_smart_naming_to_object(object);
         }
-        
+
         // Restore last selected
         if let Some(selected_id) = settings.last_selected {
             if let Ok(id) = ObjectId::new(selected_id) {
                 editor_project.selected_object = NullableObjectId(Some(id));
-                editor_project.mut_selected_object.replace(NullableObjectId(Some(id)));
+                editor_project
+                    .mut_selected_object
+                    .replace(NullableObjectId(Some(id)));
             }
         }
-        
+
         Ok(editor_project)
     }
 }

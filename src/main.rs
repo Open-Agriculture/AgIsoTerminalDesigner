@@ -140,11 +140,10 @@ impl DesignerApp {
         if let Ok(content) = self.file_channel.1.try_recv() {
             match self.file_dialog_reason {
                 Some(FileDialogReason::LoadPool) => {
-                    let mut project = EditorProject::from(ObjectPool::from_iop(content));
+                    let project = EditorProject::from(ObjectPool::from_iop(content));
                     // Apply smart naming to all objects that don't have custom names (if enabled)
                     if self.apply_smart_naming_on_import {
-                        let objects: Vec<&Object> = project.get_pool().objects().iter().collect();
-                        project.apply_smart_naming_to_objects(&objects);
+                        project.apply_smart_naming_to_all_objects();
                     }
                     self.project = Some(project);
                 }
@@ -217,7 +216,6 @@ impl DesignerApp {
     }
 }
 
-
 fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &EditorProject) {
     let this_ui_id = ui.id();
     let object_info = project.get_object_info(object);
@@ -239,7 +237,11 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
         }
     } else {
         let is_selected = project.get_selected() == object.id().into();
-        let label_text = format!("{}: {}", u16::from(object.id()), object_info.get_name(object));
+        let label_text = format!(
+            "{}: {}",
+            u16::from(object.id()),
+            object_info.get_name(object)
+        );
         let response = ui.selectable_label(is_selected, label_text);
 
         if response.clicked() {
@@ -373,7 +375,7 @@ impl eframe::App for DesignerApp {
         if let Some((object_type, mut name)) = self.new_object_dialog.clone() {
             let mut should_create = false;
             let mut should_cancel = false;
-            
+
             egui::Window::new(format!("New {:?}", object_type))
                 .collapsible(false)
                 .resizable(false)
@@ -381,24 +383,24 @@ impl eframe::App for DesignerApp {
                 .show(ctx, |ui| {
                     ui.label("Enter a name for the new object:");
                     ui.add_space(10.0);
-                    
+
                     let response = ui.text_edit_singleline(&mut name);
-                    
+
                     // Auto-focus the text field
                     if !response.has_focus() && !response.lost_focus() {
                         response.request_focus();
                     }
-                    
+
                     // Check for Enter key
                     if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         should_create = true;
                     }
-                    
+
                     // Check for Escape key
                     if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         should_cancel = true;
                     }
-                    
+
                     ui.add_space(20.0);
                     ui.horizontal(|ui| {
                         if ui.button("Create").clicked() || should_create {
@@ -409,19 +411,19 @@ impl eframe::App for DesignerApp {
                         }
                     });
                 });
-            
+
             if should_create {
                 // Create the object with the given name
                 if let Some(pool) = &mut self.project {
                     let mut new_obj = ag_iso_terminal_designer::default_object(object_type);
-                    
+
                     // Allocate a new ID efficiently
                     let id = pool.allocate_object_id();
                     new_obj.mut_id().set_value(id.value()).ok();
-                    
+
                     // Add object to pool
                     pool.get_mut_pool().borrow_mut().add(new_obj.clone());
-                    
+
                     // Set the custom name
                     let mut object_info = pool.object_info.borrow_mut();
                     let info = object_info
@@ -429,9 +431,10 @@ impl eframe::App for DesignerApp {
                         .or_insert_with(|| ag_iso_terminal_designer::ObjectInfo::new(&new_obj));
                     info.set_name(name);
                     drop(object_info);
-                    
+
                     // Select the new object
-                    pool.get_mut_selected().replace(NullableObjectId::new(id.value()));
+                    pool.get_mut_selected()
+                        .replace(NullableObjectId::new(id.value()));
                 }
                 self.new_object_dialog = None;
             } else if should_cancel {
@@ -489,17 +492,22 @@ impl eframe::App for DesignerApp {
                         self.save_project();
                         ui.close();
                     }
-                    
+
                     ui.separator();
                     ui.label("ISOBUS Files");
-                    
+
                     if ui.button("Import IOP (.iop)").clicked() {
                         self.open_file_dialog(FileDialogReason::LoadPool, ctx);
                         ui.close();
                     }
-                    
-                    ui.checkbox(&mut self.apply_smart_naming_on_import, "Apply smart naming on import")
-                        .on_hover_text("Automatically apply smart naming to objects when importing IOP files");
+
+                    ui.checkbox(
+                        &mut self.apply_smart_naming_on_import,
+                        "Apply smart naming on import",
+                    )
+                    .on_hover_text(
+                        "Automatically apply smart naming to objects when importing IOP files",
+                    );
                     if self.project.is_some() && ui.button("Export IOP (.iop)").clicked() {
                         self.save_pool();
                         ui.close();
@@ -514,7 +522,8 @@ impl eframe::App for DesignerApp {
                                 if ui.button(format!("{:?}", object_type)).clicked() {
                                     // Generate smart default name
                                     let pool = self.project.as_ref().unwrap();
-                                    let default_name = pool.generate_smart_name_for_new_object(object_type);
+                                    let default_name =
+                                        pool.generate_smart_name_for_new_object(object_type);
                                     self.new_object_dialog = Some((object_type, default_name));
                                     ui.close();
                                 }
@@ -659,7 +668,7 @@ impl eframe::App for DesignerApp {
                         Some(mask) => match pool.get_pool().object_by_id(mask.active_mask) {
                             Some(obj) => {
                                 let selected_ref = pool.get_mut_selected();
-                                
+
                                 egui::ScrollArea::both().show(ui, |ui| {
                                     ui.add_sized(
                                         [pool.mask_size as f32, pool.mask_size as f32],
@@ -667,7 +676,8 @@ impl eframe::App for DesignerApp {
                                             object: obj,
                                             pool: pool.get_pool(),
                                             selected_callback: Box::new(move |object_id| {
-                                                *selected_ref.borrow_mut() = NullableObjectId(Some(object_id));
+                                                *selected_ref.borrow_mut() =
+                                                    NullableObjectId(Some(object_id));
                                             }),
                                         },
                                     );
@@ -697,11 +707,11 @@ impl eframe::App for DesignerApp {
                         // Display editable object name as header
                         ui.horizontal(|ui| {
                             ui.label("Name:");
-                            
+
                             let object_info = pool.get_object_info(obj);
                             let mut name = object_info.get_name(obj);
                             let response = ui.text_edit_singleline(&mut name);
-                            
+
                             if response.changed() {
                                 let mut object_info_map = pool.object_info.borrow_mut();
                                 if let Some(info) = object_info_map.get_mut(&obj.id()) {
@@ -710,7 +720,7 @@ impl eframe::App for DesignerApp {
                             }
                         });
                         ui.separator();
-                        
+
                         obj.render_parameters(ui, pool);
                         let (width, height) = pool.get_pool().content_size(obj);
                         ui.separator();

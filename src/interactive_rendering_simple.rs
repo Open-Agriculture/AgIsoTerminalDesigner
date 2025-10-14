@@ -2,10 +2,10 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool};
-use ag_iso_stack::object_pool::object_attributes::Point;
-use eframe::egui;
 use crate::RenderableObject;
+use ag_iso_stack::object_pool::object_attributes::Point;
+use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool};
+use eframe::egui;
 
 /// Interactive wrapper for rendering masks with clickable objects
 pub struct InteractiveMaskRenderer<'a> {
@@ -20,46 +20,50 @@ impl<'a> egui::Widget for InteractiveMaskRenderer<'a> {
         let (width, height) = self.pool.content_size(self.object);
         let desired_size = egui::vec2(width as f32, height as f32);
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
-        
+
         if ui.is_rect_visible(rect) {
             // Create a child UI for rendering the objects
             let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-            
+
             // Render the objects normally
-            self.object.render(&mut child_ui, self.pool, Point::default());
-            
+            self.object
+                .render(&mut child_ui, self.pool, Point::default());
+
             // Handle interaction - check if pointer is interacting with this widget
             if let Some(pointer_pos) = ui.ctx().pointer_hover_pos() {
                 // Check if the pointer is within our allocated rect
                 if rect.contains(pointer_pos) {
                     // Convert screen position to widget-relative position
-                    let relative_pos = egui::pos2(
-                        pointer_pos.x - rect.min.x,
-                        pointer_pos.y - rect.min.y
-                    );
-                    
+                    let relative_pos =
+                        egui::pos2(pointer_pos.x - rect.min.x, pointer_pos.y - rect.min.y);
+
                     // Find what object is under the hover position
                     if let Some((object_id, object_rect)) = self.find_object_at(relative_pos) {
-                        
                         // Draw highlight rectangle around the object
                         let screen_rect = egui::Rect::from_min_size(
                             rect.min + object_rect.min.to_vec2(),
-                            object_rect.size()
+                            object_rect.size(),
                         );
                         ui.painter().rect_stroke(
                             screen_rect,
                             0.0,
-                            egui::Stroke::new(2.0, egui::Color32::from_rgba_premultiplied(255, 255, 0, 200)),
-                            egui::epaint::StrokeKind::Middle
+                            egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgba_premultiplied(255, 255, 0, 200),
+                            ),
+                            egui::epaint::StrokeKind::Middle,
                         );
-                        
+
                         // Draw circle at pointer position
                         ui.painter().circle_stroke(
                             pointer_pos,
                             10.0,
-                            egui::Stroke::new(2.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 128))
+                            egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgba_premultiplied(255, 255, 255, 128),
+                            ),
                         );
-                        
+
                         if response.clicked() {
                             (self.selected_callback)(object_id);
                             ui.ctx().request_repaint(); // Force UI update
@@ -68,7 +72,7 @@ impl<'a> egui::Widget for InteractiveMaskRenderer<'a> {
                 }
             }
         }
-        
+
         response
     }
 }
@@ -78,7 +82,7 @@ impl<'a> InteractiveMaskRenderer<'a> {
     fn find_object_at(&self, pos: egui::Pos2) -> Option<(ObjectId, egui::Rect)> {
         self.find_object_recursive(self.object, Point::default(), pos)
     }
-    
+
     fn find_object_recursive(
         &self,
         object: &Object,
@@ -88,9 +92,9 @@ impl<'a> InteractiveMaskRenderer<'a> {
         let (width, height) = self.pool.content_size(object);
         let rect = egui::Rect::from_min_size(
             egui::pos2(offset.x as f32, offset.y as f32),
-            egui::vec2(width as f32, height as f32)
+            egui::vec2(width as f32, height as f32),
         );
-        
+
         // Check children first (they're on top)
         match object {
             Object::DataMask(mask) => {
@@ -134,7 +138,7 @@ impl<'a> InteractiveMaskRenderer<'a> {
             }
             _ => {}
         }
-        
+
         // Then check this object
         if rect.contains(pos) {
             Some((object.id(), rect))

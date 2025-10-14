@@ -124,15 +124,11 @@ fn render_object_id(ui: &mut egui::Ui, id: &mut ObjectId, design: &EditorProject
             design.get_mut_selected().borrow_mut().0 = Some(*id);
         }
 
-        // Add the object name
+        // Add the object type display
         if let Some(obj) = design.get_pool().object_by_id(*id) {
             ui.separator();
             ui.label("Type:");
             ui.label(format!("{:?}", obj.object_type()));
-            ui.separator();
-            ui.label("Name:");
-            let object_info = design.get_object_info(&obj);
-            ui.label(object_info.get_name(&obj));
         }
     });
 }
@@ -236,13 +232,7 @@ fn render_object_references_list(
                 let obj = design.get_pool().object_by_id(obj_ref.id);
 
                 ui.label(" - ");
-                render_object_id_selector(
-                    ui,
-                    idx,
-                    design,
-                    &mut obj_ref.id,
-                    allowed_child_objects,
-                );
+                render_object_id_selector(ui, idx, design, &mut obj_ref.id, allowed_child_objects);
 
                 if let Some(obj) = obj {
                     let mut max_x = width as i16;
@@ -254,7 +244,7 @@ fn render_object_references_list(
                     if ui.link(format!("{:?}", obj.object_type())).clicked() {
                         *design.get_mut_selected().borrow_mut() = obj.id().into();
                     }
-                    
+
                     // Add name column
                     let object_info = design.get_object_info(obj);
                     ui.label(object_info.get_name(obj));
@@ -279,8 +269,7 @@ fn render_object_references_list(
             }
         });
 
-    let (new_object_id, _) =
-        render_add_object_id(ui, design, allowed_child_objects, false);
+    let (new_object_id, _) = render_add_object_id(ui, design, allowed_child_objects, false);
     if let Some(id) = new_object_id {
         object_refs.push(ObjectRef {
             id,
@@ -316,7 +305,7 @@ fn render_object_id_list(
                     if ui.link(format!("{:?}", obj.object_type())).clicked() {
                         *design.get_mut_selected().borrow_mut() = obj.id().into();
                     }
-                    
+
                     // Add name column
                     let object_info = design.get_object_info(obj);
                     ui.label(object_info.get_name(obj));
@@ -330,8 +319,7 @@ fn render_object_id_list(
                 ui.end_row();
             }
         });
-    let (new_object_id, _) =
-        render_add_object_id(ui, design, allowed_child_objects, false);
+    let (new_object_id, _) = render_add_object_id(ui, design, allowed_child_objects, false);
     if let Some(id) = new_object_id {
         object_ids.push(id);
     }
@@ -364,7 +352,7 @@ fn render_nullable_object_id_list(
                         if ui.link(format!("{:?}", obj.object_type())).clicked() {
                             *design.get_mut_selected().borrow_mut() = obj.id().into();
                         }
-                        
+
                         // Add name column
                         let object_info = design.get_object_info(obj);
                         ui.label(object_info.get_name(obj));
@@ -382,8 +370,7 @@ fn render_nullable_object_id_list(
             }
         });
 
-    let (new_object_id, success) =
-        render_add_object_id(ui, design, allowed_child_objects, true);
+    let (new_object_id, success) = render_add_object_id(ui, design, allowed_child_objects, true);
     if success {
         nullable_object_ids.push(NullableObjectId(new_object_id));
     }
