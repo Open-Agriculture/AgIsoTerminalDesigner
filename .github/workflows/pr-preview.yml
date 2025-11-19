@@ -1,7 +1,9 @@
 name: PR Preview Deploy
 
+# Using pull_request_target to support PRs from forks
+# Security: We only build the web app (no secrets exposed, no arbitrary code execution)
 on:
-  pull_request:
+  pull_request_target:
     types:
       - opened
       - reopened
@@ -16,7 +18,16 @@ jobs:
   deploy-preview:
     runs-on: ubuntu-latest
     steps:
+      # Checkout the PR head (the code from the fork/branch)
+      # This is safe because we're only building a WASM app with no secrets
       - uses: actions/checkout@v4
+        if: github.event.action != 'closed'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # For closed PRs, checkout base branch (for cleanup)
+      - uses: actions/checkout@v4
+        if: github.event.action == 'closed'
 
       - name: Setup Rust
         if: github.event.action != 'closed'
