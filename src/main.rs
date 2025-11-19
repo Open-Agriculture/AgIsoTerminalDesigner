@@ -33,6 +33,7 @@ pub struct DesignerApp {
     show_development_popup: bool,
     new_object_dialog: Option<(ObjectType, String)>,
     apply_smart_naming_on_import: bool,
+    show_change_history: bool,
 }
 
 impl DesignerApp {
@@ -113,6 +114,7 @@ impl DesignerApp {
             show_development_popup: true,
             new_object_dialog: None,
             apply_smart_naming_on_import: true, // Default to true for better UX
+            show_change_history: false,
         }
     }
 }
@@ -259,7 +261,12 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
                 ui.close();
             }
             if ui.button("Delete").on_hover_text("Delete object").clicked() {
+                let object_name = object_info.get_name(object);
                 project.get_mut_pool().borrow_mut().remove(object.id());
+                project.set_pending_change(
+                    format!("Deleted {}", object_name),
+                    ag_iso_terminal_designer::ChangeCategory::ObjectDeleted
+                );
                 ui.close();
             }
         });
@@ -429,8 +436,14 @@ impl eframe::App for DesignerApp {
                     let info = object_info
                         .entry(new_obj.id())
                         .or_insert_with(|| ag_iso_terminal_designer::ObjectInfo::new(&new_obj));
-                    info.set_name(name);
+                    info.set_name(name.clone());
                     drop(object_info);
+
+                    // Record the change
+                    pool.set_pending_change(
+                        format!("Added {}", name),
+                        ag_iso_terminal_designer::ChangeCategory::ObjectAdded
+                    );
 
                     // Select the new object
                     pool.get_mut_selected()
@@ -529,6 +542,14 @@ impl eframe::App for DesignerApp {
                                 }
                             }
                         });
+                    });
+
+                    // View menu
+                    ui.menu_button("View", |ui| {
+                        if ui.button("Change History").clicked() {
+                            self.show_change_history = !self.show_change_history;
+                            ui.close();
+                        }
                     });
                 }
 
@@ -704,6 +725,9 @@ impl eframe::App for DesignerApp {
             egui::SidePanel::right("right_panel").show(ctx, |ui: &mut egui::Ui| {
                 if let Some(id) = pool.get_selected().into() {
                     if let Some(obj) = pool.get_mut_pool().borrow_mut().object_mut_by_id(id) {
+                        // Get object name for change tracking
+                        let object_name = pool.get_object_info(obj).get_name(obj);
+
                         // Display editable object name as header
                         ui.horizontal(|ui| {
                             ui.label("Name:");
@@ -721,7 +745,17 @@ impl eframe::App for DesignerApp {
                         });
                         ui.separator();
 
+                        // Track modifications to object parameters
+                        let pool_before = pool.get_pool().clone();
                         obj.render_parameters(ui, pool);
+
+                        // Check if parameters were modified (pool changed)
+                        if pool.get_mut_pool().borrow().to_owned() != pool_before {
+                            pool.set_pending_change(
+                                format!("Modified {}", object_name),
+                                ag_iso_terminal_designer::ChangeCategory::ObjectModified
+                            );
+                        }
                         let (width, height) = pool.get_pool().content_size(obj);
                         ui.separator();
                         let desired_size = egui::Vec2::new(width as f32, height as f32);
@@ -753,6 +787,109 @@ impl eframe::App for DesignerApp {
                     );
                 }
                 ctx.request_repaint();
+            }
+
+            // Change history window
+            if self.show_change_history {
+                egui::Window::new("Change History")
+                    .default_width(400.0)
+                    .default_height(500.0)
+                    .open(&mut self.show_change_history)
+                    .show(ctx, |ui| {
+                        ui.heading("Undo History");
+                        ui.label("Changes you can undo (most recent first):");
+                        ui.separator();
+
+                        egui::ScrollArea::vertical()
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                let undo_changes = pool.get_undo_changes();
+                                if undo_changes.is_empty() {
+                                    ui.label("No changes to undo");
+                                } else {
+                                    for (i, change) in undo_changes.iter().rev().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            // Category icon
+                                            let icon = change.category_icon();
+                                            let color_rgb = change.category_color();
+                                            let color = egui::Color32::from_rgb(
+                                                color_rgb[0],
+                                                color_rgb[1],
+                                                color_rgb[2],
+                                            );
+                                            ui.colored_label(color, icon);
+
+                                            // Description
+                                            ui.label(&change.description);
+
+                                            // Timestamp
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(change.formatted_time())
+                                                            .small()
+                                                            .weak(),
+                                                    );
+                                                },
+                                            );
+                                        });
+
+                                        if i < undo_changes.len() - 1 {
+                                            ui.add_space(4.0);
+                                        }
+                                    }
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.heading("Redo History");
+                        ui.label("Changes you can redo (most recent first):");
+                        ui.separator();
+
+                        egui::ScrollArea::vertical()
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                let redo_changes = pool.get_redo_changes();
+                                if redo_changes.is_empty() {
+                                    ui.label("No changes to redo");
+                                } else {
+                                    for (i, change) in redo_changes.iter().rev().enumerate() {
+                                        ui.horizontal(|ui| {
+                                            // Category icon
+                                            let icon = change.category_icon();
+                                            let color_rgb = change.category_color();
+                                            let color = egui::Color32::from_rgb(
+                                                color_rgb[0],
+                                                color_rgb[1],
+                                                color_rgb[2],
+                                            );
+                                            ui.colored_label(color, icon);
+
+                                            // Description
+                                            ui.label(&change.description);
+
+                                            // Timestamp
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(change.formatted_time())
+                                                            .small()
+                                                            .weak(),
+                                                    );
+                                                },
+                                            );
+                                        });
+
+                                        if i < redo_changes.len() - 1 {
+                                            ui.add_space(4.0);
+                                        }
+                                    }
+                                }
+                            });
+                    });
             }
         } else {
             egui::CentralPanel::default().show(ctx, |ui| {
