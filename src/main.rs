@@ -704,23 +704,22 @@ impl eframe::App for DesignerApp {
             egui::SidePanel::right("right_panel").show(ctx, |ui: &mut egui::Ui| {
                 if let Some(id) = pool.get_selected().into() {
                     if let Some(obj) = pool.get_mut_pool().borrow_mut().object_mut_by_id(id) {
-                        // Display editable object name as header
-                        ui.horizontal(|ui| {
-                            ui.label("Name:");
-
-                            let object_info = pool.get_object_info(obj);
-                            let mut name = object_info.get_name(obj);
-                            let response = ui.text_edit_singleline(&mut name);
-
-                            if response.changed() {
-                                let mut object_info_map = pool.object_info.borrow_mut();
-                                if let Some(info) = object_info_map.get_mut(&obj.id()) {
-                                    info.set_name(name);
-                                }
-                            }
-                        });
-
                         egui::ScrollArea::vertical().show(ui, |ui| {
+                            // Display editable object name as header
+                            ui.horizontal(|ui| {
+                                ui.label("Name:");
+
+                                let object_info = pool.get_object_info(obj);
+                                let mut name = object_info.get_name(obj);
+                                let response = ui.text_edit_singleline(&mut name);
+
+                                if response.changed() {
+                                    let mut object_info_map = pool.object_info.borrow_mut();
+                                    if let Some(info) = object_info_map.get_mut(&obj.id()) {
+                                        info.set_name(name);
+                                    }
+                                }
+                            });
                             ui.separator();
 
                             obj.render_parameters(ui, pool);
