@@ -12,8 +12,8 @@
     <!-- config for our rust wasm binary. go to https://trunkrs.dev/assets/#rust for more customization -->
     
 <script type="module">
-import init, * as bindings from 'https://open-agriculture.github.io/AgIsoTerminalDesigner/pr-preview/pr-22/ag-iso-terminal-designer-d470660368842dd3.js';
-const wasm = await init({ module_or_path: 'https://open-agriculture.github.io/AgIsoTerminalDesigner/pr-preview/pr-22/ag-iso-terminal-designer-d470660368842dd3_bg.wasm' });
+import init, * as bindings from 'https://open-agriculture.github.io/AgIsoTerminalDesigner/pr-preview/pr-22/ag-iso-terminal-designer-1e9c911862d22c91.js';
+const wasm = await init({ module_or_path: 'https://open-agriculture.github.io/AgIsoTerminalDesigner/pr-preview/pr-22/ag-iso-terminal-designer-1e9c911862d22c91_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -127,7 +127,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             }
         }
     </style>
-<link rel="modulepreload" href="https://open-agriculture.github.io/AgIsoTerminalDesigner/pr-preview/pr-22/ag-iso-terminal-designer-d470660368842dd3.js" crossorigin="anonymous" integrity="sha384-MXOXE0zA/NS/ZtgO7GunpOv+1y1YSGa9b3e+dtiWaQQQHzVzvMML6OvTag5jZwOS"><link rel="preload" href="https://open-agriculture.github.io/AgIsoTerminalDesigner/pr-preview/pr-22/ag-iso-terminal-designer-d470660368842dd3_bg.wasm" crossorigin="anonymous" integrity="sha384-7t45fMhke+GgLQfbKl8jsSrz1sPRaut9edvoa0q6GdEMgxhxMBjP52WPfEp89zyY" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="https://open-agriculture.github.io/AgIsoTerminalDesigner/pr-preview/pr-22/ag-iso-terminal-designer-1e9c911862d22c91.js" crossorigin="anonymous" integrity="sha384-r/sME+g3JLT9/fJaSEM6w75HhTGk0rP3MO1Iw0StRVREjVeK+4970xem6luQ5MFR"><link rel="preload" href="https://open-agriculture.github.io/AgIsoTerminalDesigner/pr-preview/pr-22/ag-iso-terminal-designer-1e9c911862d22c91_bg.wasm" crossorigin="anonymous" integrity="sha384-7gVFzUtMWr2zVnUOakyRVY+35qYBzAgA70LFc4JXRhQ11Tnkal7OhPBnGtuzGKr7" as="fetch" type="application/wasm"></head>
 
 <body>
     <!-- The WASM code will resize the canvas dynamically -->
