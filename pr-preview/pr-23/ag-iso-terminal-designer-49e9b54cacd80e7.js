@@ -301,10 +301,6 @@ function wasm_bindgen__convert__closures_____invoke__h078f99eab5f860b9(arg0, arg
     wasm.wasm_bindgen__convert__closures_____invoke__h078f99eab5f860b9(arg0, arg1, arg2);
 }
 
-function wasm_bindgen__convert__closures_____invoke__hff9c13d9576d72a0(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__hff9c13d9576d72a0(arg0, arg1, arg2);
-}
-
 function takeFromExternrefTable0(idx) {
     const value = wasm.__wbindgen_externrefs.get(idx);
     wasm.__externref_table_dealloc(idx);
@@ -319,6 +315,10 @@ function wasm_bindgen__convert__closures_____invoke__hc59c42ddc9c053e8(arg0, arg
 
 function wasm_bindgen__convert__closures_____invoke__hc65c942d5980b8c2(arg0, arg1) {
     wasm.wasm_bindgen__convert__closures_____invoke__hc65c942d5980b8c2(arg0, arg1);
+}
+
+function wasm_bindgen__convert__closures_____invoke__hff9c13d9576d72a0(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__hff9c13d9576d72a0(arg0, arg1, arg2);
 }
 
 function wasm_bindgen__convert__closures_____invoke__h4fba6566125b6c9b(arg0, arg1, arg2, arg3) {
