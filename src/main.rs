@@ -719,14 +719,17 @@ impl eframe::App for DesignerApp {
                                 }
                             }
                         });
-                        ui.separator();
 
-                        obj.render_parameters(ui, pool);
-                        let (width, height) = pool.get_pool().content_size(obj);
-                        ui.separator();
-                        let desired_size = egui::Vec2::new(width as f32, height as f32);
-                        ui.allocate_ui(desired_size, |ui| {
-                            obj.render(ui, pool.get_pool(), Point::default());
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.separator();
+
+                            obj.render_parameters(ui, pool);
+                            let (width, height) = pool.get_pool().content_size(obj);
+                            ui.separator();
+                            let desired_size = egui::Vec2::new(width as f32, height as f32);
+                            ui.allocate_ui(desired_size, |ui| {
+                                obj.render(ui, pool.get_pool(), Point::default());
+                            });
                         });
                     } else {
                         ui.colored_label(
