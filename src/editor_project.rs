@@ -8,7 +8,7 @@ use ag_iso_stack::object_pool::{
     object::Object, NullableObjectId, ObjectId, ObjectPool, ObjectType,
 };
 
-use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
+use crate::{change::{Change, ChangeCategory}, project_file::ProjectFile, smart_naming, ObjectInfo};
 
 const MAX_UNDO_REDO_POOL: usize = 10;
 const MAX_UNDO_REDO_SELECTED: usize = 20;
@@ -17,8 +17,8 @@ const MAX_UNDO_REDO_SELECTED: usize = 20;
 pub struct EditorProject {
     pool: ObjectPool,
     mut_pool: RefCell<ObjectPool>,
-    undo_pool_history: Vec<ObjectPool>,
-    redo_pool_history: Vec<ObjectPool>,
+    undo_changes: Vec<Change>,
+    redo_changes: Vec<Change>,
     selected_object: NullableObjectId,
     mut_selected_object: RefCell<NullableObjectId>,
     undo_selected_history: Vec<NullableObjectId>,
@@ -35,6 +35,9 @@ pub struct EditorProject {
 
     /// Cached default object names for efficient lookup
     default_object_names: RefCell<HashMap<ObjectId, String>>,
+
+    /// Pending change description and category for the next pool update
+    pending_change: RefCell<Option<(String, ChangeCategory)>>,
 }
 
 impl From<ObjectPool> for EditorProject {
@@ -52,8 +55,8 @@ impl From<ObjectPool> for EditorProject {
         EditorProject {
             mut_pool: RefCell::new(pool.clone()),
             pool,
-            undo_pool_history: Default::default(),
-            redo_pool_history: Default::default(),
+            undo_changes: Vec::new(),
+            redo_changes: Vec::new(),
             selected_object: NullableObjectId::default(),
             mut_selected_object: RefCell::new(NullableObjectId::default()),
             undo_selected_history: Default::default(),
@@ -64,6 +67,7 @@ impl From<ObjectPool> for EditorProject {
             renaming_object: RefCell::new(None),
             next_available_id: RefCell::new(max_id.saturating_add(1)),
             default_object_names: RefCell::new(HashMap::new()),
+            pending_change: RefCell::new(None),
         }
     }
 }
@@ -143,33 +147,60 @@ impl EditorProject {
         &self.mut_selected_object
     }
 
+    /// Set the pending change description and category
+    /// This will be used by the next call to update_pool() if no explicit description is provided
+    pub fn set_pending_change(&self, description: impl Into<String>, category: ChangeCategory) {
+        self.pending_change.replace(Some((description.into(), category)));
+    }
+
     /// If the mutating pool is different from the current pool, add the current pool to the history
     /// and update the current pool with the mutated pool.
+    /// Uses the pending change if set, otherwise defaults to "Modified" with Other category
     /// Returns true if the pool was updated
     pub fn update_pool(&mut self) -> bool {
         if self.mut_pool.borrow().to_owned() != self.pool {
-            self.redo_pool_history.clear();
-            self.undo_pool_history.push(self.pool.clone());
-            if self.undo_pool_history.len() > MAX_UNDO_REDO_POOL {
-                self.undo_pool_history
-                    .drain(..self.undo_pool_history.len() - MAX_UNDO_REDO_POOL);
+            self.redo_changes.clear();
+
+            // Get the change description and category from pending change or use defaults
+            let (description, category) = self.pending_change.borrow_mut().take()
+                .unwrap_or_else(|| ("Modified".to_string(), ChangeCategory::Other));
+
+            // Create a change record with the previous state
+            let change = Change::new(
+                description,
+                self.pool.clone(),
+                category,
+            );
+
+            self.undo_changes.push(change);
+            if self.undo_changes.len() > MAX_UNDO_REDO_POOL {
+                self.undo_changes
+                    .drain(..self.undo_changes.len() - MAX_UNDO_REDO_POOL);
             }
             self.pool = self.mut_pool.borrow().clone();
             // Clear the default names cache since objects may have changed
             self.default_object_names.borrow_mut().clear();
             return true;
         }
+        // Clear pending change even if pool wasn't updated
+        self.pending_change.replace(None);
         false
     }
 
     /// Undo the last action
     pub fn undo(&mut self) {
-        if let Some(pool) = self.undo_pool_history.pop() {
-            self.redo_pool_history.push(self.pool.clone());
+        if let Some(change) = self.undo_changes.pop() {
+            // Create a change for redo with the current state
+            let redo_change = Change::new(
+                change.description.clone(),
+                self.pool.clone(),
+                change.category,
+            );
+            self.redo_changes.push(redo_change);
 
             // Both need to be replaced here because otherwise it will be added to the undo history
-            self.pool = pool.clone();
-            self.mut_pool.replace(pool);
+            self.pool = change.pool_state.clone();
+            self.mut_pool.replace(change.pool_state);
 
             // Update next_available_id based on the new pool state
             self.update_next_available_id();
@@ -181,16 +212,23 @@ impl EditorProject {
 
     /// Check if there are actions available to undo
     pub fn undo_available(&self) -> bool {
-        !self.undo_pool_history.is_empty()
+        !self.undo_changes.is_empty()
     }
 
     /// Redo the last undone action
     pub fn redo(&mut self) {
-        if let Some(pool) = self.redo_pool_history.pop() {
-            self.undo_pool_history.push(self.pool.clone());
+        if let Some(change) = self.redo_changes.pop() {
+            // Create a change for undo with the current state
+            let undo_change = Change::new(
+                change.description.clone(),
+                self.pool.clone(),
+                change.category,
+            );
+            self.undo_changes.push(undo_change);
+
             // Both need to be replaced here because otherwise the redo history will be cleared
-            self.pool = pool.clone();
-            self.mut_pool.replace(pool);
+            self.pool = change.pool_state.clone();
+            self.mut_pool.replace(change.pool_state);
 
             // Update next_available_id based on the new pool state
             self.update_next_available_id();
@@ -202,7 +240,17 @@ impl EditorProject {
 
     /// Check if there are actions available to redo
     pub fn redo_available(&self) -> bool {
-        !self.redo_pool_history.is_empty()
+        !self.redo_changes.is_empty()
+    }
+
+    /// Get the undo change history for display
+    pub fn get_undo_changes(&self) -> &[Change] {
+        &self.undo_changes
+    }
+
+    /// Get the redo change history for display
+    pub fn get_redo_changes(&self) -> &[Change] {
+        &self.redo_changes
     }
 
     /// Update the selected object with the mutating selected object if it is different

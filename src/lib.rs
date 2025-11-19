@@ -3,6 +3,7 @@
 //! Authors: Daan Steenbergen
 
 mod allowed_object_relationships;
+mod change;
 mod editor_project;
 mod interactive_rendering_simple;
 mod object_configuring;
@@ -13,6 +14,7 @@ mod possible_events;
 mod project_file;
 mod smart_naming;
 
+pub use change::{Change, ChangeCategory};
 pub use editor_project::EditorProject;
 pub use interactive_rendering_simple::InteractiveMaskRenderer;
 pub use object_configuring::ConfigurableObject;
