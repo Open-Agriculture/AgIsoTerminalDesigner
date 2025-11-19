@@ -704,29 +704,31 @@ impl eframe::App for DesignerApp {
             egui::SidePanel::right("right_panel").show(ctx, |ui: &mut egui::Ui| {
                 if let Some(id) = pool.get_selected().into() {
                     if let Some(obj) = pool.get_mut_pool().borrow_mut().object_mut_by_id(id) {
-                        // Display editable object name as header
-                        ui.horizontal(|ui| {
-                            ui.label("Name:");
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            // Display editable object name as header
+                            ui.horizontal(|ui| {
+                                ui.label("Name:");
 
-                            let object_info = pool.get_object_info(obj);
-                            let mut name = object_info.get_name(obj);
-                            let response = ui.text_edit_singleline(&mut name);
+                                let object_info = pool.get_object_info(obj);
+                                let mut name = object_info.get_name(obj);
+                                let response = ui.text_edit_singleline(&mut name);
 
-                            if response.changed() {
-                                let mut object_info_map = pool.object_info.borrow_mut();
-                                if let Some(info) = object_info_map.get_mut(&obj.id()) {
-                                    info.set_name(name);
+                                if response.changed() {
+                                    let mut object_info_map = pool.object_info.borrow_mut();
+                                    if let Some(info) = object_info_map.get_mut(&obj.id()) {
+                                        info.set_name(name);
+                                    }
                                 }
-                            }
-                        });
-                        ui.separator();
+                            });
+                            ui.separator();
 
-                        obj.render_parameters(ui, pool);
-                        let (width, height) = pool.get_pool().content_size(obj);
-                        ui.separator();
-                        let desired_size = egui::Vec2::new(width as f32, height as f32);
-                        ui.allocate_ui(desired_size, |ui| {
-                            obj.render(ui, pool.get_pool(), Point::default());
+                            obj.render_parameters(ui, pool);
+                            let (width, height) = pool.get_pool().content_size(obj);
+                            ui.separator();
+                            let desired_size = egui::Vec2::new(width as f32, height as f32);
+                            ui.allocate_ui(desired_size, |ui| {
+                                obj.render(ui, pool.get_pool(), Point::default());
+                            });
                         });
                     } else {
                         ui.colored_label(
