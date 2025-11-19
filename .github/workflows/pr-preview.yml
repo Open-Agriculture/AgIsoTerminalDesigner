@@ -42,9 +42,17 @@ jobs:
         if: github.event.action != 'closed'
         uses: Swatinem/rust-cache@v2
 
-      - name: Download and install Trunk binary
+      - name: Cache Trunk binary
         if: github.event.action != 'closed'
-        run: wget -qO- https://github.com/thedodd/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
+        id: cache-trunk
+        uses: actions/cache@v4
+        with:
+          path: ./trunk
+          key: trunk-0.21.5
+
+      - name: Download and install Trunk binary
+        if: github.event.action != 'closed' && steps.cache-trunk.outputs.cache-hit != 'true'
+        run: wget -qO- https://github.com/thedodd/trunk/releases/download/v0.21.5/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
 
       - name: Build
         if: github.event.action != 'closed'

@@ -28,8 +28,15 @@ jobs:
           override: true
       - name: Cache
         uses: Swatinem/rust-cache@v2
+      - name: Cache Trunk binary
+        id: cache-trunk
+        uses: actions/cache@v4
+        with:
+          path: ./trunk
+          key: trunk-0.21.5
       - name: Download and install Trunk binary
-        run: wget -qO- https://github.com/thedodd/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
+        if: steps.cache-trunk.outputs.cache-hit != 'true'
+        run: wget -qO- https://github.com/thedodd/trunk/releases/download/v0.21.5/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
       - name: Build
         # Environment $public_url resolves to the github project page.
         # If using a user/organization page, remove the `${{ github.event.repository.name }}` part.
