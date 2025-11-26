@@ -4,7 +4,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 use ag_iso_stack::object_pool::object::*;
-use ag_iso_stack::object_pool::object_attributes::Point;
+use ag_iso_stack::object_pool::object_attributes::{DataCodeType, PictureGraphicFormat, Point};
 use ag_iso_stack::object_pool::NullableObjectId;
 use ag_iso_stack::object_pool::ObjectId;
 use ag_iso_stack::object_pool::ObjectPool;
@@ -120,10 +120,18 @@ impl DesignerApp {
 impl DesignerApp {
     /// Open a file dialog
     fn open_file_dialog(&mut self, reason: FileDialogReason, ctx: &egui::Context) {
+        let is_image_loading = matches!(reason, FileDialogReason::OpenImagePictureGraphics(_));
         self.file_dialog_reason = Some(reason);
 
         let sender = self.file_channel.0.clone();
-        let task = rfd::AsyncFileDialog::new().pick_file();
+        let mut dialog = rfd::AsyncFileDialog::new();
+
+        // Add image file filters for image loading
+        if is_image_loading {
+            dialog = dialog.add_filter("Image Files", &["png", "jpg", "jpeg", "bmp", "gif", "ico", "tiff", "tif", "webp"]);
+        }
+
+        let task = dialog.pick_file();
         let ctx = ctx.clone();
         execute(async move {
             let file = task.await;
@@ -163,7 +171,89 @@ impl DesignerApp {
                         if let Some(obj) = pool.get_mut_pool().borrow_mut().object_mut_by_id(id) {
                             match obj {
                                 Object::PictureGraphic(o) => {
-                                    // o.load_image(content);
+                                    if let Ok(img) = image::load_from_memory(&content) {
+                                        // Try to preserve alpha channel if available (PNG with transparency)
+                                        let has_alpha = img.color().has_alpha();
+                                        let rgba_img = if has_alpha {
+                                            Some(img.to_rgba8())
+                                        } else {
+                                            None
+                                        };
+
+                                        let rgb_img = img.to_rgb8();
+                                        let (width, height) = rgb_img.dimensions();
+
+                                        // Update image dimensions
+                                        o.actual_width = width as u16;
+                                        o.actual_height = height as u16;
+
+                                        // Set format to 8-bit for maximum color support
+                                        o.format = PictureGraphicFormat::EightBit;
+                                        o.options.data_code_type = DataCodeType::Raw;
+
+                                        // Detect white color index for transparency
+                                        let white_color_index = find_closest_color_index(
+                                            &pool.get_pool(),
+                                            255,
+                                            255,
+                                            255,
+                                        );
+
+                                        // Convert RGB pixels to color indices
+                                        // If we have alpha channel, use it; otherwise detect white pixels
+                                        if let Some(rgba) = rgba_img {
+                                            // Use alpha channel from PNG
+                                            o.data = rgba
+                                                .pixels()
+                                                .map(|pixel| {
+                                                    // If pixel is transparent (alpha < 128), use white index
+                                                    // Otherwise convert RGB to color index
+                                                    if pixel[3] < 128 {
+                                                        white_color_index
+                                                    } else {
+                                                        find_closest_color_index(
+                                                            &pool.get_pool(),
+                                                            pixel[0],
+                                                            pixel[1],
+                                                            pixel[2],
+                                                        )
+                                                    }
+                                                })
+                                                .collect();
+                                            // Enable transparency with white as transparent color
+                                            o.options.transparent = true;
+                                            o.transparency_colour = white_color_index;
+                                        } else {
+                                            // No alpha channel - detect white/light pixels
+                                            o.data = rgb_img
+                                                .pixels()
+                                                .map(|pixel| {
+                                                    // Detect very light/white pixels (threshold: R+G+B > 700)
+                                                    let brightness = pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16;
+                                                    if brightness > 700 {
+                                                        white_color_index
+                                                    } else {
+                                                        find_closest_color_index(
+                                                            &pool.get_pool(),
+                                                            pixel[0],
+                                                            pixel[1],
+                                                            pixel[2],
+                                                        )
+                                                    }
+                                                })
+                                                .collect();
+                                            // Enable transparency with white as transparent color
+                                            o.options.transparent = true;
+                                            o.transparency_colour = white_color_index;
+                                        }
+
+                                        // Update width to match actual image width if it's 0 or different
+                                        if o.width == 0 || o.width != o.actual_width {
+                                            o.width = o.actual_width;
+                                        }
+                                    } else {
+                                        log::error!("Failed to decode image");
+                                    }
                                 }
                                 _ => (),
                             }
@@ -344,6 +434,13 @@ impl eframe::App for DesignerApp {
 
         // Handle file dialog
         self.handle_file_loaded();
+
+        // Check for image load requests
+        if let Some(pool) = &self.project {
+            if let Some(object_id) = pool.take_image_load_request() {
+                self.open_file_dialog(FileDialogReason::OpenImagePictureGraphics(object_id), ctx);
+            }
+        }
 
         if self.show_development_popup {
             egui::Window::new("🚧 Under Active Development")
@@ -833,6 +930,35 @@ fn main() {
             }
         }
     });
+}
+
+/// Find the closest color index in the palette for a given RGB value
+fn find_closest_color_index(pool: &ObjectPool, r: u8, g: u8, b: u8) -> u8 {
+    let mut best_index = 0u8;
+    let mut best_distance = f64::MAX;
+
+    // Search through all possible color indices (0-255)
+    for index in 0..=255u8 {
+        let color = pool.color_by_index(index);
+        let distance = {
+            let dr = color.r as f64 - r as f64;
+            let dg = color.g as f64 - g as f64;
+            let db = color.b as f64 - b as f64;
+            (dr * dr + dg * dg + db * db).sqrt()
+        };
+
+        if distance < best_distance {
+            best_distance = distance;
+            best_index = index;
+        }
+
+        // Early exit if we find an exact match
+        if distance == 0.0 {
+            break;
+        }
+    }
+
+    best_index
 }
 
 #[cfg(not(target_arch = "wasm32"))]

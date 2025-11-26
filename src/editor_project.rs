@@ -5,7 +5,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use ag_iso_stack::object_pool::{
-    object::Object, NullableObjectId, ObjectId, ObjectPool, ObjectType,
+    object::Object, object_attributes::HorizontalAlignment, NullableObjectId, ObjectId, ObjectPool, ObjectType,
 };
 
 use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
@@ -35,6 +35,9 @@ pub struct EditorProject {
 
     /// Cached default object names for efficient lookup
     default_object_names: RefCell<HashMap<ObjectId, String>>,
+
+    /// Request to open image file dialog for PictureGraphic object
+    image_load_request: RefCell<Option<ObjectId>>,
 }
 
 impl From<ObjectPool> for EditorProject {
@@ -64,6 +67,7 @@ impl From<ObjectPool> for EditorProject {
             renaming_object: RefCell::new(None),
             next_available_id: RefCell::new(max_id.saturating_add(1)),
             default_object_names: RefCell::new(HashMap::new()),
+            image_load_request: RefCell::new(None),
         }
     }
 }
@@ -430,6 +434,7 @@ impl EditorProject {
         // Restore object metadata
         let metadata = project.get_metadata();
         let mut object_info = editor_project.object_info.borrow_mut();
+        let mut_pool = editor_project.get_mut_pool();
         for object in editor_project.pool.objects() {
             if let Some(meta) = metadata.get(&object.id().value()) {
                 let info = object_info
@@ -438,9 +443,28 @@ impl EditorProject {
                 if let Some(name) = &meta.name {
                     info.set_name(name.clone());
                 }
+
+                // Restore horizontal justification for OutputString objects (workaround)
+                if let Some(justification_str) = &meta.output_string_horizontal_justification {
+                    let horizontal_align = match justification_str.as_str() {
+                        "Left" => HorizontalAlignment::Left,
+                        "Middle" => HorizontalAlignment::Middle,
+                        "Right" => HorizontalAlignment::Right,
+                        _ => continue,
+                    };
+
+                    if let Some(obj) = mut_pool.borrow_mut().object_mut_by_id(object.id()) {
+                        if let Object::OutputString(os) = obj {
+                            os.justification.horizontal = horizontal_align;
+                        }
+                    }
+                }
             }
         }
         drop(object_info);
+
+        // Update the pool to apply the justification fixes
+        editor_project.update_pool();
 
         // Apply smart naming to objects without custom names
         for object in editor_project.pool.objects() {
@@ -458,5 +482,15 @@ impl EditorProject {
         }
 
         Ok(editor_project)
+    }
+
+    /// Request to open image file dialog for a PictureGraphic object
+    pub fn request_image_load(&self, object_id: ObjectId) {
+        self.image_load_request.replace(Some(object_id));
+    }
+
+    /// Take and clear the image load request if any
+    pub fn take_image_load_request(&self) -> Option<ObjectId> {
+        self.image_load_request.replace(None)
     }
 }

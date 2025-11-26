@@ -3,7 +3,7 @@
 //! Authors: Daan Steenbergen
 
 use crate::ObjectInfo;
-use ag_iso_stack::object_pool::{ObjectId, ObjectPool};
+use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -35,6 +35,11 @@ pub struct ObjectMetadata {
 
     /// Notes or comments about the object
     pub notes: Option<String>,
+
+    /// Workaround: Store horizontal justification for OutputString objects
+    /// This is needed because the IOP format may not preserve this correctly
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_string_horizontal_justification: Option<String>,
 }
 
 /// Project-level settings
@@ -58,9 +63,18 @@ impl ProjectFile {
         // Convert ObjectInfo map to ObjectMetadata map
         let mut object_metadata = HashMap::new();
         for (id, info) in object_info {
+            // Extract horizontal justification for OutputString objects as workaround
+            let output_string_justification = pool
+                .object_by_id(*id)
+                .and_then(|obj| match obj {
+                    Object::OutputString(os) => Some(format!("{:?}", os.justification.horizontal)),
+                    _ => None,
+                });
+
             let metadata = ObjectMetadata {
                 name: info.name.clone(),
                 notes: None, // Future feature
+                output_string_horizontal_justification: output_string_justification,
             };
             object_metadata.insert(id.value(), metadata);
         }
