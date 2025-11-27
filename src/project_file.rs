@@ -64,12 +64,10 @@ impl ProjectFile {
         let mut object_metadata = HashMap::new();
         for (id, info) in object_info {
             // Extract horizontal justification for OutputString objects as workaround
-            let output_string_justification = pool
-                .object_by_id(*id)
-                .and_then(|obj| match obj {
-                    Object::OutputString(os) => Some(format!("{:?}", os.justification.horizontal)),
-                    _ => None,
-                });
+            let output_string_justification = pool.object_by_id(*id).and_then(|obj| match obj {
+                Object::OutputString(os) => Some(format!("{:?}", os.justification.horizontal)),
+                _ => None,
+            });
 
             let metadata = ObjectMetadata {
                 name: info.name.clone(),

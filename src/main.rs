@@ -128,7 +128,12 @@ impl DesignerApp {
 
         // Add image file filters for image loading
         if is_image_loading {
-            dialog = dialog.add_filter("Image Files", &["png", "jpg", "jpeg", "bmp", "gif", "ico", "tiff", "tif", "webp"]);
+            dialog = dialog.add_filter(
+                "Image Files",
+                &[
+                    "png", "jpg", "jpeg", "bmp", "gif", "ico", "tiff", "tif", "webp",
+                ],
+            );
         }
 
         let task = dialog.pick_file();
@@ -229,7 +234,9 @@ impl DesignerApp {
                                                 .pixels()
                                                 .map(|pixel| {
                                                     // Detect very light/white pixels (threshold: R+G+B > 700)
-                                                    let brightness = pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16;
+                                                    let brightness = pixel[0] as u16
+                                                        + pixel[1] as u16
+                                                        + pixel[2] as u16;
                                                     if brightness > 700 {
                                                         white_color_index
                                                     } else {

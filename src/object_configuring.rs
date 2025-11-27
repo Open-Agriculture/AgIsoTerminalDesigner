@@ -202,7 +202,11 @@ fn render_object_id_selector(
                     u16::from(child_id),
                     potential_child.object_type(),
                     name,
-                    if would_be_circular { " ⚠ (circular)" } else { "" }
+                    if would_be_circular {
+                        " ⚠ (circular)"
+                    } else {
+                        ""
+                    }
                 );
 
                 // Disable selection if it would create a circular reference
@@ -247,7 +251,11 @@ fn render_nullable_object_id_selector(
                     u16::from(child_id),
                     potential_child.object_type(),
                     name,
-                    if would_be_circular { " ⚠ (circular)" } else { "" }
+                    if would_be_circular {
+                        " ⚠ (circular)"
+                    } else {
+                        ""
+                    }
                 );
 
                 // Disable selection if it would create a circular reference
@@ -297,7 +305,14 @@ fn render_object_references_list(
                 let obj = design.get_pool().object_by_id(obj_ref.id);
 
                 ui.label(" - ");
-                render_object_id_selector(ui, idx, design, &mut obj_ref.id, allowed_child_objects, Some(current_object_id));
+                render_object_id_selector(
+                    ui,
+                    idx,
+                    design,
+                    &mut obj_ref.id,
+                    allowed_child_objects,
+                    Some(current_object_id),
+                );
 
                 if let Some(obj) = obj {
                     let mut max_x = width as i16;
@@ -334,7 +349,13 @@ fn render_object_references_list(
             }
         });
 
-    let (new_object_id, _) = render_add_object_id(ui, design, allowed_child_objects, false, Some(current_object_id));
+    let (new_object_id, _) = render_add_object_id(
+        ui,
+        design,
+        allowed_child_objects,
+        false,
+        Some(current_object_id),
+    );
     if let Some(id) = new_object_id {
         object_refs.push(ObjectRef {
             id,
@@ -386,7 +407,13 @@ fn render_object_id_list(
                 ui.end_row();
             }
         });
-    let (new_object_id, _) = render_add_object_id(ui, design, allowed_child_objects, false, Some(current_object_id));
+    let (new_object_id, _) = render_add_object_id(
+        ui,
+        design,
+        allowed_child_objects,
+        false,
+        Some(current_object_id),
+    );
     if let Some(id) = new_object_id {
         object_ids.push(id);
     }
@@ -439,7 +466,13 @@ fn render_nullable_object_id_list(
             }
         });
 
-    let (new_object_id, success) = render_add_object_id(ui, design, allowed_child_objects, true, Some(current_object_id));
+    let (new_object_id, success) = render_add_object_id(
+        ui,
+        design,
+        allowed_child_objects,
+        true,
+        Some(current_object_id),
+    );
     if success {
         nullable_object_ids.push(NullableObjectId(new_object_id));
     }
@@ -481,7 +514,11 @@ fn render_add_object_id(
                         u16::from(child_id),
                         potential_child.object_type(),
                         name,
-                        if would_be_circular { " ⚠ (circular)" } else { "" }
+                        if would_be_circular {
+                            " ⚠ (circular)"
+                        } else {
+                            ""
+                        }
                     );
 
                     // Only allow clicking if it wouldn't create a circular reference

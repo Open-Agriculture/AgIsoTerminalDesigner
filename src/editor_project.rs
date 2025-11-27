@@ -5,7 +5,8 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use ag_iso_stack::object_pool::{
-    object::Object, object_attributes::HorizontalAlignment, NullableObjectId, ObjectId, ObjectPool, ObjectType,
+    object::Object, object_attributes::HorizontalAlignment, NullableObjectId, ObjectId, ObjectPool,
+    ObjectType,
 };
 
 use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
