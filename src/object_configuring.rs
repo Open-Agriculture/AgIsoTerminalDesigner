@@ -17,6 +17,46 @@ use ag_iso_stack::object_pool::ObjectRef;
 use ag_iso_stack::object_pool::ObjectType;
 use eframe::egui;
 use eframe::egui::TextWrapMode;
+use std::collections::HashSet;
+
+/// Check if adding a reference from `parent_id` to `child_id` would create a circular reference
+/// Returns true if it would create a cycle (and should be blocked)
+fn would_create_circular_reference(
+    pool: &ObjectPool,
+    parent_id: ObjectId,
+    child_id: ObjectId,
+) -> bool {
+    // If parent and child are the same, it's definitely circular
+    if parent_id == child_id {
+        return true;
+    }
+
+    // Check if child already references parent (directly or indirectly)
+    // Use depth-first search to check all descendants of child_id
+    let mut visited = HashSet::new();
+    let mut stack = vec![child_id];
+
+    while let Some(current_id) = stack.pop() {
+        // If we've already visited this object, skip it (prevents infinite loops)
+        if !visited.insert(current_id) {
+            continue;
+        }
+
+        // If we find the parent in the descendants of child, it's circular
+        if current_id == parent_id {
+            return true;
+        }
+
+        // Add all children of current object to the stack
+        if let Some(obj) = pool.object_by_id(current_id) {
+            for ref_id in obj.referenced_objects() {
+                stack.push(ref_id);
+            }
+        }
+    }
+
+    false
+}
 
 pub trait ConfigurableObject {
     fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject);
@@ -139,24 +179,40 @@ fn render_object_id_selector(
     design: &EditorProject,
     object_id: &mut ObjectId,
     allowed_child_objects: &[ObjectType],
+    current_object_id: Option<ObjectId>,
 ) {
     let pool = design.get_pool();
     egui::ComboBox::from_id_salt(format!("object_id_selector_{}", idx))
         .selected_text(format!("{:?}", object_id.value()))
         .show_ui(ui, |ui| {
             for potential_child in pool.objects_by_types(allowed_child_objects) {
+                let child_id = potential_child.id();
+
+                // Check if this would create a circular reference
+                let would_be_circular = if let Some(parent_id) = current_object_id {
+                    would_create_circular_reference(pool, parent_id, child_id)
+                } else {
+                    false
+                };
+
                 let object_info = design.get_object_info(potential_child);
                 let name = object_info.get_name(potential_child);
-                ui.selectable_value(
-                    object_id,
-                    potential_child.id(),
-                    format!(
-                        "{:?}: {:?} - {}",
-                        u16::from(potential_child.id()),
-                        potential_child.object_type(),
-                        name
-                    ),
+                let label = format!(
+                    "{:?}: {:?} - {}{}",
+                    u16::from(child_id),
+                    potential_child.object_type(),
+                    name,
+                    if would_be_circular {
+                        " ⚠ (circular)"
+                    } else {
+                        ""
+                    }
                 );
+
+                // Disable selection if it would create a circular reference
+                ui.add_enabled_ui(!would_be_circular, |ui| {
+                    ui.selectable_value(object_id, child_id, label);
+                });
             }
         });
 }
@@ -167,6 +223,7 @@ fn render_nullable_object_id_selector(
     design: &EditorProject,
     object_id: &mut NullableObjectId,
     allowed_child_objects: &[ObjectType],
+    current_object_id: Option<ObjectId>,
 ) {
     let pool = design.get_pool();
     egui::ComboBox::from_id_salt(format!("nullable_object_id_selector_{}", idx))
@@ -178,18 +235,33 @@ fn render_nullable_object_id_selector(
         .show_ui(ui, |ui| {
             ui.selectable_value(object_id, NullableObjectId::NULL, "None");
             for potential_child in pool.objects_by_types(allowed_child_objects) {
+                let child_id = potential_child.id();
+
+                // Check if this would create a circular reference
+                let would_be_circular = if let Some(parent_id) = current_object_id {
+                    would_create_circular_reference(pool, parent_id, child_id)
+                } else {
+                    false
+                };
+
                 let object_info = design.get_object_info(potential_child);
                 let name = object_info.get_name(potential_child);
-                ui.selectable_value(
-                    object_id,
-                    potential_child.id().into(),
-                    format!(
-                        "{:?}: {:?} - {}",
-                        u16::from(potential_child.id()),
-                        potential_child.object_type(),
-                        name
-                    ),
+                let label = format!(
+                    "{:?}: {:?} - {}{}",
+                    u16::from(child_id),
+                    potential_child.object_type(),
+                    name,
+                    if would_be_circular {
+                        " ⚠ (circular)"
+                    } else {
+                        ""
+                    }
                 );
+
+                // Disable selection if it would create a circular reference
+                ui.add_enabled_ui(!would_be_circular, |ui| {
+                    ui.selectable_value(object_id, child_id.into(), label);
+                });
             }
         });
 }
@@ -221,6 +293,7 @@ fn render_object_references_list(
     height: u16,
     object_refs: &mut Vec<ObjectRef>,
     allowed_child_objects: &[ObjectType],
+    current_object_id: ObjectId,
 ) {
     egui::Grid::new("object_ref_grid")
         .striped(true)
@@ -232,7 +305,14 @@ fn render_object_references_list(
                 let obj = design.get_pool().object_by_id(obj_ref.id);
 
                 ui.label(" - ");
-                render_object_id_selector(ui, idx, design, &mut obj_ref.id, allowed_child_objects);
+                render_object_id_selector(
+                    ui,
+                    idx,
+                    design,
+                    &mut obj_ref.id,
+                    allowed_child_objects,
+                    Some(current_object_id),
+                );
 
                 if let Some(obj) = obj {
                     let mut max_x = width as i16;
@@ -269,7 +349,13 @@ fn render_object_references_list(
             }
         });
 
-    let (new_object_id, _) = render_add_object_id(ui, design, allowed_child_objects, false);
+    let (new_object_id, _) = render_add_object_id(
+        ui,
+        design,
+        allowed_child_objects,
+        false,
+        Some(current_object_id),
+    );
     if let Some(id) = new_object_id {
         object_refs.push(ObjectRef {
             id,
@@ -283,6 +369,7 @@ fn render_object_id_list(
     design: &EditorProject,
     object_ids: &mut Vec<ObjectId>,
     allowed_child_objects: &[ObjectType],
+    current_object_id: ObjectId,
 ) {
     egui::Grid::new("object_id_grid")
         .striped(true)
@@ -299,6 +386,7 @@ fn render_object_id_list(
                     design,
                     &mut object_ids[idx],
                     allowed_child_objects,
+                    Some(current_object_id),
                 );
 
                 if let Some(obj) = obj {
@@ -319,7 +407,13 @@ fn render_object_id_list(
                 ui.end_row();
             }
         });
-    let (new_object_id, _) = render_add_object_id(ui, design, allowed_child_objects, false);
+    let (new_object_id, _) = render_add_object_id(
+        ui,
+        design,
+        allowed_child_objects,
+        false,
+        Some(current_object_id),
+    );
     if let Some(id) = new_object_id {
         object_ids.push(id);
     }
@@ -330,6 +424,7 @@ fn render_nullable_object_id_list(
     design: &EditorProject,
     nullable_object_ids: &mut Vec<NullableObjectId>,
     allowed_child_objects: &[ObjectType],
+    current_object_id: ObjectId,
 ) {
     egui::Grid::new("object_id_grid")
         .striped(true)
@@ -344,6 +439,7 @@ fn render_nullable_object_id_list(
                     design,
                     &mut nullable_object_ids[idx],
                     allowed_child_objects,
+                    Some(current_object_id),
                 );
                 if let Some(object_id) = &mut nullable_object_ids[idx].0 {
                     let obj: Option<&Object> = design.get_pool().object_by_id(*object_id);
@@ -370,7 +466,13 @@ fn render_nullable_object_id_list(
             }
         });
 
-    let (new_object_id, success) = render_add_object_id(ui, design, allowed_child_objects, true);
+    let (new_object_id, success) = render_add_object_id(
+        ui,
+        design,
+        allowed_child_objects,
+        true,
+        Some(current_object_id),
+    );
     if success {
         nullable_object_ids.push(NullableObjectId(new_object_id));
     }
@@ -381,6 +483,7 @@ fn render_add_object_id(
     design: &EditorProject,
     allowed_child_objects: &[ObjectType],
     allow_none: bool,
+    current_object_id: Option<ObjectId>,
 ) -> (Option<ObjectId>, bool) {
     let pool = design.get_pool();
     let mut result = (None, false);
@@ -395,22 +498,35 @@ fn render_add_object_id(
                     }
                 }
                 for potential_child in pool.objects_by_types(allowed_child_objects) {
+                    let child_id = potential_child.id();
+
+                    // Check if this would create a circular reference
+                    let would_be_circular = if let Some(parent_id) = current_object_id {
+                        would_create_circular_reference(pool, parent_id, child_id)
+                    } else {
+                        false
+                    };
+
                     let object_info = design.get_object_info(potential_child);
                     let name = object_info.get_name(potential_child);
-                    if ui
-                        .selectable_label(
-                            false,
-                            format!(
-                                "{:?}: {:?} - {}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type(),
-                                name
-                            ),
-                        )
-                        .clicked()
-                    {
-                        result = (Some(potential_child.id()), true);
-                    }
+                    let label = format!(
+                        "{:?}: {:?} - {}{}",
+                        u16::from(child_id),
+                        potential_child.object_type(),
+                        name,
+                        if would_be_circular {
+                            " ⚠ (circular)"
+                        } else {
+                            ""
+                        }
+                    );
+
+                    // Only allow clicking if it wouldn't create a circular reference
+                    ui.add_enabled_ui(!would_be_circular, |ui| {
+                        if ui.selectable_label(false, label).clicked() {
+                            result = (Some(child_id), true);
+                        }
+                    });
                 }
             });
     });
@@ -578,6 +694,7 @@ impl ConfigurableObject for WorkingSet {
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
 
         ui.separator();
@@ -635,6 +752,7 @@ impl ConfigurableObject for DataMask {
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
 
         ui.separator();
@@ -705,6 +823,7 @@ impl ConfigurableObject for AlarmMask {
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
 
         ui.separator();
@@ -741,6 +860,7 @@ impl ConfigurableObject for Container {
             self.height,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
 
         ui.separator();
@@ -769,6 +889,7 @@ impl ConfigurableObject for SoftKeyMask {
             design,
             &mut self.objects,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
 
         ui.separator();
@@ -804,6 +925,7 @@ impl ConfigurableObject for Key {
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
 
         ui.separator();
@@ -876,6 +998,7 @@ impl ConfigurableObject for Button {
             self.height,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
 
         ui.separator();
@@ -1316,6 +1439,7 @@ impl ConfigurableObject for InputList {
             design,
             &mut self.list_items,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
 
         ui.separator();
@@ -1646,6 +1770,7 @@ impl ConfigurableObject for OutputList {
             design,
             &mut self.list_items,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
 
         ui.separator();
@@ -2740,43 +2865,15 @@ impl ConfigurableObject for PictureGraphic {
         });
         ui.checkbox(&mut self.options.flashing, "Flashing");
 
-        // if let Some(dialog) =
-        //     ui.data(|data| data.get_temp::<Arc<Mutex<FileDialog>>>(Id::new("file_dialog")))
-        // {
-        //     let mut dialog = dialog.lock().unwrap();
-        //     if dialog.show(ui.ctx()).selected() {
-        //         if let Some(path) = dialog.path() {
-        //             let image = image::io::Reader::open(path).unwrap().decode().unwrap();
-        //             self.actual_width = image.width() as u16;
-        //             self.actual_height = image.height() as u16;
-        //             self.options.data_code_type = DataCodeType::Raw;
-        //             self.format = PictureGraphicFormat::EightBit;
-        //             self.data = image
-        //                 .to_rgb8()
-        //                 .pixels()
-        //                 .map(|pixel| {
-        //                     let color = Colour::new_by_rgb(pixel[0], pixel[1], pixel[2]);
-        //                     if let Some(index) = design.pool.color_to_index(color) {
-        //                         index
-        //                     } else {
-        //                         0 // Default to black?
-        //                     }
-        //                 })
-        //                 .collect();
-        //         }
-        //     }
-        // } else if ui
-        //     .button("Load Image")
-        //     .on_hover_text("Load a new image")
-        //     .clicked()
-        // {
-        //     let dialog = Arc::new(Mutex::new(FileDialog::open_file(None)));
-        //     ui.close_menu();
-        //     dialog.lock().unwrap().open();
-        //     ui.data_mut(|data| {
-        //         data.insert_temp(Id::new("file_dialog"), dialog);
-        //     });
-        // }
+        ui.separator();
+        ui.label("Image:");
+        if ui
+            .button("Load Image")
+            .on_hover_text("Load an image file (PNG, JPG, BMP, etc.)")
+            .clicked()
+        {
+            design.request_image_load(self.id);
+        }
 
         ui.separator();
         ui.label("Macros:");
@@ -3053,6 +3150,7 @@ impl ConfigurableObject for FillAttributes {
                     design,
                     &mut self.fill_pattern,
                     &[ObjectType::PictureGraphic],
+                    Some(self.id),
                 );
 
                 if let Some(pattern_id) = self.fill_pattern.0 {
@@ -3310,6 +3408,7 @@ impl ConfigurableObject for AuxiliaryFunctionType2 {
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
     }
 }
@@ -3372,6 +3471,7 @@ impl ConfigurableObject for AuxiliaryInputType2 {
             design.mask_size,
             &mut self.object_refs,
             &Self::get_allowed_child_refs(VtVersion::Version3),
+            self.id,
         );
     }
 }
