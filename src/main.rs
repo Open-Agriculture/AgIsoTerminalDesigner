@@ -271,6 +271,60 @@ impl DesignerApp {
             }
         }
     }
+
+    /// Convert a string to a valid C identifier
+    fn to_c_identifier(name: &str) -> String {
+        name.chars()
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' => c.to_ascii_uppercase(),
+                _ => '_',
+            })
+            .collect()
+    }
+
+    /// Open a file dialog to save a C header file with object IDs
+    fn save_header(&mut self) {
+        if let Some(project) = &self.project {
+            let pool = project.get_pool();
+
+            // Start with the header
+            let mut header = String::from("// Object IDs for the objects in the object pool.\n\n");
+            header.push_str("#pragma once\n");
+            header.push_str("#define UNDEFINED 65535\n");
+
+            // Collect all objects with their names and IDs
+            let mut objects: Vec<(String, u16)> = pool
+                .objects()
+                .iter()
+                .map(|obj| {
+                    let name = project.get_object_info(obj).get_name(obj);
+                    let c_name = Self::to_c_identifier(&name);
+                    let id = u16::from(obj.id());
+                    (c_name, id)
+                })
+                .collect();
+
+            // Sort by ID for consistent output
+            objects.sort_by_key(|&(_, id)| id);
+
+            // Add defines for each object
+            for (name, id) in objects {
+                header.push_str(&format!("#define {} {}\n", name, id));
+            }
+
+            let contents = header.into_bytes();
+            let task = rfd::AsyncFileDialog::new()
+                .set_file_name("object_pool.h")
+                .add_filter("C Header", &["h"])
+                .save_file();
+            execute(async move {
+                let file = task.await;
+                if let Some(file) = file {
+                    _ = file.write(&contents).await;
+                }
+            });
+        }
+    }
 }
 
 fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &EditorProject) {
@@ -574,6 +628,10 @@ impl eframe::App for DesignerApp {
                     );
                     if self.project.is_some() && ui.button("Export IOP (.iop)").clicked() {
                         self.save_pool();
+                        ui.close();
+                    }
+                    if self.project.is_some() && ui.button("Export Header (.h)").clicked() {
+                        self.save_header();
                         ui.close();
                     }
                 });
