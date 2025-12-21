@@ -18,6 +18,7 @@ use ag_iso_stack::object_pool::ObjectType;
 use eframe::egui;
 use eframe::egui::TextWrapMode;
 use std::collections::HashSet;
+use tracing_subscriber::fmt::format;
 
 /// Check if adding a reference from `parent_id` to `child_id` would create a circular reference
 /// Returns true if it would create a cycle (and should be blocked)
@@ -2726,6 +2727,7 @@ impl ConfigurableObject for PictureGraphic {
         );
         ui.label(format!("Actual Image Width: {}", self.actual_width));
         ui.label(format!("Actual Image Height: {}", self.actual_height));
+        ui.label(format!("Data Size (bytes): {}", self.data.len()));
         ui.horizontal(|ui| {
             ui.label("Format:");
             if ui
