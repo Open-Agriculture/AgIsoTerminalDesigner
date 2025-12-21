@@ -5,8 +5,7 @@
 use std::{cell::RefCell, collections::HashMap};
 
 use ag_iso_stack::object_pool::{
-    object::Object, object_attributes::HorizontalAlignment, NullableObjectId, ObjectId, ObjectPool,
-    ObjectType,
+    object::Object, NullableObjectId, ObjectId, ObjectPool, ObjectType,
 };
 
 use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
@@ -444,28 +443,9 @@ impl EditorProject {
                 if let Some(name) = &meta.name {
                     info.set_name(name.clone());
                 }
-
-                // Restore horizontal justification for OutputString objects (workaround)
-                if let Some(justification_str) = &meta.output_string_horizontal_justification {
-                    let horizontal_align = match justification_str.as_str() {
-                        "Left" => HorizontalAlignment::Left,
-                        "Middle" => HorizontalAlignment::Middle,
-                        "Right" => HorizontalAlignment::Right,
-                        _ => continue,
-                    };
-
-                    if let Some(obj) = mut_pool.borrow_mut().object_mut_by_id(object.id()) {
-                        if let Object::OutputString(os) = obj {
-                            os.justification.horizontal = horizontal_align;
-                        }
-                    }
-                }
             }
         }
         drop(object_info);
-
-        // Update the pool to apply the justification fixes
-        editor_project.update_pool();
 
         // Apply smart naming to objects without custom names
         for object in editor_project.pool.objects() {

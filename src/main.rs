@@ -177,87 +177,47 @@ impl DesignerApp {
                             match obj {
                                 Object::PictureGraphic(o) => {
                                     if let Ok(img) = image::load_from_memory(&content) {
-                                        // Try to preserve alpha channel if available (PNG with transparency)
-                                        let has_alpha = img.color().has_alpha();
-                                        let rgba_img = if has_alpha {
-                                            Some(img.to_rgba8())
-                                        } else {
-                                            None
-                                        };
-
-                                        let rgb_img = img.to_rgb8();
-                                        let (width, height) = rgb_img.dimensions();
-
                                         // Update image dimensions
-                                        o.actual_width = width as u16;
-                                        o.actual_height = height as u16;
+                                        if img.width() > u16::MAX as u32
+                                            || img.height() > u16::MAX as u32
+                                        {
+                                            log::error!(
+                                                "Image dimensions exceed maximum size of {}x{}",
+                                                u16::MAX,
+                                                u16::MAX
+                                            );
+                                            return;
+                                        }
+                                        o.actual_width = img.width() as u16;
+                                        o.actual_height = img.height() as u16;
+                                        if o.width == 0 {
+                                            // default to actual size if not set
+                                            o.width = o.actual_width;
+                                        }
 
                                         // Set format to 8-bit for maximum color support
                                         o.format = PictureGraphicFormat::EightBit;
                                         o.options.data_code_type = DataCodeType::Raw;
 
-                                        // Detect white color index for transparency
-                                        let white_color_index = find_closest_color_index(
-                                            &pool.get_pool(),
-                                            255,
-                                            255,
-                                            255,
-                                        );
+                                        // We set transparent color to 1 (arbitrary choice) as we
+                                        // only use index 15..255 for actual colors
+                                        o.transparency_colour = 1;
+                                        o.options.transparent = true;
 
                                         // Convert RGB pixels to color indices
-                                        // If we have alpha channel, use it; otherwise detect white pixels
-                                        if let Some(rgba) = rgba_img {
-                                            // Use alpha channel from PNG
-                                            o.data = rgba
-                                                .pixels()
-                                                .map(|pixel| {
-                                                    // If pixel is transparent (alpha < 128), use white index
-                                                    // Otherwise convert RGB to color index
-                                                    if pixel[3] < 128 {
-                                                        white_color_index
-                                                    } else {
-                                                        find_closest_color_index(
-                                                            &pool.get_pool(),
-                                                            pixel[0],
-                                                            pixel[1],
-                                                            pixel[2],
-                                                        )
-                                                    }
-                                                })
-                                                .collect();
-                                            // Enable transparency with white as transparent color
-                                            o.options.transparent = true;
-                                            o.transparency_colour = white_color_index;
-                                        } else {
-                                            // No alpha channel - detect white/light pixels
-                                            o.data = rgb_img
-                                                .pixels()
-                                                .map(|pixel| {
-                                                    // Detect very light/white pixels (threshold: R+G+B > 700)
-                                                    let brightness = pixel[0] as u16
-                                                        + pixel[1] as u16
-                                                        + pixel[2] as u16;
-                                                    if brightness > 700 {
-                                                        white_color_index
-                                                    } else {
-                                                        find_closest_color_index(
-                                                            &pool.get_pool(),
-                                                            pixel[0],
-                                                            pixel[1],
-                                                            pixel[2],
-                                                        )
-                                                    }
-                                                })
-                                                .collect();
-                                            // Enable transparency with white as transparent color
-                                            o.options.transparent = true;
-                                            o.transparency_colour = white_color_index;
-                                        }
-
-                                        // Update width to match actual image width if it's 0 or different
-                                        if o.width == 0 || o.width != o.actual_width {
-                                            o.width = o.actual_width;
-                                        }
+                                        o.data = img
+                                            .to_rgba8()
+                                            .pixels()
+                                            .map(|pixel| {
+                                                if pixel[3] == 0 {
+                                                    // Transparent pixel
+                                                    return o.transparency_colour;
+                                                }
+                                                find_closest_color_index(
+                                                    pixel[0], pixel[1], pixel[2],
+                                                )
+                                            })
+                                            .collect();
                                     } else {
                                         log::error!("Failed to decode image");
                                     }
@@ -940,32 +900,17 @@ fn main() {
 }
 
 /// Find the closest color index in the palette for a given RGB value
-fn find_closest_color_index(pool: &ObjectPool, r: u8, g: u8, b: u8) -> u8 {
-    let mut best_index = 0u8;
-    let mut best_distance = f64::MAX;
-
-    // Search through all possible color indices (0-255)
-    for index in 0..=255u8 {
-        let color = pool.color_by_index(index);
-        let distance = {
-            let dr = color.r as f64 - r as f64;
-            let dg = color.g as f64 - g as f64;
-            let db = color.b as f64 - b as f64;
-            (dr * dr + dg * dg + db * db).sqrt()
-        };
-
-        if distance < best_distance {
-            best_distance = distance;
-            best_index = index;
-        }
-
-        // Early exit if we find an exact match
-        if distance == 0.0 {
-            break;
-        }
+fn find_closest_color_index(r: u8, g: u8, b: u8) -> u8 {
+    fn quantize_channel(c: u8) -> u8 {
+        // ((c + 25) / 51) in integer math, capped to 0..5
+        let v = (c as u16 + 25) / 51;
+        v.min(5) as u8
     }
+    let rq = quantize_channel(r);
+    let gq = quantize_channel(g);
+    let bq = quantize_channel(b);
 
-    best_index
+    16 + 36 * rq + 6 * gq + bq
 }
 
 #[cfg(not(target_arch = "wasm32"))]
