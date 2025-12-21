@@ -1246,9 +1246,11 @@ impl RenderableObject for PictureGraphic {
             });
         }
 
+        // Use image dimensions, but clip to the available rect
+        let image_size = egui::Vec2::new(self.width as f32, self.height() as f32);
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             if let Some(texture_id) = texture_id {
-                ui.image((texture_id, rect.size()));
+                ui.image((texture_id, image_size));
             } else {
                 ui.colored_label(Color32::RED, "Failed to load image");
             }
