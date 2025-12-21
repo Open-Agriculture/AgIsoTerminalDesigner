@@ -177,10 +177,11 @@ impl DesignerApp {
                             match obj {
                                 Object::PictureGraphic(o) => {
                                     if let Ok(img) = image::load_from_memory(&content) {
-                                        // Update image dimensions
-                                        if img.width() > u16::MAX as u32
-                                            || img.height() > u16::MAX as u32
-                                        {
+                                        // Update dimensions based on the new picture
+                                        let w = img.width();
+                                        let h = img.height();
+
+                                        if w > u16::MAX as u32 || h > u16::MAX as u32 {
                                             log::error!(
                                                 "Image dimensions exceed maximum size of {}x{}",
                                                 u16::MAX,
@@ -188,36 +189,90 @@ impl DesignerApp {
                                             );
                                             return;
                                         }
-                                        o.actual_width = img.width() as u16;
-                                        o.actual_height = img.height() as u16;
+
+                                        o.actual_width = w as u16;
+                                        o.actual_height = h as u16;
                                         if o.width == 0 {
-                                            // default to actual size if not set
                                             o.width = o.actual_width;
                                         }
 
-                                        // Set format to 8-bit for maximum color support
+                                        // Set format by default to 8-bit color, user can change it in UI
                                         o.format = PictureGraphicFormat::EightBit;
-                                        o.options.data_code_type = DataCodeType::Raw;
 
                                         // We set transparent color to 1 (arbitrary choice) as we
                                         // only use index 15..255 for actual colors
                                         o.transparency_colour = 1;
                                         o.options.transparent = true;
 
-                                        // Convert RGB pixels to color indices
-                                        o.data = img
-                                            .to_rgba8()
-                                            .pixels()
-                                            .map(|pixel| {
-                                                if pixel[3] == 0 {
-                                                    // Transparent pixel
-                                                    return o.transparency_colour;
-                                                }
-                                                find_closest_color_index(
-                                                    pixel[0], pixel[1], pixel[2],
-                                                )
-                                            })
-                                            .collect();
+                                        let rgba = if let Some(view) = img.as_rgba8() {
+                                            // Borrowed view (no allocation)
+                                            std::borrow::Cow::Borrowed(view)
+                                        } else {
+                                            // Allocates once if the image isn't already RGBA8
+                                            std::borrow::Cow::Owned(img.to_rgba8())
+                                        };
+
+                                        // Build raw and run-length encoded data
+                                        let pixel_count = (w as usize) * (h as usize);
+
+                                        // Worst case: raw = N, rle = 2*N
+                                        let mut raw = Vec::with_capacity(pixel_count);
+                                        let mut rle = Vec::with_capacity(pixel_count * 2);
+
+                                        let mut have_run = false;
+                                        let mut run_value: u8 = 0;
+                                        let mut run_count: u8 = 0;
+
+                                        for p in rgba.pixels() {
+                                            let idx = if p[3] == 0 {
+                                                o.transparency_colour
+                                            } else {
+                                                find_closest_color_index(p[0], p[1], p[2])
+                                            };
+
+                                            raw.push(idx);
+
+                                            if !have_run {
+                                                have_run = true;
+                                                run_value = idx;
+                                                run_count = 1;
+                                                continue;
+                                            }
+
+                                            if idx == run_value && run_count < u8::MAX {
+                                                run_count += 1;
+                                            } else {
+                                                rle.push(run_count);
+                                                rle.push(run_value);
+                                                run_value = idx;
+                                                run_count = 1;
+                                            }
+                                        }
+
+                                        // flush final run
+                                        if have_run {
+                                            rle.push(run_count);
+                                            rle.push(run_value);
+                                        }
+
+                                        // Choose the best encoding
+                                        if rle.len() < raw.len() {
+                                            o.data = rle;
+                                            o.options.data_code_type = DataCodeType::RunLength;
+                                            log::info!(
+                                            "Selected run-length encoding ({} bytes) over raw ({} bytes)",
+                                            o.data.len(),
+                                            raw.len()
+                                        );
+                                        } else {
+                                            o.data = raw;
+                                            o.options.data_code_type = DataCodeType::Raw;
+                                            log::info!(
+                                            "Selected raw encoding ({} bytes) over run-length ({} bytes)",
+                                            o.data.len(),
+                                            rle.len()
+                                        );
+                                        }
                                     } else {
                                         log::error!("Failed to decode image");
                                     }
