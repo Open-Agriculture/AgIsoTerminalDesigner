@@ -2726,6 +2726,7 @@ impl ConfigurableObject for PictureGraphic {
         );
         ui.label(format!("Actual Image Width: {}", self.actual_width));
         ui.label(format!("Actual Image Height: {}", self.actual_height));
+        ui.label(format!("Data Size (bytes): {}", self.data.len()));
         ui.horizontal(|ui| {
             ui.label("Format:");
             if ui
