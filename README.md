@@ -122,9 +122,9 @@ The lists below only apply to version 3 of the VT specification. There are 3 sta
 - :white_circle: OutputArchedBarGraph
 - :green_circle: PictureGraphic
 - :green_circle: ObjectPointer
-- :white_circle: Auxiliary Function Type 2
-- :white_circle: Auxiliary Input Type 2
-- :white_circle: Auxiliary Control Designator Type 2 Object Pointer
+- :yellow_circle: Auxiliary Function Type 2
+- :yellow_circle: Auxiliary Input Type 2
+- :yellow_circle: Auxiliary Control Designator Type 2 Object Pointer
 
 
 ## Installation

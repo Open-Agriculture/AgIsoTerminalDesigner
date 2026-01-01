@@ -143,11 +143,6 @@ fn render_object_refs(ui: &mut egui::Ui, pool: &ObjectPool, object_refs: &Vec<Ob
 
 impl RenderableObject for WorkingSet {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, _: Point<i16>) {
-        if !self.selectable {
-            // The working set is not visible
-            return;
-        }
-
         ui.painter().rect_filled(
             ui.available_rect_before_wrap(),
             0.0,
@@ -567,7 +562,7 @@ impl RenderableObject for InputList {
 
 impl RenderableObject for Key {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(ui, position, egui::Vec2::new(100.0, 100.0));
+        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             render_object_refs(ui, pool, &self.object_refs);
@@ -1260,21 +1255,108 @@ impl RenderableObject for PictureGraphic {
 
 impl RenderableObject for AuxiliaryFunctionType2 {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        ui.colored_label(Color32::RED, "AuxiliaryFunctionType2 not implemented");
+        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
+
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            // Draw background colour
+            let background_colour = pool.color_by_index(self.background_colour).convert();
+            ui.painter().rect_filled(rect, 0.0, background_colour);
+
+            // Render child objects (the function designator content)
+            render_object_refs(ui, pool, &self.object_refs);
+        });
     }
 }
 
 impl RenderableObject for AuxiliaryInputType2 {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        ui.colored_label(Color32::RED, "AuxiliaryInputType2 not implemented");
+        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
+
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            // Draw background colour
+            let background_colour = pool.color_by_index(self.background_colour).convert();
+            ui.painter().rect_filled(rect, 0.0, background_colour);
+
+            // Render child objects (the input designator content)
+            render_object_refs(ui, pool, &self.object_refs);
+        });
     }
 }
 
 impl RenderableObject for AuxiliaryControlDesignatorType2 {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        ui.colored_label(
-            Color32::RED,
-            "AuxiliaryControlDesignatorType2 not implemented",
-        );
+        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
+
+        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            // Determine what to display based on pointer_type
+            match self.pointer_type {
+                0 => {
+                    // Pointer type 0: Points to Auxiliary Object referenced by auxiliary_object_id
+                    // Display the auxiliary object designator
+                    if let Some(aux_obj_id) = self.auxiliary_object_id.0 {
+                        match pool.object_by_id(aux_obj_id) {
+                            Some(Object::AuxiliaryFunctionType2(aux_func)) => {
+                                // Render the auxiliary function designator
+                                render_object_refs(ui, pool, &aux_func.object_refs);
+                            }
+                            Some(Object::AuxiliaryInputType2(aux_input)) => {
+                                // Render the auxiliary input designator
+                                render_object_refs(ui, pool, &aux_input.object_refs);
+                            }
+                            Some(_) => {
+                                ui.colored_label(
+                                    Color32::RED,
+                                    format!("Invalid aux object type: {:?}", aux_obj_id),
+                                );
+                            }
+                            None => {
+                                ui.colored_label(
+                                    Color32::RED,
+                                    format!("Missing aux object: {:?}", aux_obj_id),
+                                );
+                            }
+                        }
+                    }
+                }
+                1 => {
+                    // Pointer type 1: Points to Auxiliary Function/Input that is assigned to the auxiliary object
+                    // In a real VT, this would show the assigned auxiliary object designator.
+                    // Since we don't have runtime assignment info, we show a placeholder.
+                    ui.painter()
+                        .rect_filled(rect, 0.0, Color32::from_rgb(220, 220, 255));
+                    ui.colored_label(Color32::DARK_BLUE, "Assigned\nAux Obj");
+                }
+                2 => {
+                    // Pointer type 2: Points to Working Set object for the owner of this pointer
+                    if let Some(ws) = pool.objects().iter().find_map(|obj| {
+                        if let Object::WorkingSet(ws) = obj {
+                            Some(ws)
+                        } else {
+                            None
+                        }
+                    }) {
+                        // Render working set designator
+                        ws.render(ui, pool, Point { x: 0, y: 0 });
+                    } else {
+                        ui.colored_label(Color32::RED, "No working set object defined");
+                    }
+                }
+                3 => {
+                    // Pointer type 3: Points to Working Set object for the WS that owns the assigned aux object
+                    // In a real VT, this would show the working set designator of the assigned object's owner.
+                    // Since we don't have runtime assignment info, we show a placeholder.
+                    ui.painter()
+                        .rect_filled(rect, 0.0, Color32::from_rgb(255, 220, 220));
+                    ui.colored_label(Color32::DARK_RED, "Assigned\nWS");
+                }
+                _ => {
+                    // Invalid pointer type
+                    ui.colored_label(
+                        Color32::RED,
+                        format!("Invalid pointer type: {}", self.pointer_type),
+                    );
+                }
+            }
+        });
     }
 }
