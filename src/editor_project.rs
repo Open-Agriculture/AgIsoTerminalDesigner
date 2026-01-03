@@ -8,12 +8,12 @@ use ag_iso_stack::object_pool::{
     object::Object, NullableObjectId, ObjectId, ObjectPool, ObjectType,
 };
 
-use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
+use crate::{object_updates::UpdateQueue, project_file::ProjectFile, smart_naming, ObjectInfo};
 
 const MAX_UNDO_REDO_POOL: usize = 10;
 const MAX_UNDO_REDO_SELECTED: usize = 20;
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct EditorProject {
     pool: ObjectPool,
     mut_pool: RefCell<ObjectPool>,
@@ -38,6 +38,33 @@ pub struct EditorProject {
 
     /// Request to open image file dialog for PictureGraphic object
     image_load_request: RefCell<Option<ObjectId>>,
+
+    /// Queue for deferred object updates - new mechanism for efficient updates
+    #[allow(clippy::type_complexity)]
+    update_queue: UpdateQueue,
+}
+
+impl Clone for EditorProject {
+    fn clone(&self) -> Self {
+        EditorProject {
+            pool: self.pool.clone(),
+            mut_pool: RefCell::new(self.mut_pool.borrow().clone()),
+            undo_pool_history: self.undo_pool_history.clone(),
+            redo_pool_history: self.redo_pool_history.clone(),
+            selected_object: self.selected_object.clone(),
+            mut_selected_object: RefCell::new(self.mut_selected_object.borrow().clone()),
+            undo_selected_history: self.undo_selected_history.clone(),
+            redo_selected_history: self.redo_selected_history.clone(),
+            mask_size: self.mask_size,
+            soft_key_size: self.soft_key_size,
+            object_info: RefCell::new(self.object_info.borrow().clone()),
+            renaming_object: RefCell::new(self.renaming_object.borrow().clone()),
+            next_available_id: RefCell::new(*self.next_available_id.borrow()),
+            default_object_names: RefCell::new(self.default_object_names.borrow().clone()),
+            image_load_request: RefCell::new(self.image_load_request.borrow().clone()),
+            update_queue: UpdateQueue::new(), // Always start with empty queue when cloning
+        }
+    }
 }
 
 impl From<ObjectPool> for EditorProject {
@@ -68,6 +95,7 @@ impl From<ObjectPool> for EditorProject {
             next_available_id: RefCell::new(max_id.saturating_add(1)),
             default_object_names: RefCell::new(HashMap::new()),
             image_load_request: RefCell::new(None),
+            update_queue: UpdateQueue::new(),
         }
     }
 }
@@ -151,6 +179,9 @@ impl EditorProject {
     /// and update the current pool with the mutated pool.
     /// Returns true if the pool was updated
     pub fn update_pool(&mut self) -> bool {
+        // First, apply any queued updates
+        self.apply_queued_updates();
+        
         if self.mut_pool.borrow().to_owned() != self.pool {
             self.redo_pool_history.clear();
             self.undo_pool_history.push(self.pool.clone());
@@ -164,6 +195,40 @@ impl EditorProject {
             return true;
         }
         false
+    }
+
+    /// Queue an update to be applied to an object in the pool
+    /// This is the preferred way to update objects - updates are collected and applied together
+    /// at the end of the frame, creating a single undo entry
+    pub fn queue_update<F>(&self, object_id: ObjectId, update_fn: F)
+    where
+        F: FnOnce(&mut Object) + Send + 'static,
+    {
+        self.update_queue.queue(object_id, update_fn);
+    }
+
+    /// Apply all queued updates to the mutable pool
+    /// This is called automatically by update_pool()
+    fn apply_queued_updates(&self) {
+        if !self.update_queue.has_updates() {
+            return;
+        }
+
+        let mut mut_pool = self.mut_pool.borrow_mut();
+        match self.update_queue.apply_all(&mut *mut_pool) {
+            Ok(count) if count > 0 => {
+                log::debug!("Applied {} queued updates to pool", count);
+            }
+            Err(errors) => {
+                log::error!("Failed to apply some updates: {:?}", errors);
+            }
+            _ => {}
+        }
+    }
+
+    /// Check if there are any pending updates in the queue
+    pub fn has_pending_updates(&self) -> bool {
+        self.update_queue.has_updates()
     }
 
     /// Undo the last action
