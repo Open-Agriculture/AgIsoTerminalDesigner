@@ -15,6 +15,9 @@ mod project_file;
 mod smart_naming;
 mod update_helpers;
 
+#[cfg(test)]
+mod update_queue_tests;
+
 pub use editor_project::EditorProject;
 pub use interactive_rendering_simple::InteractiveMaskRenderer;
 pub use object_configuring::ConfigurableObject;

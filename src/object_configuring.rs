@@ -2891,9 +2891,20 @@ impl ConfigurableObject for NumberVariable {
     fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
         render_object_id(ui, &mut self.id, design);
 
+        let object_id = self.id;
+        let mut value = self.value;
+
         ui.horizontal(|ui| {
             ui.label("Initial Value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
+            if ui.add(egui::DragValue::new(&mut value).speed(1.0)).changed() {
+                // Queue the update using the new UpdateQueue system
+                // This demonstrates the new pattern while keeping direct mutation working
+                design.queue_update(object_id, move |obj| {
+                    if let Object::NumberVariable(nv) = obj {
+                        nv.value = value;
+                    }
+                });
+            }
         });
     }
 }
@@ -2902,9 +2913,19 @@ impl ConfigurableObject for StringVariable {
     fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
         render_object_id(ui, &mut self.id, design);
 
+        let object_id = self.id;
+        let mut value = self.value.clone();
+
         ui.horizontal(|ui| {
             ui.label("Initial Value:");
-            ui.text_edit_singleline(&mut self.value);
+            if ui.text_edit_singleline(&mut value).changed() {
+                // Queue the update using the new UpdateQueue system
+                design.queue_update(object_id, move |obj| {
+                    if let Object::StringVariable(sv) = obj {
+                        sv.value = value;
+                    }
+                });
+            }
         });
     }
 }
