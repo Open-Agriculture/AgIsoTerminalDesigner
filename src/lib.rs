@@ -14,7 +14,7 @@ mod project_file;
 mod smart_naming;
 
 pub use editor_project::EditorProject;
-pub use interactive_rendering_simple::InteractiveMaskRenderer;
+pub use interactive_rendering_simple::{InteractiveMaskRenderer, PendingObjectUpdates};
 pub use object_configuring::ConfigurableObject;
 pub use object_defaults::default_object;
 pub use object_info::ObjectInfo;

@@ -474,4 +474,163 @@ impl EditorProject {
     pub fn take_image_load_request(&self) -> Option<ObjectId> {
         self.image_load_request.replace(None)
     }
+
+    /// Update the position of an object within its parent
+    /// Returns true if the position was updated successfully
+    pub fn update_object_position(&self, object_id: ObjectId, delta_x: i16, delta_y: i16) -> bool {
+        let mut pool = self.mut_pool.borrow_mut();
+
+        // Find the parent that contains this object and get its ID
+        let parent_ids: Vec<ObjectId> = pool.objects().iter()
+            .filter_map(|parent| {
+                match parent {
+                    Object::DataMask(mask) => {
+                        if mask.object_refs.iter().any(|r| r.id == object_id) {
+                            Some(parent.id())
+                        } else {
+                            None
+                        }
+                    }
+                    Object::AlarmMask(mask) => {
+                        if mask.object_refs.iter().any(|r| r.id == object_id) {
+                            Some(parent.id())
+                        } else {
+                            None
+                        }
+                    }
+                    Object::Container(container) => {
+                        if container.object_refs.iter().any(|r| r.id == object_id) {
+                            Some(parent.id())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None
+                }
+            })
+            .collect();
+
+        for parent_id in parent_ids {
+            if let Some(parent) = pool.object_mut_by_id(parent_id) {
+                match parent {
+                    Object::DataMask(ref mut mask) => {
+                        for obj_ref in mask.object_refs.iter_mut() {
+                            if obj_ref.id == object_id {
+                                obj_ref.offset.x = (obj_ref.offset.x + delta_x).max(0);
+                                obj_ref.offset.y = (obj_ref.offset.y + delta_y).max(0);
+                                return true;
+                            }
+                        }
+                    }
+                    Object::AlarmMask(ref mut mask) => {
+                        for obj_ref in mask.object_refs.iter_mut() {
+                            if obj_ref.id == object_id {
+                                obj_ref.offset.x = (obj_ref.offset.x + delta_x).max(0);
+                                obj_ref.offset.y = (obj_ref.offset.y + delta_y).max(0);
+                                return true;
+                            }
+                        }
+                    }
+                    Object::Container(ref mut container) => {
+                        for obj_ref in container.object_refs.iter_mut() {
+                            if obj_ref.id == object_id {
+                                obj_ref.offset.x = (obj_ref.offset.x + delta_x).max(0);
+                                obj_ref.offset.y = (obj_ref.offset.y + delta_y).max(0);
+                                return true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Update the size of an object
+    /// Returns true if the size was updated successfully
+    pub fn update_object_size(&self, object_id: ObjectId, delta_width: i16, delta_height: i16) -> bool {
+        let mut pool = self.mut_pool.borrow_mut();
+
+        if let Some(object) = pool.object_mut_by_id(object_id) {
+            match object {
+                Object::Container(ref mut container) => {
+                    let new_width = (container.width as i32 + delta_width as i32).max(1).min(u16::MAX as i32) as u16;
+                    let new_height = (container.height as i32 + delta_height as i32).max(1).min(u16::MAX as i32) as u16;
+                    container.width = new_width;
+                    container.height = new_height;
+                    return true;
+                }
+                Object::Button(ref mut button) => {
+                    let new_width = (button.width as i32 + delta_width as i32).max(1).min(u16::MAX as i32) as u16;
+                    let new_height = (button.height as i32 + delta_height as i32).max(1).min(u16::MAX as i32) as u16;
+                    button.width = new_width;
+                    button.height = new_height;
+                    return true;
+                }
+                Object::InputBoolean(ref mut input) => {
+                    let new_width = (input.width as i32 + delta_width as i32).max(1).min(u16::MAX as i32) as u16;
+                    input.width = new_width;
+                    return true;
+                }
+                Object::OutputRectangle(ref mut rect) => {
+                    let new_width = (rect.width as i32 + delta_width as i32).max(1).min(u16::MAX as i32) as u16;
+                    let new_height = (rect.height as i32 + delta_height as i32).max(1).min(u16::MAX as i32) as u16;
+                    rect.width = new_width;
+                    rect.height = new_height;
+                    return true;
+                }
+                Object::OutputLine(ref mut line) => {
+                    let new_width = (line.width as i32 + delta_width as i32).max(1).min(u16::MAX as i32) as u16;
+                    let new_height = (line.height as i32 + delta_height as i32).max(1).min(u16::MAX as i32) as u16;
+                    line.width = new_width;
+                    line.height = new_height;
+                    return true;
+                }
+                Object::PictureGraphic(ref mut pic) => {
+                    let new_width = (pic.width as i32 + delta_width as i32).max(1).min(u16::MAX as i32) as u16;
+                    pic.width = new_width;
+                    return true;
+                }
+                _ => {
+                    // Other object types - add as needed
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Apply pending updates from interactive rendering
+    /// Returns true if any updates were applied
+    pub fn apply_pending_updates(&self, ctx: &eframe::egui::Context) -> bool {
+        use crate::PendingObjectUpdates;
+
+        let updates_id = eframe::egui::Id::new("pending_object_updates");
+        let mut pending_updates: PendingObjectUpdates =
+            ctx.data_mut(|d| d.get_temp(updates_id).unwrap_or_default());
+
+        let mut changed = false;
+
+        // Apply position updates
+        for (object_id, delta_x, delta_y) in pending_updates.position_updates.drain(..) {
+            if self.update_object_position(object_id, delta_x, delta_y) {
+                changed = true;
+            }
+        }
+
+        // Apply size updates
+        for (object_id, delta_w, delta_h) in pending_updates.size_updates.drain(..) {
+            if self.update_object_size(object_id, delta_w, delta_h) {
+                changed = true;
+            }
+        }
+
+        // Clear the pending updates
+        pending_updates.clear();
+        ctx.data_mut(|d| d.insert_temp(updates_id, pending_updates));
+
+        changed
+    }
 }

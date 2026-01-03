@@ -845,10 +845,13 @@ impl eframe::App for DesignerApp {
                         Some(mask) => match pool.get_pool().object_by_id(mask.active_mask) {
                             Some(obj) => {
                                 let selected_ref = pool.get_mut_selected();
+                                let current_selected = pool.get_selected().0;
+                                let mut_pool_ref = pool.get_mut_pool();
+                                let mask_size = pool.mask_size;
 
                                 egui::ScrollArea::both().show(ui, |ui| {
                                     ui.add_sized(
-                                        [pool.mask_size as f32, pool.mask_size as f32],
+                                        [mask_size as f32, mask_size as f32],
                                         InteractiveMaskRenderer {
                                             object: obj,
                                             pool: pool.get_pool(),
@@ -856,6 +859,9 @@ impl eframe::App for DesignerApp {
                                                 *selected_ref.borrow_mut() =
                                                     NullableObjectId(Some(object_id));
                                             }),
+                                            selected_object_id: current_selected,
+                                            position_callback: None,
+                                            resize_callback: None,
                                         },
                                     );
                                 });
@@ -916,6 +922,11 @@ impl eframe::App for DesignerApp {
                 }
                 ui.allocate_space(ui.available_size());
             });
+
+            // Apply any pending drag/resize updates
+            if pool.apply_pending_updates(ctx) {
+                ctx.request_repaint();
+            }
 
             if pool.update_pool() {
                 ctx.request_repaint();
