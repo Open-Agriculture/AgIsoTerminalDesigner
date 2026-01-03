@@ -1184,17 +1184,31 @@ impl RenderableObject for PictureGraphic {
                 match self.format {
                     PictureGraphicFormat::Monochrome => {
                         for bit in 0..8 {
-                            colors.push(pool.color_by_index((raw >> (7 - bit)) & 0x01).convert());
+                            let color_index = (raw >> (7 - bit)) & 0x01;
+                            if self.options.transparent && color_index == self.transparency_colour {
+                                colors.push(Color32::TRANSPARENT);
+                            } else {
+                                colors.push(pool.color_by_index(color_index).convert());
+                            }
                         }
                     }
                     PictureGraphicFormat::FourBit => {
                         for segment in 0..2 {
                             let shift = 4 - (segment * 4);
-                            colors.push(pool.color_by_index((raw >> shift) & 0x0F).convert());
+                            let color_index = (raw >> shift) & 0x0F;
+                            if self.options.transparent && color_index == self.transparency_colour {
+                                colors.push(Color32::TRANSPARENT);
+                            } else {
+                                colors.push(pool.color_by_index(color_index).convert());
+                            }
                         }
                     }
                     PictureGraphicFormat::EightBit => {
-                        colors.push(pool.color_by_index(raw).convert());
+                        if self.options.transparent && raw == self.transparency_colour {
+                            colors.push(Color32::TRANSPARENT);
+                        } else {
+                            colors.push(pool.color_by_index(raw).convert());
+                        }
                     }
                 }
 
@@ -1203,11 +1217,7 @@ impl RenderableObject for PictureGraphic {
                     if idx >= image.pixels.len() {
                         break;
                     }
-                    if !(self.options.transparent
-                        && color == pool.color_by_index(self.transparency_colour).convert())
-                    {
-                        image.pixels[idx] = color;
-                    }
+                    image.pixels[idx] = color;
 
                     x += 1;
                     if x >= self.actual_width {

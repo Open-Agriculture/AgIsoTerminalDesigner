@@ -2868,13 +2868,22 @@ impl ConfigurableObject for PictureGraphic {
 
         ui.separator();
         ui.label("Image:");
-        if ui
-            .button("Load Image")
-            .on_hover_text("Load an image file (PNG, JPG, BMP, etc.)")
-            .clicked()
-        {
-            design.request_image_load(self.id);
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .button("Load Image")
+                .on_hover_text("Load an image file (PNG, JPG, BMP, etc.)")
+                .clicked()
+            {
+                design.request_image_load(self.id);
+            }
+            if ui
+                .button("Export Image")
+                .on_hover_text("Export image to PNG file")
+                .clicked()
+            {
+                design.request_image_export(self.id);
+            }
+        });
 
         ui.separator();
         ui.label("Macros:");

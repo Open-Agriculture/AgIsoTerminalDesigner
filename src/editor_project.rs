@@ -38,6 +38,9 @@ pub struct EditorProject {
 
     /// Request to open image file dialog for PictureGraphic object
     image_load_request: RefCell<Option<ObjectId>>,
+
+    /// Request to export image file for PictureGraphic object
+    image_export_request: RefCell<Option<ObjectId>>,
 }
 
 impl From<ObjectPool> for EditorProject {
@@ -68,6 +71,7 @@ impl From<ObjectPool> for EditorProject {
             next_available_id: RefCell::new(max_id.saturating_add(1)),
             default_object_names: RefCell::new(HashMap::new()),
             image_load_request: RefCell::new(None),
+            image_export_request: RefCell::new(None),
         }
     }
 }
@@ -473,5 +477,15 @@ impl EditorProject {
     /// Take and clear the image load request if any
     pub fn take_image_load_request(&self) -> Option<ObjectId> {
         self.image_load_request.replace(None)
+    }
+
+    /// Request to export image file for a PictureGraphic object
+    pub fn request_image_export(&self, object_id: ObjectId) {
+        self.image_export_request.replace(Some(object_id));
+    }
+
+    /// Take and clear the image export request if any
+    pub fn take_image_export_request(&self) -> Option<ObjectId> {
+        self.image_export_request.replace(None)
     }
 }

@@ -14,6 +14,7 @@ use ag_iso_terminal_designer::EditorProject;
 use ag_iso_terminal_designer::InteractiveMaskRenderer;
 use ag_iso_terminal_designer::RenderableObject;
 use eframe::egui;
+use image::ImageEncoder;
 use std::future::Future;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
@@ -24,6 +25,7 @@ enum FileDialogReason {
     LoadPool,
     LoadProject,
     OpenImagePictureGraphics(ObjectId),
+    ExportImagePictureGraphics(ObjectId),
 }
 
 pub struct DesignerApp {
@@ -380,6 +382,143 @@ impl DesignerApp {
             });
         }
     }
+
+    /// Export a PictureGraphic object to a PNG file
+    fn export_image(&mut self, object_id: ObjectId) {
+        if let Some(project) = &self.project {
+            let pool = project.get_pool();
+
+            // Find the PictureGraphic object
+            if let Some(Object::PictureGraphic(picture)) = pool.object_by_id(object_id) {
+                // Decode the image to RGBA pixels
+                let rgba_data = decode_picture_graphic_to_rgba(picture, pool);
+
+                if rgba_data.is_empty() {
+                    log::error!("Failed to decode image data");
+                    return;
+                }
+
+                // Create image buffer
+                let width = picture.actual_width as u32;
+                let height = picture.actual_height as u32;
+
+                // Encode to PNG
+                let mut png_data = Vec::new();
+                {
+                    let encoder = image::codecs::png::PngEncoder::new(&mut png_data);
+                    if let Err(e) = encoder.write_image(
+                        &rgba_data,
+                        width,
+                        height,
+                        image::ExtendedColorType::Rgba8,
+                    ) {
+                        log::error!("Failed to encode PNG: {}", e);
+                        return;
+                    }
+                }
+
+                // Open save dialog
+                let default_name = format!(
+                    "{}.png",
+                    project
+                        .get_object_info(&Object::PictureGraphic(picture.clone()))
+                        .get_name(&Object::PictureGraphic(picture.clone()))
+                );
+                let task = rfd::AsyncFileDialog::new()
+                    .set_file_name(&default_name)
+                    .add_filter("PNG Image", &["png"])
+                    .save_file();
+
+                execute(async move {
+                    let file = task.await;
+                    if let Some(file) = file {
+                        _ = file.write(&png_data).await;
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Decode a PictureGraphic object to RGBA pixel data
+fn decode_picture_graphic_to_rgba(picture: &PictureGraphic, pool: &ObjectPool) -> Vec<u8> {
+    let width = picture.actual_width as usize;
+    let height = picture.actual_height as usize;
+    let mut rgba_data = vec![0u8; width * height * 4];
+
+    let mut pixel_index = 0;
+
+    // Decode based on format
+    for raw_byte in picture.data_as_raw_encoded() {
+        match picture.format {
+            PictureGraphicFormat::Monochrome => {
+                // 8 pixels per byte (1 bit each)
+                for bit in 0..8 {
+                    if pixel_index >= width * height {
+                        break;
+                    }
+                    let color_index = (raw_byte >> (7 - bit)) & 0x01;
+                    let color = pool.color_by_index(color_index);
+                    let rgba_offset = pixel_index * 4;
+                    rgba_data[rgba_offset] = color.r;
+                    rgba_data[rgba_offset + 1] = color.g;
+                    rgba_data[rgba_offset + 2] = color.b;
+                    rgba_data[rgba_offset + 3] = if picture.options.transparent
+                        && color_index == picture.transparency_colour
+                    {
+                        0
+                    } else {
+                        255
+                    };
+                    pixel_index += 1;
+                }
+            }
+            PictureGraphicFormat::FourBit => {
+                // 2 pixels per byte (4 bits each)
+                for segment in 0..2 {
+                    if pixel_index >= width * height {
+                        break;
+                    }
+                    let shift = 4 - (segment * 4);
+                    let color_index = (raw_byte >> shift) & 0x0F;
+                    let color = pool.color_by_index(color_index);
+                    let rgba_offset = pixel_index * 4;
+                    rgba_data[rgba_offset] = color.r;
+                    rgba_data[rgba_offset + 1] = color.g;
+                    rgba_data[rgba_offset + 2] = color.b;
+                    rgba_data[rgba_offset + 3] = if picture.options.transparent
+                        && color_index == picture.transparency_colour
+                    {
+                        0
+                    } else {
+                        255
+                    };
+                    pixel_index += 1;
+                }
+            }
+            PictureGraphicFormat::EightBit => {
+                // 1 pixel per byte
+                if pixel_index >= width * height {
+                    break;
+                }
+                let color_index = raw_byte;
+                let color = pool.color_by_index(color_index);
+                let rgba_offset = pixel_index * 4;
+                rgba_data[rgba_offset] = color.r;
+                rgba_data[rgba_offset + 1] = color.g;
+                rgba_data[rgba_offset + 2] = color.b;
+                rgba_data[rgba_offset + 3] =
+                    if picture.options.transparent && color_index == picture.transparency_colour {
+                        0
+                    } else {
+                        255
+                    };
+                pixel_index += 1;
+            }
+        }
+    }
+
+    rgba_data
 }
 
 fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &EditorProject) {
@@ -512,10 +651,20 @@ impl eframe::App for DesignerApp {
         self.handle_file_loaded();
 
         // Check for image load requests
-        if let Some(pool) = &self.project {
-            if let Some(object_id) = pool.take_image_load_request() {
-                self.open_file_dialog(FileDialogReason::OpenImagePictureGraphics(object_id), ctx);
-            }
+        let image_load_request = self
+            .project
+            .as_ref()
+            .and_then(|p| p.take_image_load_request());
+        let image_export_request = self
+            .project
+            .as_ref()
+            .and_then(|p| p.take_image_export_request());
+
+        if let Some(object_id) = image_load_request {
+            self.open_file_dialog(FileDialogReason::OpenImagePictureGraphics(object_id), ctx);
+        }
+        if let Some(object_id) = image_export_request {
+            self.export_image(object_id);
         }
 
         if self.show_development_popup {
