@@ -5,7 +5,10 @@
 //! Structured update helpers that provide descriptive updates with parameter information
 
 use crate::EditorProject;
-use ag_iso_stack::object_pool::{object::Object, ObjectId};
+use ag_iso_stack::object_pool::{
+    object::{NumberVariable, Object, StringVariable},
+    ObjectId,
+};
 
 /// Describes a specific parameter update with metadata for logging/debugging
 #[derive(Debug, Clone)]
@@ -84,6 +87,29 @@ pub trait UpdateHelpers {
         old_value: u32,
         new_value: u32,
         setter: impl FnOnce(&mut Object, u32) + Send + 'static,
+    ) -> ParameterUpdate;
+
+    // Type-specific update methods that avoid runtime type checks
+    // These methods know the exact object type at compile-time
+
+    /// Queue an update for a NumberVariable field
+    fn queue_number_variable_update(
+        &self,
+        object_id: ObjectId,
+        field_name: &str,
+        old_value: u32,
+        new_value: u32,
+        setter: impl FnOnce(&mut NumberVariable, u32) + Send + 'static,
+    ) -> ParameterUpdate;
+
+    /// Queue an update for a StringVariable field
+    fn queue_string_variable_update(
+        &self,
+        object_id: ObjectId,
+        field_name: &str,
+        old_value: String,
+        new_value: String,
+        setter: impl FnOnce(&mut StringVariable, String) + Send + 'static,
     ) -> ParameterUpdate;
 }
 
@@ -207,6 +233,66 @@ impl UpdateHelpers for EditorProject {
 
         update_desc
     }
+
+    fn queue_number_variable_update(
+        &self,
+        object_id: ObjectId,
+        field_name: &str,
+        old_value: u32,
+        new_value: u32,
+        setter: impl FnOnce(&mut NumberVariable, u32) + Send + 'static,
+    ) -> ParameterUpdate {
+        let update_desc = ParameterUpdate {
+            object_id,
+            field_name: field_name.to_string(),
+            old_value: old_value.to_string(),
+            new_value: new_value.to_string(),
+        };
+
+        log::debug!("{}", update_desc.description());
+
+        // Type-specific update: the type check happens once here, not at every call site
+        self.queue_update(object_id, move |obj| {
+            // This match is generated once by the helper method
+            // Call sites don't need to duplicate this logic
+            match obj {
+                Object::NumberVariable(nv) => setter(nv, new_value),
+                _ => log::warn!("Expected NumberVariable for object {}", object_id.value()),
+            }
+        });
+
+        update_desc
+    }
+
+    fn queue_string_variable_update(
+        &self,
+        object_id: ObjectId,
+        field_name: &str,
+        old_value: String,
+        new_value: String,
+        setter: impl FnOnce(&mut StringVariable, String) + Send + 'static,
+    ) -> ParameterUpdate {
+        let update_desc = ParameterUpdate {
+            object_id,
+            field_name: field_name.to_string(),
+            old_value: format!("\"{}\"", old_value),
+            new_value: format!("\"{}\"", new_value.clone()),
+        };
+
+        log::debug!("{}", update_desc.description());
+
+        // Type-specific update: the type check happens once here, not at every call site
+        self.queue_update(object_id, move |obj| {
+            // This match is generated once by the helper method
+            // Call sites don't need to duplicate this logic
+            match obj {
+                Object::StringVariable(sv) => setter(sv, new_value),
+                _ => log::warn!("Expected StringVariable for object {}", object_id.value()),
+            }
+        });
+
+        update_desc
+    }
 }
 
 #[cfg(test)]
@@ -272,5 +358,42 @@ mod tests {
 
         // Verify updates were queued
         assert!(project.has_pending_updates());
+    }
+
+    #[test]
+    fn test_type_specific_update_helpers() {
+        let mut pool = ObjectPool::new();
+        let nv = NumberVariable::new(ObjectId::new(1).unwrap(), 42);
+        pool.add(ag_iso_stack::object_pool::object::Object::NumberVariable(nv));
+        
+        let mut project = EditorProject::from(pool);
+        let obj_id = ObjectId::new(1).unwrap();
+
+        // Test NumberVariable-specific update - no type check at call site!
+        let desc = project.queue_number_variable_update(
+            obj_id,
+            "value",
+            42,
+            100,
+            |nv, val| {
+                nv.value = val;
+            },
+        );
+
+        assert_eq!(desc.field_name, "value");
+        assert_eq!(desc.old_value, "42");
+        assert_eq!(desc.new_value, "100");
+
+        // Apply updates
+        assert!(project.update_pool());
+
+        // Verify the value was changed
+        if let Some(ag_iso_stack::object_pool::object::Object::NumberVariable(nv)) = 
+            project.get_pool().object_by_id(obj_id) 
+        {
+            assert_eq!(nv.value, 100);
+        } else {
+            panic!("Expected NumberVariable");
+        }
     }
 }

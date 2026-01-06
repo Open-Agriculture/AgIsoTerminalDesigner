@@ -5,6 +5,7 @@
 use crate::allowed_object_relationships::get_allowed_child_refs;
 use crate::allowed_object_relationships::AllowedChildRefs;
 use crate::possible_events::PossibleEvents;
+use crate::update_helpers::UpdateHelpers;
 use crate::EditorProject;
 
 use ag_iso_stack::object_pool::object::*;
@@ -2892,18 +2893,22 @@ impl ConfigurableObject for NumberVariable {
         render_object_id(ui, &mut self.id, design);
 
         let object_id = self.id;
+        let old_value = self.value;
         let mut value = self.value;
 
         ui.horizontal(|ui| {
             ui.label("Initial Value:");
             if ui.add(egui::DragValue::new(&mut value).speed(1.0)).changed() {
-                // Queue the update using the new UpdateQueue system
-                // This demonstrates the new pattern while keeping direct mutation working
-                design.queue_update(object_id, move |obj| {
-                    if let Object::NumberVariable(nv) = obj {
-                        nv.value = value;
-                    }
-                });
+                // Use type-specific update helper - no runtime type check needed at call site!
+                design.queue_number_variable_update(
+                    object_id,
+                    "value",
+                    old_value,
+                    value,
+                    |nv, val| {
+                        nv.value = val;
+                    },
+                );
             }
         });
     }
@@ -2914,17 +2919,22 @@ impl ConfigurableObject for StringVariable {
         render_object_id(ui, &mut self.id, design);
 
         let object_id = self.id;
+        let old_value = self.value.clone();
         let mut value = self.value.clone();
 
         ui.horizontal(|ui| {
             ui.label("Initial Value:");
             if ui.text_edit_singleline(&mut value).changed() {
-                // Queue the update using the new UpdateQueue system
-                design.queue_update(object_id, move |obj| {
-                    if let Object::StringVariable(sv) = obj {
-                        sv.value = value;
-                    }
-                });
+                // Use type-specific update helper - no runtime type check needed at call site!
+                design.queue_string_variable_update(
+                    object_id,
+                    "value",
+                    old_value,
+                    value,
+                    |sv, val| {
+                        sv.value = val;
+                    },
+                );
             }
         });
     }
