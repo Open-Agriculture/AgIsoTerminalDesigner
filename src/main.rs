@@ -14,11 +14,13 @@ use ag_iso_terminal_designer::EditorProject;
 use ag_iso_terminal_designer::InteractiveMaskRenderer;
 use ag_iso_terminal_designer::RenderableObject;
 use eframe::egui;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::Sender;
 
 const OBJECT_HIERARCHY_ID: &str = "object_hierarchy_ui";
+const SELECTED_ANCESTRY_HIERARCHY_ID: &str = "selected_ancestry_hierarchy_ui";
 
 enum FileDialogReason {
     LoadPool,
@@ -502,6 +504,172 @@ fn update_object_hierarchy_headers(
     is_selected_or_descendant
 }
 
+fn collect_selected_to_root_chains(
+    pool: &ObjectPool,
+    current: ObjectId,
+    current_chain: &mut Vec<ObjectId>,
+    current_path: &mut HashSet<ObjectId>,
+    chains: &mut Vec<Vec<ObjectId>>,
+) {
+    let mut parent_ids: Vec<ObjectId> = pool
+        .parent_objects(current)
+        .iter()
+        .map(|parent| parent.id())
+        .collect();
+    parent_ids.sort_by_key(|id| id.value());
+    parent_ids.dedup_by_key(|id| id.value());
+
+    if parent_ids.is_empty() {
+        chains.push(current_chain.clone());
+        return;
+    }
+
+    for parent_id in parent_ids {
+        if current_path.contains(&parent_id) {
+            continue;
+        }
+
+        current_path.insert(parent_id);
+        current_chain.push(parent_id);
+        collect_selected_to_root_chains(pool, parent_id, current_chain, current_path, chains);
+        current_chain.pop();
+        current_path.remove(&parent_id);
+    }
+}
+
+fn build_selected_ancestry_adjacency(
+    pool: &ObjectPool,
+    selected: ObjectId,
+) -> HashMap<ObjectId, Vec<ObjectId>> {
+    let mut chains = Vec::new();
+    let mut current_chain = vec![selected];
+    let mut current_path = HashSet::from([selected]);
+    collect_selected_to_root_chains(
+        pool,
+        selected,
+        &mut current_chain,
+        &mut current_path,
+        &mut chains,
+    );
+
+    let mut adjacency_sets: HashMap<ObjectId, HashSet<ObjectId>> = HashMap::new();
+    for chain in chains {
+        for edge in chain.windows(2) {
+            adjacency_sets.entry(edge[0]).or_default().insert(edge[1]);
+        }
+        if let Some(last) = chain.last() {
+            adjacency_sets.entry(*last).or_default();
+        }
+    }
+
+    adjacency_sets
+        .into_iter()
+        .map(|(id, parents)| {
+            let mut sorted_parents: Vec<ObjectId> = parents.into_iter().collect();
+            sorted_parents.sort_by_key(|parent| parent.value());
+            (id, sorted_parents)
+        })
+        .collect()
+}
+
+fn render_selected_ancestry_hierarchy(
+    ui: &mut egui::Ui,
+    parent_id: egui::Id,
+    object_id: ObjectId,
+    project: &EditorProject,
+    ancestry_adjacency: &HashMap<ObjectId, Vec<ObjectId>>,
+    path_guard: &mut HashSet<ObjectId>,
+) {
+    let Some(object) = project.get_pool().object_by_id(object_id) else {
+        ui.colored_label(
+            egui::Color32::RED,
+            format!("Missing object: {}", object_id.value()),
+        );
+        return;
+    };
+
+    let parents = ancestry_adjacency
+        .get(&object_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    if parents.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(ui.spacing().indent);
+            render_selectable_object(ui, object, project);
+        });
+        return;
+    }
+
+    let id = parent_id.with(project.get_object_info(object).get_unique_id());
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+        .show_header(ui, |ui| {
+            render_selectable_object(ui, object, project);
+        })
+        .body(|ui| {
+            for (idx, parent) in parents.iter().enumerate() {
+                if path_guard.contains(parent) {
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        format!("Cycle detected in ancestry at {}", parent.value()),
+                    );
+                    continue;
+                }
+
+                path_guard.insert(*parent);
+                render_selected_ancestry_hierarchy(
+                    ui,
+                    id.with(idx),
+                    *parent,
+                    project,
+                    ancestry_adjacency,
+                    path_guard,
+                );
+                path_guard.remove(parent);
+            }
+        });
+}
+
+fn render_selected_ancestry_panel(ui: &mut egui::Ui, project: &EditorProject) {
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+    ui.strong("Selected object ancestry");
+    ui.label("Direction: selected -> parent -> grandparent -> root");
+    ui.separator();
+
+    let Some(selected_id) = project.get_selected().into() else {
+        ui.label("Select an object to view its hierarchies.");
+        return;
+    };
+
+    if project.get_pool().object_by_id(selected_id).is_none() {
+        ui.colored_label(
+            egui::Color32::RED,
+            format!("Selected object not found: {}", selected_id.value()),
+        );
+        return;
+    }
+
+    let ancestry_adjacency = build_selected_ancestry_adjacency(project.get_pool(), selected_id);
+    let mut path_guard = HashSet::from([selected_id]);
+
+    render_selected_ancestry_hierarchy(
+        ui,
+        egui::Id::new(SELECTED_ANCESTRY_HIERARCHY_ID),
+        selected_id,
+        project,
+        &ancestry_adjacency,
+        &mut path_guard,
+    );
+
+    let parent_count = ancestry_adjacency
+        .get(&selected_id)
+        .map_or(0, std::vec::Vec::len);
+    if parent_count == 0 {
+        ui.separator();
+        ui.label("The selected object has no parent relationships.");
+    }
+}
+
 impl eframe::App for DesignerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         ctx.style_mut(|style| {
@@ -721,6 +889,16 @@ impl eframe::App for DesignerApp {
         });
 
         if let Some(pool) = &mut self.project {
+            egui::TopBottomPanel::bottom("selected_ancestry_panel")
+                .default_height(180.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        render_selected_ancestry_panel(ui, pool);
+                        ui.allocate_space(ui.available_size());
+                    });
+                });
+
             // Set forward and backward navigation shortcuts to mouse buttons
             if ctx.input(|i| i.pointer.button_released(egui::PointerButton::Extra1)) {
                 pool.set_previous_selected();
