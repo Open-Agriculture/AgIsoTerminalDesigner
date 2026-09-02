@@ -141,6 +141,69 @@ fn render_object_refs(ui: &mut egui::Ui, pool: &ObjectPool, object_refs: &Vec<Ob
     }
 }
 
+fn fill_polygon_even_odd(
+    painter: &egui::Painter,
+    polygon_points: &[egui::Pos2],
+    fill_color: Color32,
+    clip_rect: egui::Rect,
+) {
+    if polygon_points.len() < 3 || fill_color == Color32::TRANSPARENT {
+        return;
+    }
+
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for p in polygon_points {
+        min_y = min_y.min(p.y);
+        max_y = max_y.max(p.y);
+    }
+
+    min_y = min_y.max(clip_rect.top());
+    max_y = max_y.min(clip_rect.bottom());
+    if max_y <= min_y {
+        return;
+    }
+
+    let y_start = min_y.floor() as i32;
+    let y_end = max_y.ceil() as i32;
+
+    for y in y_start..y_end {
+        let y_sample = y as f32 + 0.5;
+        let mut x_intersections: Vec<f32> = Vec::new();
+
+        for idx in 0..polygon_points.len() {
+            let p0 = polygon_points[idx];
+            let p1 = polygon_points[(idx + 1) % polygon_points.len()];
+
+            let y0 = p0.y;
+            let y1 = p1.y;
+
+            if (y0 <= y_sample && y_sample < y1) || (y1 <= y_sample && y_sample < y0) {
+                let t = (y_sample - y0) / (y1 - y0);
+                let x = p0.x + t * (p1.x - p0.x);
+                x_intersections.push(x);
+            }
+        }
+
+        if x_intersections.len() < 2 {
+            continue;
+        }
+
+        x_intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        for pair in x_intersections.chunks_exact(2) {
+            let x0 = pair[0].max(clip_rect.left());
+            let x1 = pair[1].min(clip_rect.right());
+            if x1 > x0 {
+                painter.line_segment(
+                    [egui::pos2(x0, y_sample), egui::pos2(x1, y_sample)],
+                    egui::Stroke::new(1.0, fill_color),
+                );
+            }
+        }
+    }
+}
+
 impl RenderableObject for WorkingSet {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, _: Point<i16>) {
         ui.painter().rect_filled(
@@ -1094,7 +1157,71 @@ impl RenderableObject for OutputPolygon {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "OutputPolygon not implemented");
+            let line_attributes = match pool.object_by_id(self.line_attributes) {
+                Some(Object::LineAttributes(attr)) => attr,
+                _ => {
+                    ui.colored_label(
+                        Color32::RED,
+                        format!(
+                            "Missing or invalid LineAttributes ID: {:?}",
+                            self.line_attributes
+                        ),
+                    );
+                    return;
+                }
+            };
+
+            if self.points.len() < 2 {
+                return;
+            }
+
+            let points: Vec<egui::Pos2> = self
+                .points
+                .iter()
+                .map(|point| rect.min + egui::vec2(point.x as f32, point.y as f32))
+                .collect();
+
+            let is_open_polygon = self.polygon_type == 3;
+
+            if !is_open_polygon && self.points.len() >= 3 {
+                if let Some(fill_id) = self.fill_attributes.into() {
+                    let fill_attributes = match pool.object_by_id(fill_id) {
+                        Some(Object::FillAttributes(f)) => f,
+                        _ => {
+                            ui.colored_label(
+                                Color32::RED,
+                                format!("Missing fill attributes: {:?}", fill_id),
+                            );
+                            return;
+                        }
+                    };
+
+                    fill_polygon_even_odd(
+                        ui.painter(),
+                        &points,
+                        pool.color_by_index(fill_attributes.fill_colour).convert(),
+                        rect,
+                    );
+                    // TODO: implement fill type for infill
+                    // TODO: implement fill pattern for infill
+                }
+            }
+
+            if line_attributes.line_width == 0 {
+                return;
+            }
+
+            let stroke = egui::Stroke::new(
+                line_attributes.line_width,
+                pool.color_by_index(line_attributes.line_colour).convert(),
+            );
+
+            if is_open_polygon {
+                ui.painter().add(egui::Shape::line(points, stroke));
+            } else {
+                ui.painter().add(egui::Shape::closed_line(points, stroke));
+            }
+            // TODO: implement line art for border
         });
     }
 }
