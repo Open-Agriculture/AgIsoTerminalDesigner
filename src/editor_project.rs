@@ -2,7 +2,10 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+};
 
 use ag_iso_stack::object_pool::{
     object::Object, NullableObjectId, ObjectId, ObjectPool, ObjectType,
@@ -12,6 +15,13 @@ use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
 
 const MAX_UNDO_REDO_POOL: usize = 10;
 const MAX_UNDO_REDO_SELECTED: usize = 20;
+
+#[derive(Clone, PartialEq)]
+struct ProjectContentCheckpoint {
+    pool: ObjectPool,
+    object_names: Vec<(u16, String)>,
+    mask_size: u16,
+}
 
 #[derive(Default, Clone)]
 pub struct EditorProject {
@@ -25,7 +35,7 @@ pub struct EditorProject {
     redo_selected_history: Vec<NullableObjectId>,
     pub mask_size: u16,
     soft_key_size: (u16, u16),
-    pub object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
+    object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
 
     /// Used to keep track of the object that is being renamed
     renaming_object: RefCell<Option<(eframe::egui::Id, ObjectId, String)>>,
@@ -38,6 +48,10 @@ pub struct EditorProject {
 
     /// Request to open image file dialog for PictureGraphic object
     image_load_request: RefCell<Option<ObjectId>>,
+
+    /// Last project content that was opened or successfully saved.
+    saved_content: RefCell<Option<ProjectContentCheckpoint>>,
+    dirty: Cell<bool>,
 }
 
 impl From<ObjectPool> for EditorProject {
@@ -52,7 +66,7 @@ impl From<ObjectPool> for EditorProject {
             .max()
             .unwrap_or(0);
 
-        EditorProject {
+        let project = EditorProject {
             mut_pool: RefCell::new(pool.clone()),
             pool,
             undo_pool_history: Default::default(),
@@ -68,7 +82,11 @@ impl From<ObjectPool> for EditorProject {
             next_available_id: RefCell::new(max_id.saturating_add(1)),
             default_object_names: RefCell::new(HashMap::new()),
             image_load_request: RefCell::new(None),
-        }
+            saved_content: RefCell::new(None),
+            dirty: Cell::new(false),
+        };
+        project.mark_saved();
+        project
     }
 }
 
@@ -147,6 +165,67 @@ impl EditorProject {
         &self.mut_selected_object
     }
 
+    fn content_checkpoint(&self) -> ProjectContentCheckpoint {
+        let object_info = self.object_info.borrow();
+        let mut object_names: Vec<_> = object_info
+            .iter()
+            .filter_map(|(id, info)| info.name.clone().map(|name| (id.value(), name)))
+            .collect();
+        object_names.sort_by_key(|(id, _)| *id);
+
+        ProjectContentCheckpoint {
+            pool: self.pool.clone(),
+            object_names,
+            mask_size: self.mask_size,
+        }
+    }
+
+    fn refresh_dirty(&self) {
+        let dirty = self
+            .saved_content
+            .borrow()
+            .as_ref()
+            .is_none_or(|saved| *saved != self.content_checkpoint());
+        self.dirty.set(dirty);
+    }
+
+    /// Whether meaningful project content differs from the last open/save checkpoint.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.get()
+    }
+
+    /// Establish the current content as the last successfully saved state.
+    pub fn mark_saved(&self) {
+        self.saved_content.replace(Some(self.content_checkpoint()));
+        self.dirty.set(false);
+    }
+
+    /// Mark a restored recovery snapshot as content that still needs an explicit save.
+    pub fn mark_recovered(&self) {
+        self.saved_content.replace(None);
+        self.dirty.set(true);
+    }
+
+    pub fn set_mask_size(&mut self, mask_size: u16) {
+        if self.mask_size != mask_size {
+            self.mask_size = mask_size;
+            self.refresh_dirty();
+        }
+    }
+
+    pub fn set_object_name(&self, object: &Object, name: String) {
+        let mut object_info = self.object_info.borrow_mut();
+        let info = object_info
+            .entry(object.id())
+            .or_insert_with(|| ObjectInfo::new(object));
+        let old_name = info.name.clone();
+        info.set_name(name);
+        if info.name != old_name {
+            drop(object_info);
+            self.refresh_dirty();
+        }
+    }
+
     /// If the mutating pool is different from the current pool, add the current pool to the history
     /// and update the current pool with the mutated pool.
     /// Returns true if the pool was updated
@@ -161,6 +240,7 @@ impl EditorProject {
             self.pool = self.mut_pool.borrow().clone();
             // Clear the default names cache since objects may have changed
             self.default_object_names.borrow_mut().clear();
+            self.refresh_dirty();
             return true;
         }
         false
@@ -180,6 +260,7 @@ impl EditorProject {
 
             // Clear the default names cache since objects may have changed
             self.default_object_names.borrow_mut().clear();
+            self.refresh_dirty();
         }
     }
 
@@ -201,6 +282,7 @@ impl EditorProject {
 
             // Clear the default names cache since objects may have changed
             self.default_object_names.borrow_mut().clear();
+            self.refresh_dirty();
         }
     }
 
@@ -284,7 +366,12 @@ impl EditorProject {
             if let Some(renaming_object) = self.renaming_object.borrow().as_ref() {
                 let mut object_info = self.object_info.borrow_mut();
                 if let Some(info) = object_info.get_mut(&renaming_object.1) {
+                    let old_name = info.name.clone();
                     info.set_name(renaming_object.2.clone());
+                    if info.name != old_name {
+                        drop(object_info);
+                        self.refresh_dirty();
+                    }
                 }
             }
         }
@@ -434,7 +521,6 @@ impl EditorProject {
         // Restore object metadata
         let metadata = project.get_metadata();
         let mut object_info = editor_project.object_info.borrow_mut();
-        let mut_pool = editor_project.get_mut_pool();
         for object in editor_project.pool.objects() {
             if let Some(meta) = metadata.get(&object.id().value()) {
                 let info = object_info
@@ -462,6 +548,8 @@ impl EditorProject {
             }
         }
 
+        editor_project.mark_saved();
+
         Ok(editor_project)
     }
 
@@ -473,5 +561,67 @@ impl EditorProject {
     /// Take and clear the image load request if any
     pub fn take_image_load_request(&self) -> Option<ObjectId> {
         self.image_load_request.replace(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::default_object;
+
+    #[test]
+    fn content_changes_and_undo_update_dirty_state() {
+        let mut project = EditorProject::from(ObjectPool::default());
+        assert!(!project.is_dirty());
+
+        let object = default_object(ObjectType::WorkingSet);
+        project.get_mut_pool().borrow_mut().add(object);
+        assert!(project.update_pool());
+        assert!(project.is_dirty());
+
+        project.undo();
+        assert!(!project.is_dirty());
+    }
+
+    #[test]
+    fn mask_size_and_names_are_tracked_but_selection_is_not() {
+        let mut pool = ObjectPool::default();
+        let object = default_object(ObjectType::WorkingSet);
+        let object_id = object.id();
+        pool.add(object);
+        let mut project = EditorProject::from(pool);
+
+        project
+            .get_mut_selected()
+            .replace(NullableObjectId(Some(object_id)));
+        project.update_selected();
+        assert!(!project.is_dirty());
+
+        // Lazily-created display metadata without a custom name is not project content.
+        let object = project.get_pool().object_by_id(object_id).unwrap().clone();
+        project.get_object_info(&object);
+
+        let original_mask_size = project.mask_size;
+        project.set_mask_size(original_mask_size.saturating_add(1));
+        assert!(project.is_dirty());
+        project.set_mask_size(original_mask_size);
+        assert!(!project.is_dirty());
+
+        project.set_object_name(&object, "First name".to_owned());
+        assert!(project.is_dirty());
+        project.mark_saved();
+        project.set_object_name(&object, "Second name".to_owned());
+        assert!(project.is_dirty());
+        project.set_object_name(&object, "First name".to_owned());
+        assert!(!project.is_dirty());
+    }
+
+    #[test]
+    fn recovered_projects_remain_dirty_until_marked_saved() {
+        let project = EditorProject::from(ObjectPool::default());
+        project.mark_recovered();
+        assert!(project.is_dirty());
+        project.mark_saved();
+        assert!(!project.is_dirty());
     }
 }
