@@ -2,7 +2,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use ag_iso_stack::object_pool::{object::Object, ObjectPool, ObjectType};
+use ag_iso_stack::object_pool::ObjectType;
 use std::collections::HashMap;
 
 /// ISOBUS maximum object count (16-bit IDs)

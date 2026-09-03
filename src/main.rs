@@ -1414,7 +1414,13 @@ impl eframe::App for DesignerApp {
                             pool.undo_available(),
                             egui::widgets::Button::new("\u{2BAA}"),
                         )
-                        .on_hover_text(format!("Undo ({})", ctx.format_shortcut(&undo_shortcut)))
+                        .on_hover_text(format!(
+                            "Undo{} ({})",
+                            pool.undo_description()
+                                .map(|description| format!(": {description}"))
+                                .unwrap_or_default(),
+                            ctx.format_shortcut(&undo_shortcut)
+                        ))
                         .clicked()
                         || ctx.input_mut(|i| i.consume_shortcut(&undo_shortcut))
                     {
@@ -1425,7 +1431,13 @@ impl eframe::App for DesignerApp {
                             pool.redo_available(),
                             egui::widgets::Button::new("\u{2BAB}"),
                         )
-                        .on_hover_text(format!("Redo ({})", ctx.format_shortcut(&redo_shortcut)))
+                        .on_hover_text(format!(
+                            "Redo{} ({})",
+                            pool.redo_description()
+                                .map(|description| format!(": {description}"))
+                                .unwrap_or_default(),
+                            ctx.format_shortcut(&redo_shortcut)
+                        ))
                         .clicked()
                         || ctx.input_mut(|i| i.consume_shortcut(&redo_shortcut))
                     {
@@ -1732,6 +1744,9 @@ impl eframe::App for DesignerApp {
 
             if pool.update_pool() {
                 ctx.request_repaint();
+            }
+            if let Some(error) = pool.take_operation_error() {
+                self.error_message = Some(error);
             }
             if pool.update_selected() {
                 // Make sure all collapsing headers for the selected object are open

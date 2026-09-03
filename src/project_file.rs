@@ -3,7 +3,7 @@
 //! Authors: Daan Steenbergen
 
 use crate::ObjectInfo;
-use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool};
+use ag_iso_stack::object_pool::{ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

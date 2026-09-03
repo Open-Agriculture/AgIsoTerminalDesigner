@@ -17,46 +17,6 @@ use ag_iso_stack::object_pool::ObjectRef;
 use ag_iso_stack::object_pool::ObjectType;
 use eframe::egui;
 use eframe::egui::TextWrapMode;
-use std::collections::HashSet;
-
-/// Check if adding a reference from `parent_id` to `child_id` would create a circular reference
-/// Returns true if it would create a cycle (and should be blocked)
-fn would_create_circular_reference(
-    pool: &ObjectPool,
-    parent_id: ObjectId,
-    child_id: ObjectId,
-) -> bool {
-    // If parent and child are the same, it's definitely circular
-    if parent_id == child_id {
-        return true;
-    }
-
-    // Check if child already references parent (directly or indirectly)
-    // Use depth-first search to check all descendants of child_id
-    let mut visited = HashSet::new();
-    let mut stack = vec![child_id];
-
-    while let Some(current_id) = stack.pop() {
-        // If we've already visited this object, skip it (prevents infinite loops)
-        if !visited.insert(current_id) {
-            continue;
-        }
-
-        // If we find the parent in the descendants of child, it's circular
-        if current_id == parent_id {
-            return true;
-        }
-
-        // Add all children of current object to the stack
-        if let Some(obj) = pool.object_by_id(current_id) {
-            for ref_id in obj.referenced_objects() {
-                stack.push(ref_id);
-            }
-        }
-    }
-
-    false
-}
 
 pub trait ConfigurableObject {
     fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject);
@@ -190,7 +150,10 @@ fn render_object_id_selector(
 
                 // Check if this would create a circular reference
                 let would_be_circular = if let Some(parent_id) = current_object_id {
-                    would_create_circular_reference(pool, parent_id, child_id)
+                    crate::pool_validation::would_create_circular_reference(
+                        pool, parent_id, child_id,
+                    )
+                    .is_err()
                 } else {
                     false
                 };
@@ -239,7 +202,10 @@ fn render_nullable_object_id_selector(
 
                 // Check if this would create a circular reference
                 let would_be_circular = if let Some(parent_id) = current_object_id {
-                    would_create_circular_reference(pool, parent_id, child_id)
+                    crate::pool_validation::would_create_circular_reference(
+                        pool, parent_id, child_id,
+                    )
+                    .is_err()
                 } else {
                     false
                 };
@@ -502,7 +468,10 @@ fn render_add_object_id(
 
                     // Check if this would create a circular reference
                     let would_be_circular = if let Some(parent_id) = current_object_id {
-                        would_create_circular_reference(pool, parent_id, child_id)
+                        crate::pool_validation::would_create_circular_reference(
+                            pool, parent_id, child_id,
+                        )
+                        .is_err()
                     } else {
                         false
                     };
