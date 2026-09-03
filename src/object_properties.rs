@@ -10,7 +10,7 @@
 //! For whole-object operations (CreateObject, DeleteObject, copy/paste),
 //! use Object::serialize/deserialize directly via Serde.
 
-use ag_iso_stack::object_pool::{ObjectId, ObjectPool, ObjectType};
+use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool, ObjectType};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -713,14 +713,12 @@ macro_rules! supported_property_objects {
 
 macro_rules! dispatch_property_impl {
     ($obj:expr, $method:ident, $args:tt; $($variant:ident),* $(,)?) => {
-        #[allow(unreachable_patterns)]
         match $obj {
             $(
                 ag_iso_stack::object_pool::object::Object::$variant(v) => {
                     v.$method$args
                 }
             )*
-            _ => Err(PropertyAccessError::UnsupportedObjectType),
         }
     };
 }
@@ -819,6 +817,83 @@ pub fn set_property(
 
 pub fn get_property_descriptors(object_type: ObjectType) -> Vec<PropertyDescriptor> {
     supported_property_objects!(property_descriptors_impl, object_type)
+}
+
+/// Return the writable property changes needed to turn `old` into `new`.
+///
+/// `None` means that the change is not completely representable by
+/// [`PropertyAccess`] (for example an ID, positioned-child, or macro-reference
+/// change). The operations diff handles those specialized structures and
+/// rejects any still-unmapped change. An empty vector means the objects are
+/// identical.
+pub fn changed_properties(old: &Object, new: &Object) -> Option<Vec<(String, Value)>> {
+    if old.id() != new.id() || old.object_type() != new.object_type() {
+        return None;
+    }
+
+    let mut candidate = old.clone();
+    let mut changes = Vec::new();
+
+    for descriptor in get_property_descriptors(old.object_type()) {
+        let old_value = dispatch_property!(old, get_property, descriptor.name).ok()?;
+        let new_value = dispatch_property!(new, get_property, descriptor.name).ok()?;
+        if old_value != new_value {
+            dispatch_property!(
+                &mut candidate,
+                set_property,
+                descriptor.name,
+                new_value.clone()
+            )
+            .ok()?;
+            changes.push((descriptor.name.to_owned(), new_value));
+        }
+    }
+
+    (candidate == *new).then_some(changes)
+}
+
+/// Rewrite property-backed references after an object's identity changes.
+/// Structural reference collections are handled by the operations layer.
+pub(crate) fn replace_object_reference(
+    object: &mut Object,
+    old_id: ObjectId,
+    new_id: ObjectId,
+) -> Result<bool, PropertyAccessError> {
+    let mut changed = false;
+    for descriptor in get_property_descriptors(object.object_type()) {
+        if !matches!(
+            &descriptor.semantic,
+            PropertySemantic::ObjectReference { .. }
+        ) {
+            continue;
+        }
+
+        let value = dispatch_property!(object, get_property, descriptor.name)?;
+        if value.is_null() {
+            continue;
+        }
+        let reference_id = serde_json::from_value::<ObjectId>(value).map_err(|error| {
+            PropertyAccessError::InvalidValue {
+                property: descriptor.name,
+                reason: error.to_string(),
+            }
+        })?;
+        if reference_id == old_id {
+            dispatch_property!(
+                object,
+                set_property,
+                descriptor.name,
+                serde_json::to_value(new_id).map_err(|error| {
+                    PropertyAccessError::InvalidValue {
+                        property: descriptor.name,
+                        reason: error.to_string(),
+                    }
+                })?
+            )?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 /// Get every non-identity, non-placement property exposed by an object.
@@ -1038,5 +1113,41 @@ mod tests {
                 assert_eq!(old_value, value, "{object_type:?}.{}", descriptor.name);
             }
         }
+    }
+
+    #[test]
+    fn changed_properties_returns_only_changed_fields() {
+        let old = default_object(ObjectType::Button);
+        let mut new = old.clone();
+        if let Object::Button(button) = &mut new {
+            button.width = 120;
+            button.height = 80;
+        }
+
+        let changes = changed_properties(&old, &new).unwrap();
+
+        assert_eq!(
+            changes,
+            vec![
+                ("width".to_owned(), json!(120)),
+                ("height".to_owned(), json!(80)),
+            ]
+        );
+    }
+
+    #[test]
+    fn changed_properties_rejects_structural_changes() {
+        use ag_iso_stack::object_pool::object_attributes::{ObjectRef, Point};
+
+        let old = default_object(ObjectType::DataMask);
+        let mut new = old.clone();
+        if let Object::DataMask(mask) = &mut new {
+            mask.object_refs.push(ObjectRef {
+                id: ObjectId::new(2).unwrap(),
+                offset: Point::default(),
+            });
+        }
+
+        assert!(changed_properties(&old, &new).is_none());
     }
 }

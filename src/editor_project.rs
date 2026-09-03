@@ -242,6 +242,8 @@ impl EditorProject {
         let draft_info = self.mut_object_info.borrow().clone();
         let mut transaction = OperationTransaction::new(Some("Edit object pool".to_owned()));
         let mut consumed_new_ids = std::collections::HashSet::new();
+        let mut renamed_old_ids = std::collections::HashSet::new();
+        let mut renamed_new_to_old = HashMap::new();
         let old_ids: std::collections::HashSet<_> = self
             .pool
             .objects()
@@ -262,25 +264,34 @@ impl EditorProject {
                 && !new_ids.contains(&old.id())
                 && !old_ids.contains(&new.id())
             {
-                transaction.add_operation(Operation::ReplaceObject {
-                    object_id: old.id().value(),
-                    object: new.clone(),
+                transaction.add_operation(Operation::ChangeObjectId {
+                    old_id: old.id().value(),
+                    new_id: new.id().value(),
                 });
+                let mut normalized_old = old.clone();
+                *normalized_old.mut_id() = new.id();
+                match crate::operations::diff_object(&normalized_old, new) {
+                    Ok(operations) => transaction.add_operations(operations),
+                    Err(error) => return self.reject_draft_edit(error),
+                }
                 consumed_new_ids.insert(new.id());
+                renamed_old_ids.insert(old.id());
+                renamed_new_to_old.insert(new.id(), old.id());
             }
         }
 
         for old in self.pool.objects() {
+            if renamed_old_ids.contains(&old.id()) {
+                continue;
+            }
             if let Some(new) = draft_pool.object_by_id(old.id()) {
                 if old != new {
-                    transaction.add_operation(Operation::ReplaceObject {
-                        object_id: old.id().value(),
-                        object: new.clone(),
-                    });
+                    match crate::operations::diff_object(old, new) {
+                        Ok(operations) => transaction.add_operations(operations),
+                        Err(error) => return self.reject_draft_edit(error),
+                    }
                 }
-            } else if !transaction.operations.iter().any(|operation| {
-                matches!(operation, Operation::ReplaceObject { object_id, .. } if *object_id == old.id().value())
-            }) {
+            } else {
                 transaction.add_operation(Operation::DeleteObject {
                     object_id: old.id().value(),
                     captured_object: None,
@@ -317,10 +328,11 @@ impl EditorProject {
                 continue;
             }
             let new_name = info.name.clone().unwrap_or_default();
+            let old_id = renamed_new_to_old.get(id).copied().unwrap_or(*id);
             let old_name = self
                 .object_info
                 .borrow()
-                .get(id)
+                .get(&old_id)
                 .and_then(|old| old.name.clone())
                 .unwrap_or_default();
             if new_name != old_name && new_ids.contains(id) {
@@ -356,7 +368,26 @@ impl EditorProject {
             match &transaction.operations[0] {
                 Operation::CreateObject { object_type, .. } => format!("Create {object_type}"),
                 Operation::DeleteObject { object_id, .. } => format!("Delete object {object_id}"),
-                Operation::ReplaceObject { object_id, .. } => format!("Edit object {object_id}"),
+                Operation::ChangeObjectId { old_id, new_id } => {
+                    format!("Change object ID {old_id} to {new_id}")
+                }
+                Operation::SetProperty {
+                    object_id,
+                    property,
+                    ..
+                } => format!("Set {property} on object {object_id}"),
+                Operation::SetChildren { parent_id, .. } => {
+                    format!("Edit children of object {parent_id}")
+                }
+                Operation::SetObjectList { object_id, .. } => {
+                    format!("Edit object list of object {object_id}")
+                }
+                Operation::SetMacroReferences { object_id, .. } => {
+                    format!("Edit macros of object {object_id}")
+                }
+                Operation::SetObjectLabels { object_id, .. } => {
+                    format!("Edit labels of object {object_id}")
+                }
                 Operation::RenameObject { object_id, .. } => format!("Rename object {object_id}"),
                 Operation::ReorderObjects { .. } => "Reorder objects".to_owned(),
                 _ => "Edit object pool".to_owned(),
@@ -377,6 +408,16 @@ impl EditorProject {
                 false
             }
         }
+    }
+
+    fn reject_draft_edit(&self, error: impl std::fmt::Display) -> bool {
+        log::error!("Could not translate UI edit to operations: {error}");
+        self.last_operation_error
+            .replace(Some(format!("Could not apply edit: {error}")));
+        self.mut_pool.replace(self.pool.clone());
+        self.mut_object_info
+            .replace(self.object_info.borrow().clone());
+        false
     }
 
     /// Undo the last action
@@ -719,6 +760,7 @@ impl EditorProject {
             .replace(self.object_info.borrow().clone());
         self.update_next_available_id();
         self.default_object_names.borrow_mut().clear();
+        self.remap_selection_for_operations(&applied.forward_operations);
 
         // Record in history (this is a user action)
         self.operation_history.borrow_mut().push(applied.clone());
@@ -743,7 +785,7 @@ impl EditorProject {
             let mut object_info = self.object_info.borrow().clone();
             let mut context = crate::operations::OperationContext::default();
 
-            for op in inverse_tx.operations {
+            for op in &inverse_tx.operations {
                 match op.apply(&mut pool, &mut object_info, &mut context) {
                     Ok(_) => {}
                     Err(_) => {
@@ -762,6 +804,8 @@ impl EditorProject {
                 .replace(self.object_info.borrow().clone());
             self.update_next_available_id();
             self.default_object_names.borrow_mut().clear();
+            drop(history);
+            self.remap_selection_for_operations(&inverse_tx.operations);
             self.refresh_dirty();
             return true;
         }
@@ -798,10 +842,24 @@ impl EditorProject {
                 .replace(self.object_info.borrow().clone());
             self.update_next_available_id();
             self.default_object_names.borrow_mut().clear();
+            drop(history);
+            self.remap_selection_for_operations(&applied_tx.forward_operations);
             self.refresh_dirty();
             return true;
         }
         false
+    }
+
+    fn remap_selection_for_operations(&mut self, operations: &[Operation]) {
+        for operation in operations {
+            if let Operation::ChangeObjectId { old_id, new_id } = operation {
+                if self.selected_object.0.map(|id| id.value()) == Some(*old_id) {
+                    let selected = NullableObjectId::new(*new_id);
+                    self.selected_object = selected;
+                    self.mut_selected_object.replace(selected);
+                }
+            }
+        }
     }
 
     /// Create a snapshot for AI context
@@ -1140,6 +1198,244 @@ mod tests {
         assert_eq!(
             project.get_object_info(&object).name.as_deref(),
             Some("Apply button")
+        );
+    }
+
+    #[test]
+    fn ui_draft_field_edit_is_committed_as_a_property_operation() {
+        let object = object_with_id(ObjectType::Button, 10);
+        let mut pool = ObjectPool::default();
+        pool.add(object.clone());
+        let mut project = EditorProject::from(pool);
+
+        if let Some(Object::Button(button)) = project
+            .get_mut_pool()
+            .borrow_mut()
+            .object_mut_by_id(object.id())
+        {
+            button.width = 123;
+        }
+
+        assert!(project.update_pool());
+        assert_eq!(
+            project.undo_description().as_deref(),
+            Some("Set width on object 10")
+        );
+        assert!(project.undo_operation());
+        assert!(matches!(
+            project.get_pool().object_by_id(object.id()),
+            Some(Object::Button(button)) if button.width == 0
+        ));
+    }
+
+    #[test]
+    fn ui_draft_structural_edits_use_reversible_structural_operations() {
+        use ag_iso_stack::object_pool::object_attributes::{Event, MacroRef, ObjectRef, Point};
+
+        let parent = object_with_id(ObjectType::Button, 10);
+        let child = object_with_id(ObjectType::PictureGraphic, 11);
+        let macro_object = object_with_id(ObjectType::Macro, 12);
+        let mut pool = ObjectPool::default();
+        pool.add(parent.clone());
+        pool.add(child.clone());
+        pool.add(macro_object);
+        let mut project = EditorProject::from(pool);
+        let before = project.get_pool().as_iop();
+
+        if let Some(Object::Button(button)) = project
+            .get_mut_pool()
+            .borrow_mut()
+            .object_mut_by_id(parent.id())
+        {
+            button.object_refs.push(ObjectRef {
+                id: child.id(),
+                offset: Point { x: 4, y: 8 },
+            });
+            button.macro_refs.push(MacroRef {
+                macro_id: 12,
+                event_id: Event::OnActivate,
+            });
+        }
+
+        assert!(project.update_pool());
+        let after = project.get_pool().as_iop();
+        assert_ne!(after, before);
+        assert!(project.undo_operation());
+        assert_eq!(project.get_pool().as_iop(), before);
+        assert!(project.redo_operation());
+        assert_eq!(project.get_pool().as_iop(), after);
+    }
+
+    #[test]
+    fn deleting_a_macro_referenced_by_an_event_is_rejected() {
+        use ag_iso_stack::object_pool::object_attributes::{Event, MacroRef};
+
+        let mut parent = object_with_id(ObjectType::Button, 10);
+        if let Object::Button(button) = &mut parent {
+            button.macro_refs.push(MacroRef {
+                macro_id: 12,
+                event_id: Event::OnActivate,
+            });
+        }
+        let macro_object = object_with_id(ObjectType::Macro, 12);
+        let mut pool = ObjectPool::default();
+        pool.add(parent);
+        pool.add(macro_object);
+        let mut project = EditorProject::from(pool);
+        let mut transaction = OperationTransaction::new(Some("Delete macro".to_owned()));
+        transaction.add_operation(Operation::DeleteObject {
+            object_id: 12,
+            captured_object: None,
+        });
+
+        assert!(matches!(
+            project.execute_transaction(transaction),
+            Err(OperationError::DeleteReferencedObject(12))
+        ));
+    }
+
+    #[test]
+    fn changing_an_object_id_rewrites_all_reference_kinds_and_selection() {
+        use ag_iso_stack::object_pool::object_attributes::{
+            Event, MacroRef, ObjectLabel, ObjectRef, Point,
+        };
+
+        let target = object_with_id(ObjectType::Macro, 10);
+        let mut positioned_parent = object_with_id(ObjectType::Button, 20);
+        if let Object::Button(button) = &mut positioned_parent {
+            button.object_refs.push(ObjectRef {
+                id: target.id(),
+                offset: Point::default(),
+            });
+            button.macro_refs.push(MacroRef {
+                macro_id: 10,
+                event_id: Event::OnActivate,
+            });
+        }
+        let mut required_list = object_with_id(ObjectType::SoftKeyMask, 21);
+        if let Object::SoftKeyMask(mask) = &mut required_list {
+            mask.objects.push(target.id());
+        }
+        let mut nullable_list = object_with_id(ObjectType::InputList, 22);
+        if let Object::InputList(list) = &mut nullable_list {
+            list.list_items.push(target.id().into());
+        }
+        let mut labels = object_with_id(ObjectType::ObjectLabelReferenceList, 23);
+        if let Object::ObjectLabelReferenceList(list) = &mut labels {
+            list.object_labels.push(ObjectLabel {
+                id: target.id(),
+                string_variable_reference: target.id().into(),
+                font_type: 0,
+                graphic_representation: target.id().into(),
+            });
+        }
+        let mut property_parent = object_with_id(ObjectType::ObjectPointer, 24);
+        if let Object::ObjectPointer(pointer) = &mut property_parent {
+            pointer.value = target.id().into();
+        }
+
+        let mut pool = ObjectPool::default();
+        for object in [
+            target.clone(),
+            positioned_parent,
+            required_list,
+            nullable_list,
+            labels,
+            property_parent,
+        ] {
+            pool.add(object);
+        }
+        let mut project = EditorProject::from(pool);
+        project
+            .get_mut_selected()
+            .replace(NullableObjectId::new(target.id().value()));
+        project.update_selected();
+        project.set_object_name(&target, "Renumbered macro".to_owned());
+        assert!(project.update_pool());
+
+        let mut transaction = OperationTransaction::new(Some("Renumber macro".to_owned()));
+        transaction.add_operation(Operation::ChangeObjectId {
+            old_id: 10,
+            new_id: 30,
+        });
+        project.execute_transaction(transaction).unwrap();
+
+        let new_id = ObjectId::new(30).unwrap();
+        assert!(project.get_pool().object_by_id(target.id()).is_none());
+        assert!(project.get_pool().object_by_id(new_id).is_some());
+        assert_eq!(project.get_selected(), NullableObjectId::new(30));
+        assert!(matches!(
+            project
+                .get_pool()
+                .object_by_id(ObjectId::new(20).unwrap()),
+            Some(Object::Button(button))
+                if button.macro_refs.first().map(|reference| reference.macro_id) == Some(30)
+        ));
+        assert_eq!(
+            project
+                .get_pool()
+                .objects()
+                .iter()
+                .filter(|object| object.id() != new_id)
+                .flat_map(Object::referenced_objects)
+                .filter(|id| *id == target.id())
+                .count(),
+            0
+        );
+        assert_eq!(
+            project
+                .get_object_info(project.get_pool().object_by_id(new_id).unwrap())
+                .name
+                .as_deref(),
+            Some("Renumbered macro")
+        );
+
+        assert!(project.undo_operation());
+        assert!(project.get_pool().object_by_id(target.id()).is_some());
+        assert_eq!(project.get_selected(), NullableObjectId::new(10));
+        assert!(project.redo_operation());
+        assert!(project.get_pool().object_by_id(new_id).is_some());
+        assert_eq!(project.get_selected(), NullableObjectId::new(30));
+    }
+
+    #[test]
+    fn ui_draft_id_change_uses_change_id_operation() {
+        let target = object_with_id(ObjectType::PictureGraphic, 10);
+        let mut parent = object_with_id(ObjectType::Button, 20);
+        if let Object::Button(button) = &mut parent {
+            button
+                .object_refs
+                .push(ag_iso_stack::object_pool::ObjectRef {
+                    id: target.id(),
+                    offset: Default::default(),
+                });
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(target.clone());
+        pool.add(parent);
+        let mut project = EditorProject::from(pool);
+
+        if let Some(object) = project
+            .get_mut_pool()
+            .borrow_mut()
+            .object_mut_by_id(target.id())
+        {
+            object.mut_id().set_value(30).unwrap();
+        }
+        project.update_object_id_for_info(target.id(), ObjectId::new(30).unwrap());
+
+        assert!(project.update_pool());
+        assert_eq!(
+            project.undo_description().as_deref(),
+            Some("Change object ID 10 to 30")
+        );
+        assert_eq!(
+            project
+                .get_pool()
+                .object_by_id(ObjectId::new(20).unwrap())
+                .unwrap()
+                .referenced_objects(),
+            vec![ObjectId::new(30).unwrap()]
         );
     }
 

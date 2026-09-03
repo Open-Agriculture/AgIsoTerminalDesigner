@@ -3,8 +3,8 @@
 
 use crate::object_info::ObjectInfo;
 use ag_iso_stack::object_pool::object::Object;
-use ag_iso_stack::object_pool::object_attributes::Point;
-use ag_iso_stack::object_pool::{ObjectId, ObjectPool, ObjectRef};
+use ag_iso_stack::object_pool::object_attributes::{MacroRef, ObjectLabel, Point};
+use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectPool, ObjectRef};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -45,10 +45,8 @@ pub enum Operation {
         value: Value,
     },
 
-    /// Replace one complete object. This is primarily the adapter used by the
-    /// existing egui property editors: widgets edit a draft object and the
-    /// draft is committed as one reversible operation at the end of the frame.
-    ReplaceObject { object_id: u16, object: Object },
+    /// Change an object's identity and rewrite every inbound reference.
+    ChangeObjectId { old_id: u16, new_id: u16 },
 
     /// Change serialization/display order without copying the object pool.
     ReorderObjects { object_ids: Vec<u16> },
@@ -75,9 +73,64 @@ pub enum Operation {
         y: i16,
     },
 
+    /// Replace the complete ordered positioned-child list.
+    /// This covers reorder and child replacement edits that cannot be expressed
+    /// by AddChild/RemoveChild/SetChildPosition alone.
+    SetChildren {
+        parent_id: u16,
+        children: Vec<ObjectRef>,
+    },
+
+    /// Replace an object's ordered, unpositioned child-reference list.
+    SetObjectList {
+        object_id: u16,
+        objects: ObjectReferenceList,
+    },
+
+    /// Replace the complete ordered macro-reference list.
+    SetMacroReferences {
+        object_id: u16,
+        macro_refs: Vec<MacroRef>,
+    },
+
+    /// Replace the labels owned by an ObjectLabelReferenceList.
+    SetObjectLabels {
+        object_id: u16,
+        labels: Vec<ObjectLabel>,
+    },
+
     /// Rename an object (modifies editor metadata, not ObjectPool)
     /// Returns old name as inverse
     RenameObject { object_id: u16, name: String },
+}
+
+/// The two list representations used for unpositioned child references.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "objects")]
+pub enum ObjectReferenceList {
+    Required(Vec<ObjectId>),
+    Nullable(Vec<NullableObjectId>),
+}
+
+impl ObjectReferenceList {
+    fn ids(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        match self {
+            Self::Required(objects) => {
+                Box::new(objects.iter().copied()) as Box<dyn Iterator<Item = ObjectId>>
+            }
+            Self::Nullable(objects) => Box::new(objects.iter().filter_map(|object| object.0)),
+        }
+    }
+}
+
+fn object_label_references(label: &ObjectLabel) -> impl Iterator<Item = ObjectId> + '_ {
+    [
+        Some(label.id),
+        label.string_variable_reference.0,
+        label.graphic_representation.0,
+    ]
+    .into_iter()
+    .flatten()
 }
 
 /// Context passed to each operation during execution
@@ -325,51 +378,42 @@ impl Operation {
                 })
             }
 
-            Operation::ReplaceObject { object_id, object } => {
-                let old_id = ObjectId::new(*object_id)
-                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
-                let old_object = pool
-                    .object_by_id(old_id)
-                    .cloned()
-                    .ok_or(OperationError::ObjectNotFound(*object_id))?;
-                let new_id = object.id();
-
-                if new_id != old_id && pool.object_by_id(new_id).is_some() {
+            Operation::ChangeObjectId { old_id, new_id } => {
+                let old_id =
+                    ObjectId::new(*old_id).map_err(|_| OperationError::ObjectNotFound(*old_id))?;
+                let new_id =
+                    ObjectId::new(*new_id).map_err(|_| OperationError::ObjectNotFound(*new_id))?;
+                validate_object_exists(pool, old_id)
+                    .map_err(|_| OperationError::ObjectNotFound(old_id.value()))?;
+                if pool.object_by_id(new_id).is_some() {
                     return Err(OperationError::ObjectAlreadyExists(new_id.value()));
                 }
 
-                if new_id == old_id {
-                    let old_references = old_object.referenced_objects();
-                    for child_id in object.referenced_objects() {
-                        if !old_references.contains(&child_id) {
-                            would_create_circular_reference(pool, old_id, child_id).map_err(
-                                |_| OperationError::CircularReference {
-                                    parent: old_id.value(),
-                                    child: child_id.value(),
-                                },
-                            )?;
-                        }
+                for object in pool.objects_mut() {
+                    let references_changed = replace_references(object, old_id, new_id)?;
+                    if references_changed {
+                        context.affected_objects.insert(object.id());
+                    }
+                    if object.id() == old_id {
+                        object.mut_id().set_value(new_id.value()).map_err(|error| {
+                            OperationError::PropertyError {
+                                object_id: old_id.value(),
+                                property: "id".to_owned(),
+                                reason: format!("{error:?}"),
+                            }
+                        })?;
                     }
                 }
 
-                let slot = pool
-                    .objects_mut()
-                    .iter_mut()
-                    .find(|candidate| candidate.id() == old_id)
-                    .ok_or(OperationError::ObjectNotFound(*object_id))?;
-                *slot = object.clone();
-
-                if new_id != old_id {
-                    if let Some(info) = object_info.remove(&old_id) {
-                        object_info.insert(new_id, info);
-                    }
+                if let Some(info) = object_info.remove(&old_id) {
+                    object_info.insert(new_id, info);
                 }
                 context.affected_objects.insert(old_id);
                 context.affected_objects.insert(new_id);
 
-                Ok(Operation::ReplaceObject {
-                    object_id: new_id.value(),
-                    object: old_object,
+                Ok(Operation::ChangeObjectId {
+                    old_id: new_id.value(),
+                    new_id: old_id.value(),
                 })
             }
 
@@ -557,6 +601,217 @@ impl Operation {
                 })
             }
 
+            Operation::SetChildren {
+                parent_id,
+                children,
+            } => {
+                let parent_obj_id = ObjectId::new(*parent_id)
+                    .map_err(|_| OperationError::ObjectNotFound(*parent_id))?;
+                validate_object_exists(pool, parent_obj_id).map_err(|diag| {
+                    OperationError::PropertyError {
+                        object_id: *parent_id,
+                        property: "children".to_owned(),
+                        reason: diag.message,
+                    }
+                })?;
+
+                for child in children {
+                    validate_object_exists(pool, child.id).map_err(|diag| {
+                        OperationError::PropertyError {
+                            object_id: *parent_id,
+                            property: "children".to_owned(),
+                            reason: diag.message,
+                        }
+                    })?;
+                    would_create_circular_reference(pool, parent_obj_id, child.id).map_err(
+                        |_| OperationError::CircularReference {
+                            parent: *parent_id,
+                            child: child.id.value(),
+                        },
+                    )?;
+                    crate::pool_validation::validate_parent_child_relationship(
+                        pool,
+                        parent_obj_id,
+                        child.id,
+                    )
+                    .map_err(|diag| OperationError::InvalidReference {
+                        parent_type: format!("{}: {}", parent_id, diag.message),
+                        child_type: child.id.value().to_string(),
+                    })?;
+                }
+
+                let refs = object_refs_mut(pool, parent_obj_id, "SetChildren")?;
+                let old_children = std::mem::replace(refs, children.clone());
+                context.affected_objects.insert(parent_obj_id);
+                context
+                    .affected_objects
+                    .extend(old_children.iter().chain(children).map(|child| child.id));
+
+                Ok(Operation::SetChildren {
+                    parent_id: *parent_id,
+                    children: old_children,
+                })
+            }
+
+            Operation::SetObjectList { object_id, objects } => {
+                let parent_id = ObjectId::new(*object_id)
+                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+                validate_object_exists(pool, parent_id).map_err(|diag| {
+                    OperationError::PropertyError {
+                        object_id: *object_id,
+                        property: "objects".to_owned(),
+                        reason: diag.message,
+                    }
+                })?;
+
+                for child_id in objects.ids() {
+                    validate_object_exists(pool, child_id).map_err(|diag| {
+                        OperationError::PropertyError {
+                            object_id: *object_id,
+                            property: "objects".to_owned(),
+                            reason: diag.message,
+                        }
+                    })?;
+                    would_create_circular_reference(pool, parent_id, child_id).map_err(|_| {
+                        OperationError::CircularReference {
+                            parent: *object_id,
+                            child: child_id.value(),
+                        }
+                    })?;
+                    crate::pool_validation::validate_parent_child_relationship(
+                        pool, parent_id, child_id,
+                    )
+                    .map_err(|diag| OperationError::InvalidReference {
+                        parent_type: format!("{}: {}", object_id, diag.message),
+                        child_type: child_id.value().to_string(),
+                    })?;
+                }
+
+                let parent = pool
+                    .object_mut_by_id(parent_id)
+                    .ok_or(OperationError::ObjectNotFound(*object_id))?;
+                let old_objects =
+                    object_list(parent).ok_or_else(|| OperationError::PropertyError {
+                        object_id: *object_id,
+                        property: "objects".to_owned(),
+                        reason: "This object type does not support an object list".to_owned(),
+                    })?;
+                if !set_object_list(parent, objects.clone()) {
+                    return Err(OperationError::PropertyError {
+                        object_id: *object_id,
+                        property: "objects".to_owned(),
+                        reason: "Object-list representation does not match object type".to_owned(),
+                    });
+                }
+
+                context.affected_objects.insert(parent_id);
+                context
+                    .affected_objects
+                    .extend(old_objects.ids().chain(objects.ids()));
+                Ok(Operation::SetObjectList {
+                    object_id: *object_id,
+                    objects: old_objects,
+                })
+            }
+
+            Operation::SetMacroReferences {
+                object_id,
+                macro_refs,
+            } => {
+                let id = ObjectId::new(*object_id)
+                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+
+                for macro_ref in macro_refs {
+                    let macro_id = ObjectId::new(u16::from(macro_ref.macro_id)).map_err(|_| {
+                        OperationError::PropertyError {
+                            object_id: *object_id,
+                            property: "macro_refs".to_owned(),
+                            reason: format!("Invalid macro object ID {}", macro_ref.macro_id),
+                        }
+                    })?;
+                    let macro_object = pool.object_by_id(macro_id).ok_or_else(|| {
+                        OperationError::PropertyError {
+                            object_id: *object_id,
+                            property: "macro_refs".to_owned(),
+                            reason: format!("Macro object {} does not exist", macro_ref.macro_id),
+                        }
+                    })?;
+                    if macro_object.object_type() != ag_iso_stack::object_pool::ObjectType::Macro {
+                        return Err(OperationError::InvalidReference {
+                            parent_type: format!("Object {} macro reference", object_id),
+                            child_type: format!("{:?}", macro_object.object_type()),
+                        });
+                    }
+                }
+
+                let refs = macro_refs_mut(pool, id, "SetMacroReferences")?;
+                let old_macro_refs = std::mem::replace(refs, macro_refs.clone());
+                context.affected_objects.insert(id);
+                for macro_ref in old_macro_refs.iter().chain(macro_refs) {
+                    if let Ok(macro_id) = ObjectId::new(u16::from(macro_ref.macro_id)) {
+                        context.affected_objects.insert(macro_id);
+                    }
+                }
+
+                Ok(Operation::SetMacroReferences {
+                    object_id: *object_id,
+                    macro_refs: old_macro_refs,
+                })
+            }
+
+            Operation::SetObjectLabels { object_id, labels } => {
+                let id = ObjectId::new(*object_id)
+                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+                for reference_id in labels.iter().flat_map(object_label_references) {
+                    validate_object_exists(pool, reference_id).map_err(|diag| {
+                        OperationError::PropertyError {
+                            object_id: *object_id,
+                            property: "object_labels".to_owned(),
+                            reason: diag.message,
+                        }
+                    })?;
+                    would_create_circular_reference(pool, id, reference_id).map_err(|_| {
+                        OperationError::CircularReference {
+                            parent: *object_id,
+                            child: reference_id.value(),
+                        }
+                    })?;
+                    crate::pool_validation::validate_parent_child_relationship(
+                        pool,
+                        id,
+                        reference_id,
+                    )
+                    .map_err(|diag| OperationError::InvalidReference {
+                        parent_type: format!("{}: {}", object_id, diag.message),
+                        child_type: reference_id.value().to_string(),
+                    })?;
+                }
+
+                let object = pool
+                    .object_mut_by_id(id)
+                    .ok_or(OperationError::ObjectNotFound(*object_id))?;
+                let Object::ObjectLabelReferenceList(object) = object else {
+                    return Err(OperationError::PropertyError {
+                        object_id: *object_id,
+                        property: "object_labels".to_owned(),
+                        reason: "This object type does not support object labels".to_owned(),
+                    });
+                };
+                let old_labels = std::mem::replace(&mut object.object_labels, labels.clone());
+                context.affected_objects.insert(id);
+                context.affected_objects.extend(
+                    old_labels
+                        .iter()
+                        .chain(labels)
+                        .flat_map(object_label_references),
+                );
+
+                Ok(Operation::SetObjectLabels {
+                    object_id: *object_id,
+                    labels: old_labels,
+                })
+            }
+
             Operation::RenameObject { object_id, name } => {
                 let id = ObjectId::new(*object_id)
                     .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
@@ -591,6 +846,64 @@ impl Operation {
     }
 }
 
+macro_rules! with_positioned_children {
+    ($object:expr, $binding:ident => $body:expr, $fallback:expr) => {
+        match $object {
+            Object::WorkingSet($binding) => $body,
+            Object::DataMask($binding) => $body,
+            Object::AlarmMask($binding) => $body,
+            Object::Container($binding) => $body,
+            Object::Key($binding) => $body,
+            Object::Button($binding) => $body,
+            Object::AuxiliaryFunctionType1($binding) => $body,
+            Object::AuxiliaryInputType1($binding) => $body,
+            Object::AuxiliaryFunctionType2($binding) => $body,
+            Object::AuxiliaryInputType2($binding) => $body,
+            Object::WindowMask($binding) => $body,
+            Object::Animation($binding) => $body,
+            _ => $fallback,
+        }
+    };
+}
+
+macro_rules! with_macro_references {
+    ($object:expr, $binding:ident => $body:expr, $fallback:expr) => {
+        match $object {
+            Object::WorkingSet($binding) => $body,
+            Object::DataMask($binding) => $body,
+            Object::AlarmMask($binding) => $body,
+            Object::Container($binding) => $body,
+            Object::SoftKeyMask($binding) => $body,
+            Object::Key($binding) => $body,
+            Object::Button($binding) => $body,
+            Object::InputBoolean($binding) => $body,
+            Object::InputString($binding) => $body,
+            Object::InputNumber($binding) => $body,
+            Object::InputList($binding) => $body,
+            Object::OutputString($binding) => $body,
+            Object::OutputNumber($binding) => $body,
+            Object::OutputList($binding) => $body,
+            Object::OutputLine($binding) => $body,
+            Object::OutputRectangle($binding) => $body,
+            Object::OutputEllipse($binding) => $body,
+            Object::OutputPolygon($binding) => $body,
+            Object::OutputMeter($binding) => $body,
+            Object::OutputLinearBarGraph($binding) => $body,
+            Object::OutputArchedBarGraph($binding) => $body,
+            Object::PictureGraphic($binding) => $body,
+            Object::FontAttributes($binding) => $body,
+            Object::LineAttributes($binding) => $body,
+            Object::FillAttributes($binding) => $body,
+            Object::InputAttributes($binding) => $body,
+            Object::WindowMask($binding) => $body,
+            Object::KeyGroup($binding) => $body,
+            Object::Animation($binding) => $body,
+            Object::ScaledGraphic($binding) => $body,
+            _ => $fallback,
+        }
+    };
+}
+
 fn object_refs_mut<'a>(
     pool: &'a mut ObjectPool,
     parent_id: ObjectId,
@@ -599,23 +912,238 @@ fn object_refs_mut<'a>(
     let object = pool
         .object_mut_by_id(parent_id)
         .ok_or(OperationError::ObjectNotFound(parent_id.value()))?;
-    match object {
-        Object::WorkingSet(object) => Ok(&mut object.object_refs),
-        Object::DataMask(object) => Ok(&mut object.object_refs),
-        Object::AlarmMask(object) => Ok(&mut object.object_refs),
-        Object::Container(object) => Ok(&mut object.object_refs),
-        Object::Key(object) => Ok(&mut object.object_refs),
-        Object::Button(object) => Ok(&mut object.object_refs),
-        Object::AuxiliaryFunctionType1(object) => Ok(&mut object.object_refs),
-        Object::AuxiliaryInputType1(object) => Ok(&mut object.object_refs),
-        Object::AuxiliaryFunctionType2(object) => Ok(&mut object.object_refs),
-        Object::AuxiliaryInputType2(object) => Ok(&mut object.object_refs),
-        Object::WindowMask(object) => Ok(&mut object.object_refs),
-        Object::Animation(object) => Ok(&mut object.object_refs),
-        _ => Err(OperationError::PropertyError {
+    with_positioned_children!(
+        object,
+        object => Ok(&mut object.object_refs),
+        Err(OperationError::PropertyError {
             object_id: parent_id.value(),
             property: operation.to_owned(),
             reason: "This object type does not support positioned children".to_owned(),
-        }),
+        })
+    )
+}
+
+pub(super) fn object_refs(object: &Object) -> Option<&[ObjectRef]> {
+    with_positioned_children!(object, object => Some(object.object_refs.as_slice()), None)
+}
+
+pub(super) fn set_object_refs(object: &mut Object, refs: Vec<ObjectRef>) -> bool {
+    with_positioned_children!(
+        object,
+        object => {
+            object.object_refs = refs;
+            true
+        },
+        false
+    )
+}
+
+pub(super) fn object_list(object: &Object) -> Option<ObjectReferenceList> {
+    match object {
+        Object::SoftKeyMask(object) => Some(ObjectReferenceList::Required(object.objects.clone())),
+        Object::KeyGroup(object) => Some(ObjectReferenceList::Required(object.objects.clone())),
+        Object::InputList(object) => Some(ObjectReferenceList::Nullable(object.list_items.clone())),
+        Object::OutputList(object) => {
+            Some(ObjectReferenceList::Nullable(object.list_items.clone()))
+        }
+        Object::WindowMask(object) => Some(ObjectReferenceList::Nullable(object.objects.clone())),
+        Object::ExternalObjectDefinition(object) => {
+            Some(ObjectReferenceList::Nullable(object.objects.clone()))
+        }
+        _ => None,
     }
+}
+
+pub(super) fn set_object_list(object: &mut Object, objects: ObjectReferenceList) -> bool {
+    match (object, objects) {
+        (Object::SoftKeyMask(object), ObjectReferenceList::Required(objects)) => {
+            object.objects = objects
+        }
+        (Object::KeyGroup(object), ObjectReferenceList::Required(objects)) => {
+            object.objects = objects
+        }
+        (Object::InputList(object), ObjectReferenceList::Nullable(objects)) => {
+            object.list_items = objects
+        }
+        (Object::OutputList(object), ObjectReferenceList::Nullable(objects)) => {
+            object.list_items = objects
+        }
+        (Object::WindowMask(object), ObjectReferenceList::Nullable(objects)) => {
+            object.objects = objects
+        }
+        (Object::ExternalObjectDefinition(object), ObjectReferenceList::Nullable(objects)) => {
+            object.objects = objects
+        }
+        _ => return false,
+    }
+    true
+}
+
+pub(super) fn object_labels(object: &Object) -> Option<&[ObjectLabel]> {
+    match object {
+        Object::ObjectLabelReferenceList(object) => Some(&object.object_labels),
+        _ => None,
+    }
+}
+
+pub(super) fn set_object_labels(object: &mut Object, labels: Vec<ObjectLabel>) -> bool {
+    match object {
+        Object::ObjectLabelReferenceList(object) => object.object_labels = labels,
+        _ => return false,
+    }
+    true
+}
+
+fn replace_references(
+    object: &mut Object,
+    old_id: ObjectId,
+    new_id: ObjectId,
+) -> Result<bool, OperationError> {
+    let mut changed = crate::object_properties::replace_object_reference(object, old_id, new_id)
+        .map_err(|error| OperationError::PropertyError {
+            object_id: object.id().value(),
+            property: "object reference".to_owned(),
+            reason: format!("{error:?}"),
+        })?;
+
+    with_positioned_children!(
+        object,
+        value => {
+            for child in &mut value.object_refs {
+                if child.id == old_id {
+                    child.id = new_id;
+                    changed = true;
+                }
+            }
+        },
+        ()
+    );
+
+    match object {
+        Object::SoftKeyMask(value) => {
+            for child in &mut value.objects {
+                if *child == old_id {
+                    *child = new_id;
+                    changed = true;
+                }
+            }
+        }
+        Object::KeyGroup(value) => {
+            for child in &mut value.objects {
+                if *child == old_id {
+                    *child = new_id;
+                    changed = true;
+                }
+            }
+        }
+        Object::InputList(value) => {
+            replace_nullable_references(&mut value.list_items, old_id, new_id, &mut changed)
+        }
+        Object::OutputList(value) => {
+            replace_nullable_references(&mut value.list_items, old_id, new_id, &mut changed)
+        }
+        Object::WindowMask(value) => {
+            replace_nullable_references(&mut value.objects, old_id, new_id, &mut changed)
+        }
+        Object::ExternalObjectDefinition(value) => {
+            replace_nullable_references(&mut value.objects, old_id, new_id, &mut changed)
+        }
+        Object::ObjectLabelReferenceList(value) => {
+            for label in &mut value.object_labels {
+                if label.id == old_id {
+                    label.id = new_id;
+                    changed = true;
+                }
+                for reference in [
+                    &mut label.string_variable_reference,
+                    &mut label.graphic_representation,
+                ] {
+                    if reference.0 == Some(old_id) {
+                        reference.0 = Some(new_id);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if old_id.value() <= u8::MAX.into() {
+        let owner_id = object.id().value();
+        with_macro_references!(
+            object,
+            value => {
+                for macro_ref in &mut value.macro_refs {
+                    if u16::from(macro_ref.macro_id) == old_id.value() {
+                        macro_ref.macro_id = u8::try_from(new_id.value()).map_err(|_| {
+                            OperationError::PropertyError {
+                                object_id: owner_id,
+                                property: "macro_refs".to_owned(),
+                                reason: format!(
+                                    "Macro object ID {} cannot be represented in a macro reference",
+                                    new_id.value()
+                                ),
+                            }
+                        })?;
+                        changed = true;
+                    }
+                }
+            },
+            ()
+        );
+    }
+
+    Ok(changed)
+}
+
+fn replace_nullable_references(
+    references: &mut [NullableObjectId],
+    old_id: ObjectId,
+    new_id: ObjectId,
+    changed: &mut bool,
+) {
+    for reference in references {
+        if reference.0 == Some(old_id) {
+            reference.0 = Some(new_id);
+            *changed = true;
+        }
+    }
+}
+
+pub(crate) fn macro_refs(object: &Object) -> Option<&[MacroRef]> {
+    with_macro_references!(
+        object,
+        object => Some(object.macro_refs.as_slice()),
+        None
+    )
+}
+
+pub(super) fn set_macro_refs(object: &mut Object, refs: Vec<MacroRef>) -> bool {
+    with_macro_references!(
+        object,
+        object => {
+            object.macro_refs = refs;
+            true
+        },
+        false
+    )
+}
+
+fn macro_refs_mut<'a>(
+    pool: &'a mut ObjectPool,
+    object_id: ObjectId,
+    operation: &str,
+) -> Result<&'a mut Vec<MacroRef>, OperationError> {
+    let object = pool
+        .object_mut_by_id(object_id)
+        .ok_or(OperationError::ObjectNotFound(object_id.value()))?;
+    with_macro_references!(
+        object,
+        object => Ok(&mut object.macro_refs),
+        Err(OperationError::PropertyError {
+            object_id: object_id.value(),
+            property: operation.to_owned(),
+            reason: "This object type does not support macro references".to_owned(),
+        })
+    )
 }

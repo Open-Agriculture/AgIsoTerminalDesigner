@@ -169,10 +169,17 @@ pub fn validate_reference_integrity(
 
 /// Get all objects that reference the given object
 pub fn get_referencing_objects(pool: &ObjectPool, object_id: ObjectId) -> Vec<ObjectId> {
-    pool.parent_objects(object_id)
-        .into_iter()
-        .filter(|object| object.id() != object_id)
-        .map(|obj| obj.id())
+    pool.objects()
+        .iter()
+        .filter(|object| {
+            object.id() != object_id
+                && (object.referenced_objects().contains(&object_id)
+                    || crate::operations::operation::macro_refs(object).is_some_and(|refs| {
+                        refs.iter()
+                            .any(|macro_ref| u16::from(macro_ref.macro_id) == object_id.value())
+                    }))
+        })
+        .map(|object| object.id())
         .collect()
 }
 

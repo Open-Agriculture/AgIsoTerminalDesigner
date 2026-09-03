@@ -57,24 +57,26 @@ impl OperationExecutor {
                 Operation::SetProperty { .. } => {
                     // Validate property exists and is writable
                 }
-                Operation::ReplaceObject { object_id, object } => {
+                Operation::ChangeObjectId { old_id, new_id } => {
                     if pool
-                        .object_by_id(ObjectId::new(*object_id).unwrap_or_default())
+                        .object_by_id(ObjectId::new(*old_id).unwrap_or_default())
                         .is_none()
                     {
                         diagnostics.push(ValidationDiagnostic {
                             severity: ValidationSeverity::Error,
-                            message: format!("Object {} not found for replacement", object_id),
-                            affected_objects: Some(vec![*object_id]),
-                            code: "E009_REPLACE_NOT_FOUND".to_string(),
+                            message: format!("Object {} not found for ID change", old_id),
+                            affected_objects: Some(vec![*old_id]),
+                            code: "E009_CHANGE_ID_NOT_FOUND".to_string(),
                         });
                     }
-                    if object.id().value() != *object_id && pool.object_by_id(object.id()).is_some()
+                    if pool
+                        .object_by_id(ObjectId::new(*new_id).unwrap_or_default())
+                        .is_some()
                     {
                         diagnostics.push(ValidationDiagnostic {
                             severity: ValidationSeverity::Error,
-                            message: format!("Object {} already exists", object.id().value()),
-                            affected_objects: Some(vec![object.id().value()]),
+                            message: format!("Object {} already exists", new_id),
+                            affected_objects: Some(vec![*new_id]),
                             code: "E010_DUPLICATE_ID".to_string(),
                         });
                     }
@@ -88,6 +90,20 @@ impl OperationExecutor {
                 }
                 Operation::SetChildPosition { .. } => {
                     // Validate position values
+                }
+                Operation::SetChildren { .. } => {
+                    // Full validation is performed against the evolving working
+                    // pool while the operation is applied.
+                }
+                Operation::SetObjectList { .. } => {
+                    // Full validation is performed against the evolving working
+                    // pool while the operation is applied.
+                }
+                Operation::SetMacroReferences { .. } => {
+                    // Macro targets are validated while the operation is applied.
+                }
+                Operation::SetObjectLabels { .. } => {
+                    // Label targets are validated while the operation is applied.
                 }
                 Operation::RenameObject { .. } => {
                     // Validate name is not empty
