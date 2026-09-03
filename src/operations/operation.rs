@@ -923,7 +923,8 @@ fn object_refs_mut<'a>(
     )
 }
 
-pub(super) fn object_refs(object: &Object) -> Option<&[ObjectRef]> {
+/// Read-only positioned children for descriptor-driven structural editors.
+pub(crate) fn object_refs(object: &Object) -> Option<&[ObjectRef]> {
     with_positioned_children!(object, object => Some(object.object_refs.as_slice()), None)
 }
 
@@ -938,7 +939,8 @@ pub(super) fn set_object_refs(object: &mut Object, refs: Vec<ObjectRef>) -> bool
     )
 }
 
-pub(super) fn object_list(object: &Object) -> Option<ObjectReferenceList> {
+/// Clone an object's ordered unpositioned reference list for structural edits.
+pub(crate) fn object_list(object: &Object) -> Option<ObjectReferenceList> {
     match object {
         Object::SoftKeyMask(object) => Some(ObjectReferenceList::Required(object.objects.clone())),
         Object::KeyGroup(object) => Some(ObjectReferenceList::Required(object.objects.clone())),

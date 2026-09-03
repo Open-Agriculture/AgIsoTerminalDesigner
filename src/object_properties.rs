@@ -23,6 +23,108 @@ pub struct PropertyDescriptor {
     pub valid_range: Option<(Value, Value)>,
 }
 
+/// Presentation metadata for the generic property editor.
+///
+/// This intentionally complements `PropertyDescriptor`: validation semantics
+/// stay available to all callers, while UI-only labels and widget choices are
+/// declared only for object types that use the generic renderer.
+#[derive(Debug, Clone, Copy)]
+pub struct PropertyEditorDescriptor {
+    pub property: &'static str,
+    pub editor: EditorKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EditorKind {
+    Auto,
+    Colour,
+    ObjectReference,
+    Json,
+    /// A bit-mask or JSON object of boolean options.
+    FlagSet,
+    Justification,
+    MacroReferences,
+}
+
+/// UI schemas for every writable property of an object type.
+///
+/// This is deliberately derived from `PropertyAccess`, so configuration cannot
+/// silently fall back to an object-specific widget when a new property is
+/// added.
+pub fn property_editor_descriptors(object_type: ObjectType) -> Vec<PropertyEditorDescriptor> {
+    let mut descriptors: Vec<_> = get_property_descriptors(object_type)
+        .into_iter()
+        .filter(|descriptor| descriptor.writable)
+        .map(|descriptor| PropertyEditorDescriptor {
+            property: descriptor.name,
+            editor: editor_override(object_type, descriptor.name)
+                .unwrap_or_else(|| default_editor(&descriptor.semantic)),
+        })
+        .collect();
+    if supports_macro_references(object_type) {
+        descriptors.push(PropertyEditorDescriptor {
+            property: "macro_refs",
+            editor: EditorKind::MacroReferences,
+        });
+    }
+    descriptors
+}
+
+/// Map property semantics to the generic renderer's default widgets.
+fn default_editor(semantic: &PropertySemantic) -> EditorKind {
+    match semantic {
+        PropertySemantic::Colour => EditorKind::Colour,
+        PropertySemantic::ObjectReference { .. } => EditorKind::ObjectReference,
+        PropertySemantic::Enum => EditorKind::Json,
+        PropertySemantic::Bitflags => EditorKind::FlagSet,
+        PropertySemantic::Normal => EditorKind::Auto,
+    }
+}
+
+/// Widgets whose presentation cannot be determined from their semantic alone.
+fn editor_override(object_type: ObjectType, property: &str) -> Option<EditorKind> {
+    match (object_type, property) {
+        (_, "justification") => Some(EditorKind::Justification),
+        _ => None,
+    }
+}
+
+fn supports_macro_references(object_type: ObjectType) -> bool {
+    matches!(
+        object_type,
+        ObjectType::WorkingSet
+            | ObjectType::DataMask
+            | ObjectType::AlarmMask
+            | ObjectType::Container
+            | ObjectType::SoftKeyMask
+            | ObjectType::Key
+            | ObjectType::Button
+            | ObjectType::InputBoolean
+            | ObjectType::InputString
+            | ObjectType::InputNumber
+            | ObjectType::InputList
+            | ObjectType::OutputString
+            | ObjectType::OutputNumber
+            | ObjectType::OutputList
+            | ObjectType::OutputLine
+            | ObjectType::OutputRectangle
+            | ObjectType::OutputEllipse
+            | ObjectType::OutputPolygon
+            | ObjectType::OutputMeter
+            | ObjectType::OutputLinearBarGraph
+            | ObjectType::OutputArchedBarGraph
+            | ObjectType::PictureGraphic
+            | ObjectType::FontAttributes
+            | ObjectType::LineAttributes
+            | ObjectType::FillAttributes
+            | ObjectType::InputAttributes
+            | ObjectType::WindowMask
+            | ObjectType::KeyGroup
+            | ObjectType::Animation
+            | ObjectType::ScaledGraphic
+    )
+}
+
 /// Meaning that cannot be recovered reliably from a property's JSON value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PropertySemantic {
@@ -787,6 +889,11 @@ pub fn get_property(
     })
 }
 
+/// Get one declared property from an object without requiring a pool lookup.
+pub fn get_object_property(object: &Object, property: &str) -> Result<Value, PropertyAccessError> {
+    dispatch_property!(object, get_property, property)
+}
+
 /// Set a property on an object in the pool
 pub fn set_property(
     pool: &mut ObjectPool,
@@ -817,39 +924,6 @@ pub fn set_property(
 
 pub fn get_property_descriptors(object_type: ObjectType) -> Vec<PropertyDescriptor> {
     supported_property_objects!(property_descriptors_impl, object_type)
-}
-
-/// Return the writable property changes needed to turn `old` into `new`.
-///
-/// `None` means that the change is not completely representable by
-/// [`PropertyAccess`] (for example an ID, positioned-child, or macro-reference
-/// change). The operations diff handles those specialized structures and
-/// rejects any still-unmapped change. An empty vector means the objects are
-/// identical.
-pub fn changed_properties(old: &Object, new: &Object) -> Option<Vec<(String, Value)>> {
-    if old.id() != new.id() || old.object_type() != new.object_type() {
-        return None;
-    }
-
-    let mut candidate = old.clone();
-    let mut changes = Vec::new();
-
-    for descriptor in get_property_descriptors(old.object_type()) {
-        let old_value = dispatch_property!(old, get_property, descriptor.name).ok()?;
-        let new_value = dispatch_property!(new, get_property, descriptor.name).ok()?;
-        if old_value != new_value {
-            dispatch_property!(
-                &mut candidate,
-                set_property,
-                descriptor.name,
-                new_value.clone()
-            )
-            .ok()?;
-            changes.push((descriptor.name.to_owned(), new_value));
-        }
-    }
-
-    (candidate == *new).then_some(changes)
 }
 
 /// Rewrite property-backed references after an object's identity changes.
@@ -1116,38 +1190,23 @@ mod tests {
     }
 
     #[test]
-    fn changed_properties_returns_only_changed_fields() {
-        let old = default_object(ObjectType::Button);
-        let mut new = old.clone();
-        if let Object::Button(button) = &mut new {
-            button.width = 120;
-            button.height = 80;
+    fn every_writable_property_has_an_editor_descriptor() {
+        for object_type in supported_object_types() {
+            let properties = get_property_descriptors(object_type);
+            let editors = property_editor_descriptors(object_type);
+            assert_eq!(
+                editors.len(),
+                properties
+                    .iter()
+                    .filter(|property| property.writable)
+                    .count()
+                    + usize::from(supports_macro_references(object_type))
+            );
+            for property in properties.into_iter().filter(|property| property.writable) {
+                assert!(editors
+                    .iter()
+                    .any(|editor| editor.property == property.name));
+            }
         }
-
-        let changes = changed_properties(&old, &new).unwrap();
-
-        assert_eq!(
-            changes,
-            vec![
-                ("width".to_owned(), json!(120)),
-                ("height".to_owned(), json!(80)),
-            ]
-        );
-    }
-
-    #[test]
-    fn changed_properties_rejects_structural_changes() {
-        use ag_iso_stack::object_pool::object_attributes::{ObjectRef, Point};
-
-        let old = default_object(ObjectType::DataMask);
-        let mut new = old.clone();
-        if let Object::DataMask(mask) = &mut new {
-            mask.object_refs.push(ObjectRef {
-                id: ObjectId::new(2).unwrap(),
-                offset: Point::default(),
-            });
-        }
-
-        assert!(changed_properties(&old, &new).is_none());
     }
 }

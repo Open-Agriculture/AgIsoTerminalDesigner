@@ -8,6 +8,51 @@ pub trait PossibleEvents {
     fn get_possible_events() -> Vec<Event>;
 }
 
+/// Return the macro events supported by an object without making UI code know
+/// about each concrete object structure.
+pub fn get_possible_events(object: &Object) -> Vec<Event> {
+    match object {
+        Object::WorkingSet(_) => WorkingSet::get_possible_events(),
+        Object::DataMask(_) => DataMask::get_possible_events(),
+        Object::AlarmMask(_) => AlarmMask::get_possible_events(),
+        Object::Container(_) => Container::get_possible_events(),
+        Object::SoftKeyMask(_) => SoftKeyMask::get_possible_events(),
+        Object::Key(_) => Key::get_possible_events(),
+        Object::Button(_) => Button::get_possible_events(),
+        Object::InputBoolean(_) => InputBoolean::get_possible_events(),
+        Object::InputString(_) => InputString::get_possible_events(),
+        Object::InputNumber(_) => InputNumber::get_possible_events(),
+        Object::InputList(_) => InputList::get_possible_events(),
+        Object::OutputString(_) => OutputString::get_possible_events(),
+        Object::OutputNumber(_) => OutputNumber::get_possible_events(),
+        Object::OutputList(_) => OutputList::get_possible_events(),
+        Object::OutputLine(_) => OutputLine::get_possible_events(),
+        Object::OutputRectangle(_) => OutputRectangle::get_possible_events(),
+        Object::OutputEllipse(_) => OutputEllipse::get_possible_events(),
+        Object::OutputPolygon(_) => OutputPolygon::get_possible_events(),
+        Object::OutputMeter(_) => OutputMeter::get_possible_events(),
+        Object::OutputLinearBarGraph(_) => OutputLinearBarGraph::get_possible_events(),
+        Object::OutputArchedBarGraph(_) => OutputArchedBarGraph::get_possible_events(),
+        Object::PictureGraphic(_) => PictureGraphic::get_possible_events(),
+        Object::NumberVariable(_) => NumberVariable::get_possible_events(),
+        Object::StringVariable(_) => StringVariable::get_possible_events(),
+        Object::FontAttributes(_) => FontAttributes::get_possible_events(),
+        Object::LineAttributes(_) => LineAttributes::get_possible_events(),
+        Object::FillAttributes(_) => FillAttributes::get_possible_events(),
+        Object::InputAttributes(_) => InputAttributes::get_possible_events(),
+        Object::ObjectPointer(_) => ObjectPointer::get_possible_events(),
+        Object::GraphicsContext(_) => GraphicsContext::get_possible_events(),
+        Object::KeyGroup(_) => KeyGroup::get_possible_events(),
+        Object::ExternalObjectDefinition(_) => ExternalObjectDefinition::get_possible_events(),
+        Object::WindowMask(_) => WindowMask::get_possible_events(),
+        Object::ExternalReferenceName(_) => ExternalReferenceName::get_possible_events(),
+        Object::ExternalObjectPointer(_) => ExternalObjectPointer::get_possible_events(),
+        Object::Animation(_) => Animation::get_possible_events(),
+        Object::ScaledGraphic(_) => ScaledGraphic::get_possible_events(),
+        _ => Vec::new(),
+    }
+}
+
 impl PossibleEvents for WorkingSet {
     fn get_possible_events() -> Vec<Event> {
         vec![

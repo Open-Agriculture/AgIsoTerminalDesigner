@@ -30,9 +30,8 @@ struct ProjectContentCheckpoint {
 #[derive(Default, Clone)]
 pub struct EditorProject {
     pool: ObjectPool,
-    mut_pool: RefCell<ObjectPool>,
     selected_object: NullableObjectId,
-    mut_selected_object: RefCell<NullableObjectId>,
+    pending_selected_object: Cell<NullableObjectId>,
     undo_selected_history: Vec<NullableObjectId>,
     redo_selected_history: Vec<NullableObjectId>,
     pub mask_size: u16,
@@ -52,6 +51,13 @@ pub struct EditorProject {
 
     /// Request to open image file dialog for PictureGraphic object
     image_load_request: RefCell<Option<ObjectId>>,
+    /// A hierarchy context-menu delete, consumed by the app after draft edits
+    /// from the same frame have been committed.
+    delete_request: RefCell<Option<ObjectId>>,
+    /// A hierarchy inline rename, consumed after same-frame draft edits.
+    rename_request: RefCell<Option<(ObjectId, String)>>,
+    /// Operations queued by UI widgets that only hold a shared project reference.
+    queued_operations: RefCell<Vec<Operation>>,
     last_operation_error: RefCell<Option<String>>,
 
     /// Last project content that was opened or successfully saved.
@@ -75,10 +81,9 @@ impl From<ObjectPool> for EditorProject {
             .unwrap_or(0);
 
         let project = EditorProject {
-            mut_pool: RefCell::new(pool.clone()),
             pool,
             selected_object: NullableObjectId::default(),
-            mut_selected_object: RefCell::new(NullableObjectId::default()),
+            pending_selected_object: Cell::new(NullableObjectId::default()),
             undo_selected_history: Default::default(),
             redo_selected_history: Default::default(),
             mask_size,
@@ -89,6 +94,9 @@ impl From<ObjectPool> for EditorProject {
             next_available_id: RefCell::new(max_id.saturating_add(1)),
             default_object_names: RefCell::new(HashMap::new()),
             image_load_request: RefCell::new(None),
+            delete_request: RefCell::new(None),
+            rename_request: RefCell::new(None),
+            queued_operations: RefCell::new(Vec::new()),
             last_operation_error: RefCell::new(None),
             saved_content: RefCell::new(None),
             dirty: Cell::new(false),
@@ -160,18 +168,11 @@ impl EditorProject {
         self.selected_object
     }
 
-    /// Get the current mutating object pool
-    /// This is used to make changes to the pool in the next frame
-    /// without affecting the current pool
-    pub fn get_mut_pool(&self) -> &RefCell<ObjectPool> {
-        &self.mut_pool
-    }
-
     /// Set the mutating selected object
     /// This is used to make changes to the selected object in the next frame
     /// without affecting the current selected object
-    pub fn get_mut_selected(&self) -> &RefCell<NullableObjectId> {
-        &self.mut_selected_object
+    pub fn get_mut_selected(&self) -> &Cell<NullableObjectId> {
+        &self.pending_selected_object
     }
 
     fn content_checkpoint(&self) -> ProjectContentCheckpoint {
@@ -235,189 +236,28 @@ impl EditorProject {
         }
     }
 
+    /// Queue one UI operation for the end-of-frame transaction.
+    pub fn queue_operation(&self, operation: Operation) {
+        self.queued_operations.borrow_mut().push(operation);
+    }
+
+    /// Commit queued UI operations as one reversible transaction.
+    pub fn commit_queued(&mut self, description: impl Into<String>) -> bool {
+        let operations = self.queued_operations.take();
+        if operations.is_empty() {
+            return false;
+        }
+        self.execute_ui_transaction(OperationTransaction {
+            schema_version: 1,
+            description: Some(description.into()),
+            operations,
+        })
+    }
+
     /// Commit the UI draft as one reversible operation transaction.
     /// Returns true if the pool was updated
     pub fn update_pool(&mut self) -> bool {
-        let draft_pool = self.mut_pool.borrow().clone();
-        let draft_info = self.mut_object_info.borrow().clone();
-        let mut transaction = OperationTransaction::new(Some("Edit object pool".to_owned()));
-        let mut consumed_new_ids = std::collections::HashSet::new();
-        let mut renamed_old_ids = std::collections::HashSet::new();
-        let mut renamed_new_to_old = HashMap::new();
-        let old_ids: std::collections::HashSet<_> = self
-            .pool
-            .objects()
-            .iter()
-            .map(|object| object.id())
-            .collect();
-        let new_ids: std::collections::HashSet<_> = draft_pool
-            .objects()
-            .iter()
-            .map(|object| object.id())
-            .collect();
-
-        // Match in-place ID changes by vector slot and object type. Object editors
-        // mutate one draft object in place, so this is deterministic.
-        for (old, new) in self.pool.objects().iter().zip(draft_pool.objects()) {
-            if old.id() != new.id()
-                && old.object_type() == new.object_type()
-                && !new_ids.contains(&old.id())
-                && !old_ids.contains(&new.id())
-            {
-                transaction.add_operation(Operation::ChangeObjectId {
-                    old_id: old.id().value(),
-                    new_id: new.id().value(),
-                });
-                let mut normalized_old = old.clone();
-                *normalized_old.mut_id() = new.id();
-                match crate::operations::diff_object(&normalized_old, new) {
-                    Ok(operations) => transaction.add_operations(operations),
-                    Err(error) => return self.reject_draft_edit(error),
-                }
-                consumed_new_ids.insert(new.id());
-                renamed_old_ids.insert(old.id());
-                renamed_new_to_old.insert(new.id(), old.id());
-            }
-        }
-
-        for old in self.pool.objects() {
-            if renamed_old_ids.contains(&old.id()) {
-                continue;
-            }
-            if let Some(new) = draft_pool.object_by_id(old.id()) {
-                if old != new {
-                    match crate::operations::diff_object(old, new) {
-                        Ok(operations) => transaction.add_operations(operations),
-                        Err(error) => return self.reject_draft_edit(error),
-                    }
-                }
-            } else {
-                transaction.add_operation(Operation::DeleteObject {
-                    object_id: old.id().value(),
-                    captured_object: None,
-                });
-            }
-        }
-
-        for new in draft_pool.objects() {
-            if !old_ids.contains(&new.id()) && !consumed_new_ids.contains(&new.id()) {
-                transaction.add_operation(Operation::CreateObject {
-                    handle: None,
-                    object_id: Some(new.id().value()),
-                    object_type: format!("{:?}", new.object_type()),
-                    name: draft_info.get(&new.id()).and_then(|info| info.name.clone()),
-                    captured_object: serde_json::to_value(new).ok(),
-                    captured_info: draft_info.get(&new.id()).cloned(),
-                });
-            }
-        }
-
-        let created_ids: std::collections::HashSet<_> = transaction
-            .operations
-            .iter()
-            .filter_map(|operation| match operation {
-                Operation::CreateObject {
-                    object_id: Some(id),
-                    ..
-                } => ObjectId::new(*id).ok(),
-                _ => None,
-            })
-            .collect();
-        for (id, info) in &draft_info {
-            if created_ids.contains(id) {
-                continue;
-            }
-            let new_name = info.name.clone().unwrap_or_default();
-            let old_id = renamed_new_to_old.get(id).copied().unwrap_or(*id);
-            let old_name = self
-                .object_info
-                .borrow()
-                .get(&old_id)
-                .and_then(|old| old.name.clone())
-                .unwrap_or_default();
-            if new_name != old_name && new_ids.contains(id) {
-                transaction.add_operation(Operation::RenameObject {
-                    object_id: id.value(),
-                    name: new_name,
-                });
-            }
-        }
-
-        let old_order: Vec<_> = self
-            .pool
-            .objects()
-            .iter()
-            .map(|object| object.id())
-            .collect();
-        let new_order: Vec<_> = draft_pool
-            .objects()
-            .iter()
-            .map(|object| object.id())
-            .collect();
-        if old_ids == new_ids && old_order != new_order {
-            transaction.add_operation(Operation::ReorderObjects {
-                object_ids: new_order.iter().map(|id| id.value()).collect(),
-            });
-        }
-
-        if transaction.operations.is_empty() {
-            return false;
-        }
-
-        transaction.description = Some(if transaction.operations.len() == 1 {
-            match &transaction.operations[0] {
-                Operation::CreateObject { object_type, .. } => format!("Create {object_type}"),
-                Operation::DeleteObject { object_id, .. } => format!("Delete object {object_id}"),
-                Operation::ChangeObjectId { old_id, new_id } => {
-                    format!("Change object ID {old_id} to {new_id}")
-                }
-                Operation::SetProperty {
-                    object_id,
-                    property,
-                    ..
-                } => format!("Set {property} on object {object_id}"),
-                Operation::SetChildren { parent_id, .. } => {
-                    format!("Edit children of object {parent_id}")
-                }
-                Operation::SetObjectList { object_id, .. } => {
-                    format!("Edit object list of object {object_id}")
-                }
-                Operation::SetMacroReferences { object_id, .. } => {
-                    format!("Edit macros of object {object_id}")
-                }
-                Operation::SetObjectLabels { object_id, .. } => {
-                    format!("Edit labels of object {object_id}")
-                }
-                Operation::RenameObject { object_id, .. } => format!("Rename object {object_id}"),
-                Operation::ReorderObjects { .. } => "Reorder objects".to_owned(),
-                _ => "Edit object pool".to_owned(),
-            }
-        } else {
-            "Edit object pool".to_owned()
-        });
-
-        match self.execute_transaction(transaction) {
-            Ok(_) => true,
-            Err(error) => {
-                log::error!("Failed to commit UI transaction: {:?}", error);
-                self.last_operation_error
-                    .replace(Some(format!("Could not apply edit: {:?}", error)));
-                self.mut_pool.replace(self.pool.clone());
-                self.mut_object_info
-                    .replace(self.object_info.borrow().clone());
-                false
-            }
-        }
-    }
-
-    fn reject_draft_edit(&self, error: impl std::fmt::Display) -> bool {
-        log::error!("Could not translate UI edit to operations: {error}");
-        self.last_operation_error
-            .replace(Some(format!("Could not apply edit: {error}")));
-        self.mut_pool.replace(self.pool.clone());
-        self.mut_object_info
-            .replace(self.object_info.borrow().clone());
-        false
+        self.commit_queued("Edit object pool")
     }
 
     /// Undo the last action
@@ -458,10 +298,141 @@ impl EditorProject {
         self.last_operation_error.replace(None)
     }
 
+    /// Create a default object through the operation executor and return its ID.
+    ///
+    /// UI callers should use this instead of inserting into the draft pool: the
+    /// creation is immediately undoable and does not depend on the end-of-frame
+    /// draft diff finding the new object again.
+    pub fn create_object(&mut self, object_type: ObjectType, name: String) -> Option<ObjectId> {
+        let object_id = self.allocate_object_id();
+        let transaction = OperationTransaction {
+            schema_version: 1,
+            description: Some(format!("Create {object_type:?}")),
+            operations: vec![Operation::CreateObject {
+                handle: None,
+                object_id: Some(object_id.value()),
+                object_type: format!("{object_type:?}"),
+                name: Some(name),
+                captured_object: None,
+                captured_info: None,
+            }],
+        };
+
+        self.execute_ui_transaction(transaction)
+            .then_some(object_id)
+    }
+
+    /// Delete an object through a reversible operation.
+    pub fn delete_object(&mut self, object_id: ObjectId) -> bool {
+        let deleted = self.execute_ui_transaction(OperationTransaction {
+            schema_version: 1,
+            description: Some(format!("Delete object {}", object_id.value())),
+            operations: vec![Operation::DeleteObject {
+                object_id: object_id.value(),
+                captured_object: None,
+            }],
+        });
+        if deleted && self.get_selected().0 == Some(object_id) {
+            self.pending_selected_object.set(NullableObjectId::NULL);
+        }
+        deleted
+    }
+
+    /// Request deletion from UI code that only has a shared project reference.
+    pub fn request_delete_object(&self, object_id: ObjectId) {
+        self.delete_request.replace(Some(object_id));
+    }
+
+    /// Consume a pending hierarchy delete request.
+    pub fn take_delete_request(&self) -> Option<ObjectId> {
+        self.delete_request.replace(None)
+    }
+
+    /// Rename an object through a reversible metadata operation.
+    pub fn rename_object(&mut self, object_id: ObjectId, name: String) -> bool {
+        let current_name = self
+            .object_info
+            .borrow()
+            .get(&object_id)
+            .and_then(|info| info.name.clone())
+            .unwrap_or_default();
+        if current_name == name {
+            return false;
+        }
+        self.execute_ui_transaction(OperationTransaction {
+            schema_version: 1,
+            description: Some(format!("Rename object {}", object_id.value())),
+            operations: vec![Operation::RenameObject {
+                object_id: object_id.value(),
+                name,
+            }],
+        })
+    }
+
+    /// Request a rename from UI code that only has a shared project reference.
+    pub fn request_rename_object(&self, object_id: ObjectId, name: String) {
+        self.rename_request.replace(Some((object_id, name)));
+    }
+
+    /// Consume a pending hierarchy rename request.
+    pub fn take_rename_request(&self) -> Option<(ObjectId, String)> {
+        self.rename_request.replace(None)
+    }
+
+    /// Reorder the canonical pool through a reversible operation.
+    pub fn reorder_objects(&mut self, object_ids: Vec<ObjectId>) -> bool {
+        if self
+            .pool
+            .objects()
+            .iter()
+            .map(Object::id)
+            .eq(object_ids.iter().copied())
+        {
+            return false;
+        }
+        self.execute_ui_transaction(OperationTransaction {
+            schema_version: 1,
+            description: Some("Reorder objects".to_owned()),
+            operations: vec![Operation::ReorderObjects {
+                object_ids: object_ids.into_iter().map(|id| id.value()).collect(),
+            }],
+        })
+    }
+
+    /// Sort objects by their displayed names through `ReorderObjects`.
+    pub fn sort_objects_by_name(&mut self) -> bool {
+        let mut objects: Vec<_> = self.pool.objects().iter().collect();
+        objects.sort_by(|a, b| {
+            self.get_object_info(a)
+                .get_name(a)
+                .cmp(&self.get_object_info(b).get_name(b))
+        });
+        self.reorder_objects(objects.into_iter().map(Object::id).collect())
+    }
+
+    /// Sort objects by ID through `ReorderObjects`.
+    pub fn sort_objects_by_id(&mut self) -> bool {
+        let mut object_ids: Vec<_> = self.pool.objects().iter().map(Object::id).collect();
+        object_ids.sort_by_key(|id| id.value());
+        self.reorder_objects(object_ids)
+    }
+
+    fn execute_ui_transaction(&mut self, transaction: OperationTransaction) -> bool {
+        match self.execute_transaction(transaction) {
+            Ok(_) => true,
+            Err(error) => {
+                log::error!("Failed to execute UI operation: {error:?}");
+                self.last_operation_error
+                    .replace(Some(format!("Could not apply edit: {error:?}")));
+                false
+            }
+        }
+    }
+
     /// Update the selected object with the mutating selected object if it is different
     /// Returns true if the selected object was updated
     pub fn update_selected(&mut self) -> bool {
-        let mut_selected = self.mut_selected_object.borrow().to_owned();
+        let mut_selected = self.pending_selected_object.get();
         if mut_selected != self.selected_object {
             self.redo_selected_history.clear();
             if mut_selected != NullableObjectId::NULL {
@@ -483,7 +454,7 @@ impl EditorProject {
             self.redo_selected_history.push(self.selected_object);
             // Both need to be replaced here because otherwise it will be added to the undo history
             self.selected_object = selected.clone();
-            self.mut_selected_object.replace(selected);
+            self.pending_selected_object.set(selected);
         }
     }
 
@@ -493,7 +464,7 @@ impl EditorProject {
             self.undo_selected_history.push(self.selected_object);
             // Both need to be replaced here because otherwise the redo history will be cleared
             self.selected_object = selected.clone();
-            self.mut_selected_object.replace(selected);
+            self.pending_selected_object.set(selected);
         }
     }
 
@@ -526,30 +497,15 @@ impl EditorProject {
         self.renaming_object.borrow().clone()
     }
 
-    /// Finish renaming an object
-    /// If store is true, we store the new name in the object info hashmap
+    /// Finish inline renaming. The operation is submitted after this frame's
+    /// draft edits have been committed.
     pub fn finish_renaming_object(&self, store: bool) {
         if store {
             if let Some(renaming_object) = self.renaming_object.borrow().as_ref() {
-                let mut object_info = self.mut_object_info.borrow_mut();
-                if let Some(info) = object_info.get_mut(&renaming_object.1) {
-                    let old_name = info.name.clone();
-                    info.set_name(renaming_object.2.clone());
-                    if info.name != old_name {
-                        drop(object_info);
-                        self.refresh_dirty();
-                    }
-                }
+                self.request_rename_object(renaming_object.1, renaming_object.2.clone());
             }
         }
         self.renaming_object.replace(None);
-    }
-
-    pub fn sort_objects_by<F>(&mut self, cmp: F)
-    where
-        F: Fn(&Object, &Object) -> std::cmp::Ordering,
-    {
-        self.mut_pool.borrow_mut().objects_mut().sort_by(cmp);
     }
 
     /// Get all existing object names for validation
@@ -671,14 +627,13 @@ impl EditorProject {
     pub fn save_project(&self) -> Result<Vec<u8>, serde_json::Error> {
         // Make sure we're saving the current state
         let object_info = self.mut_object_info.borrow();
-        let selected = if self.mut_selected_object.borrow().0.is_some() {
-            self.mut_selected_object.borrow().0
+        let selected = if self.pending_selected_object.get().0.is_some() {
+            self.pending_selected_object.get().0
         } else {
             self.selected_object.0
         };
 
-        let draft_pool = self.mut_pool.borrow();
-        let project = ProjectFile::new(&draft_pool, &object_info, self.mask_size, selected);
+        let project = ProjectFile::new(&self.pool, &object_info, self.mask_size, selected);
         project.to_bytes()
     }
 
@@ -720,8 +675,8 @@ impl EditorProject {
             if let Ok(id) = ObjectId::new(selected_id) {
                 editor_project.selected_object = NullableObjectId(Some(id));
                 editor_project
-                    .mut_selected_object
-                    .replace(NullableObjectId(Some(id)));
+                    .pending_selected_object
+                    .set(NullableObjectId(Some(id)));
             }
         }
 
@@ -752,8 +707,7 @@ impl EditorProject {
             executor.execute(transaction, &self.pool, &self.object_info.borrow())?;
 
         // Replace pool and metadata with results
-        self.pool = modified_pool.clone();
-        self.mut_pool.replace(modified_pool);
+        self.pool = modified_pool;
 
         self.object_info.replace(modified_object_info);
         self.mut_object_info
@@ -796,9 +750,7 @@ impl EditorProject {
             }
 
             // Success: update editor state
-            let pool_clone = pool.clone();
             self.pool = pool;
-            self.mut_pool.replace(pool_clone);
             self.object_info.replace(object_info);
             self.mut_object_info
                 .replace(self.object_info.borrow().clone());
@@ -834,9 +786,7 @@ impl EditorProject {
             }
 
             // Success: update editor state
-            let pool_clone = pool.clone();
             self.pool = pool;
-            self.mut_pool.replace(pool_clone);
             self.object_info.replace(object_info);
             self.mut_object_info
                 .replace(self.object_info.borrow().clone());
@@ -856,7 +806,7 @@ impl EditorProject {
                 if self.selected_object.0.map(|id| id.value()) == Some(*old_id) {
                     let selected = NullableObjectId::new(*new_id);
                     self.selected_object = selected;
-                    self.mut_selected_object.replace(selected);
+                    self.pending_selected_object.set(selected);
                 }
             }
         }
@@ -890,9 +840,9 @@ mod tests {
         let mut project = EditorProject::from(ObjectPool::default());
         assert!(!project.is_dirty());
 
-        let object = default_object(ObjectType::WorkingSet);
-        project.get_mut_pool().borrow_mut().add(object);
-        assert!(project.update_pool());
+        project
+            .create_object(ObjectType::StringVariable, "String variable".to_owned())
+            .expect("CreateObject should succeed");
         assert!(project.is_dirty());
 
         project.undo();
@@ -917,7 +867,7 @@ mod tests {
                 _ => unreachable!(),
             };
         }
-        project.get_mut_pool().borrow_mut().add(ws);
+        project.pool.add(ws);
         project.update_pool();
 
         // Create initial object info entry
@@ -1014,14 +964,12 @@ mod tests {
         let mut pool = ObjectPool::default();
         pool.add(object.clone());
         let mut project = EditorProject::from(pool);
-        project.set_object_name(&object, "Temporary".to_owned());
-        assert!(project.update_pool());
+        assert!(project.rename_object(object.id(), "Temporary".to_owned()));
         let unique_id = project.get_object_info(&object).get_unique_id();
         project.mark_saved();
         let before = project.get_pool().as_iop();
 
-        project.get_mut_pool().borrow_mut().remove(object.id());
-        assert!(project.update_pool());
+        assert!(project.delete_object(object.id()));
         assert!(project.get_pool().object_by_id(object.id()).is_none());
 
         assert!(project.undo_operation());
@@ -1038,15 +986,16 @@ mod tests {
     #[test]
     fn ui_created_object_keeps_metadata_identity_after_redo() {
         let mut project = EditorProject::from(ObjectPool::default());
-        let object = object_with_id(ObjectType::Button, 10);
-        project.get_mut_pool().borrow_mut().add(object.clone());
-        project.set_object_name(&object, "Created button".to_owned());
+        let object_id = project
+            .create_object(ObjectType::Button, "Created button".to_owned())
+            .expect("CreateObject should succeed");
+        let object = project.get_pool().object_by_id(object_id).unwrap().clone();
         let unique_id = project.get_object_info(&object).get_unique_id();
 
-        assert!(project.update_pool());
         assert!(project.undo_operation());
         assert!(project.redo_operation());
-        let info = project.get_object_info(&object);
+        let restored = project.get_pool().object_by_id(object_id).unwrap();
+        let info = project.get_object_info(restored);
         assert_eq!(info.name.as_deref(), Some("Created button"));
         assert_eq!(info.get_unique_id(), unique_id);
     }
@@ -1079,7 +1028,7 @@ mod tests {
 
         // Add a button object
         let mut button = default_object(ObjectType::Button);
-        project.get_mut_pool().borrow_mut().add(button.clone());
+        project.pool.add(button.clone());
         project.update_pool();
 
         // Set button width via SetProperty operation
@@ -1161,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_draft_property_and_name_round_trip_through_history() {
+    fn property_and_name_operations_round_trip_as_one_transaction() {
         let object = object_with_id(ObjectType::Button, 10);
         let mut pool = ObjectPool::default();
         pool.add(object.clone());
@@ -1169,16 +1118,21 @@ mod tests {
         project.mark_saved();
         let before = project.get_pool().as_iop();
 
-        if let Some(Object::Button(button)) = project
-            .get_mut_pool()
-            .borrow_mut()
-            .object_mut_by_id(object.id())
-        {
-            button.width = 123;
-            button.height = 45;
-        }
-        project.set_object_name(&object, "Apply button".to_owned());
-        assert!(project.update_pool());
+        project.queue_operation(Operation::SetProperty {
+            object_id: object.id().value(),
+            property: "width".to_owned(),
+            value: serde_json::json!(123),
+        });
+        project.queue_operation(Operation::SetProperty {
+            object_id: object.id().value(),
+            property: "height".to_owned(),
+            value: serde_json::json!(45),
+        });
+        project.queue_operation(Operation::RenameObject {
+            object_id: object.id().value(),
+            name: "Apply button".to_owned(),
+        });
+        assert!(project.commit_queued("Edit button"));
         let after = project.get_pool().as_iop();
         assert_ne!(after, before);
         assert_eq!(
@@ -1202,21 +1156,18 @@ mod tests {
     }
 
     #[test]
-    fn ui_draft_field_edit_is_committed_as_a_property_operation() {
+    fn queued_field_edit_is_committed_as_a_property_operation() {
         let object = object_with_id(ObjectType::Button, 10);
         let mut pool = ObjectPool::default();
         pool.add(object.clone());
         let mut project = EditorProject::from(pool);
 
-        if let Some(Object::Button(button)) = project
-            .get_mut_pool()
-            .borrow_mut()
-            .object_mut_by_id(object.id())
-        {
-            button.width = 123;
-        }
-
-        assert!(project.update_pool());
+        project.queue_operation(Operation::SetProperty {
+            object_id: object.id().value(),
+            property: "width".to_owned(),
+            value: serde_json::json!(123),
+        });
+        assert!(project.commit_queued("Set width on object 10"));
         assert_eq!(
             project.undo_description().as_deref(),
             Some("Set width on object 10")
@@ -1229,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_draft_structural_edits_use_reversible_structural_operations() {
+    fn queued_structural_edits_use_reversible_structural_operations() {
         use ag_iso_stack::object_pool::object_attributes::{Event, MacroRef, ObjectRef, Point};
 
         let parent = object_with_id(ObjectType::Button, 10);
@@ -1242,22 +1193,22 @@ mod tests {
         let mut project = EditorProject::from(pool);
         let before = project.get_pool().as_iop();
 
-        if let Some(Object::Button(button)) = project
-            .get_mut_pool()
-            .borrow_mut()
-            .object_mut_by_id(parent.id())
-        {
-            button.object_refs.push(ObjectRef {
+        project.queue_operation(Operation::SetChildren {
+            parent_id: parent.id().value(),
+            children: vec![ObjectRef {
                 id: child.id(),
                 offset: Point { x: 4, y: 8 },
-            });
-            button.macro_refs.push(MacroRef {
+            }],
+        });
+        project.queue_operation(Operation::SetMacroReferences {
+            object_id: parent.id().value(),
+            macro_refs: vec![MacroRef {
                 macro_id: 12,
                 event_id: Event::OnActivate,
-            });
-        }
+            }],
+        });
 
-        assert!(project.update_pool());
+        assert!(project.commit_queued("Edit button structure"));
         let after = project.get_pool().as_iop();
         assert_ne!(after, before);
         assert!(project.undo_operation());
@@ -1350,8 +1301,7 @@ mod tests {
             .get_mut_selected()
             .replace(NullableObjectId::new(target.id().value()));
         project.update_selected();
-        project.set_object_name(&target, "Renumbered macro".to_owned());
-        assert!(project.update_pool());
+        assert!(project.rename_object(target.id(), "Renumbered macro".to_owned()));
 
         let mut transaction = OperationTransaction::new(Some("Renumber macro".to_owned()));
         transaction.add_operation(Operation::ChangeObjectId {
@@ -1399,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn ui_draft_id_change_uses_change_id_operation() {
+    fn change_id_operation_rewrites_inbound_references() {
         let target = object_with_id(ObjectType::PictureGraphic, 10);
         let mut parent = object_with_id(ObjectType::Button, 20);
         if let Object::Button(button) = &mut parent {
@@ -1415,16 +1365,13 @@ mod tests {
         pool.add(parent);
         let mut project = EditorProject::from(pool);
 
-        if let Some(object) = project
-            .get_mut_pool()
-            .borrow_mut()
-            .object_mut_by_id(target.id())
-        {
-            object.mut_id().set_value(30).unwrap();
-        }
-        project.update_object_id_for_info(target.id(), ObjectId::new(30).unwrap());
-
-        assert!(project.update_pool());
+        let mut transaction =
+            OperationTransaction::new(Some("Change object ID 10 to 30".to_owned()));
+        transaction.add_operation(Operation::ChangeObjectId {
+            old_id: 10,
+            new_id: 30,
+        });
+        project.execute_transaction(transaction).unwrap();
         assert_eq!(
             project.undo_description().as_deref(),
             Some("Change object ID 10 to 30")
@@ -1489,20 +1436,107 @@ mod tests {
         pool.add(object.clone());
         let mut project = EditorProject::from(pool);
 
-        if let Some(Object::Button(button)) = project
-            .get_mut_pool()
-            .borrow_mut()
-            .object_mut_by_id(object.id())
-        {
-            button.width = 99;
-        }
-        assert!(project.update_pool());
+        project.queue_operation(Operation::SetProperty {
+            object_id: object.id().value(),
+            property: "width".to_owned(),
+            value: serde_json::json!(99),
+        });
+        assert!(project.commit_queued("Set button width"));
         // Corrupt only the live state to make the inverse's target unavailable.
         project.pool.remove(object.id());
-        project.mut_pool.replace(project.pool.clone());
 
         assert!(!project.undo_operation());
         assert!(project.undo_available());
         assert!(!project.redo_available());
+    }
+
+    #[test]
+    fn command_create_and_reorder_are_undoable() {
+        let mut pool = ObjectPool::default();
+        pool.add(object_with_id(ObjectType::Button, 20));
+        pool.add(object_with_id(ObjectType::Button, 10));
+        let mut project = EditorProject::from(pool);
+
+        let created = project
+            .create_object(ObjectType::StringVariable, "Created variable".to_owned())
+            .expect("CreateObject should succeed");
+        assert!(project.get_pool().object_by_id(created).is_some());
+        assert_eq!(
+            project
+                .get_object_info(project.get_pool().object_by_id(created).unwrap())
+                .name
+                .as_deref(),
+            Some("Created variable")
+        );
+        assert!(project.undo_operation());
+        assert!(project.get_pool().object_by_id(created).is_none());
+        assert!(project.redo_operation());
+        assert!(project.get_pool().object_by_id(created).is_some());
+
+        assert!(project.rename_object(created, "Renamed variable".to_owned()));
+        assert_eq!(
+            project
+                .get_object_info(project.get_pool().object_by_id(created).unwrap())
+                .name
+                .as_deref(),
+            Some("Renamed variable")
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            project
+                .get_object_info(project.get_pool().object_by_id(created).unwrap())
+                .name
+                .as_deref(),
+            Some("Created variable")
+        );
+        assert!(project.redo_operation());
+
+        assert!(project.sort_objects_by_id());
+        assert_eq!(
+            project
+                .get_pool()
+                .objects()
+                .iter()
+                .map(|object| object.id().value())
+                .collect::<Vec<_>>(),
+            vec![10, 20, created.value()]
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            project
+                .get_pool()
+                .objects()
+                .iter()
+                .map(|object| object.id().value())
+                .collect::<Vec<_>>(),
+            vec![20, 10, created.value()]
+        );
+    }
+
+    #[test]
+    fn queued_property_operation_round_trips_through_history() {
+        let button = object_with_id(ObjectType::Button, 10);
+        let mut pool = ObjectPool::default();
+        pool.add(button.clone());
+        let mut project = EditorProject::from(pool);
+
+        project.queue_operation(Operation::SetProperty {
+            object_id: button.id().value(),
+            property: "width".to_owned(),
+            value: serde_json::json!(30),
+        });
+
+        assert!(project.commit_queued("Edit button"));
+        assert_eq!(project.undo_description().as_deref(), Some("Edit button"));
+        assert!(matches!(
+            project.get_pool().object_by_id(button.id()),
+            Some(Object::Button(button)) if button.width == 30
+        ));
+
+        assert!(project.undo_operation());
+        assert!(matches!(
+            project.get_pool().object_by_id(button.id()),
+            Some(Object::Button(button)) if button.width == 0
+        ));
     }
 }

@@ -21,7 +21,7 @@ pub mod pool_validation;
 
 pub use editor_project::EditorProject;
 pub use interactive_rendering_simple::InteractiveMaskRenderer;
-pub use object_configuring::ConfigurableObject;
+pub use object_configuring::render_property_editor;
 pub use object_defaults::default_object;
 pub use object_info::ObjectInfo;
 pub use object_rendering::RenderableObject;

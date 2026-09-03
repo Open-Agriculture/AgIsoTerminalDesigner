@@ -11,15 +11,14 @@ use ag_iso_stack::object_pool::NullableObjectId;
 use ag_iso_stack::object_pool::ObjectId;
 use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectType;
-use ag_iso_terminal_designer::ConfigurableObject;
-use ag_iso_terminal_designer::EditorProject;
+use ag_iso_terminal_designer::render_property_editor;
 use ag_iso_terminal_designer::InteractiveMaskRenderer;
 use ag_iso_terminal_designer::RenderableObject;
+use ag_iso_terminal_designer::{EditorProject, Operation};
 #[cfg(not(target_arch = "wasm32"))]
 use app_persistence::RecentProject;
 use app_persistence::{AppPersistence, RecoveryRecord};
 use eframe::egui;
-use egui::Layout;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 #[cfg(not(target_arch = "wasm32"))]
@@ -355,10 +354,9 @@ impl DesignerApp {
                     },
                     FileDialogReason::OpenImagePictureGraphics(id) => {
                         if let Some(pool) = &mut self.project {
-                            if let Some(obj) = pool.get_mut_pool().borrow_mut().object_mut_by_id(id)
+                            if let Some(Object::PictureGraphic(o)) =
+                                pool.get_pool().object_by_id(id)
                             {
-                                match obj {
-                                    Object::PictureGraphic(o) => {
                                         if let Ok(img) = image::load_from_memory(&content) {
                                             // Update dimensions based on the new picture
                                             let w = img.width();
@@ -378,19 +376,13 @@ impl DesignerApp {
                                                 continue;
                                             }
 
-                                            o.actual_width = w as u16;
-                                            o.actual_height = h as u16;
-                                            if o.width == 0 {
-                                                o.width = o.actual_width;
-                                            }
-
-                                            // Set format by default to 8-bit color, user can change it in UI
-                                            o.format = PictureGraphicFormat::EightBit;
-
-                                            // We set transparent color to 1 (arbitrary choice) as we
-                                            // only use index 15..255 for actual colors
-                                            o.transparency_colour = 1;
-                                            o.options.transparent = true;
+                                            let width = if o.width == 0 {
+                                                w as u16
+                                            } else {
+                                                o.width
+                                            };
+                                            let mut options = o.options.clone();
+                                            options.transparent = true;
 
                                             let rgba = if let Some(view) = img.as_rgba8() {
                                                 // Borrowed view (no allocation)
@@ -413,7 +405,7 @@ impl DesignerApp {
 
                                             for p in rgba.pixels() {
                                                 let idx = if p[3] == 0 {
-                                                    o.transparency_colour
+                                                    1
                                                 } else {
                                                     find_closest_color_index(p[0], p[1], p[2])
                                                 };
@@ -445,30 +437,42 @@ impl DesignerApp {
 
                                             // Choose the best encoding
                                             if rle.len() < raw.len() {
-                                                o.data = rle;
-                                                o.options.data_code_type = DataCodeType::RunLength;
+                                                options.data_code_type = DataCodeType::RunLength;
                                                 log::info!(
                                             "Selected run-length encoding ({} bytes) over raw ({} bytes)",
-                                            o.data.len(),
+                                            rle.len(),
                                             raw.len()
                                         );
                                             } else {
-                                                o.data = raw;
-                                                o.options.data_code_type = DataCodeType::Raw;
+                                                options.data_code_type = DataCodeType::Raw;
                                                 log::info!(
                                             "Selected raw encoding ({} bytes) over run-length ({} bytes)",
-                                            o.data.len(),
+                                            raw.len(),
                                             rle.len()
                                         );
+                                            }
+
+                                            let data = if rle.len() < raw.len() { rle } else { raw };
+                                            for (property, value) in [
+                                                ("actual_width", serde_json::json!(w)),
+                                                ("actual_height", serde_json::json!(h)),
+                                                ("width", serde_json::json!(width)),
+                                                ("format", serde_json::to_value(PictureGraphicFormat::EightBit).unwrap()),
+                                                ("transparency_colour", serde_json::json!(1)),
+                                                ("options", serde_json::to_value(options).unwrap()),
+                                                ("data", serde_json::json!(data)),
+                                            ] {
+                                                pool.queue_operation(Operation::SetProperty {
+                                                    object_id: id.value(),
+                                                    property: property.to_owned(),
+                                                    value,
+                                                });
                                             }
                                         } else {
                                             self.error_message = Some(
                                                 "Failed to decode the selected image".to_owned(),
                                             );
                                         }
-                                    }
-                                    _ => (),
-                                }
                             }
                         }
                     }
@@ -919,7 +923,7 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
         if response.clicked() {
             project
                 .get_mut_selected()
-                .replace(NullableObjectId(Some(object.id())));
+                .set(NullableObjectId(Some(object.id())));
         }
         if response.double_clicked() {
             project.set_renaming_object(this_ui_id, object.id(), object_info.get_name(object));
@@ -931,7 +935,7 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
                 ui.close();
             }
             if ui.button("Delete").on_hover_text("Delete object").clicked() {
-                project.get_mut_pool().borrow_mut().remove(object.id());
+                project.request_delete_object(object.id());
                 ui.close();
             }
         });
@@ -1363,23 +1367,13 @@ impl eframe::App for DesignerApp {
                 });
 
             if should_create {
-                // Create the object with the given name
+                // Create the object through the operation API so it is
+                // immediately represented in undo/redo history.
                 if let Some(pool) = &mut self.project {
-                    let mut new_obj = ag_iso_terminal_designer::default_object(object_type);
-
-                    // Allocate a new ID efficiently
-                    let id = pool.allocate_object_id();
-                    new_obj.mut_id().set_value(id.value()).ok();
-
-                    // Add object to pool
-                    pool.get_mut_pool().borrow_mut().add(new_obj.clone());
-
-                    // Set the custom name through the tracked project API.
-                    pool.set_object_name(&new_obj, name);
-
-                    // Select the new object
-                    pool.get_mut_selected()
-                        .replace(NullableObjectId::new(id.value()));
+                    if let Some(id) = pool.create_object(object_type, name) {
+                        pool.get_mut_selected()
+                            .set(NullableObjectId::new(id.value()));
+                    }
                 }
                 self.new_object_dialog = None;
             } else if should_cancel {
@@ -1598,19 +1592,11 @@ impl eframe::App for DesignerApp {
                             ui.add_space(ui.spacing().scroll.bar_width);
                             ui.menu_button("\u{2195}", |ui| {
                                 if ui.button("Sort by name").clicked() {
-                                    let pool_copy = pool.clone();
-                                    pool.sort_objects_by(|a, b| {
-                                        pool_copy
-                                            .get_object_info(a)
-                                            .get_name(a)
-                                            .cmp(&pool_copy.get_object_info(b).get_name(b))
-                                    });
+                                    pool.sort_objects_by_name();
                                     ui.close();
                                 }
                                 if ui.button("Sort by id").clicked() {
-                                    pool.sort_objects_by(|a, b| {
-                                        u16::from(a.id()).cmp(&u16::from(b.id()))
-                                    });
+                                    pool.sort_objects_by_id();
                                     ui.close();
                                 }
                             })
@@ -1681,8 +1667,7 @@ impl eframe::App for DesignerApp {
                                             object: obj,
                                             pool: pool.get_pool(),
                                             selected_callback: Box::new(move |object_id| {
-                                                *selected_ref.borrow_mut() =
-                                                    NullableObjectId(Some(object_id));
+                                                selected_ref.set(NullableObjectId(Some(object_id)));
                                             }),
                                         },
                                     );
@@ -1708,28 +1693,31 @@ impl eframe::App for DesignerApp {
             // Parameters panel
             egui::SidePanel::right("right_panel").show(ctx, |ui: &mut egui::Ui| {
                 if let Some(id) = pool.get_selected().into() {
-                    if let Some(obj) = pool.get_mut_pool().borrow_mut().object_mut_by_id(id) {
+                    if let Some(original) = pool.get_pool().object_by_id(id) {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             // Display editable object name as header
                             ui.horizontal(|ui| {
                                 ui.label("Name:");
 
-                                let object_info = pool.get_object_info(obj);
-                                let mut name = object_info.get_name(obj);
+                                let object_info = pool.get_object_info(original);
+                                let mut name = object_info.get_name(original);
                                 let response = ui.text_edit_singleline(&mut name);
 
                                 if response.changed() {
-                                    pool.set_object_name(obj, name);
+                                    pool.queue_operation(Operation::RenameObject {
+                                        object_id: original.id().value(),
+                                        name,
+                                    });
                                 }
                             });
                             ui.separator();
 
-                            obj.render_parameters(ui, pool);
-                            let (width, height) = pool.get_pool().content_size(obj);
+                            render_property_editor(ui, original, pool);
+                            let (width, height) = pool.get_pool().content_size(original);
                             ui.separator();
                             let desired_size = egui::Vec2::new(width as f32, height as f32);
                             ui.allocate_ui(desired_size, |ui| {
-                                obj.render(ui, pool.get_pool(), Point::default());
+                                original.render(ui, pool.get_pool(), Point::default());
                             });
                         });
                     } else {
@@ -1742,8 +1730,18 @@ impl eframe::App for DesignerApp {
                 ui.allocate_space(ui.available_size());
             });
 
-            if pool.update_pool() {
+            if pool.commit_queued("Edit object pool") {
                 ctx.request_repaint();
+            }
+            if let Some((object_id, name)) = pool.take_rename_request() {
+                if pool.rename_object(object_id, name) {
+                    ctx.request_repaint();
+                }
+            }
+            if let Some(object_id) = pool.take_delete_request() {
+                if pool.delete_object(object_id) {
+                    ctx.request_repaint();
+                }
             }
             if let Some(error) = pool.take_operation_error() {
                 self.error_message = Some(error);

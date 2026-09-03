@@ -1,3529 +1,1285 @@
-//! Copyright 2024 - The Open-Agriculture Developers
-//! SPDX-License-Identifier: GPL-3.0-or-later
-//! Authors: Daan Steenbergen
+//! Descriptor-driven object configuration.
+//!
+//! This module is deliberately generic: object types expose properties through
+//! `PropertyAccess`, and this renderer is the sole configuration UI.
 
-use crate::allowed_object_relationships::get_allowed_child_refs;
-use crate::allowed_object_relationships::AllowedChildRefs;
-use crate::possible_events::PossibleEvents;
-use crate::EditorProject;
-
-use ag_iso_stack::object_pool::object::*;
-use ag_iso_stack::object_pool::object_attributes::*;
+use crate::object_properties::{
+    get_object_property, get_property_descriptors, property_editor_descriptors, EditorKind,
+    PropertySemantic,
+};
+use crate::operations::ObjectReferenceList;
+use crate::{EditorProject, Operation};
+use ag_iso_stack::object_pool::object::Object;
+use ag_iso_stack::object_pool::object_attributes::{Event, MacroRef};
 use ag_iso_stack::object_pool::vt_version::VtVersion;
-use ag_iso_stack::object_pool::NullableObjectId;
-use ag_iso_stack::object_pool::ObjectId;
-use ag_iso_stack::object_pool::ObjectPool;
-use ag_iso_stack::object_pool::ObjectRef;
-use ag_iso_stack::object_pool::ObjectType;
+use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectRef, ObjectType};
 use eframe::egui;
-use eframe::egui::TextWrapMode;
 
-pub trait ConfigurableObject {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject);
+#[derive(Clone)]
+enum PendingValue {
+    Number(f64),
+    Text(String),
 }
 
-impl ConfigurableObject for Object {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        // Specific UI settings that are applied to all configuration screens
+/// A drag value changes on every pointer-move frame. Keep displaying those
+/// intermediate values, but only turn the edit into an operation when the
+/// pointer is released (or a keyboard edit loses focus).
+fn drag_value_finished(response: &egui::Response) -> bool {
+    response.drag_stopped() || response.lost_focus()
+}
 
-        // The combination below makes the comboboxes used throughout the configuration UI have minimal width, yet still be able to show the full text
-        ui.style_mut().wrap_mode = Some(TextWrapMode::Extend);
-        ui.style_mut().spacing.combo_width = 0.0;
+/// Render every writable property declared for `object`.
+pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &EditorProject) {
+    ui.style_mut().spacing.combo_width = 0.0;
+    let id = object.id();
+    let object_type = object.object_type();
+    let properties = get_property_descriptors(object_type);
 
-        match self {
-            Object::WorkingSet(o) => o.render_parameters(ui, design),
-            Object::DataMask(o) => o.render_parameters(ui, design),
-            Object::AlarmMask(o) => o.render_parameters(ui, design),
-            Object::Container(o) => o.render_parameters(ui, design),
-            Object::SoftKeyMask(o) => o.render_parameters(ui, design),
-            Object::Key(o) => o.render_parameters(ui, design),
-            Object::Button(o) => o.render_parameters(ui, design),
-            Object::InputBoolean(o) => o.render_parameters(ui, design),
-            Object::InputString(o) => o.render_parameters(ui, design),
-            Object::InputNumber(o) => o.render_parameters(ui, design),
-            Object::InputList(o) => o.render_parameters(ui, design),
-            Object::OutputString(o) => o.render_parameters(ui, design),
-            Object::OutputNumber(o) => o.render_parameters(ui, design),
-            Object::OutputList(o) => o.render_parameters(ui, design),
-            Object::OutputLine(o) => o.render_parameters(ui, design),
-            Object::OutputRectangle(o) => o.render_parameters(ui, design),
-            Object::OutputEllipse(o) => o.render_parameters(ui, design),
-            Object::OutputPolygon(o) => o.render_parameters(ui, design),
-            Object::OutputMeter(o) => o.render_parameters(ui, design),
-            Object::OutputLinearBarGraph(o) => o.render_parameters(ui, design),
-            Object::OutputArchedBarGraph(o) => o.render_parameters(ui, design),
-            Object::PictureGraphic(o) => o.render_parameters(ui, design),
-            Object::NumberVariable(o) => o.render_parameters(ui, design),
-            Object::StringVariable(o) => o.render_parameters(ui, design),
-            Object::FontAttributes(o) => o.render_parameters(ui, design),
-            Object::LineAttributes(o) => o.render_parameters(ui, design),
-            Object::FillAttributes(o) => o.render_parameters(ui, design),
-            Object::InputAttributes(o) => o.render_parameters(ui, design),
-            Object::ObjectPointer(o) => o.render_parameters(ui, design),
-            Object::Macro(o) => o.render_parameters(ui, design),
-            Object::AuxiliaryFunctionType1(o) => (),
-            Object::AuxiliaryInputType1(o) => (),
-            Object::AuxiliaryFunctionType2(o) => o.render_parameters(ui, design),
-            Object::AuxiliaryInputType2(o) => o.render_parameters(ui, design),
-            Object::AuxiliaryControlDesignatorType2(o) => o.render_parameters(ui, design),
-            Object::WindowMask(o) => (),
-            Object::KeyGroup(o) => (),
-            Object::GraphicsContext(o) => (),
-            Object::ExtendedInputAttributes(o) => (),
-            Object::ColourMap(o) => (),
-            Object::ObjectLabelReferenceList(o) => (),
-            Object::ExternalObjectDefinition(o) => (),
-            Object::ExternalReferenceName(o) => (),
-            Object::ExternalObjectPointer(o) => (),
-            Object::Animation(o) => (),
-            Object::ColourPalette(o) => (),
-            Object::GraphicData(o) => (),
-            Object::WorkingSetSpecialControls(o) => (),
-            Object::ScaledGraphic(o) => (),
+    render_identity(ui, id, object_type, design);
+    ui.separator();
+    for editor in property_editor_descriptors(object_type) {
+        // Structural collections are rendered below and never use SetProperty.
+        if matches!(editor.editor, EditorKind::MacroReferences) {
+            continue;
         }
+        let Some(property) = properties.iter().find(|item| item.name == editor.property) else {
+            continue;
+        };
+        let Ok(value) = get_object_property(object, editor.property) else {
+            continue;
+        };
+        let label = human_readable_property_name(editor.property);
+        ui.push_id(editor.property, |ui| match editor.editor {
+            EditorKind::Colour => {
+                render_number(ui, &label, &value, 0.0..=255.0, id, editor.property, design)
+            }
+            EditorKind::ObjectReference => {
+                render_reference(ui, &label, &value, property, id, editor.property, design)
+            }
+            EditorKind::Json => render_json(ui, &label, &value, id, editor.property, design),
+            EditorKind::FlagSet => render_flag_set(ui, &label, &value, id, editor.property, design),
+            EditorKind::Justification => {
+                render_justification(ui, &label, &value, id, editor.property, design)
+            }
+            EditorKind::Auto => render_auto(ui, &label, &value, id, editor.property, design),
+            _ => render_auto(ui, &label, &value, id, editor.property, design),
+        });
+    }
+
+    if let Some(children) = crate::operations::operation::object_refs(object) {
+        ui.separator();
+        ui.label("Objects");
+        render_positioned_children(ui, object, children, design);
+    }
+    if let Some(objects) = crate::operations::operation::object_list(object) {
+        ui.separator();
+        ui.label("Objects");
+        render_object_list(ui, object, objects, design);
+    }
+    if crate::operations::operation::macro_refs(object).is_some() {
+        ui.separator();
+        render_macro_references(ui, object, id, design);
     }
 }
 
-fn render_object_id(ui: &mut egui::Ui, id: &mut ObjectId, design: &EditorProject) {
-    let mut current_id = u16::from(*id);
-
-    ui.horizontal(|ui| {
-        ui.label("Object ID:");
-
-        let widget = egui::DragValue::new(&mut current_id)
-            .speed(1.0)
-            .range(0..=65534);
-        let resp = ui.add(widget);
-
-        let new_id = ObjectId::new(current_id).unwrap();
-
-        // Check if the new ID is already used by another object (excluding the current object)
-        let conflict = design.get_pool().object_by_id(new_id).is_some() && new_id != *id;
-
-        let conflict_storage = ui.id().with("conflict");
-        let was_conflict = ui.data(|data| data.get_temp::<u16>(conflict_storage));
-
-        if conflict || was_conflict.is_some_and(|id| id == current_id) {
-            ui.colored_label(egui::Color32::RED, "ID already in use!");
-
-            // Save the conflict in storage so it is still displayed next frame
-            ui.data_mut(|data| {
-                data.insert_temp(conflict_storage, u16::from(*id));
-            });
-        } else if resp.changed() || was_conflict.is_some_and(|id| id != current_id) {
-            // Remove the conflict from storage if we are actively changing the ID,
-            // or if the ID has changed (most likely another object is selected)
-            ui.data_mut(|data| {
-                data.remove_temp::<u16>(conflict_storage);
-            });
+/// Convert a snake_case property identifier to a title-cased editor label.
+fn human_readable_property_name(property: &str) -> String {
+    let mut label = String::with_capacity(property.len());
+    let mut capitalise_next = true;
+    for character in property.chars() {
+        if character == '_' {
+            label.push(' ');
+            capitalise_next = true;
+        } else if capitalise_next {
+            label.extend(character.to_uppercase());
+            capitalise_next = false;
+        } else {
+            label.push(character);
         }
-
-        if !conflict && resp.changed() {
-            design.update_object_id_for_info(*id, new_id);
-            *id = new_id;
-            design.get_mut_selected().borrow_mut().0 = Some(*id);
-        }
-
-        // Add the object type display
-        if let Some(obj) = design.get_pool().object_by_id(*id) {
-            ui.separator();
-            ui.label("Type:");
-            ui.label(format!("{:?}", obj.object_type()));
-        }
-    });
+    }
+    label
 }
 
-fn render_object_id_selector(
-    ui: &mut egui::Ui,
-    idx: usize,
-    design: &EditorProject,
-    object_id: &mut ObjectId,
-    allowed_child_objects: &[ObjectType],
-    current_object_id: Option<ObjectId>,
-) {
-    let pool = design.get_pool();
-    egui::ComboBox::from_id_salt(format!("object_id_selector_{}", idx))
-        .selected_text(format!("{:?}", object_id.value()))
-        .show_ui(ui, |ui| {
-            for potential_child in pool.objects_by_types(allowed_child_objects) {
-                let child_id = potential_child.id();
-
-                // Check if this would create a circular reference
-                let would_be_circular = if let Some(parent_id) = current_object_id {
-                    crate::pool_validation::would_create_circular_reference(
-                        pool, parent_id, child_id,
-                    )
-                    .is_err()
-                } else {
-                    false
-                };
-
-                let object_info = design.get_object_info(potential_child);
-                let name = object_info.get_name(potential_child);
-                let label = format!(
-                    "{:?}: {:?} - {}{}",
-                    u16::from(child_id),
-                    potential_child.object_type(),
-                    name,
-                    if would_be_circular {
-                        " ⚠ (circular)"
-                    } else {
-                        ""
-                    }
-                );
-
-                // Disable selection if it would create a circular reference
-                ui.add_enabled_ui(!would_be_circular, |ui| {
-                    ui.selectable_value(object_id, child_id, label);
-                });
-            }
-        });
+#[derive(Clone)]
+enum ListAction {
+    MoveUp(usize),
+    MoveDown(usize),
+    Remove(usize),
+    ReplaceMacro(usize, MacroRef),
 }
 
-fn render_nullable_object_id_selector(
-    ui: &mut egui::Ui,
-    idx: usize,
-    design: &EditorProject,
-    object_id: &mut NullableObjectId,
-    allowed_child_objects: &[ObjectType],
-    current_object_id: Option<ObjectId>,
-) {
-    let pool = design.get_pool();
-    egui::ComboBox::from_id_salt(format!("nullable_object_id_selector_{}", idx))
-        .selected_text(
-            object_id
-                .0
-                .map_or("None".to_string(), |id| format!("{:?}", id.value())),
-        )
-        .show_ui(ui, |ui| {
-            ui.selectable_value(object_id, NullableObjectId::NULL, "None");
-            for potential_child in pool.objects_by_types(allowed_child_objects) {
-                let child_id = potential_child.id();
-
-                // Check if this would create a circular reference
-                let would_be_circular = if let Some(parent_id) = current_object_id {
-                    crate::pool_validation::would_create_circular_reference(
-                        pool, parent_id, child_id,
-                    )
-                    .is_err()
-                } else {
-                    false
-                };
-
-                let object_info = design.get_object_info(potential_child);
-                let name = object_info.get_name(potential_child);
-                let label = format!(
-                    "{:?}: {:?} - {}{}",
-                    u16::from(child_id),
-                    potential_child.object_type(),
-                    name,
-                    if would_be_circular {
-                        " ⚠ (circular)"
-                    } else {
-                        ""
-                    }
-                );
-
-                // Disable selection if it would create a circular reference
-                ui.add_enabled_ui(!would_be_circular, |ui| {
-                    ui.selectable_value(object_id, child_id.into(), label);
-                });
-            }
-        });
-}
-
-fn render_index_modifiers<T>(ui: &mut egui::Ui, idx: usize, list: &mut Vec<T>) {
+fn row_actions(ui: &mut egui::Ui, index: usize, len: usize, action: &mut Option<ListAction>) {
     if ui
-        .add_enabled(idx > 0, egui::Button::new("\u{23F6}"))
+        .add_enabled(index > 0, egui::Button::new("\u{23F6}"))
         .on_hover_text("Move up")
         .clicked()
     {
-        list.swap(idx, idx - 1);
+        *action = Some(ListAction::MoveUp(index));
     }
     if ui
-        .add_enabled(idx < list.len() - 1, egui::Button::new("\u{23F7}"))
+        .add_enabled(index + 1 < len, egui::Button::new("\u{23F7}"))
         .on_hover_text("Move down")
         .clicked()
     {
-        list.swap(idx, idx + 1);
+        *action = Some(ListAction::MoveDown(index));
     }
     if ui.button("\u{1F5D9}").on_hover_text("Remove").clicked() {
-        list.remove(idx);
+        *action = Some(ListAction::Remove(index));
     }
 }
 
-fn render_object_references_list(
+fn object_label(design: &EditorProject, object: &Object) -> String {
+    format!(
+        "{}: {:?} - {}",
+        object.id().value(),
+        object.object_type(),
+        design.get_object_info(object).get_name(object)
+    )
+}
+
+fn object_selector_label(design: &EditorProject, object: &Object) -> String {
+    let info = design.get_object_info(object);
+    info.name.map_or_else(
+        || object.id().value().to_string(),
+        |name| format!("{} - {name}", object.id().value()),
+    )
+}
+
+fn select_object(design: &EditorProject, id: ObjectId) {
+    design.get_mut_selected().set(NullableObjectId(Some(id)));
+}
+
+fn candidate_is_valid(design: &EditorProject, parent: ObjectId, child: ObjectId) -> bool {
+    crate::pool_validation::would_create_circular_reference(design.get_pool(), parent, child)
+        .is_ok()
+        && crate::pool_validation::validate_parent_child_relationship(
+            design.get_pool(),
+            parent,
+            child,
+        )
+        .is_ok()
+}
+
+fn render_object_selector(
     ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
     design: &EditorProject,
-    width: u16,
-    height: u16,
-    object_refs: &mut Vec<ObjectRef>,
-    allowed_child_objects: &[ObjectType],
-    current_object_id: ObjectId,
+    parent: ObjectId,
+    selected: ObjectId,
+    allowed_types: &[ObjectType],
+) -> Option<ObjectId> {
+    let selected_text = design.get_pool().object_by_id(selected).map_or_else(
+        || format!("{}: Missing object", selected.value()),
+        |object| object_selector_label(design, object),
+    );
+    let mut replacement = None;
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            for candidate in design.get_pool().objects_by_types(allowed_types) {
+                let valid = candidate_is_valid(design, parent, candidate.id());
+                ui.add_enabled_ui(valid, |ui| {
+                    if ui
+                        .selectable_label(
+                            candidate.id() == selected,
+                            object_selector_label(design, candidate),
+                        )
+                        .clicked()
+                    {
+                        replacement = Some(candidate.id());
+                    }
+                });
+            }
+        });
+    replacement.filter(|replacement| *replacement != selected)
+}
+
+fn parent_dimensions(object: &Object, design: &EditorProject) -> (u16, u16) {
+    object
+        .as_sized_object()
+        .map(|sized| (sized.width(), sized.height()))
+        .unwrap_or((design.mask_size, design.mask_size))
+}
+
+fn child_position_limits(
+    parent: &Object,
+    child: Option<&Object>,
+    design: &EditorProject,
+) -> (i16, i16) {
+    let (width, height) = parent_dimensions(parent, design);
+    let (child_width, child_height) = child
+        .and_then(Object::as_sized_object)
+        .map(|sized| (sized.width(), sized.height()))
+        .unwrap_or_default();
+    (
+        width.saturating_sub(child_width).min(i16::MAX as u16) as i16,
+        height.saturating_sub(child_height).min(i16::MAX as u16) as i16,
+    )
+}
+
+fn render_positioned_children(
+    ui: &mut egui::Ui,
+    parent: &Object,
+    children: &[ObjectRef],
+    design: &EditorProject,
 ) {
-    egui::Grid::new("object_ref_grid")
+    let parent_id = parent.id();
+    let allowed = crate::allowed_object_relationships::get_allowed_child_refs(
+        parent.object_type(),
+        VtVersion::Version6,
+    );
+    let mut replacement = None;
+    let mut position = None;
+    let mut action = None;
+    egui::Grid::new(("positioned_children", parent_id.value()))
         .striped(true)
         .min_col_width(0.0)
         .show(ui, |ui| {
-            let mut idx = 0;
-            while idx < object_refs.len() {
-                let obj_ref = &mut object_refs[idx];
-                let obj = design.get_pool().object_by_id(obj_ref.id);
-
-                ui.label(" - ");
-                render_object_id_selector(
+            ui.label("Object");
+            ui.label("Type");
+            ui.label("X");
+            ui.label("Y");
+            ui.label("");
+            ui.label("");
+            ui.label("");
+            ui.end_row();
+            for (index, child_ref) in children.iter().enumerate() {
+                if let Some(new_id) = render_object_selector(
                     ui,
-                    idx,
+                    ("positioned_child", index),
                     design,
-                    &mut obj_ref.id,
-                    allowed_child_objects,
-                    Some(current_object_id),
-                );
-
-                if let Some(obj) = obj {
-                    let mut max_x = width as i16;
-                    let mut max_y = height as i16;
-                    if let Some(sized_obj) = obj.as_sized_object() {
-                        max_x -= sized_obj.width() as i16;
-                        max_y -= sized_obj.height() as i16;
+                    parent_id,
+                    child_ref.id,
+                    &allowed,
+                ) {
+                    replacement = Some((index, new_id));
+                }
+                let child = design.get_pool().object_by_id(child_ref.id);
+                if let Some(child) = child {
+                    if ui.link(format!("{:?}", child.object_type())).clicked() {
+                        select_object(design, child.id());
                     }
-                    if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                        *design.get_mut_selected().borrow_mut() = obj.id().into();
-                    }
-
-                    // Add name column
-                    let object_info = design.get_object_info(obj);
-                    ui.label(object_info.get_name(obj));
-
-                    ui.add(
-                        egui::Slider::new(&mut obj_ref.offset.x, 0..=max_x)
-                            .text("X")
-                            .drag_value_speed(1.0),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut obj_ref.offset.y, 0..=max_y)
-                            .text("Y")
-                            .drag_value_speed(1.0),
-                    );
                 } else {
                     ui.colored_label(egui::Color32::RED, "Missing object");
                 }
-
-                render_index_modifiers(ui, idx, object_refs);
-                idx += 1;
-                ui.end_row();
-            }
-        });
-
-    let (new_object_id, _) = render_add_object_id(
-        ui,
-        design,
-        allowed_child_objects,
-        false,
-        Some(current_object_id),
-    );
-    if let Some(id) = new_object_id {
-        object_refs.push(ObjectRef {
-            id,
-            offset: Point::default(),
-        });
-    }
-}
-
-fn render_object_id_list(
-    ui: &mut egui::Ui,
-    design: &EditorProject,
-    object_ids: &mut Vec<ObjectId>,
-    allowed_child_objects: &[ObjectType],
-    current_object_id: ObjectId,
-) {
-    egui::Grid::new("object_id_grid")
-        .striped(true)
-        .min_col_width(0.0)
-        .show(ui, |ui| {
-            let mut idx = 0;
-            while idx < object_ids.len() {
-                let obj: Option<&Object> = design.get_pool().object_by_id(object_ids[idx]);
-
-                ui.label(" - ");
-                render_object_id_selector(
-                    ui,
-                    idx,
-                    design,
-                    &mut object_ids[idx],
-                    allowed_child_objects,
-                    Some(current_object_id),
-                );
-
-                if let Some(obj) = obj {
-                    if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                        *design.get_mut_selected().borrow_mut() = obj.id().into();
-                    }
-
-                    // Add name column
-                    let object_info = design.get_object_info(obj);
-                    ui.label(object_info.get_name(obj));
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object");
-                    ui.label(""); // Empty cell for name column
+                let (max_x, max_y) = child_position_limits(parent, child, design);
+                let mut x = child_ref.offset.x.clamp(0, max_x);
+                let mut y = child_ref.offset.y.clamp(0, max_y);
+                let x_changed = ui
+                    .add(
+                        egui::Slider::new(&mut x, 0..=max_x)
+                            .show_value(true)
+                            .drag_value_speed(1.0),
+                    )
+                    .changed();
+                let y_changed = ui
+                    .add(
+                        egui::Slider::new(&mut y, 0..=max_y)
+                            .show_value(true)
+                            .drag_value_speed(1.0),
+                    )
+                    .changed();
+                if x_changed || y_changed {
+                    position = Some((child_ref.id, x, y));
                 }
-
-                render_index_modifiers(ui, idx, object_ids);
-                idx += 1;
-                ui.end_row();
-            }
-        });
-    let (new_object_id, _) = render_add_object_id(
-        ui,
-        design,
-        allowed_child_objects,
-        false,
-        Some(current_object_id),
-    );
-    if let Some(id) = new_object_id {
-        object_ids.push(id);
-    }
-}
-
-fn render_nullable_object_id_list(
-    ui: &mut egui::Ui,
-    design: &EditorProject,
-    nullable_object_ids: &mut Vec<NullableObjectId>,
-    allowed_child_objects: &[ObjectType],
-    current_object_id: ObjectId,
-) {
-    egui::Grid::new("object_id_grid")
-        .striped(true)
-        .min_col_width(0.0)
-        .show(ui, |ui| {
-            let mut idx = 0;
-            while idx < nullable_object_ids.len() {
-                ui.label(" - ");
-                render_nullable_object_id_selector(
-                    ui,
-                    idx,
-                    design,
-                    &mut nullable_object_ids[idx],
-                    allowed_child_objects,
-                    Some(current_object_id),
-                );
-                if let Some(object_id) = &mut nullable_object_ids[idx].0 {
-                    let obj: Option<&Object> = design.get_pool().object_by_id(*object_id);
-
-                    if let Some(obj) = obj {
-                        if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                            *design.get_mut_selected().borrow_mut() = obj.id().into();
-                        }
-
-                        // Add name column
-                        let object_info = design.get_object_info(obj);
-                        ui.label(object_info.get_name(obj));
-                    } else {
-                        ui.colored_label(egui::Color32::RED, "Missing object");
-                        ui.label(""); // Empty cell for name column
-                    }
-                } else {
-                    ui.label(""); // Empty cell for type
-                    ui.label(""); // Empty cell for name
-                }
-                render_index_modifiers(ui, idx, nullable_object_ids);
-                idx += 1;
+                row_actions(ui, index, children.len(), &mut action);
                 ui.end_row();
             }
         });
 
-    let (new_object_id, success) = render_add_object_id(
-        ui,
-        design,
-        allowed_child_objects,
-        true,
-        Some(current_object_id),
-    );
-    if success {
-        nullable_object_ids.push(NullableObjectId(new_object_id));
+    if let Some((index, child_id)) = replacement {
+        let mut updated = children.to_vec();
+        updated[index].id = child_id;
+        design.queue_operation(Operation::SetChildren {
+            parent_id: parent_id.value(),
+            children: updated,
+        });
+    } else if let Some((child_id, x, y)) = position {
+        design.queue_operation(Operation::SetChildPosition {
+            parent_id: parent_id.value(),
+            child_id: child_id.value(),
+            x,
+            y,
+        });
+    } else if let Some(action) = action {
+        let mut updated = children.to_vec();
+        apply_list_action(&mut updated, action);
+        design.queue_operation(Operation::SetChildren {
+            parent_id: parent_id.value(),
+            children: updated,
+        });
     }
-}
 
-fn render_add_object_id(
-    ui: &mut egui::Ui,
-    design: &EditorProject,
-    allowed_child_objects: &[ObjectType],
-    allow_none: bool,
-    current_object_id: Option<ObjectId>,
-) -> (Option<ObjectId>, bool) {
-    let pool = design.get_pool();
-    let mut result = (None, false);
     ui.horizontal(|ui| {
         ui.label("Add object:");
-        egui::ComboBox::from_id_salt("New Object Type")
+        egui::ComboBox::from_id_salt(("add_positioned_child", parent_id.value()))
             .selected_text("Select existing object")
             .show_ui(ui, |ui| {
-                if allow_none {
-                    if ui.selectable_label(false, "None").clicked() {
-                        result = (None, true);
-                    }
-                }
-                for potential_child in pool.objects_by_types(allowed_child_objects) {
-                    let child_id = potential_child.id();
-
-                    // Check if this would create a circular reference
-                    let would_be_circular = if let Some(parent_id) = current_object_id {
-                        crate::pool_validation::would_create_circular_reference(
-                            pool, parent_id, child_id,
-                        )
-                        .is_err()
-                    } else {
-                        false
-                    };
-
-                    let object_info = design.get_object_info(potential_child);
-                    let name = object_info.get_name(potential_child);
-                    let label = format!(
-                        "{:?}: {:?} - {}{}",
-                        u16::from(child_id),
-                        potential_child.object_type(),
-                        name,
-                        if would_be_circular {
-                            " ⚠ (circular)"
-                        } else {
-                            ""
-                        }
-                    );
-
-                    // Only allow clicking if it wouldn't create a circular reference
-                    ui.add_enabled_ui(!would_be_circular, |ui| {
-                        if ui.selectable_label(false, label).clicked() {
-                            result = (Some(child_id), true);
+                for candidate in design.get_pool().objects_by_types(&allowed) {
+                    let valid = candidate_is_valid(design, parent_id, candidate.id());
+                    ui.add_enabled_ui(valid, |ui| {
+                        if ui
+                            .selectable_label(false, object_label(design, candidate))
+                            .clicked()
+                        {
+                            design.queue_operation(Operation::AddChild {
+                                parent_id: parent_id.value(),
+                                child_id: candidate.id().value(),
+                                x: 0,
+                                y: 0,
+                            });
                         }
                     });
                 }
             });
     });
-    result
 }
 
-fn render_macro_references(
+fn apply_list_action<T>(list: &mut Vec<T>, action: ListAction) {
+    match action {
+        ListAction::MoveUp(index) => list.swap(index, index - 1),
+        ListAction::MoveDown(index) => list.swap(index, index + 1),
+        ListAction::Remove(index) => {
+            list.remove(index);
+        }
+        ListAction::ReplaceMacro(_, _) => unreachable!(),
+    }
+}
+
+fn render_object_list(
+    ui: &mut egui::Ui,
+    parent: &Object,
+    objects: ObjectReferenceList,
+    design: &EditorProject,
+) {
+    let parent_id = parent.id();
+    let allowed = crate::allowed_object_relationships::get_allowed_child_refs(
+        parent.object_type(),
+        VtVersion::Version6,
+    );
+    match objects {
+        ObjectReferenceList::Required(objects) => {
+            let mut replacement = None;
+            let mut action = None;
+            egui::Grid::new(("required_object_list", parent_id.value()))
+                .striped(true)
+                .show(ui, |ui| {
+                    for (index, object_id) in objects.iter().copied().enumerate() {
+                        ui.label(object_id.value().to_string());
+                        if let Some(new_id) = render_object_selector(
+                            ui,
+                            ("required_object", index),
+                            design,
+                            parent_id,
+                            object_id,
+                            &allowed,
+                        ) {
+                            replacement = Some((index, new_id));
+                        }
+                        render_reference_links(ui, design, object_id);
+                        row_actions(ui, index, objects.len(), &mut action);
+                        ui.end_row();
+                    }
+                });
+            if let Some((index, object_id)) = replacement {
+                let mut updated = objects.clone();
+                updated[index] = object_id;
+                queue_object_list(design, parent_id, ObjectReferenceList::Required(updated));
+            } else if let Some(action) = action {
+                let mut updated = objects.clone();
+                apply_list_action(&mut updated, action);
+                queue_object_list(design, parent_id, ObjectReferenceList::Required(updated));
+            }
+            render_add_object(ui, design, parent_id, &allowed, false, |object_id| {
+                let mut updated = objects.clone();
+                if let Some(object_id) = object_id {
+                    updated.push(object_id);
+                    queue_object_list(design, parent_id, ObjectReferenceList::Required(updated));
+                }
+            });
+        }
+        ObjectReferenceList::Nullable(objects) => {
+            let mut replacement = None;
+            let mut action = None;
+            egui::Grid::new(("nullable_object_list", parent_id.value()))
+                .striped(true)
+                .show(ui, |ui| {
+                    for (index, object_id) in objects.iter().copied().enumerate() {
+                        ui.label(
+                            object_id
+                                .0
+                                .map_or_else(|| "None".to_owned(), |id| id.value().to_string()),
+                        );
+                        let mut selected = object_id;
+                        egui::ComboBox::from_id_salt(("nullable_object", index))
+                            .selected_text(object_id.0.map_or_else(
+                                || "None".to_owned(),
+                                |id| {
+                                    design.get_pool().object_by_id(id).map_or_else(
+                                        || format!("{}: Missing object", id.value()),
+                                        |object| object_label(design, object),
+                                    )
+                                },
+                            ))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut selected, NullableObjectId::NULL, "None");
+                                for candidate in design.get_pool().objects_by_types(&allowed) {
+                                    let valid =
+                                        candidate_is_valid(design, parent_id, candidate.id());
+                                    ui.add_enabled_ui(valid, |ui| {
+                                        ui.selectable_value(
+                                            &mut selected,
+                                            NullableObjectId(Some(candidate.id())),
+                                            object_label(design, candidate),
+                                        );
+                                    });
+                                }
+                            });
+                        if selected != object_id {
+                            replacement = Some((index, selected));
+                        }
+                        if let Some(id) = object_id.0 {
+                            render_reference_links(ui, design, id);
+                        } else {
+                            ui.label("");
+                            ui.label("");
+                        }
+                        row_actions(ui, index, objects.len(), &mut action);
+                        ui.end_row();
+                    }
+                });
+            if let Some((index, object_id)) = replacement {
+                let mut updated = objects.clone();
+                updated[index] = object_id;
+                queue_object_list(design, parent_id, ObjectReferenceList::Nullable(updated));
+            } else if let Some(action) = action {
+                let mut updated = objects.clone();
+                apply_list_action(&mut updated, action);
+                queue_object_list(design, parent_id, ObjectReferenceList::Nullable(updated));
+            }
+            render_add_object(ui, design, parent_id, &allowed, true, |object_id| {
+                let mut updated = objects.clone();
+                updated.push(NullableObjectId(object_id));
+                queue_object_list(design, parent_id, ObjectReferenceList::Nullable(updated));
+            });
+        }
+    }
+}
+
+fn render_reference_links(ui: &mut egui::Ui, design: &EditorProject, object_id: ObjectId) {
+    if let Some(object) = design.get_pool().object_by_id(object_id) {
+        if ui.link(format!("{:?}", object.object_type())).clicked() {
+            select_object(design, object_id);
+        }
+        if ui
+            .link(design.get_object_info(object).get_name(object))
+            .clicked()
+        {
+            select_object(design, object_id);
+        }
+    } else {
+        ui.colored_label(egui::Color32::RED, "Missing object");
+        ui.label("");
+    }
+}
+
+fn render_add_object(
     ui: &mut egui::Ui,
     design: &EditorProject,
-    macro_refs: &mut Vec<MacroRef>,
-    possible_events: &[Event],
+    parent_id: ObjectId,
+    allowed: &[ObjectType],
+    allow_none: bool,
+    mut add: impl FnMut(Option<ObjectId>),
 ) {
-    egui::Grid::new("macro_grid")
-        .striped(true)
-        .min_col_width(0.0)
-        .show(ui, |ui| {
-            let mut idx = 0;
-            while idx < macro_refs.len() {
-                let macro_ref = &mut macro_refs[idx];
-
-                if let Some(macro_obj) = design
-                    .get_pool()
-                    .objects_by_type(ObjectType::Macro)
-                    .iter()
-                    .find(|o| u16::from(o.id()) == macro_ref.macro_id as u16)
-                {
-                    ui.label(" - ");
-                    ui.push_id(idx, |ui| {
-                        egui::ComboBox::from_id_salt("event_id")
-                            .selected_text(format!("{:?}", macro_ref.event_id))
-                            .show_ui(ui, |ui| {
-                                for event in possible_events {
-                                    ui.selectable_value(
-                                        &mut macro_ref.event_id,
-                                        *event,
-                                        format!("{:?}", event),
-                                    );
-                                }
-                            });
-
-                        if ui.link(" Macro ").clicked() {
-                            *design.get_mut_selected().borrow_mut() = macro_obj.id().into();
-                        }
-
-                        egui::ComboBox::from_id_salt("macro_id")
-                            .selected_text(format!("{:?}", macro_ref.macro_id))
-                            .show_ui(ui, |ui| {
-                                for potential_macro in
-                                    design.get_pool().objects_by_type(ObjectType::Macro)
-                                {
-                                    ui.selectable_value(
-                                        &mut macro_ref.macro_id,
-                                        u16::from(potential_macro.id()) as u8,
-                                        format!("{:?}", u16::from(potential_macro.id())),
-                                    );
-                                }
-                            });
-                    });
-                } else {
-                    ui.label(format!(
-                        "- {:?}: Missing macro object {:?}",
-                        macro_ref.event_id, macro_ref.macro_id
-                    ));
+    ui.horizontal(|ui| {
+        ui.label("Add object:");
+        egui::ComboBox::from_id_salt(("add_object_list_item", parent_id.value()))
+            .selected_text("Select existing object")
+            .show_ui(ui, |ui| {
+                if allow_none && ui.selectable_label(false, "None").clicked() {
+                    add(None);
                 }
+                for candidate in design.get_pool().objects_by_types(allowed) {
+                    let valid = candidate_is_valid(design, parent_id, candidate.id());
+                    ui.add_enabled_ui(valid, |ui| {
+                        if ui
+                            .selectable_label(false, object_label(design, candidate))
+                            .clicked()
+                        {
+                            add(Some(candidate.id()));
+                        }
+                    });
+                }
+            });
+    });
+}
 
-                render_index_modifiers(ui, idx, macro_refs);
-                idx += 1;
-                ui.end_row();
-            }
-        });
+fn queue_object_list(design: &EditorProject, id: ObjectId, objects: ObjectReferenceList) {
+    design.queue_operation(Operation::SetObjectList {
+        object_id: id.value(),
+        objects,
+    });
+}
 
-    render_add_macro_reference(ui, design.get_pool(), macro_refs, possible_events);
+fn macro_object(design: &EditorProject, macro_id: u8) -> Option<&Object> {
+    ObjectId::new(macro_id.into())
+        .ok()
+        .and_then(|id| design.get_pool().object_by_id(id))
+        .filter(|object| object.object_type() == ObjectType::Macro)
+}
+
+fn apply_macro_action(references: &mut Vec<MacroRef>, action: ListAction) {
+    match action {
+        ListAction::ReplaceMacro(index, reference) => references[index] = reference,
+        action => apply_list_action(references, action),
+    }
+}
+
+fn queue_macro_references(design: &EditorProject, id: ObjectId, macro_refs: Vec<MacroRef>) {
+    design.queue_operation(Operation::SetMacroReferences {
+        object_id: id.value(),
+        macro_refs,
+    });
 }
 
 fn render_add_macro_reference(
     ui: &mut egui::Ui,
-    pool: &ObjectPool,
-    macro_refs: &mut Vec<MacroRef>,
-    possible_events: &[Event],
+    design: &EditorProject,
+    id: ObjectId,
+    references: &[MacroRef],
+    events: &[Event],
 ) {
+    if events.is_empty() {
+        return;
+    }
+    let event_key = ui.make_persistent_id((id.value(), "new_macro_event"));
+    let mut selected_event = ui.data(|data| data.get_temp::<Event>(event_key));
     ui.horizontal(|ui| {
         ui.label("Add macro:");
-        ui.horizontal(|ui| {
-            let mut selected_event = ui.data_mut(|data| {
-                data.get_temp(egui::Id::new("selected_event"))
-                    .unwrap_or(Event::Reserved)
+        egui::ComboBox::from_id_salt(("new_macro_event", id.value()))
+            .selected_text(
+                selected_event
+                    .map_or_else(|| "Select event".to_owned(), |event| format!("{event:?}")),
+            )
+            .show_ui(ui, |ui| {
+                for event in events {
+                    if ui
+                        .selectable_value(&mut selected_event, Some(*event), format!("{event:?}"))
+                        .changed()
+                    {
+                        ui.data_mut(|data| data.insert_temp(event_key, *event));
+                    }
+                }
             });
-            egui::ComboBox::from_id_salt("New Event Type")
-                .selected_text(if selected_event == Event::Reserved {
-                    "Select event".to_string()
-                } else {
-                    format!("{:?}", selected_event)
-                })
+        if let Some(event_id) = selected_event {
+            egui::ComboBox::from_id_salt(("new_macro_object", id.value()))
+                .selected_text("Select macro")
                 .show_ui(ui, |ui| {
-                    for event in possible_events {
-                        if ui
-                            .selectable_value(&mut selected_event, *event, format!("{:?}", event))
-                            .changed()
+                    for candidate in design.get_pool().objects_by_type(ObjectType::Macro) {
+                        if candidate.id().value() <= u8::MAX.into()
+                            && ui
+                                .selectable_label(false, object_label(design, candidate))
+                                .clicked()
                         {
-                            ui.data_mut(|data| {
-                                data.insert_temp(egui::Id::new("selected_event"), selected_event);
+                            let mut updated = references.to_vec();
+                            updated.push(MacroRef {
+                                event_id,
+                                macro_id: candidate.id().value() as u8,
                             });
+                            queue_macro_references(design, id, updated);
+                            ui.data_mut(|data| data.remove::<Event>(event_key));
                         }
                     }
                 });
-
-            if selected_event != Event::Reserved {
-                egui::ComboBox::from_id_salt("New Macro")
-                    .selected_text("Select macro")
-                    .show_ui(ui, |ui| {
-                        for potential_macro in pool.objects_by_type(ObjectType::Macro) {
-                            if ui
-                                .selectable_label(
-                                    false,
-                                    format!("{:?}", u16::from(potential_macro.id())),
-                                )
-                                .clicked()
-                            {
-                                macro_refs.push(MacroRef {
-                                    event_id: selected_event,
-                                    macro_id: u16::from(potential_macro.id()) as u8,
-                                });
-                            }
-                        }
-                    });
-            }
-        });
+        }
     });
 }
 
-impl ConfigurableObject for WorkingSet {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.checkbox(&mut self.selectable, "Selectable");
-        ui.horizontal(|ui| {
-            let masks = design
-                .get_pool()
-                .objects_by_types(&[ObjectType::DataMask, ObjectType::AlarmMask]);
-            egui::ComboBox::from_label("Active Mask")
-                .selected_text(format!("{:?}", u16::from(self.active_mask)))
-                .show_ui(ui, |ui| {
-                    for object in masks {
-                        ui.selectable_value(
-                            &mut self.active_mask,
-                            object.id(),
-                            format!("{:?}", u16::from(object.id())),
-                        );
-                    }
-                });
-            if ui.link("(view)").clicked() {
-                *design.get_mut_selected().borrow_mut() = self.active_mask.into();
-            }
-        });
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for DataMask {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_label("Soft Key Mask")
-                .selected_text(
-                    self.soft_key_mask
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.soft_key_mask,
-                        NullableObjectId(None),
-                        "None".to_string(),
-                    );
-                    for object in design.get_pool().objects_by_type(ObjectType::SoftKeyMask) {
-                        ui.selectable_value(
-                            &mut self.soft_key_mask,
-                            NullableObjectId(Some(object.id())),
-                            format!("{:?}", u16::from(object.id())),
-                        );
-                    }
-                });
-            if let Some(mask) = self.soft_key_mask.0 {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = mask.into();
-                }
-            }
-        });
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for AlarmMask {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_label("Soft Key Mask")
-                .selected_text(
-                    self.soft_key_mask
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.soft_key_mask,
-                        NullableObjectId(None),
-                        "None".to_string(),
-                    );
-                    for object in design.get_pool().objects_by_type(ObjectType::SoftKeyMask) {
-                        ui.selectable_value(
-                            &mut self.soft_key_mask,
-                            NullableObjectId(Some(object.id())),
-                            format!("{:?}", u16::from(object.id())),
-                        );
-                    }
-                });
-            if let Some(mask) = self.soft_key_mask.0 {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = mask.into();
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Priority:");
-            ui.radio_value(&mut self.priority, 2, "Low");
-            ui.radio_value(&mut self.priority, 1, "Medium");
-            ui.radio_value(&mut self.priority, 0, "High");
-        });
-        ui.horizontal(|ui| {
-            ui.label("Acoustic signal:");
-            ui.radio_value(&mut self.acoustic_signal, 3, "None");
-            ui.radio_value(&mut self.acoustic_signal, 2, "Lowest");
-            ui.radio_value(&mut self.acoustic_signal, 1, "Medium");
-            ui.radio_value(&mut self.acoustic_signal, 0, "Highest");
-        });
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for Container {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.checkbox(&mut self.hidden, "Hidden");
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            self.width,
-            self.height,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for SoftKeyMask {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.separator();
-        ui.label("Objects:");
-        render_object_id_list(
-            ui,
-            design,
-            &mut self.objects,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for Key {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Key code:");
-            ui.radio_value(&mut self.key_code, 0, "ACK");
-            ui.add(egui::DragValue::new(&mut self.key_code).speed(1));
-        });
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for Button {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.border_colour, 0..=255)
-                .text("Border Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Key code:");
-            ui.add(egui::DragValue::new(&mut self.key_code).speed(1.0));
-        });
-
-        ui.separator();
-        ui.checkbox(&mut self.options.latchable, "Latchable");
-        if self.options.latchable {
-            ui.horizontal(|ui| {
-                ui.label("Initial State:");
-                ui.radio_value(&mut self.options.state, ButtonState::Released, "Released");
-                ui.radio_value(&mut self.options.state, ButtonState::Latched, "Latched");
-            });
-        }
-
-        // TODO: check if we have VT version 4 or later
-        // ui.checkbox(&mut self.options.suppress_border, "Suppress Border");
-        // ui.checkbox(
-        //     &mut self.options.transparent_background,
-        //     "Transparent Background",
-        // );
-        // ui.checkbox(&mut self.options.disabled, "Disabled");
-        // ui.checkbox(&mut self.options.no_border, "No Border");
-
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            self.width,
-            self.height,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for InputBoolean {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        egui::ComboBox::from_id_salt("foreground_colour")
-            .selected_text(format!("{:?}", u16::from(self.foreground_colour)))
-            .show_ui(ui, |ui| {
-                for potential_child in design
-                    .get_pool()
-                    .objects_by_type(ObjectType::FontAttributes)
-                {
-                    ui.selectable_value(
-                        &mut self.foreground_colour,
-                        potential_child.id(),
-                        format!(
-                            "{:?}: {:?}",
-                            u16::from(potential_child.id()),
-                            potential_child.object_type()
-                        ),
-                    );
-                }
-            });
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            egui::ComboBox::from_id_salt("initial_value")
-                .selected_text(format!("{:?}", self.value))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.value, false, "False");
-                    ui.selectable_value(&mut self.value, true, "True");
-                });
-        }
-        ui.checkbox(&mut self.enabled, "Enabled");
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for InputString {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Font attributes:");
-            egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FontAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.font_attributes,
-                            potential_child.id(),
-                            format!("{:?}", u16::from(potential_child.id())),
-                        );
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Input attributes:");
-            egui::ComboBox::from_id_salt("input_attributes")
-                .selected_text(format!("{:?}", u16::from(self.input_attributes)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.input_attributes, NullableObjectId::NULL, "None");
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::InputAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.input_attributes,
-                            potential_child.id().into(),
-                            format!("{:?}", u16::from(potential_child.id())),
-                        );
-                    }
-                });
-        });
-        ui.checkbox(&mut self.options.transparent, "Transparent Background");
-        ui.checkbox(&mut self.options.auto_wrap, "Auto Wrap");
-        // TODO: check if we have VT version 4 or later
-        // if self.options.auto_wrap {
-        //     ui.checkbox(&mut self.options.wrap_on_hyphen, "Wrap on Hyphen");
-        // }
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::StringVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Horizontal Justification:");
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Left,
-                "Left",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Middle,
-                "Middle",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Right,
-                "Right",
-            );
-        });
-        // TODO: check if we have VT version 4 or later
-        // ui.horizontal(|ui| {
-        //     ui.label("Vertical Justification:");
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Top,
-        //         "Top",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Middle,
-        //         "Middle",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Bottom,
-        //         "Bottom",
-        //     );
-        // });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.text_edit_singleline(&mut self.value);
-        }
-        ui.checkbox(&mut self.enabled, "Enabled");
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for InputNumber {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Font attributes:");
-            egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FontAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.font_attributes,
-                            potential_child.id(),
-                            format!("{:?}", u16::from(potential_child.id())),
-                        );
-                    }
-                });
-        });
-        ui.checkbox(&mut self.options.transparent, "Transparent Background");
-        ui.checkbox(
-            &mut self.options.display_leading_zeros,
-            "Display Leading Zeros",
-        );
-        ui.checkbox(
-            &mut self.options.display_zero_as_blank,
-            "Display Zero as Blank",
-        );
-        // TODO: check if we have VT version 4 or later
-        // ui.checkbox(&mut self.options.truncate, "Truncate");
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        }
-        ui.add(
-            egui::DragValue::new(&mut self.min_value)
-                .speed(1.0)
-                .prefix("Min: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.max_value)
-                .speed(1.0)
-                .prefix("Max: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.offset)
-                .speed(1.0)
-                .prefix("Offset: "),
-        );
-        ui.add(egui::DragValue::new(&mut self.scale).prefix("Scale: "));
-        ui.add(
-            egui::DragValue::new(&mut self.nr_of_decimals)
-                .speed(1.0)
-                .prefix("Number of Decimals: "),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Format:");
-            ui.radio_value(&mut self.format, FormatType::Decimal, "Decimal");
-            ui.radio_value(&mut self.format, FormatType::Exponential, "Exponential");
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Horizontal Justification:");
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Left,
-                "Left",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Middle,
-                "Middle",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Right,
-                "Right",
-            );
-        });
-        // TODO: check if we have VT version 4 or later
-        // ui.horizontal(|ui| {
-        //     ui.label("Vertical Justification:");
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Top,
-        //         "Top",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Middle,
-        //         "Middle",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Bottom,
-        //         "Bottom",
-        //     );
-        // });
-
-        ui.checkbox(&mut self.options2.enabled, "Enabled");
-        // TODO: check if we have VT version 4 or later
-        // ui.checkbox(&mut self.options2.real_time_editing, "Real Time Editing");
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for InputList {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        }
-
-        ui.checkbox(&mut self.options.enabled, "Enabled");
-        // TODO: check if we have VT version 4 or later
-        // ui.checkbox(&mut self.options.real_time_editing, "Real Time Editing");
-
-        ui.separator();
-        ui.label("List items:");
-        render_nullable_object_id_list(
-            ui,
-            design,
-            &mut self.list_items,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputString {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Font attributes:");
-            egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FontAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.font_attributes,
-                            potential_child.id(),
-                            format!("{:?}", u16::from(potential_child.id())),
-                        );
-                    }
-                });
-        });
-        ui.checkbox(&mut self.options.transparent, "Transparent Background");
-        ui.checkbox(&mut self.options.auto_wrap, "Auto Wrap");
-        // TODO: check if we have VT version 4 or later
-        // if self.options.auto_wrap {
-        //     ui.checkbox(&mut self.options.wrap_on_hyphen, "Wrap on Hyphen");
-        // }
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::StringVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Horizontal Justification:");
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Left,
-                "Left",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Middle,
-                "Middle",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Right,
-                "Right",
-            );
-        });
-        // TODO: check if we have VT version 4 or later
-        // ui.horizontal(|ui| {
-        //     ui.label("Vertical Justification:");
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Top,
-        //         "Top",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Middle,
-        //         "Middle",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Bottom,
-        //         "Bottom",
-        //     );
-        // });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.text_edit_singleline(&mut self.value);
-        }
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputNumber {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Font attributes:");
-            egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FontAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.font_attributes,
-                            potential_child.id(),
-                            format!("{:?}", u16::from(potential_child.id())),
-                        );
-                    }
-                });
-        });
-
-        ui.checkbox(&mut self.options.transparent, "Transparent Background");
-        ui.checkbox(
-            &mut self.options.display_leading_zeros,
-            "Display Leading Zeros",
-        );
-        ui.checkbox(
-            &mut self.options.display_zero_as_blank,
-            "Display Zero as Blank",
-        );
-        // TODO: check if we have VT version 4 or later
-        // ui.checkbox(&mut self.options.truncate, "Truncate");
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        }
-        ui.horizontal(|ui| {
-            ui.label("Offset:");
-            ui.add(egui::DragValue::new(&mut self.offset).speed(1.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Scale:");
-            ui.add(egui::DragValue::new(&mut self.scale).speed(1.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Number of Decimals:");
-            ui.add(egui::DragValue::new(&mut self.nr_of_decimals).speed(1.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Format:");
-            ui.radio_value(&mut self.format, FormatType::Decimal, "Decimal");
-            ui.radio_value(&mut self.format, FormatType::Exponential, "Exponential");
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Horizontal Justification:");
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Left,
-                "Left",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Middle,
-                "Middle",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Right,
-                "Right",
-            );
-        });
-        // TODO: check if we have VT version 4 or later
-        // ui.horizontal(|ui| {
-        //     ui.label("Vertical Justification:");
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Top,
-        //         "Top",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Middle,
-        //         "Middle",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Bottom,
-        //         "Bottom",
-        //     );
-        // });
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputList {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        }
-
-        ui.separator();
-        ui.label("List items:");
-        render_nullable_object_id_list(
-            ui,
-            design,
-            &mut self.list_items,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputLine {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Line Attributes:");
-            egui::ComboBox::from_id_salt("line_attributes")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::LineAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.line_attributes,
-                            potential_child.id(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // If a valid line_attributes object is selected, provide a link to navigate there
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
-                }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
-            }
-        });
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Line Direction:");
-            ui.radio_value(
-                &mut self.line_direction,
-                LineDirection::TopLeftToBottomRight,
-                "Top-left to bottom-right",
-            );
-            ui.radio_value(
-                &mut self.line_direction,
-                LineDirection::BottomLeftToTopRight,
-                "Bottom-left to top-right",
-            );
-        });
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputRectangle {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Line Attributes:");
-            egui::ComboBox::from_id_salt("line_attributes_selector")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::LineAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.line_attributes,
-                            potential_child.id(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to view the selected line attributes object
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
-                }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
-            }
-        });
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Line Suppression:");
-            ui.add(egui::DragValue::new(&mut self.line_suppression).speed(1.0));
-        });
-
-        // Fill Attributes Selection
-        ui.horizontal(|ui| {
-            ui.label("Fill Attributes:");
-            egui::ComboBox::from_id_salt("fill_attributes_selector")
-                .selected_text(
-                    self.fill_attributes
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FillAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.fill_attributes,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to view the selected fill attributes object if present
-            if let Some(id) = self.fill_attributes.into() {
-                if let Some(obj) = design.get_pool().object_by_id(id) {
-                    if ui.link("(view)").clicked() {
-                        *design.get_mut_selected().borrow_mut() = id.into();
-                    }
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object");
-                }
-            }
-        });
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputEllipse {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Line Attributes:");
-            egui::ComboBox::from_id_salt("line_attributes_selector")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::LineAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.line_attributes,
-                            potential_child.id(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to navigate to the chosen line attributes object
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
-                }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
-            }
-        });
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.label("Ellipse Type:");
-        ui.radio_value(&mut self.ellipse_type, 0, "Closed Ellipse");
-        ui.radio_value(&mut self.ellipse_type, 1, "Open Ellipse");
-        ui.radio_value(&mut self.ellipse_type, 2, "Closed Ellipse Segment");
-        ui.radio_value(&mut self.ellipse_type, 3, "Closed Ellipse Section");
-
-        ui.horizontal(|ui| {
-            ui.label("Start Angle:");
-            ui.add(
-                egui::DragValue::new(&mut self.start_angle)
-                    .speed(1.0)
-                    .range(0..=180),
-            );
-            ui.label("End Angle:");
-            ui.add(
-                egui::DragValue::new(&mut self.end_angle)
-                    .speed(1.0)
-                    .range(0..=180),
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Fill Attributes:");
-            egui::ComboBox::from_id_salt("fill_attributes_selector")
-                .selected_text(
-                    self.fill_attributes
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FillAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.fill_attributes,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to view the chosen fill attributes object, if any
-            if let Some(id) = self.fill_attributes.into() {
-                if let Some(obj) = design.get_pool().object_by_id(id) {
-                    if ui.link("(view)").clicked() {
-                        *design.get_mut_selected().borrow_mut() = id.into();
-                    }
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object");
-                }
-            }
-        });
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputPolygon {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Line Attributes:");
-            egui::ComboBox::from_id_salt("line_attributes_selector")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::LineAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.line_attributes,
-                            potential_child.id(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to navigate to the chosen line attributes object
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
-                }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Fill Attributes:");
-            egui::ComboBox::from_id_salt("fill_attributes_selector")
-                .selected_text(
-                    self.fill_attributes
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FillAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.fill_attributes,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to view the chosen fill attributes object
-            if let Some(id) = self.fill_attributes.into() {
-                if let Some(obj) = design.get_pool().object_by_id(id) {
-                    if ui.link("(view)").clicked() {
-                        *design.get_mut_selected().borrow_mut() = id.into();
-                    }
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object");
-                }
-            }
-        });
-
-        ui.label("Polygon Type:");
-        ui.radio_value(&mut self.polygon_type, 0, "Convex");
-        ui.radio_value(&mut self.polygon_type, 1, "Non-Convex");
-        ui.radio_value(&mut self.polygon_type, 2, "Complex");
-        ui.radio_value(&mut self.polygon_type, 3, "Open");
-
-        ui.separator();
-        ui.label("Points:");
-        egui::Grid::new("points_grid")
-            .striped(true)
-            .min_col_width(0.0)
-            .show(ui, |ui| {
-                let mut idx = 0;
-                while idx < self.points.len() {
-                    ui.label(format!("Point {}", idx));
-                    ui.add(egui::DragValue::new(&mut self.points[idx].x).speed(1.0));
-                    ui.add(egui::DragValue::new(&mut self.points[idx].y).speed(1.0));
-
-                    if ui
-                        .add_enabled(idx > 0, egui::Button::new("\u{23F6}"))
-                        .on_hover_text("Move Up")
-                        .clicked()
-                    {
-                        self.points.swap(idx, idx - 1);
-                    }
-
-                    if ui
-                        .add_enabled(idx < self.points.len() - 1, egui::Button::new("\u{23F7}"))
-                        .on_hover_text("Move Down")
-                        .clicked()
-                    {
-                        self.points.swap(idx, idx + 1);
-                    }
-                    if self.points.len() > 3 {
-                        if ui
-                            .add(egui::Button::new("\u{1F5D9}"))
-                            .on_hover_text("Remove")
-                            .clicked()
-                        {
-                            self.points.remove(idx);
-                            continue; // Skip incrementing idx since we removed this item
+fn render_macro_references(
+    ui: &mut egui::Ui,
+    object: &Object,
+    id: ObjectId,
+    design: &EditorProject,
+) {
+    let Some(references) = crate::operations::operation::macro_refs(object) else {
+        return;
+    };
+    ui.label("Macros");
+    let events = crate::possible_events::get_possible_events(object);
+    let mut action = None;
+    egui::Grid::new(("macro_grid", id.value()))
+        .striped(true)
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            for (index, reference) in references.iter().enumerate() {
+                let mut edited = reference.clone();
+                egui::ComboBox::from_id_salt(("macro_event", index))
+                    .selected_text(format!("{:?}", reference.event_id))
+                    .show_ui(ui, |ui| {
+                        for event in &events {
+                            ui.selectable_value(&mut edited.event_id, *event, format!("{event:?}"));
                         }
-                    }
+                    });
 
-                    idx += 1;
-                    ui.end_row();
-                }
-            });
-
-        if ui.button("Add Point").clicked() {
-            self.points.push(Point { x: 0, y: 0 });
-        }
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputMeter {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.needle_colour, 0..=255)
-                .text("Needle Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.border_colour, 0..=255)
-                .text("Border Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.arc_and_tick_colour, 0..=255)
-                .text("Arc & Tick Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.checkbox(&mut self.options.draw_arc, "Draw Arc");
-        ui.checkbox(&mut self.options.draw_border, "Draw Border");
-        ui.checkbox(&mut self.options.draw_ticks, "Draw Ticks");
-
-        ui.horizontal(|ui| {
-            ui.label("Deflection Direction:");
-            ui.radio_value(
-                &mut self.options.deflection_direction,
-                DeflectionDirection::AntiClockwise,
-                "Anti-clockwise",
-            );
-            ui.radio_value(
-                &mut self.options.deflection_direction,
-                DeflectionDirection::Clockwise,
-                "Clockwise",
-            );
-        });
-
-        ui.add(
-            egui::DragValue::new(&mut self.nr_of_ticks)
-                .speed(1.0)
-                .prefix("Number of Ticks: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.start_angle)
-                .speed(1.0)
-                .prefix("Start Angle: ")
-                .range(0..=180),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.end_angle)
-                .speed(1.0)
-                .prefix("End Angle: ")
-                .range(0..=180),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.min_value)
-                .speed(1.0)
-                .prefix("Min Value: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.max_value)
-                .speed(1.0)
-                .prefix("Max Value: "),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(
-                    self.variable_reference
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        // If there's no variable reference, allow editing the initial value
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        }
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputLinearBarGraph {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.colour, 0..=255)
-                .text("Bar Colour")
-                .drag_value_speed(1.0),
-        );
-        if self.options.draw_target_line {
-            ui.add(
-                egui::Slider::new(&mut self.target_line_colour, 0..=255)
-                    .text("Target Line Colour")
-                    .drag_value_speed(1.0),
-            );
-        }
-
-        ui.checkbox(&mut self.options.draw_border, "Draw Border");
-        ui.checkbox(&mut self.options.draw_target_line, "Draw Target Line");
-        ui.checkbox(&mut self.options.draw_ticks, "Draw Ticks");
-        ui.horizontal(|ui| {
-            ui.label("Bar Graph Type:");
-            ui.radio_value(
-                &mut self.options.bar_graph_type,
-                BarGraphType::Filled,
-                "Filled",
-            );
-            ui.radio_value(
-                &mut self.options.bar_graph_type,
-                BarGraphType::NotFilled,
-                "Not Filled",
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Axis Orientation:");
-            ui.radio_value(
-                &mut self.options.axis_orientation,
-                AxisOrientation::Vertical,
-                "Vertical",
-            );
-            ui.radio_value(
-                &mut self.options.axis_orientation,
-                AxisOrientation::Horizontal,
-                "Horizontal",
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Grow Direction:");
-            ui.radio_value(
-                &mut self.options.grow_direction,
-                GrowDirection::GrowLeftDown,
-                "Left/Down",
-            );
-            ui.radio_value(
-                &mut self.options.grow_direction,
-                GrowDirection::GrowRightUp,
-                "Right/Up",
-            );
-        });
-
-        if self.options.draw_ticks {
-            ui.add(
-                egui::DragValue::new(&mut self.nr_of_ticks)
-                    .speed(1.0)
-                    .prefix("Number of Ticks: "),
-            );
-        }
-        ui.add(
-            egui::DragValue::new(&mut self.min_value)
-                .speed(1.0)
-                .prefix("Min Value: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.max_value)
-                .speed(1.0)
-                .prefix("Max Value: "),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Variable Reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(
-                    self.variable_reference
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        // If no variable reference, allow setting initial value manually
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial Value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("Target Value Variable Reference:");
-            egui::ComboBox::from_id_salt("target_value_variable_reference")
-                .selected_text(
-                    self.target_value_variable_reference
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.target_value_variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.target_value_variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        // If no target value variable reference, allow setting target value manually
-        if self.target_value_variable_reference.0.is_none() {
-            ui.label("Target Value:");
-            ui.add(egui::DragValue::new(&mut self.target_value).speed(1.0));
-        }
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputArchedBarGraph {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.colour, 0..=255)
-                .text("Bar Colour")
-                .drag_value_speed(1.0),
-        );
-        if self.options.draw_target_line {
-            ui.add(
-                egui::Slider::new(&mut self.target_line_colour, 0..=255)
-                    .text("Target Line Colour")
-                    .drag_value_speed(1.0),
-            );
-        }
-
-        ui.checkbox(&mut self.options.draw_border, "Draw Border");
-        ui.checkbox(&mut self.options.draw_target_line, "Draw Target Line");
-
-        ui.horizontal(|ui| {
-            ui.label("Bar Graph Type:");
-            ui.radio_value(
-                &mut self.options.bar_graph_type,
-                BarGraphType::Filled,
-                "Filled",
-            );
-            ui.radio_value(
-                &mut self.options.bar_graph_type,
-                BarGraphType::NotFilled,
-                "Not Filled",
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Axis Orientation:");
-            ui.radio_value(
-                &mut self.options.axis_orientation,
-                AxisOrientation::Vertical,
-                "Vertical",
-            );
-            ui.radio_value(
-                &mut self.options.axis_orientation,
-                AxisOrientation::Horizontal,
-                "Horizontal",
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Grow Direction:");
-            ui.radio_value(
-                &mut self.options.grow_direction,
-                GrowDirection::GrowLeftDown,
-                "Left/Down",
-            );
-            ui.radio_value(
-                &mut self.options.grow_direction,
-                GrowDirection::GrowRightUp,
-                "Right/Up",
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Deflection Direction:");
-            ui.radio_value(
-                &mut self.options.deflection_direction,
-                DeflectionDirection::AntiClockwise,
-                "Anti-clockwise",
-            );
-            ui.radio_value(
-                &mut self.options.deflection_direction,
-                DeflectionDirection::Clockwise,
-                "Clockwise",
-            );
-        });
-
-        ui.add(
-            egui::DragValue::new(&mut self.start_angle)
-                .speed(1.0)
-                .prefix("Start Angle: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.end_angle)
-                .speed(1.0)
-                .prefix("End Angle: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.bar_graph_width)
-                .speed(1.0)
-                .prefix("Bar Graph Width: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.min_value)
-                .speed(1.0)
-                .prefix("Min Value: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.max_value)
-                .speed(1.0)
-                .prefix("Max Value: "),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Variable Reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(
-                    self.variable_reference
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        // If no variable reference, set initial value
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial Value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("Target Value Variable Reference:");
-            egui::ComboBox::from_id_salt("target_value_variable_reference")
-                .selected_text(
-                    self.target_value_variable_reference
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.target_value_variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.target_value_variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        // If no target value variable reference, set target value
-        if self.target_value_variable_reference.0.is_none() {
-            ui.label("Target Value:");
-            ui.add(egui::DragValue::new(&mut self.target_value).speed(1.0));
-        }
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for PictureGraphic {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.label(format!("Actual Image Width: {}", self.actual_width));
-        ui.label(format!("Actual Image Height: {}", self.actual_height));
-        ui.label(format!("Data Size (bytes): {}", self.data.len()));
-        ui.horizontal(|ui| {
-            ui.label("Format:");
-            if ui
-                .radio(
-                    self.format == PictureGraphicFormat::Monochrome,
-                    "Monochrome",
-                )
-                .clicked()
-            {
-                match self.format {
-                    PictureGraphicFormat::FourBit => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .windows(4)
-                            .step_by(4)
-                            .flat_map(|chunk| {
-                                let mut byte = 0;
-                                for (i, bit) in chunk.iter().enumerate() {
-                                    for j in 0..2 {
-                                        if *bit & (1 << j) != 0 {
-                                            byte |= 1 << (i * 2 + j);
-                                        }
-                                    }
-                                }
-                                vec![byte]
-                            })
-                            .collect();
-                    }
-                    PictureGraphicFormat::EightBit => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .windows(8)
-                            .step_by(8)
-                            .flat_map(|chunk| {
-                                let mut byte = 0;
-                                for (i, bit) in chunk.iter().enumerate() {
-                                    if *bit != 0 {
-                                        byte |= 1 << i;
-                                    }
-                                }
-                                vec![byte]
-                            })
-                            .collect();
-                    }
-                    _ => {}
-                }
-                self.format = PictureGraphicFormat::Monochrome;
-                self.options.data_code_type = DataCodeType::Raw;
-            }
-            if ui
-                .radio(self.format == PictureGraphicFormat::FourBit, "4-bit colour")
-                .clicked()
-            {
-                match self.format {
-                    PictureGraphicFormat::Monochrome => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .iter()
-                            .flat_map(|value| {
-                                let mut result = vec![];
-                                for idx in 0..8 {
-                                    let bit_color = value << idx & 0x01;
-                                    if idx % 2 == 0 {
-                                        result.push(bit_color);
-                                    } else if let Some(last) = result.last_mut() {
-                                        *last |= bit_color >> 4;
-                                    }
-                                }
-                                result
-                            })
-                            .collect();
-                    }
-                    PictureGraphicFormat::EightBit => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .windows(2)
-                            .step_by(2)
-                            .flat_map(|values| {
-                                let high = (values[0] & 0x0F) << 4;
-                                let low = values[1] & 0x0F;
-                                vec![high | low]
-                            })
-                            .collect();
-                    }
-                    _ => {}
-                }
-                self.format = PictureGraphicFormat::FourBit;
-                self.options.data_code_type = DataCodeType::Raw;
-            }
-            if ui
-                .radio(
-                    self.format == PictureGraphicFormat::EightBit,
-                    "8-bit colour",
-                )
-                .clicked()
-            {
-                match self.format {
-                    PictureGraphicFormat::Monochrome => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .iter()
-                            .flat_map(|value| {
-                                let mut result = vec![];
-                                for bit in 0..8 {
-                                    result.push(value >> bit & 0x01);
-                                }
-                                result
-                            })
-                            .collect();
-                    }
-                    PictureGraphicFormat::FourBit => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .iter()
-                            .flat_map(|value| {
-                                let high = (value >> 4) & 0x0F;
-                                let low = value & 0x0F;
-                                vec![high, low]
-                            })
-                            .collect();
-                    }
-                    _ => {}
-                }
-                self.format = PictureGraphicFormat::EightBit;
-                self.options.data_code_type = DataCodeType::Raw;
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.options.transparent, "Transparent Pixels");
-            if self.options.transparent {
-                ui.add(
-                    egui::Slider::new(&mut self.transparency_colour, 0..=255)
-                        .text("Transparent Colour")
-                        .drag_value_speed(1.0),
+                let macro_object = macro_object(design, reference.macro_id);
+                let selected_text = macro_object.map_or_else(
+                    || format!("{} - Missing macro", reference.macro_id),
+                    |object| object_label(design, object),
                 );
+                egui::ComboBox::from_id_salt(("macro_object", index))
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        for candidate in design.get_pool().objects_by_type(ObjectType::Macro) {
+                            if candidate.id().value() <= u8::MAX.into() {
+                                ui.selectable_value(
+                                    &mut edited.macro_id,
+                                    candidate.id().value() as u8,
+                                    object_label(design, candidate),
+                                );
+                            }
+                        }
+                    });
+                if let Some(macro_object) = macro_object {
+                    if ui.link("View").clicked() {
+                        select_object(design, macro_object.id());
+                    }
+                } else {
+                    ui.label("");
+                }
+                row_actions(ui, index, references.len(), &mut action);
+                if &edited != reference && action.is_none() {
+                    action = Some(ListAction::ReplaceMacro(index, edited));
+                }
+                ui.end_row();
             }
         });
-        ui.checkbox(&mut self.options.flashing, "Flashing");
 
-        ui.separator();
-        ui.label("Image:");
-        if ui
-            .button("Load Image")
-            .on_hover_text("Load an image file (PNG, JPG, BMP, etc.)")
-            .clicked()
+    if let Some(action) = action {
+        let mut updated = references.to_vec();
+        apply_macro_action(&mut updated, action);
+        queue_macro_references(design, id, updated);
+    }
+    render_add_macro_reference(ui, design, id, references, &events);
+}
+
+fn render_identity(
+    ui: &mut egui::Ui,
+    id: ObjectId,
+    object_type: ObjectType,
+    design: &EditorProject,
+) {
+    let key = ui.make_persistent_id(("object_id", id.value()));
+    let mut value = ui
+        .data(|data| match data.get_temp::<PendingValue>(key) {
+            Some(PendingValue::Number(value)) => Some(value as u16),
+            _ => None,
+        })
+        .unwrap_or_else(|| id.value());
+    ui.horizontal(|ui| {
+        ui.label("Object ID");
+        let response = ui.add(egui::DragValue::new(&mut value).range(0..=65534));
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Number(value.into())));
+        }
+
+        let conflict = value != id.value()
+            && ObjectId::new(value)
+                .ok()
+                .is_some_and(|new_id| design.get_pool().object_by_id(new_id).is_some());
+        if conflict {
+            ui.colored_label(egui::Color32::RED, "ID already in use");
+        }
+
+        if drag_value_finished(&response) {
+            if value != id.value() {
+                if let Ok(new_id) = ObjectId::new(value) {
+                    if design.get_pool().object_by_id(new_id).is_none() {
+                        design.queue_operation(Operation::ChangeObjectId {
+                            old_id: id.value(),
+                            new_id: value,
+                        });
+                        design
+                            .get_mut_selected()
+                            .set(NullableObjectId(Some(new_id)));
+                    }
+                }
+            }
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+        }
+        ui.label(format!("Type: {object_type:?}"));
+    });
+}
+
+fn queue(design: &EditorProject, id: ObjectId, property: &str, value: serde_json::Value) {
+    design.queue_operation(Operation::SetProperty {
+        object_id: id.value(),
+        property: property.to_owned(),
+        value,
+    });
+}
+
+/// Preserve the JSON number kind exposed by the property's Rust type. In
+/// particular, integer properties must be committed as `42`, not `42.0`:
+/// serde_json deliberately does not expose the latter through `as_u64()`.
+fn number_after_edit(
+    original: &serde_json::Value,
+    edited: f64,
+) -> Option<serde_json::Number> {
+    let serde_json::Value::Number(original) = original else {
+        return None;
+    };
+
+    if original.is_u64() {
+        if edited.is_finite()
+            && edited.fract() == 0.0
+            && (0.0..=u64::MAX as f64).contains(&edited)
         {
-            design.request_image_load(self.id);
+            return Some(serde_json::Number::from(edited as u64));
         }
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
+        return None;
     }
-}
 
-impl ConfigurableObject for NumberVariable {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Initial Value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        });
-    }
-}
-
-impl ConfigurableObject for StringVariable {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Initial Value:");
-            ui.text_edit_singleline(&mut self.value);
-        });
-    }
-}
-
-impl ConfigurableObject for FontAttributes {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.font_colour, 0..=255)
-                .text("Font Colour")
-                .drag_value_speed(1.0),
-        );
-
-        // let is_proportional = self.font_style.proportional; // TODO: check if we have VT version 4 or later
-        let is_proportional = false;
-
-        // If proportional bit is set, font_size is proportional, otherwise non-proportional.
-        if is_proportional {
-            // Proportional font: we have a pixel height
-            let mut height = match self.font_size {
-                FontSize::Proportional(h) => h,
-                FontSize::NonProportional(_) => 8, // default to minimal proportional height if needed
-            };
-            ui.horizontal(|ui| {
-                ui.label("Proportional Font Height (≥ 8):");
-                if ui.add(egui::DragValue::new(&mut height)).changed() {
-                    self.font_size = FontSize::Proportional(height);
-                }
-            });
-        } else {
-            // Non-proportional font sizes: combo box
-            let current_size = match &self.font_size {
-                FontSize::NonProportional(s) => *s,
-                FontSize::Proportional(_) => NonProportionalFontSize::Px6x8,
-            };
-
-            egui::ComboBox::from_label("Non-Proportional Font Size")
-                .selected_text(format!("{:?}", current_size))
-                .show_ui(ui, |ui| {
-                    for value in [
-                        NonProportionalFontSize::Px6x8,
-                        NonProportionalFontSize::Px8x8,
-                        NonProportionalFontSize::Px8x12,
-                        NonProportionalFontSize::Px12x16,
-                        NonProportionalFontSize::Px16x16,
-                        NonProportionalFontSize::Px16x24,
-                        NonProportionalFontSize::Px24x32,
-                        NonProportionalFontSize::Px32x32,
-                        NonProportionalFontSize::Px32x48,
-                        NonProportionalFontSize::Px48x64,
-                        NonProportionalFontSize::Px64x64,
-                        NonProportionalFontSize::Px64x96,
-                        NonProportionalFontSize::Px96x128,
-                        NonProportionalFontSize::Px128x128,
-                        NonProportionalFontSize::Px128x192,
-                    ] {
-                        ui.selectable_value(
-                            &mut self.font_size,
-                            FontSize::NonProportional(value),
-                            format!("{:?}", value),
-                        );
-                    }
-                });
+    if original.is_i64() {
+        if edited.is_finite()
+            && edited.fract() == 0.0
+            && (i64::MIN as f64..=i64::MAX as f64).contains(&edited)
+        {
+            return Some(serde_json::Number::from(edited as i64));
         }
+        return None;
+    }
 
-        ui.separator();
-        let mut is_proprietary = if let FontType::Proprietary(_) = self.font_type {
-            true
-        } else {
-            false
-        };
-        ui.checkbox(&mut is_proprietary, "Proprietary Font");
+    serde_json::Number::from_f64(edited)
+}
 
-        if is_proprietary {
-            const PROPRIETARY_RANGE_V3_AND_PRIOR: std::ops::RangeInclusive<u8> = 255..=255;
-            const PROPRIETARY_RANGE_V4_AND_LATER: std::ops::RangeInclusive<u8> = 240..=255;
-
-            let range = PROPRIETARY_RANGE_V3_AND_PRIOR; // TODO: check if we have VT version 4 or later
-
-            let mut raw_value = match self.font_type {
-                FontType::Proprietary(v) => v,
-                _ => range.clone().last().unwrap(),
-            };
-            ui.horizontal(|ui| {
-                ui.label("Proprietary Font Value:");
-                ui.add(egui::DragValue::new(&mut raw_value).range(range).speed(1.0));
-            });
-            self.font_type = FontType::Proprietary(raw_value);
-        } else {
-            // Reset to Latin1 if we were proprietary or reserved
-            match self.font_type {
-                FontType::Proprietary(_) | FontType::Reserved(_) => {
-                    self.font_type = FontType::Latin1;
-                }
-                _ => {}
+fn render_auto(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    id: ObjectId,
+    property: &str,
+    design: &EditorProject,
+) {
+    match value {
+        serde_json::Value::Bool(current) => {
+            let mut edited = *current;
+            if ui.checkbox(&mut edited, label).changed() {
+                queue(design, id, property, edited.into());
             }
-
-            ui.horizontal(|ui| {
-                ui.label("Font Type:");
-                egui::ComboBox::from_id_salt("font_type")
-                    .selected_text(format!("{:?}", self.font_type))
-                    .show_ui(ui, |ui| {
-                        // Known fonts
-                        for value in &[
-                            FontType::Latin1,
-                            FontType::Latin9,
-                            // TODO: check if we have VT version 4 or later
-                            // FontType::Latin2,
-                            // FontType::Latin4,
-                            // FontType::Cyrillic,
-                            // FontType::Greek,
-                        ] {
-                            if ui
-                                .selectable_label(&self.font_type == value, format!("{:?}", value))
-                                .clicked()
-                            {
-                                self.font_type = value.clone();
-                            }
-                        }
-                    });
-            });
         }
-
-        ui.separator();
-        ui.label("Font Style:");
-        ui.checkbox(&mut self.font_style.bold, "Bold");
-        ui.checkbox(&mut self.font_style.crossed_out, "Crossed Out");
-        ui.checkbox(&mut self.font_style.underlined, "Underlined");
-        ui.checkbox(&mut self.font_style.italic, "Italic");
-        ui.checkbox(&mut self.font_style.inverted, "Inverted");
-        ui.checkbox(&mut self.font_style.flashing_inverted, "Flashing Inverted");
-        ui.checkbox(&mut self.font_style.flashing_hidden, "Flashing Hidden");
-        // ui.checkbox(&mut self.font_style.proportional, "Proportional"); // TODO: check if we have VT version 4 or later
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
+        serde_json::Value::Number(_) => render_number(
             ui,
+            label,
+            value,
+            0.0..=u64::MAX as f64,
+            id,
+            property,
             design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
+        ),
+        serde_json::Value::String(current) => render_text(ui, label, current, id, property, design),
+        _ => render_json(ui, label, value, id, property, design),
     }
 }
 
-impl ConfigurableObject for LineAttributes {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
+fn render_text(
+    ui: &mut egui::Ui,
+    label: &str,
+    current: &str,
+    id: ObjectId,
+    property: &str,
+    design: &EditorProject,
+) {
+    let key = ui.make_persistent_id((id.value(), property));
+    let mut edited = pending_text(ui, key).unwrap_or_else(|| current.to_owned());
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = ui.text_edit_singleline(&mut edited);
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+        }
+        if response.lost_focus() && edited != current {
+            queue(design, id, property, edited.into());
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+        }
+    });
+}
 
-        ui.add(
-            egui::Slider::new(&mut self.line_colour, 0..=255)
-                .text("Line Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.line_width, 0..=255)
-                .text("Line Width")
-                .drag_value_speed(1.0),
-        );
-
-        ui.label("Line Art Pattern (16 bits):")
-            .on_hover_text("Each bit in this 16-bit pattern represents a 'paintbrush spot' along the line. ")
-            .on_hover_text("A '1' bit means that spot is drawn in the line color, while a '0' bit means that spot is skipped (shows background).");
-
-        ui.horizontal(|ui| {
-            for i in (0..16).rev() {
-                let bit_mask = 1 << i;
-                let mut bit_is_set = (self.line_art & bit_mask) != 0;
-                let check = ui.checkbox(&mut bit_is_set, "");
-                if check.changed() {
-                    if bit_is_set {
-                        self.line_art |= bit_mask;
-                    } else {
-                        self.line_art &= !bit_mask;
-                    }
+fn render_number(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    range: std::ops::RangeInclusive<f64>,
+    id: ObjectId,
+    property: &str,
+    design: &EditorProject,
+) {
+    let Some(current) = value.as_f64() else {
+        render_json(ui, label, value, id, property, design);
+        return;
+    };
+    let key = ui.make_persistent_id((id.value(), property));
+    let mut edited = ui
+        .data(|data| match data.get_temp::<PendingValue>(key) {
+            Some(PendingValue::Number(value)) => Some(value),
+            _ => None,
+        })
+        .unwrap_or(current);
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = ui.add(egui::DragValue::new(&mut edited).range(range).speed(1.0));
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Number(edited)));
+        }
+        if drag_value_finished(&response) {
+            if edited != current {
+                if let Some(number) = number_after_edit(value, edited) {
+                    queue(design, id, property, number.into());
                 }
-                check.on_hover_text(format!(
-                    "Bit {}: {} ({}). Click to toggle.\n1 = Draw line colour\n0 = Skip (background)",
-                    i,
-                    if bit_is_set { "Currently: Draw" } else { "Currently: Skip" },
-                    if bit_is_set { "One (1)" } else { "Zero (0)" }
-                ));
             }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Current Binary Pattern:");
-            ui.label(format!("{:016b}", self.line_art))
-                .on_hover_text("This shows the full 16-bit pattern of the line art. '1' bits represent drawn spots; '0' bits represent skipped spots.");
-        });
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for FillAttributes {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.label("Fill Type:").on_hover_text(
-            "Select how this area should be filled:\n\
-                            0 = No fill\n\
-                            1 = Fill with line colour\n\
-                            2 = Fill with specified fill colour\n\
-                            3 = Fill with a specified pattern (PictureGraphic)",
-        );
-
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.fill_type, 0, "No fill")
-                .on_hover_text("No fill will be drawn, the background will be visible.");
-            ui.radio_value(&mut self.fill_type, 1, "Fill with line colour")
-                .on_hover_text("The area will be filled using the currently set line colour of the parent shape.");
-            ui.radio_value(&mut self.fill_type, 2, "Fill with specified colour")
-                .on_hover_text("The area will be filled using the 'fill_colour' attribute specified below.");
-            ui.radio_value(&mut self.fill_type, 3, "Fill with pattern")
-                .on_hover_text("The area will be filled using a pattern defined by a PictureGraphic object referenced below.");
-        });
-
-        if self.fill_type == 2 {
-            ui.label("Fill Colour:")
-                .on_hover_text("Select the colour index (0-255) to use for filling the area.");
-            ui.add(
-                egui::Slider::new(&mut self.fill_colour, 0..=255)
-                    .text("Fill Colour")
-                    .drag_value_speed(1.0),
-            );
-        } else if self.fill_type == 3 {
-            ui.label("Fill Pattern (PictureGraphic Object):")
-                .on_hover_text("Select a PictureGraphic object to use as a pattern.\n\
-                                Make sure the PictureGraphic width and format match the restrictions.");
-            // Render a nullable object selector restricted to PictureGraphic objects
-            ui.horizontal(|ui| {
-                render_nullable_object_id_selector(
-                    ui,
-                    0,
-                    design,
-                    &mut self.fill_pattern,
-                    &[ObjectType::PictureGraphic],
-                    Some(self.id),
-                );
-
-                if let Some(pattern_id) = self.fill_pattern.0 {
-                    if let Some(obj) = design.get_pool().object_by_id(pattern_id) {
-                        if ui.link("(view)").clicked() {
-                            *design.get_mut_selected().borrow_mut() = pattern_id.into();
-                        }
-                    } else {
-                        ui.colored_label(egui::Color32::RED, "Missing pattern object");
-                    }
-                } else {
-                    ui.label("None");
-                }
-            });
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
         }
-
-        ui.separator();
-        ui.label("Macros:")
-            .on_hover_text("Define macros that could be triggered by events associated with this object.\n\
-                            Currently, FillAttributes does not trigger events, but this is included for consistency.");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
+    });
 }
 
-impl ConfigurableObject for InputAttributes {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Validation Type:");
-            ui.radio_value(
-                &mut self.validation_type,
-                ValidationType::ValidCharacters,
-                "Valid Characters",
-            );
-            ui.radio_value(
-                &mut self.validation_type,
-                ValidationType::InvalidCharacters,
-                "Invalid Characters",
-            );
-        });
-
-        ui.label("Validation String:");
-        ui.text_edit_singleline(&mut self.validation_string);
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for ObjectPointer {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.horizontal(|ui| {
-            ui.label("Object reference:");
-            egui::ComboBox::from_id_salt("object_reference")
-                .selected_text(format!("{:?}", u16::from(self.value)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.value, NullableObjectId::NULL, "None");
-                    let object_types: Vec<ObjectType> = design
-                        .get_pool()
-                        .parent_objects(self.id)
-                        .iter()
-                        .flat_map(|parent_obj| {
-                            get_allowed_child_refs(parent_obj.object_type(), VtVersion::Version3)
-                                .into_iter()
-                        })
-                        .collect();
-                    for potential_child in design.get_pool().objects_by_types(&object_types) {
-                        ui.selectable_value(
-                            &mut self.value,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-            if let Some(id) = self.value.into() {
-                if let Some(object) = design.get_pool().object_by_id(id) {
-                    if ui.link(format!("{:?}", object.object_type())).clicked() {
-                        *design.get_mut_selected().borrow_mut() = id.into();
-                    }
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object in pool");
+/// Render bit-mask and object-style options as individual checkboxes rather
+/// than leaking their JSON encoding into the UI.
+fn render_flag_set(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    id: ObjectId,
+    property: &str,
+    design: &EditorProject,
+) {
+    if let Some(current) = value.as_u64() {
+        let bits = if property == "line_art" { 16 } else { 8 };
+        ui.label(label);
+        ui.horizontal_wrapped(|ui| {
+            for bit in (0..bits).rev() {
+                let mask = 1_u64 << bit;
+                let mut enabled = current & mask != 0;
+                if ui
+                    .checkbox(&mut enabled, format!("{bit}"))
+                    .on_hover_text(format!("Bit {bit}"))
+                    .changed()
+                {
+                    let updated = if enabled {
+                        current | mask
+                    } else {
+                        current & !mask
+                    };
+                    queue(design, id, property, updated.into());
                 }
             }
         });
+    } else if let Some(fields) = value.as_object() {
+        ui.label(label);
+        for (field, value) in fields {
+            let Some(mut enabled) = value.as_bool() else {
+                render_json(ui, label, value, id, property, design);
+                return;
+            };
+            if ui.checkbox(&mut enabled, field).changed() {
+                let mut updated = fields.clone();
+                updated.insert(field.clone(), enabled.into());
+                queue(design, id, property, serde_json::Value::Object(updated));
+            }
+        }
+    } else {
+        render_json(ui, label, value, id, property, design);
     }
 }
 
-const ALLOWED_MACRO_COMMANDS: &[(u8, &str, VtVersion)] = &[
-    (0xA0, "Hide/Show Object command", VtVersion::Version2),
-    (0xA1, "Enable/Disable Object command", VtVersion::Version2),
-    (0xA2, "Select Input Object command", VtVersion::Version2),
-    (0x92, "ESC command", VtVersion::Version2),
-    (0xA3, "Control Audio Signal command", VtVersion::Version2),
-    (0xA4, "Set Audio Volume command", VtVersion::Version2),
-    (0xA5, "Change Child Location command", VtVersion::Version2),
-    (0xB4, "Change Child Position command", VtVersion::Version2),
-    (0xA6, "Change Size command", VtVersion::Version2),
-    (
-        0xA7,
-        "Change Background Colour command",
-        VtVersion::Version2,
-    ),
-    (0xA8, "Change Numeric Value command", VtVersion::Version2),
-    (0xB3, "Change String Value command", VtVersion::Version2),
-    (0xA9, "Change End Point command", VtVersion::Version2),
-    (0xAA, "Change Font Attributes command", VtVersion::Version2),
-    (0xAB, "Change Line Attributes command", VtVersion::Version2),
-    (0xAC, "Change Fill Attributes command", VtVersion::Version2),
-    (0xAD, "Change Active Mask command", VtVersion::Version2),
-    (0xAE, "Change Soft Key Mask command", VtVersion::Version2),
-    (0xAF, "Change Attribute command", VtVersion::Version2),
-    (0xB0, "Change priority command", VtVersion::Version2),
-    (0xB1, "Change List item command", VtVersion::Version2),
-    (0xBD, "Lock/Unlock Mask command", VtVersion::Version4),
-    (0xBE, "Execute Macro command", VtVersion::Version4),
-    (0xB5, "Change Object Label command", VtVersion::Version4),
-    (0xB6, "Change Polygon Point command", VtVersion::Version4),
-    (0xB7, "Change Polygon Scale command", VtVersion::Version4),
-    (0xB8, "Graphics Context command", VtVersion::Version4),
-    (
-        0xBA,
-        "Select Colour Map or Palette command",
-        VtVersion::Version4,
-    ),
-    (0xBC, "Execute Extended Macro command", VtVersion::Version5),
-    (
-        0x90,
-        "Select Active Working Set command",
-        VtVersion::Version6,
-    ),
-];
+fn render_reference(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    descriptor: &crate::object_properties::PropertyDescriptor,
+    id: ObjectId,
+    property: &str,
+    design: &EditorProject,
+) {
+    let PropertySemantic::ObjectReference { allowed_types } = &descriptor.semantic else {
+        return;
+    };
+    let selected = value.as_u64();
+    egui::ComboBox::from_label(label)
+        .selected_text(selected.map_or_else(|| "None".to_owned(), |value| value.to_string()))
+        .show_ui(ui, |ui| {
+            if selected.is_some() && ui.selectable_label(false, "None").clicked() {
+                queue(design, id, property, serde_json::Value::Null);
+            }
+            for candidate in design.get_pool().objects_by_types(allowed_types) {
+                if ui
+                    .selectable_label(
+                        selected == Some(u64::from(candidate.id().value())),
+                        format!("{}: {:?}", candidate.id().value(), candidate.object_type()),
+                    )
+                    .clicked()
+                {
+                    queue(
+                        design,
+                        id,
+                        property,
+                        serde_json::Value::from(candidate.id().value()),
+                    );
+                }
+            }
+        });
+}
 
-impl ConfigurableObject for Macro {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.label("Macro Commands:");
-        egui::Grid::new("macro_commands_grid")
-            .striped(true)
-            .min_col_width(0.0)
-            .show(ui, |ui| {
-                let mut idx = 0;
-                while idx < self.commands.len() {
-                    let code = self.commands[idx];
-                    let command_name = ALLOWED_MACRO_COMMANDS
-                        .iter()
-                        .find(|&&(c, _, __)| c == code)
-                        .map(|&(_, name, __)| name)
-                        .unwrap_or("Unknown");
-
-                    ui.label(format!("0x{:02X}", code));
-                    ui.label(command_name);
-                    render_index_modifiers(ui, idx, &mut self.commands);
-                    ui.end_row();
-
-                    idx += 1;
+fn render_justification(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    id: ObjectId,
+    property: &str,
+    design: &EditorProject,
+) {
+    let Some(fields) = value.as_object() else {
+        render_json(ui, label, value, id, property, design);
+        return;
+    };
+    let horizontal = fields
+        .get("horizontal")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Left");
+    let vertical = fields
+        .get("vertical")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Top");
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_label(label)
+            .selected_text(horizontal)
+            .show_ui(ui, |ui| {
+                for choice in ["Left", "Middle", "Right"] {
+                    if ui.selectable_label(horizontal == choice, choice).clicked() {
+                        let mut updated = fields.clone();
+                        updated.insert("horizontal".to_owned(), choice.into());
+                        queue(design, id, property, serde_json::Value::Object(updated));
+                    }
                 }
             });
-
-        ui.horizontal(|ui| {
-            ui.label("Add command:");
-            egui::ComboBox::from_id_salt("add_macro_command")
-                .selected_text("Select command")
-                .show_ui(ui, |ui| {
-                    for &(code, name, version) in ALLOWED_MACRO_COMMANDS {
-                        if version > VtVersion::Version3 {
-                            continue; // TODO: check which version pool we have
-                        }
-
-                        if ui
-                            .selectable_label(false, format!("0x{:02X} {}", code, name))
-                            .clicked()
-                        {
-                            self.commands.push(code);
-                        }
-                    }
-                });
-        });
-    }
-}
-
-impl ConfigurableObject for AuxiliaryFunctionType2 {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Function Type:");
-            egui::ComboBox::from_id_salt("function_type")
-                .selected_text(format!("{:?}", self.function_attributes.function_type))
-                .show_ui(ui, |ui| {
-                    let selectable_types = &[
-                        AuxiliaryFunctionType::BooleanLatching,
-                        AuxiliaryFunctionType::AnalogueMaintains,
-                        AuxiliaryFunctionType::BooleanNonLatching,
-                        AuxiliaryFunctionType::AnalogueReturnToCenter,
-                        AuxiliaryFunctionType::AnalogueReturnToZero,
-                        AuxiliaryFunctionType::DualBooleanLatching,
-                        AuxiliaryFunctionType::DualBooleanNonLatching,
-                        AuxiliaryFunctionType::DualBooleanLatchingUp,
-                        AuxiliaryFunctionType::DualBooleanLatchingDown,
-                        AuxiliaryFunctionType::CombinedAnalogueReturnWithLatch,
-                        AuxiliaryFunctionType::CombinedAnalogueMaintainsWithLatch,
-                        AuxiliaryFunctionType::QuadratureBooleanNonLatching,
-                        AuxiliaryFunctionType::QuadratureAnalogueMaintains,
-                        AuxiliaryFunctionType::QuadratureAnalogueReturnToCenter,
-                        AuxiliaryFunctionType::BidirectionalEncoder,
-                    ];
-
-                    for ft in selectable_types {
-                        ui.selectable_value(
-                            &mut self.function_attributes.function_type,
-                            *ft,
-                            format!("{:?}", ft),
-                        );
-                    }
-                });
-        });
-
-        ui.checkbox(&mut self.function_attributes.critical, "Critical");
-        ui.checkbox(&mut self.function_attributes.restricted, "Restricted");
-        ui.checkbox(
-            &mut self.function_attributes.single_assignment,
-            "Single-assignment",
-        );
-
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-    }
-}
-
-impl ConfigurableObject for AuxiliaryInputType2 {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Function Type:");
-            egui::ComboBox::from_id_salt("input_function_type")
-                .selected_text(format!("{:?}", self.function_attributes.function_type))
-                .show_ui(ui, |ui| {
-                    let selectable_types = &[
-                        AuxiliaryFunctionType::BooleanLatching,
-                        AuxiliaryFunctionType::AnalogueMaintains,
-                        AuxiliaryFunctionType::BooleanNonLatching,
-                        AuxiliaryFunctionType::AnalogueReturnToCenter,
-                        AuxiliaryFunctionType::AnalogueReturnToZero,
-                        AuxiliaryFunctionType::DualBooleanLatching,
-                        AuxiliaryFunctionType::DualBooleanNonLatching,
-                        AuxiliaryFunctionType::DualBooleanLatchingUp,
-                        AuxiliaryFunctionType::DualBooleanLatchingDown,
-                        AuxiliaryFunctionType::CombinedAnalogueReturnWithLatch,
-                        AuxiliaryFunctionType::CombinedAnalogueMaintainsWithLatch,
-                        AuxiliaryFunctionType::QuadratureBooleanNonLatching,
-                        AuxiliaryFunctionType::QuadratureAnalogueMaintains,
-                        AuxiliaryFunctionType::QuadratureAnalogueReturnToCenter,
-                        AuxiliaryFunctionType::BidirectionalEncoder,
-                    ];
-
-                    for ft in selectable_types {
-                        ui.selectable_value(
-                            &mut self.function_attributes.function_type,
-                            *ft,
-                            format!("{:?}", ft),
-                        );
-                    }
-                });
-        });
-
-        ui.checkbox(&mut self.function_attributes.critical, "Critical");
-        ui.checkbox(
-            &mut self.function_attributes.single_assignment,
-            "Single-assignment",
-        );
-
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-    }
-}
-
-impl ConfigurableObject for AuxiliaryControlDesignatorType2 {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Pointer Type:");
-            egui::ComboBox::from_id_salt("aux_control_pointer_type")
-                .selected_text(format!("{}", self.pointer_type))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.pointer_type,
-                        0,
-                        "0 (Points to Auxiliary Object)",
-                    );
-                    ui.selectable_value(
-                        &mut self.pointer_type,
-                        1,
-                        "1 (Points to Assigned Aux Objects)",
-                    );
-                    ui.selectable_value(
-                        &mut self.pointer_type,
-                        2,
-                        "2 (Points to WS Object of this Pool)",
-                    );
-                    ui.selectable_value(
-                        &mut self.pointer_type,
-                        3,
-                        "3 (Points to WS Object of Assigned)",
-                    );
-                });
-        });
-
-        // According to Table J.6 and J.7, when pointer_type = 2, auxiliary_object_id should be NULL (0xFFFF).
-        let must_be_null = self.pointer_type == 2;
-        if must_be_null {
-            self.auxiliary_object_id = NullableObjectId::NULL;
-        } else {
-            // Allow user to select an Auxiliary Input or Auxiliary Function object.
-            ui.horizontal(|ui| {
-                ui.label("Auxiliary Object ID:");
-                egui::ComboBox::from_id_salt("aux_object_id_selector")
-                    .selected_text(format!("{:?}", u16::from(self.auxiliary_object_id)))
-                    .show_ui(ui, |ui| {
-                        // Let’s consider that we might assign Auxiliary Function Type 2 (31) or Auxiliary Input Type 2 (32) objects.
-                        let allowed_types = &[
-                            ObjectType::AuxiliaryFunctionType2,
-                            ObjectType::AuxiliaryInputType2,
-                        ];
-
-                        for potential_child in design.get_pool().objects_by_types(allowed_types) {
-                            if ui
-                                .selectable_label(
-                                    NullableObjectId::from(potential_child.id())
-                                        == self.auxiliary_object_id,
-                                    format!(
-                                        "{:?}: {:?}",
-                                        u16::from(potential_child.id()),
-                                        potential_child.object_type()
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                self.auxiliary_object_id = potential_child.id().into();
-                            }
-                        }
-                    });
-
-                // Provide a link to navigate to the selected object
-                if let Some(ref_id) = self.auxiliary_object_id.into() {
-                    if let Some(obj) = design.get_pool().object_by_id(ref_id) {
-                        if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                            *design.get_mut_selected().borrow_mut() = ref_id.into();
-                        }
-                    } else {
-                        ui.colored_label(egui::Color32::RED, "Missing object in pool");
+        egui::ComboBox::from_label("Vertical")
+            .selected_text(vertical)
+            .show_ui(ui, |ui| {
+                for choice in ["Top", "Middle", "Bottom"] {
+                    if ui.selectable_label(vertical == choice, choice).clicked() {
+                        let mut updated = fields.clone();
+                        updated.insert("vertical".to_owned(), choice.into());
+                        queue(design, id, property, serde_json::Value::Object(updated));
                     }
                 }
+            });
+    });
+}
+
+fn render_json(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    id: ObjectId,
+    property: &str,
+    design: &EditorProject,
+) {
+    let key = ui.make_persistent_id((id.value(), property));
+    let original = serde_json::to_string(value).unwrap_or_default();
+    let mut edited = pending_text(ui, key).unwrap_or_else(|| original.clone());
+    ui.label(label);
+    let response = ui.add(
+        egui::TextEdit::multiline(&mut edited)
+            .desired_rows(2)
+            .code_editor(),
+    );
+    if response.changed() {
+        ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+    }
+    if response.lost_focus() && edited != original {
+        if let Ok(parsed) = serde_json::from_str(&edited) {
+            queue(design, id, property, parsed);
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+        } else {
+            ui.colored_label(egui::Color32::RED, "Invalid JSON");
+        }
+    }
+}
+
+fn pending_text(ui: &egui::Ui, key: egui::Id) -> Option<String> {
+    ui.data(|data| match data.get_temp::<PendingValue>(key) {
+        Some(PendingValue::Text(value)) => Some(value),
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{default_object, OperationTransaction};
+    use ag_iso_stack::object_pool::ObjectPool;
+
+    fn object(object_type: ObjectType, id: u16) -> Object {
+        let mut object = default_object(object_type);
+        object.mut_id().set_value(id).unwrap();
+        object
+    }
+
+    fn apply(project: &mut EditorProject, operation: Operation) {
+        let mut transaction = OperationTransaction::new(Some("Structural edit".to_owned()));
+        transaction.add_operation(operation);
+        project.execute_transaction(transaction).unwrap();
+    }
+
+    #[test]
+    fn numeric_edits_preserve_integer_and_float_json_kinds() {
+        let integer = number_after_edit(&serde_json::json!(0_u8), 42.0).unwrap();
+        assert_eq!(integer.as_u64(), Some(42));
+        assert!(!integer.is_f64());
+
+        let mut pool = ObjectPool::default();
+        let button = object(ObjectType::Button, 1002);
+        let button_id = button.id();
+        pool.add(button);
+        assert!(crate::object_properties::validate_property(
+            &pool,
+            button_id,
+            "background_colour",
+            &serde_json::Value::Number(integer),
+        )
+        .is_ok());
+
+        let float = number_after_edit(&serde_json::json!(0.0_f64), 42.0).unwrap();
+        assert!(float.is_f64());
+        assert_eq!(float.as_f64(), Some(42.0));
+    }
+
+    #[test]
+    fn positioned_children_reorder_remove_and_cycle_validation_are_reversible() {
+        let parent = object(ObjectType::Button, 10);
+        let first = object(ObjectType::PictureGraphic, 11);
+        let second = object(ObjectType::PictureGraphic, 12);
+        let mut pool = ObjectPool::default();
+        for object in [parent, first, second] {
+            pool.add(object);
+        }
+        let mut project = EditorProject::from(pool);
+        let initial = vec![
+            ObjectRef {
+                id: ObjectId::new(11).unwrap(),
+                offset: ag_iso_stack::object_pool::object_attributes::Point { x: 1, y: 2 },
+            },
+            ObjectRef {
+                id: ObjectId::new(12).unwrap(),
+                offset: ag_iso_stack::object_pool::object_attributes::Point { x: 3, y: 4 },
+            },
+        ];
+        apply(
+            &mut project,
+            Operation::SetChildren {
+                parent_id: 10,
+                children: initial.clone(),
+            },
+        );
+        let changed = vec![initial[1], initial[0]];
+        apply(
+            &mut project,
+            Operation::SetChildren {
+                parent_id: 10,
+                children: changed.clone(),
+            },
+        );
+        assert_eq!(
+            crate::operations::operation::object_refs(
+                project
+                    .get_pool()
+                    .object_by_id(ObjectId::new(10).unwrap())
+                    .unwrap()
+            ),
+            Some(changed.as_slice())
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            crate::operations::operation::object_refs(
+                project
+                    .get_pool()
+                    .object_by_id(ObjectId::new(10).unwrap())
+                    .unwrap()
+            ),
+            Some(initial.as_slice())
+        );
+        assert!(project.redo_operation());
+        assert_eq!(
+            crate::operations::operation::object_refs(
+                project
+                    .get_pool()
+                    .object_by_id(ObjectId::new(10).unwrap())
+                    .unwrap()
+            ),
+            Some(changed.as_slice())
+        );
+
+        apply(
+            &mut project,
+            Operation::SetChildren {
+                parent_id: 10,
+                children: vec![changed[0]],
+            },
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            crate::operations::operation::object_refs(
+                project
+                    .get_pool()
+                    .object_by_id(ObjectId::new(10).unwrap())
+                    .unwrap()
+            ),
+            Some(changed.as_slice())
+        );
+
+        let mut cyclic_child = object(ObjectType::Container, 20);
+        if let Object::Container(container) = &mut cyclic_child {
+            container.object_refs.push(ObjectRef {
+                id: ObjectId::new(10).unwrap(),
+                offset: Default::default(),
             });
         }
+        let mut cycle_pool = project.get_pool().clone();
+        cycle_pool.add(cyclic_child);
+        let mut cycle_project = EditorProject::from(cycle_pool);
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::SetChildren {
+            parent_id: 10,
+            children: vec![ObjectRef {
+                id: ObjectId::new(20).unwrap(),
+                offset: Default::default(),
+            }],
+        });
+        assert!(cycle_project.execute_transaction(transaction).is_err());
+    }
+
+    #[test]
+    fn required_and_nullable_object_lists_are_reversible() {
+        let required = object(ObjectType::SoftKeyMask, 10);
+        let nullable = object(ObjectType::InputList, 20);
+        let first = object(ObjectType::Key, 11);
+        let second = object(ObjectType::Key, 12);
+        let mut pool = ObjectPool::default();
+        for object in [required, nullable, first, second] {
+            pool.add(object);
+        }
+        let mut project = EditorProject::from(pool);
+        let first_id = ObjectId::new(11).unwrap();
+        let second_id = ObjectId::new(12).unwrap();
+        apply(
+            &mut project,
+            Operation::SetObjectList {
+                object_id: 10,
+                objects: ObjectReferenceList::Required(vec![first_id, second_id]),
+            },
+        );
+        apply(
+            &mut project,
+            Operation::SetObjectList {
+                object_id: 10,
+                objects: ObjectReferenceList::Required(vec![second_id]),
+            },
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            crate::operations::operation::object_list(
+                project
+                    .get_pool()
+                    .object_by_id(ObjectId::new(10).unwrap())
+                    .unwrap()
+            ),
+            Some(ObjectReferenceList::Required(vec![first_id, second_id]))
+        );
+        assert!(project.redo_operation());
+
+        apply(
+            &mut project,
+            Operation::SetObjectList {
+                object_id: 20,
+                objects: ObjectReferenceList::Nullable(vec![
+                    NullableObjectId(Some(first_id)),
+                    NullableObjectId::NULL,
+                ]),
+            },
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            crate::operations::operation::object_list(
+                project
+                    .get_pool()
+                    .object_by_id(ObjectId::new(20).unwrap())
+                    .unwrap()
+            ),
+            Some(ObjectReferenceList::Nullable(vec![]))
+        );
+        assert!(project.redo_operation());
+    }
+
+    #[test]
+    fn macro_reference_add_reorder_and_remove_are_reversible() {
+        let owner = object(ObjectType::Button, 10);
+        let first = object(ObjectType::Macro, 20);
+        let second = object(ObjectType::Macro, 21);
+        let mut pool = ObjectPool::default();
+        for object in [owner, first, second] {
+            pool.add(object);
+        }
+        let mut project = EditorProject::from(pool);
+        let refs = vec![
+            MacroRef {
+                event_id: Event::OnEnable,
+                macro_id: 20,
+            },
+            MacroRef {
+                event_id: Event::OnDisable,
+                macro_id: 21,
+            },
+        ];
+        apply(
+            &mut project,
+            Operation::SetMacroReferences {
+                object_id: 10,
+                macro_refs: refs.clone(),
+            },
+        );
+        let reordered = vec![refs[1].clone(), refs[0].clone()];
+        apply(
+            &mut project,
+            Operation::SetMacroReferences {
+                object_id: 10,
+                macro_refs: reordered.clone(),
+            },
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            crate::operations::operation::macro_refs(
+                project
+                    .get_pool()
+                    .object_by_id(ObjectId::new(10).unwrap())
+                    .unwrap()
+            ),
+            Some(refs.as_slice())
+        );
+        assert!(project.redo_operation());
+        apply(
+            &mut project,
+            Operation::SetMacroReferences {
+                object_id: 10,
+                macro_refs: vec![reordered[0].clone()],
+            },
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            crate::operations::operation::macro_refs(
+                project
+                    .get_pool()
+                    .object_by_id(ObjectId::new(10).unwrap())
+                    .unwrap()
+            ),
+            Some(reordered.as_slice())
+        );
     }
 }
