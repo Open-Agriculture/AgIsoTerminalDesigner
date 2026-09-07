@@ -14,7 +14,7 @@ pub use executor::{
 };
 pub use history::OperationHistory;
 pub use operation::{
-    resolve_target, ChildPlacement, MacroReferenceTarget, ObjectReferenceList, ObjectTarget,
+    macro_refs, object_list, object_refs, resolve_target, ChildPlacement, MacroReferenceTarget, ObjectReferenceList, ObjectTarget,
     ObjectTargetList, Operation, OperationContext, OperationError,
 };
 pub use transaction::{AppliedTransaction, OperationTransaction, CURRENT_OPERATION_SCHEMA_VERSION};

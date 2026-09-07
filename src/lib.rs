@@ -27,7 +27,8 @@ pub use object_info::ObjectInfo;
 pub use object_rendering::RenderableObject;
 
 // Operation system exports
-pub use ai::snapshot::PoolSnapshot;
+pub use ai::{AiDesignState, AiProposal, ProjectRevision};
+pub use ai::snapshot::{DesignSnapshot, PoolSnapshot};
 pub use object_properties::{
     get_properties, PropertyAccess, PropertyAccessError, PropertyDescriptor, PropertyError,
     PropertySemantic,

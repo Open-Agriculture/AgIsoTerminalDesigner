@@ -11,7 +11,8 @@ use ag_iso_stack::object_pool::{
     object::Object, vt_version::VtVersion, NullableObjectId, ObjectId, ObjectPool, ObjectType,
 };
 
-use crate::ai::snapshot::{PoolSnapshot, SnapshotError};
+use crate::ai::{AiDesignState, AiProposal, ProjectRevision};
+use crate::ai::snapshot::{DesignSnapshot, DesignContextRequest, SnapshotError};
 use crate::operations::{
     AppliedTransaction, ObjectTarget, Operation, OperationError, OperationExecutor,
     OperationHistory, OperationTransaction, PreparedTransaction, TransactionDiagnostics,
@@ -67,6 +68,8 @@ pub struct EditorProject {
     /// Last project content that was opened or successfully saved.
     saved_content: RefCell<Option<ProjectContentCheckpoint>>,
     dirty: Cell<bool>,
+    /// Monotonically increasing version of the authoritative project content.
+    revision: Cell<ProjectRevision>,
 
     /// Bounded operation-based undo/redo history.
     pub operation_history: RefCell<OperationHistory>,
@@ -105,6 +108,7 @@ impl From<ObjectPool> for EditorProject {
             last_operation_error: RefCell::new(None),
             saved_content: RefCell::new(None),
             dirty: Cell::new(false),
+            revision: Cell::new(0),
             operation_history: RefCell::new(OperationHistory::new(10)), // Default 10 transaction history
         };
         project.mark_saved();
@@ -116,6 +120,15 @@ impl EditorProject {
     /// Get the current object pool
     pub fn get_pool(&self) -> &ObjectPool {
         &self.pool
+    }
+
+    /// Version of the canonical project content, for stale AI proposal detection.
+    pub fn revision(&self) -> ProjectRevision {
+        self.revision.get()
+    }
+
+    fn bump_revision(&self) {
+        self.revision.set(self.revision.get().wrapping_add(1));
     }
 
     /// Allocate a new unique object ID efficiently
@@ -224,6 +237,7 @@ impl EditorProject {
     pub fn set_mask_size(&mut self, mask_size: u16) {
         if self.mask_size != mask_size {
             self.mask_size = mask_size;
+            self.bump_revision();
             self.refresh_dirty();
         }
     }
@@ -247,6 +261,7 @@ impl EditorProject {
         if info.name != old_name {
             drop(object_info);
             self.refresh_dirty();
+            self.bump_revision();
         }
     }
 
@@ -731,6 +746,7 @@ impl EditorProject {
 
         // Mark dirty and refresh state
         self.refresh_dirty();
+        self.bump_revision();
 
         Ok(applied)
     }
@@ -790,6 +806,7 @@ impl EditorProject {
             drop(history);
             self.remap_selection_for_operations(&inverse_tx.operations);
             self.refresh_dirty();
+            self.bump_revision();
             return true;
         }
         false
@@ -826,6 +843,7 @@ impl EditorProject {
             drop(history);
             self.remap_selection_for_operations(&applied_tx.forward_operations);
             self.refresh_dirty();
+            self.bump_revision();
             return true;
         }
         false
@@ -844,20 +862,45 @@ impl EditorProject {
     }
 
     /// Create a snapshot for AI context
-    pub fn snapshot(&self) -> Result<PoolSnapshot, SnapshotError> {
-        use ag_iso_stack::object_pool::vt_version::VtVersion;
+    /// Owned, UI-free input for the provider-neutral AI domain tools.
+    pub fn ai_design_state(&self) -> AiDesignState {
+        AiDesignState {
+            revision: self.revision(),
+            pool: self.pool.clone(),
+            object_info: self.object_info.borrow().clone(),
+            vt_version: self.vt_version,
+            mask_size: self.mask_size,
+            selected: self.selected_object.0,
+        }
+    }
 
-        // TODO: Get VT version from pool once that API is available
-        // For now use Version6 as default
-        let vt_version = VtVersion::Version6;
+    /// Backwards-compatible default AI snapshot.
+    pub fn snapshot(&self) -> Result<DesignSnapshot, SnapshotError> {
+        crate::ai::get_design_context(&self.ai_design_state(), DesignContextRequest::default())
+            .map_err(|error| SnapshotError::SerializationFailed(format!("{error:?}")))
+    }
 
-        PoolSnapshot::new(
-            &self.pool,
-            &self.object_info.borrow(),
-            self.selected_object.0,
-            (self.mask_size, self.soft_key_size.1),
-            vt_version,
-        )
+    /// Apply an AI proposal without allowing a stale prepared pool to overwrite edits.
+    pub fn apply_ai_proposal(
+        &mut self,
+        proposal: AiProposal,
+    ) -> Result<AppliedTransaction, TransactionDiagnostics> {
+        let prepared = if proposal.base_revision == self.revision() {
+            proposal.prepared
+        } else {
+            self.prepare_transaction(&proposal.transaction)?
+        };
+        let PreparedTransaction { pool, object_info, applied, .. } = prepared;
+        self.pool = pool;
+        self.object_info.replace(object_info);
+        self.mut_object_info.replace(self.object_info.borrow().clone());
+        self.update_next_available_id();
+        self.default_object_names.borrow_mut().clear();
+        self.remap_selection_for_operations(&applied.forward_operations);
+        self.operation_history.borrow_mut().push(applied.clone());
+        self.refresh_dirty();
+        self.bump_revision();
+        Ok(applied)
     }
 }
 

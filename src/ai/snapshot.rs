@@ -1,119 +1,345 @@
-//! AI-friendly pool snapshots for LLM context
-//! Distinguishes properties, references, and placements
-
-use ag_iso_stack::object_pool::{
-    object_attributes::ObjectRef, vt_version::VtVersion, ObjectId, ObjectPool,
-};
+//! Deterministic, semantic snapshots used by provider-neutral AI tools.
+use crate::object_properties::{get_object_property, get_property_descriptors, PropertySemantic};
+use crate::operations::{macro_refs, object_list, object_refs, ObjectReferenceList};
+use crate::{ObjectInfo, ProjectRevision};
+use ag_iso_stack::object_pool::{object::Object, NullableObjectId, ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Snapshot of pool state optimized for LLM consumption
+pub const MAX_SNAPSHOT_OBJECTS: usize = 200;
+pub const MAX_SNAPSHOT_DEPTH: usize = 16;
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PoolSnapshot {
-    pub vt_version: String,
-    pub mask_size: (u16, u16),
-    pub selected_object: Option<u16>,
+pub struct DesignSnapshot {
+    pub schema_version: u32,
+    pub project: ProjectSnapshot,
+    pub selection: Option<ObjectSummary>,
     pub objects: Vec<ObjectSnapshot>,
+    pub layout: Vec<LayoutInstance>,
+    pub truncated: bool,
 }
-
-/// Snapshot of a single object
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectSnapshot {
+    pub revision: ProjectRevision,
+    pub vt_version: String,
+    pub mask_width: u16,
+    pub mask_height: u16,
+    pub object_count: usize,
+    pub active_mask: Option<ObjectSummary>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ObjectSummary {
+    pub id: u16,
+    pub name: String,
+    pub object_type: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectSnapshot {
     pub id: u16,
+    pub name: String,
     pub object_type: String,
-    pub name: Option<String>,
-
-    /// Object properties (excluding position, excluding references)
-    pub properties: HashMap<String, serde_json::Value>,
-
-    /// Child placements (position is part of relationship)
-    pub children: Vec<ChildPlacement>,
-
-    /// Objects that reference this one
-    pub parents: Vec<u16>,
+    pub properties: BTreeMap<String, Value>,
+    pub references: BTreeMap<String, ObjectReferenceSnapshot>,
+    pub positioned_children: Vec<PositionedChildSnapshot>,
+    pub object_list: Option<ObjectListSnapshot>,
+    pub macro_references: Vec<MacroReferenceSnapshot>,
+    pub parents: Vec<ObjectSummary>,
 }
-
-/// A child placement (relationship with position)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChildPlacement {
-    pub child_id: u16,
+pub struct ObjectReferenceSnapshot {
+    pub id: Option<u16>,
+    pub name: Option<String>,
+    pub object_type: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionedChildSnapshot {
+    pub child: ObjectSummary,
     pub x: i16,
     pub y: i16,
 }
-
-/// Snapshot error type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "objects")]
+pub enum ObjectListSnapshot {
+    Required(Vec<ObjectSummary>),
+    Nullable(Vec<Option<ObjectSummary>>),
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MacroReferenceSnapshot {
+    pub event: String,
+    pub macro_id: u16,
+    pub macro_name: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutInstance {
+    pub object: ObjectSummary,
+    pub parent: ObjectSummary,
+    pub x: i32,
+    pub y: i32,
+    pub width: Option<u16>,
+    pub height: Option<u16>,
+    pub depth: usize,
+    pub path: Vec<u16>,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SnapshotScope {
+    ActiveMask,
+    Selection,
+    EntirePool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesignContextRequest {
+    pub scope: SnapshotScope,
+    pub include_selection: bool,
+    pub depth: usize,
+    pub max_objects: usize,
+}
+impl Default for DesignContextRequest {
+    fn default() -> Self {
+        Self {
+            scope: SnapshotScope::ActiveMask,
+            include_selection: true,
+            depth: MAX_SNAPSHOT_DEPTH,
+            max_objects: MAX_SNAPSHOT_OBJECTS,
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub enum SnapshotError {
-    InvalidVtVersion,
     SerializationFailed(String),
 }
 
-impl PoolSnapshot {
-    /// Create a snapshot from pool and metadata
-    /// Takes explicit parameters instead of depending on EditorProject
-    pub fn new(
-        pool: &ObjectPool,
-        object_info: &HashMap<ObjectId, crate::ObjectInfo>,
-        selected_object: Option<ObjectId>,
-        mask_size: (u16, u16),
-        vt_version: VtVersion,
-    ) -> Result<PoolSnapshot, SnapshotError> {
-        let mut objects = Vec::new();
-
-        for obj in pool.objects() {
-            let properties = crate::object_properties::get_properties(pool, obj.id())
-                .map_err(|error| SnapshotError::SerializationFailed(format!("{:?}", error)))?;
-            let serialized = serde_json::to_value(obj)
-                .map_err(|error| SnapshotError::SerializationFailed(error.to_string()))?;
-            let children = serialized
-                .get("properties")
-                .and_then(|properties| properties.get("object_refs"))
-                .cloned()
-                .map(serde_json::from_value::<Vec<ObjectRef>>)
-                .transpose()
-                .map_err(|error| SnapshotError::SerializationFailed(error.to_string()))?
-                .unwrap_or_default()
-                .into_iter()
-                .map(|reference| ChildPlacement {
-                    child_id: reference.id.value(),
-                    x: reference.offset.x,
-                    y: reference.offset.y,
-                })
-                .collect();
-            let object_snapshot = ObjectSnapshot {
-                id: obj.id().value(),
-                object_type: format!("{:?}", obj.object_type()),
-                name: object_info
-                    .get(&obj.id())
-                    .and_then(|info| info.name.clone()),
-                properties,
-                children,
-                parents: pool
-                    .parent_objects(obj.id())
-                    .into_iter()
-                    .map(|parent_obj| parent_obj.id().value())
-                    .collect(),
-            };
-
-            objects.push(object_snapshot);
-        }
-
-        Ok(PoolSnapshot {
-            vt_version: format!("{:?}", vt_version),
-            mask_size,
-            selected_object: selected_object.map(|id| id.value()),
-            objects,
-        })
-    }
-
-    /// Serialize to compact JSON suitable for LLM context
-    pub fn to_json(&self) -> Result<String, SnapshotError> {
-        serde_json::to_string(self).map_err(|e| SnapshotError::SerializationFailed(e.to_string()))
-    }
-
-    /// Serialize to pretty-printed JSON
-    pub fn to_json_pretty(&self) -> Result<String, SnapshotError> {
-        serde_json::to_string_pretty(self)
-            .map_err(|e| SnapshotError::SerializationFailed(e.to_string()))
+pub(crate) fn summary(
+    pool: &ObjectPool,
+    info: &HashMap<ObjectId, ObjectInfo>,
+    id: ObjectId,
+) -> Option<ObjectSummary> {
+    let object = pool.object_by_id(id)?;
+    Some(ObjectSummary {
+        id: id.value(),
+        name: info
+            .get(&id)
+            .and_then(|v| v.name.clone())
+            .unwrap_or_else(|| format!("Object_{}", id.value())),
+        object_type: format!("{:?}", object.object_type()),
+    })
+}
+fn reference(
+    pool: &ObjectPool,
+    info: &HashMap<ObjectId, ObjectInfo>,
+    value: Value,
+) -> ObjectReferenceSnapshot {
+    let id = serde_json::from_value::<NullableObjectId>(value)
+        .ok()
+        .and_then(|id| id.0)
+        .map(|id| id.value());
+    let found = id
+        .and_then(|id| ObjectId::new(id).ok())
+        .and_then(|id| summary(pool, info, id));
+    ObjectReferenceSnapshot {
+        id,
+        name: found.as_ref().map(|v| v.name.clone()),
+        object_type: found.map(|v| v.object_type),
     }
 }
+pub(crate) fn object_snapshot(
+    pool: &ObjectPool,
+    info: &HashMap<ObjectId, ObjectInfo>,
+    id: ObjectId,
+) -> Option<ObjectSnapshot> {
+    let object = pool.object_by_id(id)?;
+    let s = summary(pool, info, id)?;
+    let mut properties = BTreeMap::new();
+    let mut references = BTreeMap::new();
+    for descriptor in get_property_descriptors(object.object_type()) {
+        let Ok(value) = get_object_property(object, descriptor.name) else {
+            continue;
+        };
+        if matches!(
+            descriptor.semantic,
+            PropertySemantic::ObjectReference { .. }
+        ) {
+            references.insert(descriptor.name.to_owned(), reference(pool, info, value));
+        } else {
+            properties.insert(
+                descriptor.name.to_owned(),
+                sanitize_binary(descriptor.name, value),
+            );
+        }
+    }
+    let positioned_children = object_refs(object)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|placement| {
+            summary(pool, info, placement.id).map(|child| PositionedChildSnapshot {
+                child,
+                x: placement.offset.x,
+                y: placement.offset.y,
+            })
+        })
+        .collect();
+    let object_list = object_list(object).map(|list| match list {
+        ObjectReferenceList::Required(ids) => ObjectListSnapshot::Required(
+            ids.into_iter()
+                .filter_map(|id| summary(pool, info, id))
+                .collect(),
+        ),
+        ObjectReferenceList::Nullable(ids) => ObjectListSnapshot::Nullable(
+            ids.into_iter()
+                .map(|id| id.0.and_then(|id| summary(pool, info, id)))
+                .collect(),
+        ),
+    });
+    let macro_references = macro_refs(object)
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            let macro_id = u16::from(r.macro_id);
+            let macro_name = ObjectId::new(macro_id)
+                .ok()
+                .and_then(|id| summary(pool, info, id))
+                .map(|s| s.name);
+            MacroReferenceSnapshot {
+                event: format!("{:?}", r.event_id),
+                macro_id,
+                macro_name,
+            }
+        })
+        .collect();
+    let mut parents: Vec<_> = pool
+        .parent_objects(id)
+        .into_iter()
+        .filter_map(|p| summary(pool, info, p.id()))
+        .collect();
+    parents.sort_by_key(|p| p.id);
+    parents.dedup_by_key(|p| p.id);
+    Some(ObjectSnapshot {
+        id: s.id,
+        name: s.name,
+        object_type: s.object_type,
+        properties,
+        references,
+        positioned_children,
+        object_list,
+        macro_references,
+        parents,
+    })
+}
+fn sanitize_binary(name: &str, value: Value) -> Value {
+    if name == "data" {
+        if let Value::Array(bytes) = &value {
+            return serde_json::json!({ "byte_length": bytes.len() });
+        }
+    }
+    value
+}
+pub(crate) fn active_mask(pool: &ObjectPool) -> Option<ObjectId> {
+    pool.objects()
+        .iter()
+        .find(|o| matches!(o, Object::WorkingSet(_)))
+        .and_then(|o| get_object_property(o, "active_mask").ok())
+        .and_then(|v| serde_json::from_value::<NullableObjectId>(v).ok())
+        .and_then(|id| id.0)
+}
+pub(crate) fn layout_instances(
+    pool: &ObjectPool,
+    info: &HashMap<ObjectId, ObjectInfo>,
+    root: Option<ObjectId>,
+    max_depth: usize,
+) -> Vec<LayoutInstance> {
+    let Some(root) = root else { return Vec::new() };
+    let Some(root_summary) = summary(pool, info, root) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    let mut stack = vec![(
+        root,
+        0i32,
+        0i32,
+        0usize,
+        vec![root.value()],
+        HashSet::from([root]),
+    )];
+    while let Some((parent_id, px, py, depth, path, ancestors)) = stack.pop() {
+        if depth >= max_depth {
+            continue;
+        }
+        let Some(parent) = pool.object_by_id(parent_id) else {
+            continue;
+        };
+        for placement in object_refs(parent).unwrap_or_default().iter().rev() {
+            if ancestors.contains(&placement.id) {
+                continue;
+            }
+            let Some(child) = summary(pool, info, placement.id) else {
+                continue;
+            };
+            let x = px + i32::from(placement.offset.x);
+            let y = py + i32::from(placement.offset.y);
+            let Some(child_object) = pool.object_by_id(placement.id) else {
+                continue;
+            };
+            let width = get_object_property(child_object, "width")
+                .ok()
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u16::try_from(v).ok());
+            let height = get_object_property(child_object, "height")
+                .ok()
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u16::try_from(v).ok());
+            let mut child_path = path.clone();
+            child_path.push(placement.id.value());
+            result.push(LayoutInstance {
+                object: child.clone(),
+                parent: summary(pool, info, parent_id).unwrap_or_else(|| root_summary.clone()),
+                x,
+                y,
+                width,
+                height,
+                depth: depth + 1,
+                path: child_path.clone(),
+            });
+            let mut child_ancestors = ancestors.clone();
+            child_ancestors.insert(placement.id);
+            stack.push((placement.id, x, y, depth + 1, child_path, child_ancestors));
+        }
+    }
+    result
+}
+pub(crate) fn selected_ids(
+    pool: &ObjectPool,
+    root: Option<ObjectId>,
+    scope: SnapshotScope,
+    depth: usize,
+) -> (Vec<ObjectId>, bool) {
+    if scope == SnapshotScope::EntirePool {
+        let mut ids: Vec<_> = pool.objects().iter().map(Object::id).collect();
+        ids.sort_by_key(|id| id.value());
+        return (ids, false);
+    }
+    let Some(root) = root else {
+        return (Vec::new(), false);
+    };
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![(root, 0usize)];
+    let mut truncated = false;
+    while let Some((id, level)) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        ids.push(id);
+        if level >= depth {
+            truncated = true;
+            continue;
+        }
+        if let Some(object) = pool.object_by_id(id) {
+            if let Some(children) = object_refs(object) {
+                for child in children.iter().rev() {
+                    stack.push((child.id, level + 1));
+                }
+            }
+        }
+    }
+    (ids, truncated)
+}
+pub type PoolSnapshot = DesignSnapshot;
