@@ -5,7 +5,7 @@
 //! Single source of truth for constraint checking across the application
 //! Used by UI, operations engine, and AI
 
-use ag_iso_stack::object_pool::{ObjectId, ObjectPool};
+use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 
@@ -94,7 +94,17 @@ pub fn validate_parent_child_relationship(
     parent_id: ObjectId,
     child_id: ObjectId,
 ) -> Result<(), ValidationDiagnostic> {
-    let _parent = pool
+    validate_parent_child_relationship_for_version(pool, parent_id, child_id, VtVersion::Version6)
+}
+
+/// Validate a relationship using the project's authoritative VT version.
+pub fn validate_parent_child_relationship_for_version(
+    pool: &ObjectPool,
+    parent_id: ObjectId,
+    child_id: ObjectId,
+    vt_version: VtVersion,
+) -> Result<(), ValidationDiagnostic> {
+    let parent = pool
         .object_by_id(parent_id)
         .ok_or_else(|| ValidationDiagnostic {
             severity: ValidationSeverity::Error,
@@ -112,15 +122,23 @@ pub fn validate_parent_child_relationship(
             code: "E004_CHILD_NOT_FOUND".to_string(),
         })?;
 
-    // Check if parent type can have child type as reference
-    let _child_type = child.object_type();
-    // TODO: Get VT version from pool when that API is available
-    // For now we'll skip version-wise validation
-    // In the future: let allowed_child_types = get_allowed_child_refs(parent.object_type(), vt_version);
-
-    // As a simple check, just allow all parent-child relationships
-    // Future: this will use get_allowed_child_refs() with proper VT version checking
-    let _is_allowed = true;
+    let allowed = crate::allowed_object_relationships::get_allowed_child_refs(
+        parent.object_type(),
+        vt_version,
+    );
+    if !allowed.contains(&child.object_type()) {
+        return Err(ValidationDiagnostic {
+            severity: ValidationSeverity::Error,
+            message: format!(
+                "{} cannot contain {} for VT {:?}",
+                format!("{:?}", parent.object_type()),
+                format!("{:?}", child.object_type()),
+                vt_version
+            ),
+            affected_objects: Some(vec![parent_id.value(), child_id.value()]),
+            code: "INVALID_CHILD_TYPE".to_owned(),
+        });
+    }
 
     Ok(())
 }
@@ -186,6 +204,14 @@ pub fn get_referencing_objects(pool: &ObjectPool, object_id: ObjectId) -> Vec<Ob
 /// Comprehensive pool validation
 /// Returns all validation diagnostics (errors, warnings, info)
 pub fn validate_pool_state(pool: &ObjectPool) -> Vec<ValidationDiagnostic> {
+    validate_pool_state_for_version(pool, VtVersion::Version6)
+}
+
+/// Comprehensive pool validation using the project's VT version.
+pub fn validate_pool_state_for_version(
+    pool: &ObjectPool,
+    vt_version: VtVersion,
+) -> Vec<ValidationDiagnostic> {
     let mut diagnostics = Vec::new();
 
     // Check all object references for validity
@@ -196,7 +222,13 @@ pub fn validate_pool_state(pool: &ObjectPool) -> Vec<ValidationDiagnostic> {
             if referenced_id.value() == 0 {
                 continue;
             }
-            if let Err(diag) = validate_reference_integrity(pool, obj.id(), referenced_id) {
+            // `referenced_objects` also contains property references (for
+            // example OutputNumber → NumberVariable), not only child-list
+            // edges. Structural operations validate their child edge against
+            // the allowed-child table at application time; globally we can
+            // authoritatively validate the invariant shared by all reference
+            // kinds: the target exists.
+            if let Err(diag) = validate_object_exists(pool, referenced_id) {
                 diagnostics.push(diag);
             }
         }

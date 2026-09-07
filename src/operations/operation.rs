@@ -4,7 +4,7 @@
 use crate::object_info::ObjectInfo;
 use ag_iso_stack::object_pool::object::Object;
 use ag_iso_stack::object_pool::object_attributes::{MacroRef, ObjectLabel, Point};
-use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectPool, ObjectRef, ObjectType};
+use ag_iso_stack::object_pool::{vt_version::VtVersion, NullableObjectId, ObjectId, ObjectPool, ObjectRef, ObjectType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -187,6 +187,8 @@ pub struct OperationContext {
     pub inverse_operations: Vec<Operation>,
     /// Track affected object IDs for diagnostics
     pub affected_objects: HashSet<ObjectId>,
+    /// Project VT version used for relationship validation.
+    pub vt_version: VtVersion,
 }
 
 impl Default for OperationContext {
@@ -194,6 +196,7 @@ impl Default for OperationContext {
         Self {
             inverse_operations: Vec::new(),
             affected_objects: HashSet::new(),
+            vt_version: VtVersion::Version6,
         }
     }
 }
@@ -706,10 +709,11 @@ impl Operation {
                         child: child_id,
                     },
                 )?;
-                crate::pool_validation::validate_parent_child_relationship(
+                crate::pool_validation::validate_parent_child_relationship_for_version(
                     pool,
                     parent_obj_id,
                     child_obj_id,
+                    context.vt_version,
                 )
                 .map_err(|diag| OperationError::InvalidReference {
                     parent_type: format!("{}: {}", parent_id, diag.message),
@@ -861,10 +865,11 @@ impl Operation {
                             child: child.id.value(),
                         },
                     )?;
-                    crate::pool_validation::validate_parent_child_relationship(
+                    crate::pool_validation::validate_parent_child_relationship_for_version(
                         pool,
                         parent_obj_id,
                         child.id,
+                        context.vt_version,
                     )
                     .map_err(|diag| OperationError::InvalidReference {
                         parent_type: format!("{}: {}", parent_id, diag.message),
@@ -918,8 +923,8 @@ impl Operation {
                             child: child_id.value(),
                         }
                     })?;
-                    crate::pool_validation::validate_parent_child_relationship(
-                        pool, parent_id, child_id,
+                    crate::pool_validation::validate_parent_child_relationship_for_version(
+                        pool, parent_id, child_id, context.vt_version,
                     )
                     .map_err(|diag| OperationError::InvalidReference {
                         parent_type: format!("{}: {}", object_id, diag.message),
@@ -1039,10 +1044,11 @@ impl Operation {
                             child: reference_id.value(),
                         }
                     })?;
-                    crate::pool_validation::validate_parent_child_relationship(
+                    crate::pool_validation::validate_parent_child_relationship_for_version(
                         pool,
                         id,
                         reference_id,
+                        context.vt_version,
                     )
                     .map_err(|diag| OperationError::InvalidReference {
                         parent_type: format!("{}: {}", object_id, diag.message),

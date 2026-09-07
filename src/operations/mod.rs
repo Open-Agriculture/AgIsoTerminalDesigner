@@ -7,7 +7,11 @@ pub mod history;
 pub mod operation;
 pub mod transaction;
 
-pub use executor::OperationExecutor;
+pub use executor::{
+    DiagnosticSeverity, OperationExecutor, PreparedTransaction, TransactionDiagnostic,
+    TransactionDiagnostics, ValidationContext, MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH,
+    MAX_OPERATIONS_PER_TRANSACTION,
+};
 pub use history::OperationHistory;
 pub use operation::{
     resolve_target, ChildPlacement, MacroReferenceTarget, ObjectReferenceList, ObjectTarget,

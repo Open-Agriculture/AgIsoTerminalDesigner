@@ -8,13 +8,14 @@ use std::{
 };
 
 use ag_iso_stack::object_pool::{
-    object::Object, NullableObjectId, ObjectId, ObjectPool, ObjectType,
+    object::Object, vt_version::VtVersion, NullableObjectId, ObjectId, ObjectPool, ObjectType,
 };
 
 use crate::ai::snapshot::{PoolSnapshot, SnapshotError};
 use crate::operations::{
     AppliedTransaction, ObjectTarget, Operation, OperationError, OperationExecutor,
-    OperationHistory, OperationTransaction,
+    OperationHistory, OperationTransaction, PreparedTransaction, TransactionDiagnostics,
+    ValidationContext,
     CURRENT_OPERATION_SCHEMA_VERSION,
 };
 use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
@@ -36,6 +37,8 @@ pub struct EditorProject {
     undo_selected_history: Vec<NullableObjectId>,
     redo_selected_history: Vec<NullableObjectId>,
     pub mask_size: u16,
+    /// Authoritative project VT version. Old projects default to Version 6.
+    pub vt_version: VtVersion,
     soft_key_size: (u16, u16),
     object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
     /// Metadata draft edited by the UI and committed through operations.
@@ -88,6 +91,7 @@ impl From<ObjectPool> for EditorProject {
             undo_selected_history: Default::default(),
             redo_selected_history: Default::default(),
             mask_size,
+            vt_version: VtVersion::Version6,
             soft_key_size,
             object_info: RefCell::new(HashMap::new()),
             mut_object_info: RefCell::new(HashMap::new()),
@@ -639,7 +643,7 @@ impl EditorProject {
             self.selected_object.0
         };
 
-        let project = ProjectFile::new(&self.pool, &object_info, self.mask_size, selected);
+        let project = ProjectFile::new(&self.pool, &object_info, self.mask_size, self.vt_version, selected);
         project.to_bytes()
     }
 
@@ -652,6 +656,7 @@ impl EditorProject {
 
         let mut editor_project = EditorProject::from(pool);
         editor_project.mask_size = settings.mask_size;
+        editor_project.vt_version = settings.vt_version();
 
         // Restore object metadata
         let metadata = project.get_metadata();
@@ -707,10 +712,9 @@ impl EditorProject {
         &mut self,
         transaction: OperationTransaction,
     ) -> Result<AppliedTransaction, OperationError> {
-        let executor = OperationExecutor::new();
-
-        let (modified_pool, modified_object_info, applied) =
-            executor.execute(transaction, &self.pool, &self.object_info.borrow())?;
+        let prepared = self.prepare_transaction(&transaction)
+            .map_err(|diagnostics| diagnostics.legacy_operation_error())?;
+        let PreparedTransaction { pool: modified_pool, object_info: modified_object_info, applied, .. } = prepared;
 
         // Replace pool and metadata with results
         self.pool = modified_pool;
@@ -729,6 +733,27 @@ impl EditorProject {
         self.refresh_dirty();
 
         Ok(applied)
+    }
+
+    /// Prepare a transaction against a cloned candidate state without mutating this project.
+    pub fn prepare_transaction(
+        &self,
+        transaction: &OperationTransaction,
+    ) -> Result<PreparedTransaction, TransactionDiagnostics> {
+        OperationExecutor::new().prepare_transaction(
+            &self.pool,
+            &self.object_info.borrow(),
+            transaction,
+            &ValidationContext { vt_version: self.vt_version, mask_size: self.mask_size },
+        )
+    }
+
+    /// Validation is deliberately preparation with its candidate discarded.
+    pub fn validate_transaction(
+        &self,
+        transaction: &OperationTransaction,
+    ) -> Result<(), TransactionDiagnostics> {
+        self.prepare_transaction(transaction).map(|_| ())
     }
 
     /// Undo the last transaction via operation history

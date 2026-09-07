@@ -3,7 +3,7 @@
 //! Authors: Daan Steenbergen
 
 use crate::ObjectInfo;
-use ag_iso_stack::object_pool::{ObjectId, ObjectPool};
+use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -43,6 +43,10 @@ pub struct ProjectSettings {
     /// Virtual mask size for preview
     pub mask_size: u16,
 
+    /// Stored since project format v1; missing values in legacy files use VT6.
+    #[serde(default = "default_vt_version_number")]
+    pub vt_version: u8,
+
     /// Last selected object ID
     pub last_selected: Option<u16>,
 }
@@ -53,6 +57,7 @@ impl ProjectFile {
         pool: &ObjectPool,
         object_info: &HashMap<ObjectId, ObjectInfo>,
         mask_size: u16,
+        vt_version: VtVersion,
         selected: Option<ObjectId>,
     ) -> Self {
         // Convert ObjectInfo map to ObjectMetadata map
@@ -71,6 +76,7 @@ impl ProjectFile {
             object_metadata,
             settings: ProjectSettings {
                 mask_size,
+                vt_version: vt_version.into(),
                 last_selected: selected.map(|id| id.value()),
             },
         }
@@ -121,7 +127,17 @@ impl Default for ProjectSettings {
     fn default() -> Self {
         ProjectSettings {
             mask_size: 500,
+            vt_version: default_vt_version_number(),
             last_selected: None,
         }
+    }
+}
+
+fn default_vt_version_number() -> u8 { u8::from(VtVersion::Version6) }
+
+impl ProjectSettings {
+    /// VT6 is the explicit backwards-compatible fallback for missing/invalid legacy values.
+    pub fn vt_version(&self) -> VtVersion {
+        VtVersion::try_from(self.vt_version).unwrap_or(VtVersion::Version6)
     }
 }

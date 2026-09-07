@@ -1236,8 +1236,9 @@ mod tests {
         let nullable = object(ObjectType::InputList, 20);
         let first = object(ObjectType::Key, 11);
         let second = object(ObjectType::Key, 12);
+        let input_item = object(ObjectType::OutputString, 13);
         let mut pool = ObjectPool::default();
-        for object in [required, nullable, first, second] {
+        for object in [required, nullable, first, second, input_item] {
             pool.add(object);
         }
         let mut project = EditorProject::from(pool);
@@ -1277,7 +1278,7 @@ mod tests {
             Operation::SetObjectList {
                 object: ObjectTarget::id(20),
                 objects: ObjectTargetList::Nullable(vec![
-                    Some(ObjectTarget::id(first_id.value())),
+                    Some(ObjectTarget::id(13)),
                     None,
                 ]),
             },

@@ -34,7 +34,8 @@ pub use object_properties::{
 };
 pub use operations::{
     AppliedTransaction, ChildPlacement, MacroReferenceTarget, ObjectTarget, ObjectTargetList,
-    Operation, OperationError, OperationExecutor, OperationHistory, OperationTransaction,
-    CURRENT_OPERATION_SCHEMA_VERSION,
+    DiagnosticSeverity, Operation, OperationError, OperationExecutor, OperationHistory,
+    OperationTransaction, PreparedTransaction, TransactionDiagnostic, TransactionDiagnostics,
+    ValidationContext, CURRENT_OPERATION_SCHEMA_VERSION,
 };
 pub use pool_validation::{ValidationDiagnostic, ValidationSeverity};
