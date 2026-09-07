@@ -13,6 +13,7 @@ pub enum AiDomainTool {
     GetObjects,
     GetObjectSchema,
     ProposeTransaction,
+    AnalyzeDesign,
 }
 #[derive(Debug, Clone, Serialize)]
 pub enum AiToolError {
@@ -41,6 +42,7 @@ pub fn tool_definitions() -> Vec<Value> {
         function("get_objects", "Returns requested objects by ObjectId with their semantic properties and relationships.", json!({"type":"object","properties":{"ids":{"type":"array","items":{"type":"integer","minimum":1}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean"},"include_macros":{"type":"boolean"}},"required":["ids"],"additionalProperties":false})),
         function("get_object_schema", "Returns writable properties, reference types, child relationships and supported events for one ISOBUS VT object type. Use before guessing valid fields.", json!({"type":"object","properties":{"object_type":{"type":"string","enum":ObjectType::values().into_iter().map(|v| format!("{v:?}")).collect::<Vec<_>>() }},"required":["object_type"],"additionalProperties":false})),
         function("propose_transaction", "Validates and stages one atomic design change without modifying the user's project. All edits must be submitted through this tool.", transaction_schema()),
+        function("analyze_design", "Returns deterministic visual design-quality diagnostics. It is read-only and does not replace domain validation.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["active_mask","proposal"]}},"additionalProperties":false})),
     ]
 }
 fn function(name: &str, description: &str, parameters: Value) -> Value { json!({"type":"function","name":name,"description":description,"parameters":parameters,"strict":false}) }

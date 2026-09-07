@@ -13,6 +13,8 @@ pub struct AiProposal {
     pub transaction: OperationTransaction,
     pub prepared: PreparedTransaction,
     pub summary: AiProposalSummary,
+    /// Number of visual-review corrections included in this staged proposal.
+    pub refinement_round: u8,
 }
 #[derive(Debug, Clone, Default)]
 pub struct AiProposalSummary {
@@ -81,5 +83,43 @@ pub fn propose_transaction(
         transaction,
         prepared,
         summary,
+        refinement_round: 0,
     })
+}
+
+/// Prepare a corrective transaction against an already staged candidate.  The
+/// returned proposal deliberately retains the original revision, so Apply still
+/// performs the normal stale check against the canonical project.
+pub fn propose_refinement(
+    state: &AiDesignState,
+    base: &AiProposal,
+    correction: OperationTransaction,
+) -> Result<AiProposal, TransactionDiagnostics> {
+    let candidate = AiDesignState {
+        revision: state.revision,
+        pool: base.prepared.pool.clone(),
+        object_info: base.prepared.object_info.clone(),
+        vt_version: state.vt_version,
+        mask_size: state.mask_size,
+        selected: state.selected,
+    };
+    // First validate against P1. This is the important validation boundary for
+    // a visual correction; it may reference objects made by the initial edit.
+    let corrected_candidate = propose_transaction(&candidate, correction.clone())?;
+    // Flattening preserves normal one-transaction apply/undo semantics.
+    let mut operations = base.transaction.operations.clone();
+    let correction_description = correction.description.clone();
+    operations.extend(correction.operations);
+    let combined = OperationTransaction {
+        schema_version: base.transaction.schema_version,
+        description: correction_description.or_else(|| base.transaction.description.clone()),
+        operations,
+    };
+    // Reprepare the flattened sequence from P0 so its AppliedTransaction has a
+    // single, exact undo/redo record. The earlier candidate preparation above
+    // ensures correction references are interpreted against P1.
+    let mut refined = propose_transaction(state, combined)?;
+    refined.refinement_round = base.refinement_round.saturating_add(1);
+    let _ = corrected_candidate; // documents the staged validation boundary.
+    Ok(refined)
 }

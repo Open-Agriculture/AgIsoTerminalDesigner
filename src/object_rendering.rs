@@ -33,6 +33,13 @@ pub trait RenderableObject {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>);
 }
 
+/// Render one mask through the same object-rendering implementation used by
+/// the editor.  This deliberately accepts a supplied pool so staged AI
+/// candidates never need to be installed in `EditorProject`.
+pub fn render_mask(ui: &mut egui::Ui, pool: &ObjectPool, mask: &Object) {
+    mask.render(ui, pool, Point::default());
+}
+
 impl RenderableObject for Object {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
         // Make sure text is truncated if it doesn't fit for all object renderings (useful for error labels)

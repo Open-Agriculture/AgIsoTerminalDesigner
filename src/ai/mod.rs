@@ -2,6 +2,8 @@
 pub mod backend;
 pub mod conversation;
 pub mod proposal;
+pub mod preview;
+pub mod design_analysis;
 pub mod providers;
 pub mod protocol;
 pub mod schema;
@@ -23,9 +25,11 @@ pub struct AiDesignState {
     pub mask_size: u16,
     pub selected: Option<ObjectId>,
 }
-pub use proposal::{propose_transaction, AiProposal, AiProposalSummary};
+pub use proposal::{propose_transaction, propose_refinement, AiProposal, AiProposalSummary};
 pub use backend::{AiProvider, AiProviderError, AiProviderFuture, AiProviderResponse, AiSettings, AiTurnRequest};
-pub use conversation::{AiContent, AiMessage, AiRole, AiToolCall, AiToolResult, Conversation};
+pub use conversation::{AiContent, AiImage, AiMessage, AiRole, AiToolCall, AiToolResult, Conversation};
 pub use schema::{get_object_schema, ObjectSchemaSnapshot, PropertySchemaSnapshot};
 pub use snapshot::*;
 pub use tools::{get_design_context, get_objects, AiDomainTool, AiToolError, GetObjectsRequest};
+pub use preview::{render_proposal_preview, render_preview_ui, AiPreview, PreviewError, RenderedPreview};
+pub use design_analysis::{analyze_design, DesignAnalysis, DesignAnalysisError, DesignAnalysisScope, DesignDiagnostic, DesignDiagnosticSeverity, DiagnosticRegion};

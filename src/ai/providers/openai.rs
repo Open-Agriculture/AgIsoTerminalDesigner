@@ -28,7 +28,14 @@ fn to_openai_input(conversation: &crate::ai::Conversation) -> Vec<Value> {
   AiContent::Text(text) => json!({"role":match message.role { AiRole::User => "user", AiRole::Assistant => "assistant", AiRole::Tool => "user" },"content":[{"type":"input_text","text":text}]}),
   AiContent::ToolCall(call) => json!({"type":"function_call","call_id":call.call_id,"name":call.name,"arguments":call.arguments.to_string()}),
   AiContent::ToolResult(result) => json!({"type":"function_call_output","call_id":result.call_id,"output":result.result.to_string()}),
+  AiContent::Image(image) => json!({"role":match message.role { AiRole::User => "user", AiRole::Assistant => "assistant", AiRole::Tool => "user" },"content":[{"type":"input_image","image_url":format!("data:{};base64,{}", image.mime_type, base64(&image.bytes))}]}),
  })).collect()
+}
+fn base64(bytes: &[u8]) -> String {
+ const TABLE: &[u8;64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+ let mut out=String::with_capacity((bytes.len()+2)/3*4);
+ for chunk in bytes.chunks(3) { let a=chunk[0]; let b=*chunk.get(1).unwrap_or(&0); let c=*chunk.get(2).unwrap_or(&0); out.push(TABLE[(a>>2) as usize] as char); out.push(TABLE[((a&3)<<4 | b>>4) as usize] as char); out.push(if chunk.len()>1 {TABLE[((b&15)<<2 | c>>6) as usize] as char} else {'='}); out.push(if chunk.len()>2 {TABLE[(c&63) as usize] as char} else {'='}); }
+ out
 }
 fn parse_response(value: Value) -> Result<AiProviderResponse, AiProviderError> {
  let output = value.get("output").and_then(Value::as_array).ok_or_else(|| AiProviderError::InvalidResponse("missing output array".into()))?;

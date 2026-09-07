@@ -1390,7 +1390,7 @@ impl eframe::App for DesignerApp {
                     egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
                         for message in &self.ai_state.conversation.messages {
                             let prefix = match message.role { AiRole::User => "You", AiRole::Assistant => "Assistant", AiRole::Tool => "Tool" };
-                            for content in &message.content { match content { AiContent::Text(text) => { ui.label(format!("{prefix}: {text}")); }, AiContent::ToolCall(call) => { ui.label(format!("Assistant called {}", call.name)); }, AiContent::ToolResult(_) => {} } }
+                            for content in &message.content { match content { AiContent::Text(text) => { ui.label(format!("{prefix}: {text}")); }, AiContent::ToolCall(call) => { ui.label(format!("Assistant called {}", call.name)); }, AiContent::ToolResult(_) => {}, AiContent::Image(_) => { ui.label("Assistant reviewed a staged preview"); } } }
                         }
                     });
                     if let Some(error) = &self.ai_state.last_error { ui.colored_label(egui::Color32::RED, error); }
@@ -1404,6 +1404,15 @@ impl eframe::App for DesignerApp {
                         ui.label(proposal.transaction.description.as_deref().unwrap_or("Untitled change"));
                         ui.label(format!("{} operations, {} affected objects", proposal.summary.operation_count, proposal.summary.affected_objects.len()));
                         ui.label("Validation passed");
+                        if let Some(project) = self.project.as_ref() {
+                            let design = project.ai_design_state();
+                            if let Ok(preview) = ag_iso_terminal_designer::ai::render_proposal_preview(&design, proposal) {
+                                ui.label(format!("Proposed mask preview: {} × {}", preview.width, preview.height));
+                                if preview.diagnostics.is_empty() { ui.label("Design checks: no deterministic issues found"); }
+                                else { ui.label(format!("Design checks: {} issue(s)", preview.diagnostics.len())); for diagnostic in preview.diagnostics.iter().take(4) { ui.label(format!("{:?}: {}", diagnostic.severity, diagnostic.message)); } }
+                                let _ = ag_iso_terminal_designer::ai::render_preview_ui(ui, &design, proposal);
+                            }
+                        }
                         ui.horizontal(|ui| { if ui.button("Apply").clicked() { apply=true; } if ui.button("Reject").clicked() { reject=true; } });
                     }
                 });
