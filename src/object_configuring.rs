@@ -7,7 +7,9 @@ use crate::object_properties::{
     get_object_property, get_property_descriptors, property_editor_descriptors, EditorKind,
     PropertySemantic,
 };
-use crate::operations::ObjectReferenceList;
+use crate::operations::{
+    ChildPlacement, MacroReferenceTarget, ObjectReferenceList, ObjectTarget, ObjectTargetList,
+};
 use crate::{EditorProject, Operation};
 use ag_iso_stack::object_pool::object::Object;
 use ag_iso_stack::object_pool::object_attributes::{Event, MacroRef};
@@ -291,8 +293,15 @@ fn render_positioned_children(
         let mut updated = children.to_vec();
         updated[index].id = child_id;
         design.queue_operation(Operation::SetChildren {
-            parent_id: parent_id.value(),
-            children: updated,
+            parent: ObjectTarget::id(parent_id.value()),
+            children: updated
+                .into_iter()
+                .map(|child| ChildPlacement {
+                    child: ObjectTarget::id(child.id.value()),
+                    x: child.offset.x,
+                    y: child.offset.y,
+                })
+                .collect(),
         });
     } else if let Some((child_id, x, y)) = position {
         design.queue_operation(Operation::SetChildPosition {
@@ -305,8 +314,15 @@ fn render_positioned_children(
         let mut updated = children.to_vec();
         apply_list_action(&mut updated, action);
         design.queue_operation(Operation::SetChildren {
-            parent_id: parent_id.value(),
-            children: updated,
+            parent: ObjectTarget::id(parent_id.value()),
+            children: updated
+                .into_iter()
+                .map(|child| ChildPlacement {
+                    child: ObjectTarget::id(child.id.value()),
+                    x: child.offset.x,
+                    y: child.offset.y,
+                })
+                .collect(),
         });
     }
 
@@ -323,8 +339,8 @@ fn render_positioned_children(
                             .clicked()
                         {
                             design.queue_operation(Operation::AddChild {
-                                parent_id: parent_id.value(),
-                                child_id: candidate.id().value(),
+                                parent: ObjectTarget::id(parent_id.value()),
+                                child: ObjectTarget::id(candidate.id().value()),
                                 x: 0,
                                 y: 0,
                             });
@@ -516,8 +532,19 @@ fn render_add_object(
 
 fn queue_object_list(design: &EditorProject, id: ObjectId, objects: ObjectReferenceList) {
     design.queue_operation(Operation::SetObjectList {
-        object_id: id.value(),
-        objects,
+        object: ObjectTarget::id(id.value()),
+        objects: match objects {
+            ObjectReferenceList::Required(ids) => ObjectTargetList::Required(
+                ids.into_iter()
+                    .map(|id| ObjectTarget::id(id.value()))
+                    .collect(),
+            ),
+            ObjectReferenceList::Nullable(ids) => ObjectTargetList::Nullable(
+                ids.into_iter()
+                    .map(|id| id.0.map(|id| ObjectTarget::id(id.value())))
+                    .collect(),
+            ),
+        },
     });
 }
 
@@ -537,8 +564,14 @@ fn apply_macro_action(references: &mut Vec<MacroRef>, action: ListAction) {
 
 fn queue_macro_references(design: &EditorProject, id: ObjectId, macro_refs: Vec<MacroRef>) {
     design.queue_operation(Operation::SetMacroReferences {
-        object_id: id.value(),
-        macro_refs,
+        object: ObjectTarget::id(id.value()),
+        macro_refs: macro_refs
+            .into_iter()
+            .map(|reference| MacroReferenceTarget {
+                event_id: reference.event_id,
+                macro_object: ObjectTarget::id(reference.macro_id.into()),
+            })
+            .collect(),
     });
 }
 
@@ -711,28 +744,49 @@ fn render_identity(
 }
 
 fn queue(design: &EditorProject, id: ObjectId, property: &str, value: serde_json::Value) {
-    design.queue_operation(Operation::SetProperty {
-        object_id: id.value(),
-        property: property.to_owned(),
-        value,
+    let is_reference = design.get_pool().object_by_id(id).is_some_and(|object| {
+        get_property_descriptors(object.object_type())
+            .into_iter()
+            .any(|descriptor| {
+                descriptor.name == property
+                    && matches!(
+                        descriptor.semantic,
+                        PropertySemantic::ObjectReference { .. }
+                    )
+            })
     });
+    if is_reference {
+        let reference = if value.is_null() {
+            None
+        } else {
+            serde_json::from_value::<ObjectId>(value)
+                .ok()
+                .map(|id| ObjectTarget::id(id.value()))
+        };
+        design.queue_operation(Operation::SetObjectReference {
+            object: ObjectTarget::id(id.value()),
+            property: property.to_owned(),
+            reference,
+        });
+    } else {
+        design.queue_operation(Operation::SetProperty {
+            object: ObjectTarget::id(id.value()),
+            property: property.to_owned(),
+            value,
+        });
+    }
 }
 
 /// Preserve the JSON number kind exposed by the property's Rust type. In
 /// particular, integer properties must be committed as `42`, not `42.0`:
 /// serde_json deliberately does not expose the latter through `as_u64()`.
-fn number_after_edit(
-    original: &serde_json::Value,
-    edited: f64,
-) -> Option<serde_json::Number> {
+fn number_after_edit(original: &serde_json::Value, edited: f64) -> Option<serde_json::Number> {
     let serde_json::Value::Number(original) = original else {
         return None;
     };
 
     if original.is_u64() {
-        if edited.is_finite()
-            && edited.fract() == 0.0
-            && (0.0..=u64::MAX as f64).contains(&edited)
+        if edited.is_finite() && edited.fract() == 0.0 && (0.0..=u64::MAX as f64).contains(&edited)
         {
             return Some(serde_json::Number::from(edited as u64));
         }
@@ -1029,6 +1083,25 @@ mod tests {
         project.execute_transaction(transaction).unwrap();
     }
 
+    fn placements(refs: &[ObjectRef]) -> Vec<ChildPlacement> {
+        refs.iter()
+            .map(|reference| ChildPlacement {
+                child: ObjectTarget::id(reference.id.value()),
+                x: reference.offset.x,
+                y: reference.offset.y,
+            })
+            .collect()
+    }
+
+    fn macro_targets(refs: &[MacroRef]) -> Vec<MacroReferenceTarget> {
+        refs.iter()
+            .map(|reference| MacroReferenceTarget {
+                event_id: reference.event_id,
+                macro_object: ObjectTarget::id(reference.macro_id.into()),
+            })
+            .collect()
+    }
+
     #[test]
     fn numeric_edits_preserve_integer_and_float_json_kinds() {
         let integer = number_after_edit(&serde_json::json!(0_u8), 42.0).unwrap();
@@ -1075,16 +1148,16 @@ mod tests {
         apply(
             &mut project,
             Operation::SetChildren {
-                parent_id: 10,
-                children: initial.clone(),
+                parent: ObjectTarget::id(10),
+                children: placements(&initial),
             },
         );
         let changed = vec![initial[1], initial[0]];
         apply(
             &mut project,
             Operation::SetChildren {
-                parent_id: 10,
-                children: changed.clone(),
+                parent: ObjectTarget::id(10),
+                children: placements(&changed),
             },
         );
         assert_eq!(
@@ -1120,8 +1193,8 @@ mod tests {
         apply(
             &mut project,
             Operation::SetChildren {
-                parent_id: 10,
-                children: vec![changed[0]],
+                parent: ObjectTarget::id(10),
+                children: placements(&[changed[0]]),
             },
         );
         assert!(project.undo_operation());
@@ -1147,10 +1220,11 @@ mod tests {
         let mut cycle_project = EditorProject::from(cycle_pool);
         let mut transaction = OperationTransaction::new(None);
         transaction.add_operation(Operation::SetChildren {
-            parent_id: 10,
-            children: vec![ObjectRef {
-                id: ObjectId::new(20).unwrap(),
-                offset: Default::default(),
+            parent: ObjectTarget::id(10),
+            children: vec![ChildPlacement {
+                child: ObjectTarget::id(20),
+                x: 0,
+                y: 0,
             }],
         });
         assert!(cycle_project.execute_transaction(transaction).is_err());
@@ -1172,15 +1246,18 @@ mod tests {
         apply(
             &mut project,
             Operation::SetObjectList {
-                object_id: 10,
-                objects: ObjectReferenceList::Required(vec![first_id, second_id]),
+                object: ObjectTarget::id(10),
+                objects: ObjectTargetList::Required(vec![
+                    ObjectTarget::id(first_id.value()),
+                    ObjectTarget::id(second_id.value()),
+                ]),
             },
         );
         apply(
             &mut project,
             Operation::SetObjectList {
-                object_id: 10,
-                objects: ObjectReferenceList::Required(vec![second_id]),
+                object: ObjectTarget::id(10),
+                objects: ObjectTargetList::Required(vec![ObjectTarget::id(second_id.value())]),
             },
         );
         assert!(project.undo_operation());
@@ -1198,10 +1275,10 @@ mod tests {
         apply(
             &mut project,
             Operation::SetObjectList {
-                object_id: 20,
-                objects: ObjectReferenceList::Nullable(vec![
-                    NullableObjectId(Some(first_id)),
-                    NullableObjectId::NULL,
+                object: ObjectTarget::id(20),
+                objects: ObjectTargetList::Nullable(vec![
+                    Some(ObjectTarget::id(first_id.value())),
+                    None,
                 ]),
             },
         );
@@ -1241,16 +1318,16 @@ mod tests {
         apply(
             &mut project,
             Operation::SetMacroReferences {
-                object_id: 10,
-                macro_refs: refs.clone(),
+                object: ObjectTarget::id(10),
+                macro_refs: macro_targets(&refs),
             },
         );
         let reordered = vec![refs[1].clone(), refs[0].clone()];
         apply(
             &mut project,
             Operation::SetMacroReferences {
-                object_id: 10,
-                macro_refs: reordered.clone(),
+                object: ObjectTarget::id(10),
+                macro_refs: macro_targets(&reordered),
             },
         );
         assert!(project.undo_operation());
@@ -1267,8 +1344,8 @@ mod tests {
         apply(
             &mut project,
             Operation::SetMacroReferences {
-                object_id: 10,
-                macro_refs: vec![reordered[0].clone()],
+                object: ObjectTarget::id(10),
+                macro_refs: macro_targets(&[reordered[0].clone()]),
             },
         );
         assert!(project.undo_operation());

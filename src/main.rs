@@ -463,7 +463,7 @@ impl DesignerApp {
                                                 ("data", serde_json::json!(data)),
                                             ] {
                                                 pool.queue_operation(Operation::SetProperty {
-                                                    object_id: id.value(),
+                                                    object: ag_iso_terminal_designer::ObjectTarget::id(id.value()),
                                                     property: property.to_owned(),
                                                     value,
                                                 });
@@ -1705,7 +1705,7 @@ impl eframe::App for DesignerApp {
 
                                 if response.changed() {
                                     pool.queue_operation(Operation::RenameObject {
-                                        object_id: original.id().value(),
+                                        object: ag_iso_terminal_designer::ObjectTarget::id(original.id().value()),
                                         name,
                                     });
                                 }

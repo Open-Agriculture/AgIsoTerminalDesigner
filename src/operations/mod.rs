@@ -9,5 +9,8 @@ pub mod transaction;
 
 pub use executor::OperationExecutor;
 pub use history::OperationHistory;
-pub use operation::{ObjectReferenceList, Operation, OperationContext, OperationError};
-pub use transaction::{AppliedTransaction, OperationTransaction};
+pub use operation::{
+    resolve_target, ChildPlacement, MacroReferenceTarget, ObjectReferenceList, ObjectTarget,
+    ObjectTargetList, Operation, OperationContext, OperationError,
+};
+pub use transaction::{AppliedTransaction, OperationTransaction, CURRENT_OPERATION_SCHEMA_VERSION};

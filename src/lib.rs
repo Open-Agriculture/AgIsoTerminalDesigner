@@ -33,6 +33,8 @@ pub use object_properties::{
     PropertySemantic,
 };
 pub use operations::{
-    AppliedTransaction, Operation, OperationExecutor, OperationHistory, OperationTransaction,
+    AppliedTransaction, ChildPlacement, MacroReferenceTarget, ObjectTarget, ObjectTargetList,
+    Operation, OperationError, OperationExecutor, OperationHistory, OperationTransaction,
+    CURRENT_OPERATION_SCHEMA_VERSION,
 };
 pub use pool_validation::{ValidationDiagnostic, ValidationSeverity};

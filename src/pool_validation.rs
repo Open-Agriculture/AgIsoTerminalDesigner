@@ -191,6 +191,11 @@ pub fn validate_pool_state(pool: &ObjectPool) -> Vec<ValidationDiagnostic> {
     // Check all object references for validity
     for obj in pool.objects() {
         for referenced_id in obj.referenced_objects() {
+            // Default editor objects use ObjectId(0) as an unresolved required
+            // reference until the user assigns one. It is not a pool object.
+            if referenced_id.value() == 0 {
+                continue;
+            }
             if let Err(diag) = validate_reference_integrity(pool, obj.id(), referenced_id) {
                 diagnostics.push(diag);
             }

@@ -2,7 +2,9 @@
 //! Validates, executes operations, and collects inverses
 
 use super::operation::{Operation, OperationContext, OperationError};
-use super::transaction::{AppliedTransaction, OperationTransaction};
+use super::transaction::{
+    AppliedTransaction, OperationTransaction, CURRENT_OPERATION_SCHEMA_VERSION,
+};
 use crate::object_info::ObjectInfo;
 use crate::pool_validation::{ValidationDiagnostic, ValidationSeverity};
 use ag_iso_stack::object_pool::ObjectPool;
@@ -37,6 +39,7 @@ impl OperationExecutor {
                     // Validate object type is known
                     // This will be expanded as we implement operation validation
                 }
+                Operation::RestoreObject { .. } => {}
                 Operation::DeleteObject { object_id, .. } => {
                     // Check object exists
                     if pool
@@ -57,6 +60,8 @@ impl OperationExecutor {
                 Operation::SetProperty { .. } => {
                     // Validate property exists and is writable
                 }
+                Operation::SetObjectReference { .. } => {}
+                Operation::RestoreObjectReference { .. } => {}
                 Operation::ChangeObjectId { old_id, new_id } => {
                     if pool
                         .object_by_id(ObjectId::new(*old_id).unwrap_or_default())
@@ -115,7 +120,7 @@ impl OperationExecutor {
     }
 
     /// Execute a transaction atomically
-    /// - Resolves temporary handles to ObjectIds
+    /// - Resolves operation targets to ObjectIds against evolving state
     /// - Clones pool and metadata ONCE per transaction
     /// - Validates before application
     /// - Applies operations, collecting inverses
@@ -136,6 +141,13 @@ impl OperationExecutor {
     > {
         let start_time = std::time::Instant::now();
         let transaction_id = Uuid::new_v4().to_string();
+
+        if transaction.schema_version != CURRENT_OPERATION_SCHEMA_VERSION {
+            return Err(OperationError::UnsupportedSchemaVersion {
+                expected: CURRENT_OPERATION_SCHEMA_VERSION,
+                actual: transaction.schema_version,
+            });
+        }
 
         // Step 1: Validate all operations
         let diagnostics = self.validate(&transaction, pool, object_info);
@@ -162,10 +174,7 @@ impl OperationExecutor {
         let mut working_object_info = object_info.clone();
         let mut context = OperationContext::default();
 
-        // Step 3: Resolve temporary handles
-        self.resolve_handles(&transaction, &working_pool, &mut context)?;
-
-        // Step 4: Apply operations, collecting inverses and concrete forward
+        // Step 3: Apply operations, collecting inverses and concrete forward
         // operations. Concretizing CreateObject preserves allocated IDs and
         // editor metadata across redo.
         let mut forward_operations = Vec::with_capacity(transaction.operations.len());
@@ -173,33 +182,15 @@ impl OperationExecutor {
             match op.apply(&mut working_pool, &mut working_object_info, &mut context) {
                 Ok(inverse) => {
                     let applied_forward = match (op, &inverse) {
-                        (
-                            Operation::CreateObject {
-                                handle,
-                                object_type,
-                                name,
-                                ..
-                            },
-                            Operation::DeleteObject { object_id, .. },
-                        ) => {
+                        (Operation::CreateObject { .. }, Operation::DeleteObject { object_id }) => {
                             let id = ObjectId::new(*object_id)
                                 .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
-                            let object = working_pool
-                                .object_by_id(id)
-                                .ok_or(OperationError::ObjectNotFound(*object_id))?;
-                            Operation::CreateObject {
-                                handle: handle.clone(),
-                                object_id: Some(*object_id),
-                                object_type: object_type.clone(),
-                                name: name.clone(),
-                                captured_object: Some(serde_json::to_value(object).map_err(
-                                    |error| OperationError::PropertyError {
-                                        object_id: *object_id,
-                                        property: "CreateObject".to_owned(),
-                                        reason: error.to_string(),
-                                    },
-                                )?),
-                                captured_info: working_object_info.get(&id).cloned(),
+                            Operation::RestoreObject {
+                                object: working_pool
+                                    .object_by_id(id)
+                                    .cloned()
+                                    .ok_or(OperationError::ObjectNotFound(*object_id))?,
+                                info: working_object_info.get(&id).cloned(),
                             }
                         }
                         _ => op.clone(),
@@ -214,21 +205,27 @@ impl OperationExecutor {
             }
         }
 
-        // Step 5: Validate resulting pool state
+        // Step 4: Validate resulting pool state
         let final_diagnostics = crate::pool_validation::validate_pool_state(&working_pool);
         let has_errors = final_diagnostics
             .iter()
             .any(|d| d.severity == ValidationSeverity::Error);
 
         if has_errors {
+            let reason = final_diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == ValidationSeverity::Error)
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
             return Err(OperationError::PropertyError {
                 object_id: 0,
                 property: "VALIDATION_FAILED_POST_EXECUTION".to_string(),
-                reason: "Pool validation failed after execution".to_string(),
+                reason,
             });
         }
 
-        // Step 6: All good; return result
+        // Step 5: All good; return result
         let elapsed = start_time.elapsed();
         let applied = AppliedTransaction {
             transaction_id,
@@ -248,46 +245,6 @@ impl OperationExecutor {
         };
 
         Ok((working_pool, working_object_info, applied))
-    }
-
-    /// Resolve temporary handles to actual ObjectIds
-    fn resolve_handles(
-        &self,
-        transaction: &OperationTransaction,
-        pool: &ObjectPool,
-        context: &mut OperationContext,
-    ) -> Result<(), OperationError> {
-        let mut reserved: std::collections::HashSet<_> =
-            pool.objects().iter().map(|object| object.id()).collect();
-        for op in &transaction.operations {
-            if let Operation::CreateObject {
-                handle, object_id, ..
-            } = op
-            {
-                if let Some(h) = handle {
-                    if context.handle_map.contains_key(h) {
-                        return Err(OperationError::ResolveHandleFailed { handle: h.clone() });
-                    }
-                    let id = if let Some(value) = object_id {
-                        ObjectId::new(*value).map_err(|_| OperationError::ResolveHandleFailed {
-                            handle: h.clone(),
-                        })?
-                    } else {
-                        (1..u16::MAX)
-                            .filter_map(|value| ObjectId::new(value).ok())
-                            .find(|id| !reserved.contains(id))
-                            .ok_or_else(|| OperationError::ResolveHandleFailed {
-                                handle: h.clone(),
-                            })?
-                    };
-                    if !reserved.insert(id) {
-                        return Err(OperationError::ObjectAlreadyExists(id.value()));
-                    }
-                    context.handle_map.insert(h.clone(), id);
-                }
-            }
-        }
-        Ok(())
     }
 }
 

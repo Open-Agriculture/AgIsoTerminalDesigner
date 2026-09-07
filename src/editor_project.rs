@@ -13,8 +13,9 @@ use ag_iso_stack::object_pool::{
 
 use crate::ai::snapshot::{PoolSnapshot, SnapshotError};
 use crate::operations::{
-    AppliedTransaction, Operation, OperationError, OperationExecutor, OperationHistory,
-    OperationTransaction,
+    AppliedTransaction, ObjectTarget, Operation, OperationError, OperationExecutor,
+    OperationHistory, OperationTransaction,
+    CURRENT_OPERATION_SCHEMA_VERSION,
 };
 use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
 
@@ -225,6 +226,15 @@ impl EditorProject {
 
     pub fn set_object_name(&self, object: &Object, name: String) {
         let mut object_info = self.mut_object_info.borrow_mut();
+        if !name.is_empty()
+            && object_info
+                .iter()
+                .any(|(id, info)| *id != object.id() && info.name.as_deref() == Some(name.as_str()))
+        {
+            self.last_operation_error
+                .replace(Some(format!("Object name already exists: {name}")));
+            return;
+        }
         let info = object_info
             .entry(object.id())
             .or_insert_with(|| ObjectInfo::new(object));
@@ -248,7 +258,7 @@ impl EditorProject {
             return false;
         }
         self.execute_ui_transaction(OperationTransaction {
-            schema_version: 1,
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
             description: Some(description.into()),
             operations,
         })
@@ -306,15 +316,12 @@ impl EditorProject {
     pub fn create_object(&mut self, object_type: ObjectType, name: String) -> Option<ObjectId> {
         let object_id = self.allocate_object_id();
         let transaction = OperationTransaction {
-            schema_version: 1,
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
             description: Some(format!("Create {object_type:?}")),
             operations: vec![Operation::CreateObject {
-                handle: None,
                 object_id: Some(object_id.value()),
-                object_type: format!("{object_type:?}"),
-                name: Some(name),
-                captured_object: None,
-                captured_info: None,
+                object_type,
+                name,
             }],
         };
 
@@ -325,11 +332,10 @@ impl EditorProject {
     /// Delete an object through a reversible operation.
     pub fn delete_object(&mut self, object_id: ObjectId) -> bool {
         let deleted = self.execute_ui_transaction(OperationTransaction {
-            schema_version: 1,
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
             description: Some(format!("Delete object {}", object_id.value())),
             operations: vec![Operation::DeleteObject {
                 object_id: object_id.value(),
-                captured_object: None,
             }],
         });
         if deleted && self.get_selected().0 == Some(object_id) {
@@ -360,10 +366,10 @@ impl EditorProject {
             return false;
         }
         self.execute_ui_transaction(OperationTransaction {
-            schema_version: 1,
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
             description: Some(format!("Rename object {}", object_id.value())),
             operations: vec![Operation::RenameObject {
-                object_id: object_id.value(),
+                object: ObjectTarget::id(object_id.value()),
                 name,
             }],
         })
@@ -391,7 +397,7 @@ impl EditorProject {
             return false;
         }
         self.execute_ui_transaction(OperationTransaction {
-            schema_version: 1,
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
             description: Some("Reorder objects".to_owned()),
             operations: vec![Operation::ReorderObjects {
                 object_ids: object_ids.into_iter().map(|id| id.value()).collect(),
@@ -833,7 +839,7 @@ impl EditorProject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::default_object;
+    use crate::{default_object, ChildPlacement, MacroReferenceTarget};
 
     #[test]
     fn content_changes_and_undo_update_dirty_state() {
@@ -858,15 +864,7 @@ mod tests {
         // Add a working set object (ID=1, which is the default for the first object)
         let mut ws = default_object(ObjectType::WorkingSet);
         let ws_id_value = 1u16;
-        if let Ok(id) = ObjectId::new(ws_id_value) {
-            ws = match ws {
-                Object::WorkingSet(mut ws_obj) => {
-                    // The object is already created with ID 1
-                    Object::WorkingSet(ws_obj)
-                }
-                _ => unreachable!(),
-            };
-        }
+        ws.mut_id().set_value(ws_id_value).unwrap();
         project.pool.add(ws);
         project.update_pool();
 
@@ -880,7 +878,7 @@ mod tests {
         // Create a rename transaction
         let mut tx = OperationTransaction::new(Some("Rename WorkingSet".to_string()));
         tx.add_operation(Operation::RenameObject {
-            object_id: ws_id_value,
+            object: ObjectTarget::id(ws_id_value),
             name: "New Name".to_string(),
         });
 
@@ -946,10 +944,7 @@ mod tests {
         let mut project = EditorProject::from(pool);
 
         let mut tx = OperationTransaction::new(Some("Delete referenced button".to_string()));
-        tx.add_operation(Operation::DeleteObject {
-            object_id: 11,
-            captured_object: None,
-        });
+        tx.add_operation(Operation::DeleteObject { object_id: 11 });
 
         let result = project.execute_transaction(tx);
         assert!(matches!(
@@ -1007,10 +1002,7 @@ mod tests {
         let mut project = EditorProject::from(ObjectPool::default());
 
         let mut tx = OperationTransaction::new(Some("Delete nonexistent".to_string()));
-        tx.add_operation(Operation::DeleteObject {
-            object_id: 999,
-            captured_object: None,
-        });
+        tx.add_operation(Operation::DeleteObject { object_id: 999 });
 
         let result = project.execute_transaction(tx);
         assert!(
@@ -1034,7 +1026,7 @@ mod tests {
         // Set button width via SetProperty operation
         let mut tx = OperationTransaction::new(Some("Set button width".to_string()));
         tx.add_operation(Operation::SetProperty {
-            object_id: u16::from(button.id()),
+            object: ObjectTarget::id(u16::from(button.id())),
             property: "width".to_string(),
             value: json!(100),
         });
@@ -1119,17 +1111,17 @@ mod tests {
         let before = project.get_pool().as_iop();
 
         project.queue_operation(Operation::SetProperty {
-            object_id: object.id().value(),
+            object: ObjectTarget::id(object.id().value()),
             property: "width".to_owned(),
             value: serde_json::json!(123),
         });
         project.queue_operation(Operation::SetProperty {
-            object_id: object.id().value(),
+            object: ObjectTarget::id(object.id().value()),
             property: "height".to_owned(),
             value: serde_json::json!(45),
         });
         project.queue_operation(Operation::RenameObject {
-            object_id: object.id().value(),
+            object: ObjectTarget::id(object.id().value()),
             name: "Apply button".to_owned(),
         });
         assert!(project.commit_queued("Edit button"));
@@ -1163,7 +1155,7 @@ mod tests {
         let mut project = EditorProject::from(pool);
 
         project.queue_operation(Operation::SetProperty {
-            object_id: object.id().value(),
+            object: ObjectTarget::id(object.id().value()),
             property: "width".to_owned(),
             value: serde_json::json!(123),
         });
@@ -1181,7 +1173,7 @@ mod tests {
 
     #[test]
     fn queued_structural_edits_use_reversible_structural_operations() {
-        use ag_iso_stack::object_pool::object_attributes::{Event, MacroRef, ObjectRef, Point};
+        use ag_iso_stack::object_pool::object_attributes::Event;
 
         let parent = object_with_id(ObjectType::Button, 10);
         let child = object_with_id(ObjectType::PictureGraphic, 11);
@@ -1194,16 +1186,17 @@ mod tests {
         let before = project.get_pool().as_iop();
 
         project.queue_operation(Operation::SetChildren {
-            parent_id: parent.id().value(),
-            children: vec![ObjectRef {
-                id: child.id(),
-                offset: Point { x: 4, y: 8 },
+            parent: ObjectTarget::id(parent.id().value()),
+            children: vec![ChildPlacement {
+                child: ObjectTarget::id(child.id().value()),
+                x: 4,
+                y: 8,
             }],
         });
         project.queue_operation(Operation::SetMacroReferences {
-            object_id: parent.id().value(),
-            macro_refs: vec![MacroRef {
-                macro_id: 12,
+            object: ObjectTarget::id(parent.id().value()),
+            macro_refs: vec![MacroReferenceTarget {
+                macro_object: ObjectTarget::id(12),
                 event_id: Event::OnActivate,
             }],
         });
@@ -1234,10 +1227,7 @@ mod tests {
         pool.add(macro_object);
         let mut project = EditorProject::from(pool);
         let mut transaction = OperationTransaction::new(Some("Delete macro".to_owned()));
-        transaction.add_operation(Operation::DeleteObject {
-            object_id: 12,
-            captured_object: None,
-        });
+        transaction.add_operation(Operation::DeleteObject { object_id: 12 });
 
         assert!(matches!(
             project.execute_transaction(transaction),
@@ -1400,8 +1390,8 @@ mod tests {
 
         let mut add = OperationTransaction::new(Some("Add child".to_owned()));
         add.add_operation(Operation::AddChild {
-            parent_id: 10,
-            child_id: 11,
+            parent: ObjectTarget::id(10),
+            child: ObjectTarget::id(11),
             x: 7,
             y: 9,
         });
@@ -1437,7 +1427,7 @@ mod tests {
         let mut project = EditorProject::from(pool);
 
         project.queue_operation(Operation::SetProperty {
-            object_id: object.id().value(),
+            object: ObjectTarget::id(object.id().value()),
             property: "width".to_owned(),
             value: serde_json::json!(99),
         });
@@ -1521,7 +1511,7 @@ mod tests {
         let mut project = EditorProject::from(pool);
 
         project.queue_operation(Operation::SetProperty {
-            object_id: button.id().value(),
+            object: ObjectTarget::id(button.id().value()),
             property: "width".to_owned(),
             value: serde_json::json!(30),
         });

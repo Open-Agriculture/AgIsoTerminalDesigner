@@ -3,6 +3,8 @@
 use super::operation::Operation;
 use serde::{Deserialize, Serialize};
 
+pub const CURRENT_OPERATION_SCHEMA_VERSION: u32 = 2;
+
 /// A transaction bundles multiple operations into a single undo/redo action
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationTransaction {
@@ -15,7 +17,7 @@ impl OperationTransaction {
     /// Create a new empty transaction
     pub fn new(description: Option<String>) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
             description,
             operations: Vec::new(),
         }
@@ -48,7 +50,7 @@ impl AppliedTransaction {
     /// Reverses the inverse operations so they execute in reverse order
     pub fn create_inverse(&self) -> OperationTransaction {
         OperationTransaction {
-            schema_version: 1,
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
             description: self.description.as_ref().map(|d| format!("Undo: {}", d)),
             // Reverse the inverse_operations: they were collected in execution order,
             // so reversing puts them in correct undo order

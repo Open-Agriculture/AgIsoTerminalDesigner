@@ -4,7 +4,7 @@
 use crate::object_info::ObjectInfo;
 use ag_iso_stack::object_pool::object::Object;
 use ag_iso_stack::object_pool::object_attributes::{MacroRef, ObjectLabel, Point};
-use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectPool, ObjectRef};
+use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectPool, ObjectRef, ObjectType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -16,30 +16,42 @@ use std::collections::{HashMap, HashSet};
 pub enum Operation {
     /// Create a new object with default properties
     /// If object_id is None, executor allocates one
-    /// If handle is Some, executor maps handle → allocated_id for same-transaction reference
-    /// If captured_object is Some, deserialize and restore (from DeleteObject inverse)
     CreateObject {
-        handle: Option<String>,
         object_id: Option<u16>,
-        object_type: String,
-        name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        captured_object: Option<serde_json::Value>,
-        #[serde(skip)]
-        captured_info: Option<ObjectInfo>,
+        object_type: ObjectType,
+        name: String,
+    },
+
+    /// Internal-only exact restoration operation used by undo history.
+    #[serde(skip)]
+    RestoreObject {
+        object: Object,
+        info: Option<ObjectInfo>,
     },
 
     /// Delete an object (must not be referenced by any other object)
-    /// Inverse recreates with all metadata via captured_object
-    DeleteObject {
-        object_id: u16,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        captured_object: Option<serde_json::Value>,
-    },
+    /// Its internal inverse restores the exact object and editor metadata.
+    DeleteObject { object_id: u16 },
 
     /// Set an object property (position excluded - handled via placement)
     /// Returns old value as inverse via JSON
     SetProperty {
+        object: ObjectTarget,
+        property: String,
+        value: Value,
+    },
+
+    /// Set a property whose declared semantic is an object reference.
+    SetObjectReference {
+        object: ObjectTarget,
+        property: String,
+        reference: Option<ObjectTarget>,
+    },
+
+    /// Internal-only inverse that can also restore the editor's unresolved
+    /// ObjectId(0) default for required references.
+    #[serde(skip)]
+    RestoreObjectReference {
         object_id: u16,
         property: String,
         value: Value,
@@ -54,8 +66,8 @@ pub enum Operation {
     /// Add a parent → child reference with placement at (x, y)
     /// Inverse is RemoveChild
     AddChild {
-        parent_id: u16,
-        child_id: u16,
+        parent: ObjectTarget,
+        child: ObjectTarget,
         x: i16,
         y: i16,
     },
@@ -77,20 +89,20 @@ pub enum Operation {
     /// This covers reorder and child replacement edits that cannot be expressed
     /// by AddChild/RemoveChild/SetChildPosition alone.
     SetChildren {
-        parent_id: u16,
-        children: Vec<ObjectRef>,
+        parent: ObjectTarget,
+        children: Vec<ChildPlacement>,
     },
 
     /// Replace an object's ordered, unpositioned child-reference list.
     SetObjectList {
-        object_id: u16,
-        objects: ObjectReferenceList,
+        object: ObjectTarget,
+        objects: ObjectTargetList,
     },
 
     /// Replace the complete ordered macro-reference list.
     SetMacroReferences {
-        object_id: u16,
-        macro_refs: Vec<MacroRef>,
+        object: ObjectTarget,
+        macro_refs: Vec<MacroReferenceTarget>,
     },
 
     /// Replace the labels owned by an ObjectLabelReferenceList.
@@ -101,7 +113,40 @@ pub enum Operation {
 
     /// Rename an object (modifies editor metadata, not ObjectPool)
     /// Returns old name as inverse
-    RenameObject { object_id: u16, name: String },
+    RenameObject { object: ObjectTarget, name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ObjectTarget {
+    Id { id: u16 },
+    Name { name: String },
+}
+
+impl ObjectTarget {
+    pub fn id(id: u16) -> Self {
+        Self::Id { id }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildPlacement {
+    pub child: ObjectTarget,
+    pub x: i16,
+    pub y: i16,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "objects")]
+pub enum ObjectTargetList {
+    Required(Vec<ObjectTarget>),
+    Nullable(Vec<Option<ObjectTarget>>),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MacroReferenceTarget {
+    pub event_id: ag_iso_stack::object_pool::object_attributes::Event,
+    pub macro_object: ObjectTarget,
 }
 
 /// The two list representations used for unpositioned child references.
@@ -134,11 +179,9 @@ fn object_label_references(label: &ObjectLabel) -> impl Iterator<Item = ObjectId
 }
 
 /// Context passed to each operation during execution
-/// Manages handle resolution and inverse collection
+/// Collects inverses and affected object IDs.
 #[derive(Debug, Clone)]
 pub struct OperationContext {
-    /// Maps temporary handles (e.g., "rate_value") to allocated ObjectIds
-    pub handle_map: HashMap<String, ObjectId>,
     /// Collects inverse operations as we apply forward operations
     /// Stored in execution order; reversed when creating undo transaction
     pub inverse_operations: Vec<Operation>,
@@ -149,7 +192,6 @@ pub struct OperationContext {
 impl Default for OperationContext {
     fn default() -> Self {
         Self {
-            handle_map: HashMap::new(),
             inverse_operations: Vec::new(),
             affected_objects: HashSet::new(),
         }
@@ -174,11 +216,131 @@ pub enum OperationError {
         reason: String,
     },
     DeleteReferencedObject(u16),
-    ResolveHandleFailed {
-        handle: String,
+    ObjectNameNotFound(String),
+    DuplicateObjectName(String),
+    AmbiguousObjectName(String),
+    UnsupportedSchemaVersion {
+        expected: u32,
+        actual: u32,
+    },
+    ReferencePropertyRequiresReferenceOperation {
+        object_id: u16,
+        property: String,
+    },
+    PropertyIsNotObjectReference {
+        object_id: u16,
+        property: String,
     },
     ObjectAlreadyExists(u16),
     InvalidObjectOrder,
+}
+
+/// Resolve the operation-layer symbolic target to the ISOBUS identity.
+pub fn resolve_target(
+    target: &ObjectTarget,
+    pool: &ObjectPool,
+    object_info: &HashMap<ObjectId, ObjectInfo>,
+) -> Result<ObjectId, OperationError> {
+    match target {
+        ObjectTarget::Id { id } => {
+            let id = ObjectId::new(*id).map_err(|_| OperationError::ObjectNotFound(*id))?;
+            pool.object_by_id(id)
+                .map(|_| id)
+                .ok_or(OperationError::ObjectNotFound(id.value()))
+        }
+        ObjectTarget::Name { name } => {
+            let matches: Vec<_> = object_info
+                .iter()
+                .filter_map(|(id, info)| {
+                    (info.name.as_deref() == Some(name.as_str())).then_some(*id)
+                })
+                .collect();
+            match matches.as_slice() {
+                [] => Err(OperationError::ObjectNameNotFound(name.clone())),
+                [id] => pool
+                    .object_by_id(*id)
+                    .map(|_| *id)
+                    .ok_or(OperationError::ObjectNotFound(id.value())),
+                _ => Err(OperationError::AmbiguousObjectName(name.clone())),
+            }
+        }
+    }
+}
+
+fn ensure_unique_name(
+    name: &str,
+    except: Option<ObjectId>,
+    object_info: &HashMap<ObjectId, ObjectInfo>,
+) -> Result<(), OperationError> {
+    if !name.is_empty()
+        && object_info
+            .iter()
+            .any(|(id, info)| Some(*id) != except && info.name.as_deref() == Some(name))
+    {
+        return Err(OperationError::DuplicateObjectName(name.to_owned()));
+    }
+    Ok(())
+}
+
+fn property_semantic(
+    pool: &ObjectPool,
+    id: ObjectId,
+    property: &str,
+) -> Result<crate::object_properties::PropertySemantic, OperationError> {
+    let object = pool
+        .object_by_id(id)
+        .ok_or(OperationError::ObjectNotFound(id.value()))?;
+    crate::object_properties::get_property_descriptors(object.object_type())
+        .into_iter()
+        .find(|descriptor| descriptor.name == property)
+        .map(|descriptor| descriptor.semantic)
+        .ok_or_else(|| OperationError::PropertyError {
+            object_id: id.value(),
+            property: property.to_owned(),
+            reason: "Property not found".to_owned(),
+        })
+}
+
+fn resolve_object_list(
+    objects: &ObjectTargetList,
+    pool: &ObjectPool,
+    object_info: &HashMap<ObjectId, ObjectInfo>,
+) -> Result<ObjectReferenceList, OperationError> {
+    match objects {
+        ObjectTargetList::Required(targets) => Ok(ObjectReferenceList::Required(
+            targets
+                .iter()
+                .map(|target| resolve_target(target, pool, object_info))
+                .collect::<Result<_, _>>()?,
+        )),
+        ObjectTargetList::Nullable(targets) => Ok(ObjectReferenceList::Nullable(
+            targets
+                .iter()
+                .map(|target| {
+                    target
+                        .as_ref()
+                        .map(|target| resolve_target(target, pool, object_info))
+                        .transpose()
+                        .map(NullableObjectId)
+                })
+                .collect::<Result<_, _>>()?,
+        )),
+    }
+}
+
+fn target_list_from_resolved(objects: ObjectReferenceList) -> ObjectTargetList {
+    match objects {
+        ObjectReferenceList::Required(ids) => ObjectTargetList::Required(
+            ids.into_iter()
+                .map(|id| ObjectTarget::id(id.value()))
+                .collect(),
+        ),
+        ObjectReferenceList::Nullable(ids) => ObjectTargetList::Nullable(
+            ids.into_iter()
+                .map(|id| id.0.map(|id| ObjectTarget::id(id.value())))
+                .collect(),
+        ),
+    }
 }
 
 impl Operation {
@@ -195,20 +357,12 @@ impl Operation {
 
         match self {
             Operation::CreateObject {
-                handle,
                 object_id,
                 object_type,
                 name,
-                captured_object,
-                captured_info,
             } => {
                 let target_id = if let Some(id) = object_id {
                     ObjectId::new(*id).map_err(|_| OperationError::ObjectNotFound(*id))?
-                } else if let Some(id) = handle
-                    .as_ref()
-                    .and_then(|handle| context.handle_map.get(handle))
-                {
-                    *id
                 } else {
                     (1..u16::MAX)
                         .filter_map(|value| ObjectId::new(value).ok())
@@ -223,35 +377,9 @@ impl Operation {
                 if pool.object_by_id(target_id).is_some() {
                     return Err(OperationError::ObjectAlreadyExists(target_id.value()));
                 }
+                ensure_unique_name(name, None, object_info)?;
 
-                // If we have a captured object (from DeleteObject inverse), deserialize and restore
-                let mut obj = if let Some(captured_json) = captured_object {
-                    serde_json::from_value::<Object>(captured_json.clone()).map_err(|_| {
-                        OperationError::PropertyError {
-                            object_id: object_id.unwrap_or(0),
-                            property: "CreateObject".to_string(),
-                            reason: "Failed to deserialize captured object".to_string(),
-                        }
-                    })?
-                } else {
-                    let object_type = ag_iso_stack::object_pool::ObjectType::values()
-                        .into_iter()
-                        .find(|candidate| format!("{:?}", candidate) == *object_type)
-                        .ok_or_else(|| OperationError::PropertyError {
-                            object_id: target_id.value(),
-                            property: "CreateObject".to_string(),
-                            reason: format!("Unknown object type {object_type}"),
-                        })?;
-                    let mut object = crate::default_object(object_type);
-                    object.mut_id().set_value(target_id.value()).map_err(|_| {
-                        OperationError::PropertyError {
-                            object_id: target_id.value(),
-                            property: "CreateObject".to_string(),
-                            reason: "Invalid allocated object ID".to_string(),
-                        }
-                    })?;
-                    object
-                };
+                let mut obj = crate::default_object(*object_type);
                 obj.mut_id().set_value(target_id.value()).map_err(|_| {
                     OperationError::PropertyError {
                         object_id: target_id.value(),
@@ -263,31 +391,37 @@ impl Operation {
                 // Add to pool
                 pool.add(obj.clone());
 
-                if let Some(handle) = handle {
-                    context.handle_map.insert(handle.clone(), target_id);
-                }
                 context.affected_objects.insert(target_id);
 
-                // Add to object_info if name provided
-                if let Some(info) = captured_info {
-                    object_info.insert(target_id, info.clone());
-                } else if let Some(n) = name {
-                    let mut info = ObjectInfo::new(&obj);
-                    info.name = Some(n.clone());
-                    object_info.insert(target_id, info);
-                }
+                let mut info = ObjectInfo::new(&obj);
+                info.name = (!name.is_empty()).then(|| name.clone());
+                object_info.insert(target_id, info);
 
                 // Inverse is DeleteObject without captured state (will be captured on re-deletion)
                 Ok(Operation::DeleteObject {
                     object_id: target_id.value(),
-                    captured_object: None,
                 })
             }
 
-            Operation::DeleteObject {
-                object_id,
-                captured_object: _,
-            } => {
+            Operation::RestoreObject { object, info } => {
+                let id = object.id();
+                if pool.object_by_id(id).is_some() {
+                    return Err(OperationError::ObjectAlreadyExists(id.value()));
+                }
+                if let Some(name) = info.as_ref().and_then(|info| info.name.as_deref()) {
+                    ensure_unique_name(name, None, object_info)?;
+                }
+                pool.add(object.clone());
+                if let Some(info) = info {
+                    object_info.insert(id, info.clone());
+                }
+                context.affected_objects.insert(id);
+                Ok(Operation::DeleteObject {
+                    object_id: id.value(),
+                })
+            }
+
+            Operation::DeleteObject { object_id } => {
                 let id = ObjectId::new(*object_id)
                     .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
 
@@ -296,17 +430,7 @@ impl Operation {
                     .object_by_id(id)
                     .ok_or(OperationError::ObjectNotFound(*object_id))?;
 
-                let object_type_str = format!("{:?}", obj.object_type());
-                let old_name = object_info.get(&id).and_then(|info| info.name.clone());
-
-                let captured_json =
-                    Some(
-                        serde_json::to_value(obj).map_err(|_| OperationError::PropertyError {
-                            object_id: *object_id,
-                            property: "DeleteObject".to_string(),
-                            reason: "Failed to serialize object for capture".to_string(),
-                        })?,
-                    );
+                let captured_object = obj.clone();
                 let captured_info = object_info.get(&id).cloned();
 
                 // RejectIfReferenced policy: prevent deletion if other objects reference this
@@ -320,35 +444,42 @@ impl Operation {
                 object_info.remove(&id);
                 context.affected_objects.insert(id);
 
-                // Inverse: CreateObject with captured state for full restoration
-                Ok(Operation::CreateObject {
-                    handle: None,
-                    object_id: Some(*object_id),
-                    object_type: object_type_str,
-                    name: old_name,
-                    captured_object: captured_json,
-                    captured_info,
+                Ok(Operation::RestoreObject {
+                    object: captured_object,
+                    info: captured_info,
                 })
             }
 
             Operation::SetProperty {
-                object_id,
+                object,
                 property,
                 value,
             } => {
-                let id = ObjectId::new(*object_id)
-                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+                let id = resolve_target(object, pool, object_info)?;
+                let object_id = id.value();
 
                 // Validate object exists
                 validate_object_exists(pool, id).map_err(|diag| OperationError::PropertyError {
-                    object_id: *object_id,
+                    object_id,
                     property: property.clone(),
                     reason: diag.message,
                 })?;
 
+                let semantic = property_semantic(pool, id, property)?;
+                if matches!(
+                    semantic,
+                    crate::object_properties::PropertySemantic::ObjectReference { .. }
+                ) {
+                    return Err(
+                        OperationError::ReferencePropertyRequiresReferenceOperation {
+                            object_id,
+                            property: property.clone(),
+                        },
+                    );
+                }
                 crate::object_properties::validate_property(pool, id, property, value).map_err(
                     |e| OperationError::PropertyError {
-                        object_id: *object_id,
+                        object_id,
                         property: property.clone(),
                         reason: format!("{:?}", e),
                     },
@@ -357,21 +488,113 @@ impl Operation {
                 // Get old value for inverse, then set new value.
                 let old_value = crate::object_properties::get_property(pool, id, property)
                     .map_err(|e| OperationError::PropertyError {
-                        object_id: *object_id,
+                        object_id,
                         property: property.clone(),
                         reason: format!("{:?}", e),
                     })?;
 
                 crate::object_properties::set_property(pool, id, property, value.clone()).map_err(
                     |e| OperationError::PropertyError {
-                        object_id: *object_id,
+                        object_id,
                         property: property.clone(),
                         reason: format!("{:?}", e),
                     },
                 )?;
+                context.affected_objects.insert(id);
 
                 // Inverse: SetProperty with old value
                 Ok(Operation::SetProperty {
+                    object: ObjectTarget::id(object_id),
+                    property: property.clone(),
+                    value: old_value,
+                })
+            }
+
+            Operation::SetObjectReference {
+                object,
+                property,
+                reference,
+            } => {
+                let id = resolve_target(object, pool, object_info)?;
+                let object_id = id.value();
+                let semantic = property_semantic(pool, id, property)?;
+                if !matches!(
+                    semantic,
+                    crate::object_properties::PropertySemantic::ObjectReference { .. }
+                ) {
+                    return Err(OperationError::PropertyIsNotObjectReference {
+                        object_id,
+                        property: property.clone(),
+                    });
+                }
+                let old_value = crate::object_properties::get_property(pool, id, property)
+                    .map_err(|e| OperationError::PropertyError {
+                        object_id,
+                        property: property.clone(),
+                        reason: format!("{e:?}"),
+                    })?;
+                let value = match reference {
+                    Some(target) => {
+                        let reference_id = resolve_target(target, pool, object_info)?;
+                        context.affected_objects.insert(reference_id);
+                        serde_json::to_value(reference_id).unwrap()
+                    }
+                    None => Value::Null,
+                };
+                crate::object_properties::validate_property(pool, id, property, &value).map_err(
+                    |e| OperationError::PropertyError {
+                        object_id,
+                        property: property.clone(),
+                        reason: format!("{e:?}"),
+                    },
+                )?;
+                crate::object_properties::set_property(pool, id, property, value).map_err(|e| {
+                    OperationError::PropertyError {
+                        object_id,
+                        property: property.clone(),
+                        reason: format!("{e:?}"),
+                    }
+                })?;
+                context.affected_objects.insert(id);
+                Ok(Operation::RestoreObjectReference {
+                    object_id,
+                    property: property.clone(),
+                    value: old_value,
+                })
+            }
+
+            Operation::RestoreObjectReference {
+                object_id,
+                property,
+                value,
+            } => {
+                let id = ObjectId::new(*object_id)
+                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+                let semantic = property_semantic(pool, id, property)?;
+                if !matches!(
+                    semantic,
+                    crate::object_properties::PropertySemantic::ObjectReference { .. }
+                ) {
+                    return Err(OperationError::PropertyIsNotObjectReference {
+                        object_id: *object_id,
+                        property: property.clone(),
+                    });
+                }
+                let old_value = crate::object_properties::get_property(pool, id, property)
+                    .map_err(|e| OperationError::PropertyError {
+                        object_id: *object_id,
+                        property: property.clone(),
+                        reason: format!("{e:?}"),
+                    })?;
+                crate::object_properties::set_property(pool, id, property, value.clone()).map_err(
+                    |e| OperationError::PropertyError {
+                        object_id: *object_id,
+                        property: property.clone(),
+                        reason: format!("{e:?}"),
+                    },
+                )?;
+                context.affected_objects.insert(id);
+                Ok(Operation::RestoreObjectReference {
                     object_id: *object_id,
                     property: property.clone(),
                     value: old_value,
@@ -449,20 +672,20 @@ impl Operation {
             }
 
             Operation::AddChild {
-                parent_id,
-                child_id,
+                parent,
+                child,
                 x,
                 y,
             } => {
-                let parent_obj_id = ObjectId::new(*parent_id)
-                    .map_err(|_| OperationError::ObjectNotFound(*parent_id))?;
-                let child_obj_id = ObjectId::new(*child_id)
-                    .map_err(|_| OperationError::ObjectNotFound(*child_id))?;
+                let parent_obj_id = resolve_target(parent, pool, object_info)?;
+                let child_obj_id = resolve_target(child, pool, object_info)?;
+                let parent_id = parent_obj_id.value();
+                let child_id = child_obj_id.value();
 
                 // Validate both objects exist
                 validate_object_exists(pool, parent_obj_id).map_err(|diag| {
                     OperationError::PropertyError {
-                        object_id: *parent_id,
+                        object_id: parent_id,
                         property: "parent".to_string(),
                         reason: diag.message,
                     }
@@ -470,7 +693,7 @@ impl Operation {
 
                 validate_object_exists(pool, child_obj_id).map_err(|diag| {
                     OperationError::PropertyError {
-                        object_id: *child_id,
+                        object_id: child_id,
                         property: "child".to_string(),
                         reason: diag.message,
                     }
@@ -479,8 +702,8 @@ impl Operation {
                 // Check for circular references
                 would_create_circular_reference(pool, parent_obj_id, child_obj_id).map_err(
                     |_| OperationError::CircularReference {
-                        parent: *parent_id,
-                        child: *child_id,
+                        parent: parent_id,
+                        child: child_id,
                     },
                 )?;
                 crate::pool_validation::validate_parent_child_relationship(
@@ -501,8 +724,8 @@ impl Operation {
                 context.affected_objects.insert(parent_obj_id);
                 context.affected_objects.insert(child_obj_id);
                 Ok(Operation::RemoveChild {
-                    parent_id: *parent_id,
-                    child_id: *child_id,
+                    parent_id,
+                    child_id,
                 })
             }
 
@@ -545,8 +768,8 @@ impl Operation {
                 context.affected_objects.insert(parent_obj_id);
                 context.affected_objects.insert(child_obj_id);
                 Ok(Operation::AddChild {
-                    parent_id: *parent_id,
-                    child_id: *child_id,
+                    parent: ObjectTarget::id(*parent_id),
+                    child: ObjectTarget::id(*child_id),
                     x: removed.offset.x,
                     y: removed.offset.y,
                 })
@@ -601,31 +824,40 @@ impl Operation {
                 })
             }
 
-            Operation::SetChildren {
-                parent_id,
-                children,
-            } => {
-                let parent_obj_id = ObjectId::new(*parent_id)
-                    .map_err(|_| OperationError::ObjectNotFound(*parent_id))?;
+            Operation::SetChildren { parent, children } => {
+                let parent_obj_id = resolve_target(parent, pool, object_info)?;
+                let parent_id = parent_obj_id.value();
+                let resolved: Vec<ObjectRef> = children
+                    .iter()
+                    .map(|child| {
+                        resolve_target(&child.child, pool, object_info).map(|id| ObjectRef {
+                            id,
+                            offset: Point {
+                                x: child.x,
+                                y: child.y,
+                            },
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
                 validate_object_exists(pool, parent_obj_id).map_err(|diag| {
                     OperationError::PropertyError {
-                        object_id: *parent_id,
+                        object_id: parent_id,
                         property: "children".to_owned(),
                         reason: diag.message,
                     }
                 })?;
 
-                for child in children {
+                for child in &resolved {
                     validate_object_exists(pool, child.id).map_err(|diag| {
                         OperationError::PropertyError {
-                            object_id: *parent_id,
+                            object_id: parent_id,
                             property: "children".to_owned(),
                             reason: diag.message,
                         }
                     })?;
                     would_create_circular_reference(pool, parent_obj_id, child.id).map_err(
                         |_| OperationError::CircularReference {
-                            parent: *parent_id,
+                            parent: parent_id,
                             child: child.id.value(),
                         },
                     )?;
@@ -641,40 +873,48 @@ impl Operation {
                 }
 
                 let refs = object_refs_mut(pool, parent_obj_id, "SetChildren")?;
-                let old_children = std::mem::replace(refs, children.clone());
+                let old_children = std::mem::replace(refs, resolved.clone());
                 context.affected_objects.insert(parent_obj_id);
                 context
                     .affected_objects
-                    .extend(old_children.iter().chain(children).map(|child| child.id));
+                    .extend(old_children.iter().chain(&resolved).map(|child| child.id));
 
                 Ok(Operation::SetChildren {
-                    parent_id: *parent_id,
-                    children: old_children,
+                    parent: ObjectTarget::id(parent_id),
+                    children: old_children
+                        .into_iter()
+                        .map(|child| ChildPlacement {
+                            child: ObjectTarget::id(child.id.value()),
+                            x: child.offset.x,
+                            y: child.offset.y,
+                        })
+                        .collect(),
                 })
             }
 
-            Operation::SetObjectList { object_id, objects } => {
-                let parent_id = ObjectId::new(*object_id)
-                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+            Operation::SetObjectList { object, objects } => {
+                let parent_id = resolve_target(object, pool, object_info)?;
+                let object_id = parent_id.value();
+                let resolved = resolve_object_list(objects, pool, object_info)?;
                 validate_object_exists(pool, parent_id).map_err(|diag| {
                     OperationError::PropertyError {
-                        object_id: *object_id,
+                        object_id,
                         property: "objects".to_owned(),
                         reason: diag.message,
                     }
                 })?;
 
-                for child_id in objects.ids() {
+                for child_id in resolved.ids() {
                     validate_object_exists(pool, child_id).map_err(|diag| {
                         OperationError::PropertyError {
-                            object_id: *object_id,
+                            object_id,
                             property: "objects".to_owned(),
                             reason: diag.message,
                         }
                     })?;
                     would_create_circular_reference(pool, parent_id, child_id).map_err(|_| {
                         OperationError::CircularReference {
-                            parent: *object_id,
+                            parent: object_id,
                             child: child_id.value(),
                         }
                     })?;
@@ -689,16 +929,16 @@ impl Operation {
 
                 let parent = pool
                     .object_mut_by_id(parent_id)
-                    .ok_or(OperationError::ObjectNotFound(*object_id))?;
+                    .ok_or(OperationError::ObjectNotFound(object_id))?;
                 let old_objects =
                     object_list(parent).ok_or_else(|| OperationError::PropertyError {
-                        object_id: *object_id,
+                        object_id,
                         property: "objects".to_owned(),
                         reason: "This object type does not support an object list".to_owned(),
                     })?;
-                if !set_object_list(parent, objects.clone()) {
+                if !set_object_list(parent, resolved.clone()) {
                     return Err(OperationError::PropertyError {
-                        object_id: *object_id,
+                        object_id,
                         property: "objects".to_owned(),
                         reason: "Object-list representation does not match object type".to_owned(),
                     });
@@ -707,31 +947,48 @@ impl Operation {
                 context.affected_objects.insert(parent_id);
                 context
                     .affected_objects
-                    .extend(old_objects.ids().chain(objects.ids()));
+                    .extend(old_objects.ids().chain(resolved.ids()));
                 Ok(Operation::SetObjectList {
-                    object_id: *object_id,
-                    objects: old_objects,
+                    object: ObjectTarget::id(object_id),
+                    objects: target_list_from_resolved(old_objects),
                 })
             }
 
-            Operation::SetMacroReferences {
-                object_id,
-                macro_refs,
-            } => {
-                let id = ObjectId::new(*object_id)
-                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+            Operation::SetMacroReferences { object, macro_refs } => {
+                let id = resolve_target(object, pool, object_info)?;
+                let object_id = id.value();
+                let resolved: Vec<MacroRef> = macro_refs
+                    .iter()
+                    .map(|reference| {
+                        let macro_id = resolve_target(&reference.macro_object, pool, object_info)?;
+                        let macro_id_u8 = u8::try_from(macro_id.value()).map_err(|_| {
+                            OperationError::PropertyError {
+                                object_id,
+                                property: "macro_refs".to_owned(),
+                                reason: format!(
+                                    "Macro object ID {} does not fit in u8",
+                                    macro_id.value()
+                                ),
+                            }
+                        })?;
+                        Ok(MacroRef {
+                            event_id: reference.event_id,
+                            macro_id: macro_id_u8,
+                        })
+                    })
+                    .collect::<Result<_, OperationError>>()?;
 
-                for macro_ref in macro_refs {
+                for macro_ref in &resolved {
                     let macro_id = ObjectId::new(u16::from(macro_ref.macro_id)).map_err(|_| {
                         OperationError::PropertyError {
-                            object_id: *object_id,
+                            object_id,
                             property: "macro_refs".to_owned(),
                             reason: format!("Invalid macro object ID {}", macro_ref.macro_id),
                         }
                     })?;
                     let macro_object = pool.object_by_id(macro_id).ok_or_else(|| {
                         OperationError::PropertyError {
-                            object_id: *object_id,
+                            object_id,
                             property: "macro_refs".to_owned(),
                             reason: format!("Macro object {} does not exist", macro_ref.macro_id),
                         }
@@ -745,17 +1002,23 @@ impl Operation {
                 }
 
                 let refs = macro_refs_mut(pool, id, "SetMacroReferences")?;
-                let old_macro_refs = std::mem::replace(refs, macro_refs.clone());
+                let old_macro_refs = std::mem::replace(refs, resolved.clone());
                 context.affected_objects.insert(id);
-                for macro_ref in old_macro_refs.iter().chain(macro_refs) {
+                for macro_ref in old_macro_refs.iter().chain(&resolved) {
                     if let Ok(macro_id) = ObjectId::new(u16::from(macro_ref.macro_id)) {
                         context.affected_objects.insert(macro_id);
                     }
                 }
 
                 Ok(Operation::SetMacroReferences {
-                    object_id: *object_id,
-                    macro_refs: old_macro_refs,
+                    object: ObjectTarget::id(object_id),
+                    macro_refs: old_macro_refs
+                        .into_iter()
+                        .map(|reference| MacroReferenceTarget {
+                            event_id: reference.event_id,
+                            macro_object: ObjectTarget::id(reference.macro_id.into()),
+                        })
+                        .collect(),
                 })
             }
 
@@ -812,9 +1075,10 @@ impl Operation {
                 })
             }
 
-            Operation::RenameObject { object_id, name } => {
-                let id = ObjectId::new(*object_id)
-                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+            Operation::RenameObject { object, name } => {
+                let id = resolve_target(object, pool, object_info)?;
+                let object_id = id.value();
+                ensure_unique_name(name, Some(id), object_info)?;
 
                 // Get old name for inverse operation
                 let old_name = if let Some(info) = object_info.get(&id) {
@@ -829,7 +1093,7 @@ impl Operation {
                 } else {
                     let object = pool
                         .object_by_id(id)
-                        .ok_or(OperationError::ObjectNotFound(*object_id))?;
+                        .ok_or(OperationError::ObjectNotFound(object_id))?;
                     let mut info = ObjectInfo::new(object);
                     info.name = Some(name.clone());
                     object_info.insert(id, info);
@@ -838,7 +1102,7 @@ impl Operation {
 
                 // Return inverse operation (rename back to old name)
                 Ok(Operation::RenameObject {
-                    object_id: *object_id,
+                    object: ObjectTarget::id(object_id),
                     name: old_name,
                 })
             }
