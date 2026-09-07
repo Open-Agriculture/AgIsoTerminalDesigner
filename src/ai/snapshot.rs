@@ -87,6 +87,7 @@ pub enum SnapshotScope {
     EntirePool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DesignContextRequest {
     pub scope: SnapshotScope,
     pub include_selection: bool,

@@ -1,0 +1,16 @@
+use super::conversation::{AiContent, AiMessage, AiRole, Conversation};
+use std::{future::Future, pin::Pin};
+
+pub type AiProviderFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+#[derive(Debug, Clone)] pub enum AiProviderKind { OpenAI }
+#[derive(Debug, Clone)] pub struct AiSettings { pub provider: AiProviderKind, pub model: String, pub reasoning_effort: Option<String> }
+impl Default for AiSettings { fn default() -> Self { Self { provider: AiProviderKind::OpenAI, model: "gpt-5.6".into(), reasoning_effort: Some("medium".into()) } } }
+#[derive(Debug, Clone)] pub struct AiTurnRequest { pub instructions: String, pub conversation: Conversation, pub tools: Vec<serde_json::Value>, pub settings: AiSettings }
+#[derive(Debug, Clone)] pub struct AiProviderResponse { pub content: Vec<AiContent> }
+#[derive(Debug, Clone)] pub enum AiProviderError { MissingApiKey, Http(String), Unauthorized, RateLimited, Timeout, InvalidResponse(String), Cancelled }
+impl std::fmt::Display for AiProviderError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", match self { Self::MissingApiKey => "OpenAI API key not configured".into(), Self::Http(e) => format!("OpenAI request failed: {e}"), Self::Unauthorized => "OpenAI rejected the API key".into(), Self::RateLimited => "OpenAI rate limit reached".into(), Self::Timeout => "OpenAI request timed out".into(), Self::InvalidResponse(e) => format!("OpenAI returned an invalid response: {e}"), Self::Cancelled => "Assistant request was cancelled".into() }) } }
+impl std::error::Error for AiProviderError {}
+pub trait AiProvider: Send + Sync { fn run_turn(&self, request: AiTurnRequest) -> AiProviderFuture<Result<AiProviderResponse, AiProviderError>>; }
+pub const SYSTEM_INSTRUCTIONS: &str = "You are an assistant for an ISO 11783 VT object-pool designer. Object names are symbolic references, while ObjectId remains the real identity. Inspect context and schemas before guessing. All edits must use propose_transaction; it only stages a change, so never say it is applied. Never modify raw object JSON or invent unsupported properties. Position belongs to parent-child relationships. Use SetObjectReference for object-reference properties and preserve references unless asked otherwise. Submit related edits in one transaction.";
+
+pub fn assistant_message(content: Vec<AiContent>) -> AiMessage { AiMessage { role: AiRole::Assistant, content } }

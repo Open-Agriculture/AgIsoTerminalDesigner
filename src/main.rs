@@ -16,6 +16,12 @@ use ag_iso_terminal_designer::InteractiveMaskRenderer;
 use ag_iso_terminal_designer::RenderableObject;
 use ag_iso_terminal_designer::{EditorProject, Operation};
 #[cfg(not(target_arch = "wasm32"))]
+use ag_iso_terminal_designer::ai::{AiContent, AiMessage, AiRole, AiSettings};
+#[cfg(not(target_arch = "wasm32"))]
+use ag_iso_terminal_designer::ai::ui::{AiAssistantState, AiRequestState, AiWorkerEvent};
+#[cfg(not(target_arch = "wasm32"))]
+use ag_iso_terminal_designer::ai::providers::openai::OpenAiProvider;
+#[cfg(not(target_arch = "wasm32"))]
 use app_persistence::RecentProject;
 use app_persistence::{AppPersistence, RecoveryRecord};
 use eframe::egui;
@@ -98,6 +104,12 @@ pub struct DesignerApp {
     browser_dirty: Rc<Cell<bool>>,
     #[cfg(target_arch = "wasm32")]
     _before_unload: Option<Closure<dyn FnMut(web_sys::BeforeUnloadEvent)>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    ai_state: AiAssistantState,
+    #[cfg(not(target_arch = "wasm32"))]
+    ai_input: String,
+    #[cfg(not(target_arch = "wasm32"))]
+    ai_channel: (Sender<AiWorkerEvent>, Receiver<AiWorkerEvent>),
 }
 
 impl DesignerApp {
@@ -237,11 +249,49 @@ impl DesignerApp {
             browser_dirty,
             #[cfg(target_arch = "wasm32")]
             _before_unload: before_unload,
+            #[cfg(not(target_arch = "wasm32"))]
+            ai_state: AiAssistantState::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            ai_input: String::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            ai_channel: std::sync::mpsc::channel(),
         }
     }
 }
 
 impl DesignerApp {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_ai(&mut self, ctx: &egui::Context) {
+        for event in self.ai_channel.1.try_iter() {
+            let current = match &self.ai_state.request_state { AiRequestState::Running { request_id } => request_id.clone(), _ => continue };
+            match event {
+                AiWorkerEvent::Finished { request_id, conversation, proposal } if request_id == current => {
+                    self.ai_state.conversation = conversation;
+                    self.ai_state.active_proposal = proposal;
+                    self.ai_state.request_state = if self.ai_state.active_proposal.is_some() { AiRequestState::ProposalReady } else { AiRequestState::Idle };
+                    self.ai_state.last_error = None;
+                    ctx.request_repaint();
+                }
+                AiWorkerEvent::Failed { request_id, error } if request_id == current => { self.ai_state.request_state=AiRequestState::Error; self.ai_state.last_error=Some(error); ctx.request_repaint(); }
+                _ => {}
+            }
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn send_ai(&mut self, ctx: &egui::Context) {
+        let Some(project) = self.project.as_ref() else { self.ai_state.last_error=Some("Open or create a project before using the assistant.".into()); self.ai_state.request_state=AiRequestState::Error; return; };
+        if self.ai_input.trim().is_empty() { return; }
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.ai_state.conversation.push(AiMessage::text(AiRole::User, std::mem::take(&mut self.ai_input)));
+        self.ai_state.active_proposal = None;
+        self.ai_state.last_error = None;
+        self.ai_state.request_state = AiRequestState::Running { request_id: request_id.clone() };
+        let state=project.ai_design_state(); let conversation=self.ai_state.conversation.clone(); let sender=self.ai_channel.0.clone(); let repaint=ctx.clone();
+        std::thread::spawn(move || match OpenAiProvider::from_environment() {
+            Ok(provider) => { ag_iso_terminal_designer::ai::ui::run_request(&provider, state, conversation, AiSettings::default(), request_id, sender); repaint.request_repaint(); }
+            Err(error) => { let _=sender.send(AiWorkerEvent::Failed { request_id, error:error.to_string() }); repaint.request_repaint(); }
+        });
+    }
     /// Open a file dialog
     fn open_file_dialog(&mut self, reason: FileDialogReason, ctx: &egui::Context) {
         if matches!(
@@ -1186,6 +1236,8 @@ impl eframe::App for DesignerApp {
 
         // Handle file dialogs and deferred writes first.
         self.handle_file_loaded(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_ai(ctx);
 
         #[cfg(not(target_arch = "wasm32"))]
         if ctx.input(|input| input.viewport().close_requested()) {
@@ -1323,6 +1375,42 @@ impl eframe::App for DesignerApp {
                     });
                 });
             return;
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut send = false;
+            let mut cancel = false;
+            let mut apply = false;
+            let mut reject = false;
+            egui::Window::new("Assistant")
+                .default_width(360.0)
+                .default_height(360.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
+                        for message in &self.ai_state.conversation.messages {
+                            let prefix = match message.role { AiRole::User => "You", AiRole::Assistant => "Assistant", AiRole::Tool => "Tool" };
+                            for content in &message.content { match content { AiContent::Text(text) => { ui.label(format!("{prefix}: {text}")); }, AiContent::ToolCall(call) => { ui.label(format!("Assistant called {}", call.name)); }, AiContent::ToolResult(_) => {} } }
+                        }
+                    });
+                    if let Some(error) = &self.ai_state.last_error { ui.colored_label(egui::Color32::RED, error); }
+                    match &self.ai_state.request_state {
+                        AiRequestState::Running { .. } => { ui.label("Working…"); if ui.button("Cancel").clicked() { cancel=true; } }
+                        _ => { ui.label("User input:"); ui.add(egui::TextEdit::multiline(&mut self.ai_input).desired_rows(3)); if ui.add_enabled(self.project.is_some(), egui::Button::new("Send")).clicked() { send=true; } }
+                    }
+                    if let Some(proposal) = &self.ai_state.active_proposal {
+                        ui.separator();
+                        ui.label("Proposed change:");
+                        ui.label(proposal.transaction.description.as_deref().unwrap_or("Untitled change"));
+                        ui.label(format!("{} operations, {} affected objects", proposal.summary.operation_count, proposal.summary.affected_objects.len()));
+                        ui.label("Validation passed");
+                        ui.horizontal(|ui| { if ui.button("Apply").clicked() { apply=true; } if ui.button("Reject").clicked() { reject=true; } });
+                    }
+                });
+            if cancel { self.ai_state.request_state=AiRequestState::Idle; self.ai_state.last_error=Some("Assistant request cancelled.".into()); }
+            if send { self.send_ai(ctx); }
+            if reject { self.ai_state.active_proposal=None; self.ai_state.request_state=AiRequestState::Idle; }
+            if apply { if let (Some(project), Some(proposal)) = (&mut self.project, self.ai_state.active_proposal.take()) { match project.apply_ai_proposal(proposal) { Ok(_) => { self.ai_state.conversation.push(AiMessage::text(AiRole::Assistant, "The proposed change was applied. You can use Undo normally.")); self.ai_state.request_state=AiRequestState::Idle; }, Err(diagnostics) => { self.ai_state.last_error=Some(format!("Could not apply proposal: {diagnostics:?}")); self.ai_state.request_state=AiRequestState::Error; } } } }
         }
 
         // Show new object name dialog

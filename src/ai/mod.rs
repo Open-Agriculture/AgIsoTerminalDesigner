@@ -1,9 +1,14 @@
 //! Provider-neutral AI domain layer. It only reads snapshots and proposes transactions.
+pub mod backend;
+pub mod conversation;
 pub mod proposal;
+pub mod providers;
 pub mod protocol;
 pub mod schema;
 pub mod snapshot;
 pub mod tools;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ui;
 
 use crate::ObjectInfo;
 use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectId, ObjectPool};
@@ -19,6 +24,8 @@ pub struct AiDesignState {
     pub selected: Option<ObjectId>,
 }
 pub use proposal::{propose_transaction, AiProposal, AiProposalSummary};
+pub use backend::{AiProvider, AiProviderError, AiProviderFuture, AiProviderResponse, AiSettings, AiTurnRequest};
+pub use conversation::{AiContent, AiMessage, AiRole, AiToolCall, AiToolResult, Conversation};
 pub use schema::{get_object_schema, ObjectSchemaSnapshot, PropertySchemaSnapshot};
 pub use snapshot::*;
 pub use tools::{get_design_context, get_objects, AiDomainTool, AiToolError, GetObjectsRequest};

@@ -4,6 +4,9 @@ use crate::ai::snapshot::{
     DesignSnapshot, ProjectSnapshot, SnapshotScope, MAX_SNAPSHOT_OBJECTS,
 };
 use ag_iso_stack::object_pool::ObjectId;
+use ag_iso_stack::object_pool::ObjectType;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiDomainTool {
     GetDesignContext,
@@ -11,13 +14,14 @@ pub enum AiDomainTool {
     GetObjectSchema,
     ProposeTransaction,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum AiToolError {
     ObjectNotFound(u16),
     RequestTooLarge,
     InvalidScope,
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct GetObjectsRequest {
     pub ids: Vec<u16>,
     pub include_properties: bool,
@@ -26,6 +30,23 @@ pub struct GetObjectsRequest {
     pub include_parents: bool,
     pub include_macros: bool,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetObjectSchemaRequest { pub object_type: String }
+
+/// Provider-facing definitions for precisely the four Phase 3 domain tools.
+pub fn tool_definitions() -> Vec<Value> {
+    vec![
+        function("get_design_context", "Returns a semantic overview of the current VT design, including active mask, selection, object relationships and layout. Use this first when inspecting or modifying a design.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["ActiveMask","Selection","EntirePool"]},"include_selection":{"type":"boolean"},"depth":{"type":"integer","minimum":0,"maximum":16},"max_objects":{"type":"integer","minimum":1,"maximum":200}},"additionalProperties":false})),
+        function("get_objects", "Returns requested objects by ObjectId with their semantic properties and relationships.", json!({"type":"object","properties":{"ids":{"type":"array","items":{"type":"integer","minimum":1}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean"},"include_macros":{"type":"boolean"}},"required":["ids"],"additionalProperties":false})),
+        function("get_object_schema", "Returns writable properties, reference types, child relationships and supported events for one ISOBUS VT object type. Use before guessing valid fields.", json!({"type":"object","properties":{"object_type":{"type":"string","enum":ObjectType::values().into_iter().map(|v| format!("{v:?}")).collect::<Vec<_>>() }},"required":["object_type"],"additionalProperties":false})),
+        function("propose_transaction", "Validates and stages one atomic design change without modifying the user's project. All edits must be submitted through this tool.", transaction_schema()),
+    ]
+}
+fn function(name: &str, description: &str, parameters: Value) -> Value { json!({"type":"function","name":name,"description":description,"parameters":parameters,"strict":false}) }
+/// Mirrors the public serde transaction envelope. Operation payloads remain the source of truth
+/// and are deserialized by `OperationTransaction`; skipped restoration variants are excluded.
+fn transaction_schema() -> Value { json!({"type":"object","properties":{"schema_version":{"type":"integer","const":2},"description":{"type":["string","null"]},"operations":{"type":"array","minItems":1,"items":{"type":"object","properties":{"type":{"type":"string","enum":["CreateObject","DeleteObject","SetProperty","SetObjectReference","ChangeObjectId","ReorderObjects","AddChild","RemoveChild","SetChildPosition","SetChildren","SetObjectList","SetMacroReferences","SetObjectLabels","RenameObject"]},"data":{"type":"object","description":"Payload for the selected public Operation variant. Object references use {id:number} or {name:string}."}},"required":["type","data"]}}},"required":["schema_version","operations"],"additionalProperties":false}) }
 pub fn get_design_context(
     state: &AiDesignState,
     request: DesignContextRequest,
