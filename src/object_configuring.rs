@@ -1026,15 +1026,20 @@ impl ConfigurableObject for InputBoolean {
                 .drag_value_speed(1.0),
         );
         egui::ComboBox::from_id_salt("foreground_colour")
-            .selected_text(format!("{:?}", u16::from(self.foreground_colour)))
+            .selected_text(
+                self.foreground_colour
+                    .0
+                    .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+            )
             .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.foreground_colour, NullableObjectId::NULL, "None");
                 for potential_child in design
                     .get_pool()
                     .objects_by_type(ObjectType::FontAttributes)
                 {
                     ui.selectable_value(
                         &mut self.foreground_colour,
-                        potential_child.id(),
+                        potential_child.id().into(),
                         format!(
                             "{:?}: {:?}",
                             u16::from(potential_child.id()),
@@ -1111,15 +1116,20 @@ impl ConfigurableObject for InputString {
         ui.horizontal(|ui| {
             ui.label("Font attributes:");
             egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
+                .selected_text(
+                    self.font_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
                 .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.font_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::FontAttributes)
                     {
                         ui.selectable_value(
                             &mut self.font_attributes,
-                            potential_child.id(),
+                            potential_child.id().into(),
                             format!("{:?}", u16::from(potential_child.id())),
                         );
                     }
@@ -1249,15 +1259,20 @@ impl ConfigurableObject for InputNumber {
         ui.horizontal(|ui| {
             ui.label("Font attributes:");
             egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
+                .selected_text(
+                    self.font_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
                 .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.font_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::FontAttributes)
                     {
                         ui.selectable_value(
                             &mut self.font_attributes,
-                            potential_child.id(),
+                            potential_child.id().into(),
                             format!("{:?}", u16::from(potential_child.id())),
                         );
                     }
@@ -1474,15 +1489,20 @@ impl ConfigurableObject for OutputString {
         ui.horizontal(|ui| {
             ui.label("Font attributes:");
             egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
+                .selected_text(
+                    self.font_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
                 .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.font_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::FontAttributes)
                     {
                         ui.selectable_value(
                             &mut self.font_attributes,
-                            potential_child.id(),
+                            potential_child.id().into(),
                             format!("{:?}", u16::from(potential_child.id())),
                         );
                     }
@@ -1593,15 +1613,20 @@ impl ConfigurableObject for OutputNumber {
         ui.horizontal(|ui| {
             ui.label("Font attributes:");
             egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
+                .selected_text(
+                    self.font_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
                 .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.font_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::FontAttributes)
                     {
                         ui.selectable_value(
                             &mut self.font_attributes,
-                            potential_child.id(),
+                            potential_child.id().into(),
                             format!("{:?}", u16::from(potential_child.id())),
                         );
                     }
@@ -1791,15 +1816,20 @@ impl ConfigurableObject for OutputLine {
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
             egui::ComboBox::from_id_salt("line_attributes")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
+                .selected_text(
+                    self.line_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
                 .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.line_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::LineAttributes)
                     {
                         ui.selectable_value(
                             &mut self.line_attributes,
-                            potential_child.id(),
+                            potential_child.id().into(),
                             format!(
                                 "{:?}: {:?}",
                                 u16::from(potential_child.id()),
@@ -1810,12 +1840,14 @@ impl ConfigurableObject for OutputLine {
                 });
 
             // If a valid line_attributes object is selected, provide a link to navigate there
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
+            if let Some(id) = self.line_attributes.into() {
+                if let Some(obj) = design.get_pool().object_by_id(id) {
+                    if ui.link("(view)").clicked() {
+                        *design.get_mut_selected().borrow_mut() = id.into();
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::RED, "Missing object");
                 }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
             }
         });
 
@@ -1862,15 +1894,20 @@ impl ConfigurableObject for OutputRectangle {
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
             egui::ComboBox::from_id_salt("line_attributes_selector")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
+                .selected_text(
+                    self.line_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
                 .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.line_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::LineAttributes)
                     {
                         ui.selectable_value(
                             &mut self.line_attributes,
-                            potential_child.id(),
+                            potential_child.id().into(),
                             format!(
                                 "{:?}: {:?}",
                                 u16::from(potential_child.id()),
@@ -1881,12 +1918,14 @@ impl ConfigurableObject for OutputRectangle {
                 });
 
             // Link to view the selected line attributes object
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
+            if let Some(id) = self.line_attributes.into() {
+                if let Some(obj) = design.get_pool().object_by_id(id) {
+                    if ui.link("(view)").clicked() {
+                        *design.get_mut_selected().borrow_mut() = id.into();
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::RED, "Missing object");
                 }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
             }
         });
 
@@ -1963,15 +2002,20 @@ impl ConfigurableObject for OutputEllipse {
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
             egui::ComboBox::from_id_salt("line_attributes_selector")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
+                .selected_text(
+                    self.line_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
                 .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.line_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::LineAttributes)
                     {
                         ui.selectable_value(
                             &mut self.line_attributes,
-                            potential_child.id(),
+                            potential_child.id().into(),
                             format!(
                                 "{:?}: {:?}",
                                 u16::from(potential_child.id()),
@@ -1982,12 +2026,14 @@ impl ConfigurableObject for OutputEllipse {
                 });
 
             // Link to navigate to the chosen line attributes object
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
+            if let Some(id) = self.line_attributes.into() {
+                if let Some(obj) = design.get_pool().object_by_id(id) {
+                    if ui.link("(view)").clicked() {
+                        *design.get_mut_selected().borrow_mut() = id.into();
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::RED, "Missing object");
                 }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
             }
         });
 
@@ -2090,15 +2136,20 @@ impl ConfigurableObject for OutputPolygon {
         ui.horizontal(|ui| {
             ui.label("Line Attributes:");
             egui::ComboBox::from_id_salt("line_attributes_selector")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
+                .selected_text(
+                    self.line_attributes
+                        .0
+                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
+                )
                 .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.line_attributes, NullableObjectId::NULL, "None");
                     for potential_child in design
                         .get_pool()
                         .objects_by_type(ObjectType::LineAttributes)
                     {
                         ui.selectable_value(
                             &mut self.line_attributes,
-                            potential_child.id(),
+                            potential_child.id().into(),
                             format!(
                                 "{:?}: {:?}",
                                 u16::from(potential_child.id()),
@@ -2109,12 +2160,14 @@ impl ConfigurableObject for OutputPolygon {
                 });
 
             // Link to navigate to the chosen line attributes object
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
+            if let Some(id) = self.line_attributes.into() {
+                if let Some(obj) = design.get_pool().object_by_id(id) {
+                    if ui.link("(view)").clicked() {
+                        *design.get_mut_selected().borrow_mut() = id.into();
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::RED, "Missing object");
                 }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
             }
         });
 

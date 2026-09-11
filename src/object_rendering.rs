@@ -21,6 +21,8 @@ use ag_iso_stack::object_pool::Colour;
 use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectRef;
 use eframe::egui;
+
+use crate::object_defaults::default_font_attributes;
 use eframe::egui::Color32;
 use eframe::egui::ColorImage;
 use eframe::egui::FontId;
@@ -390,7 +392,11 @@ impl RenderableObject for InputBoolean {
 
             // If the boolean is true, we display a checkmark in the center
             if is_true {
-                let fg_color = match pool.object_by_id(self.foreground_colour) {
+                let fg_color = match self
+                    .foreground_colour
+                    .0
+                    .and_then(|id| pool.object_by_id(id))
+                {
                     Some(Object::FontAttributes(font_attr)) => {
                         pool.color_by_index(font_attr.font_colour).convert()
                     }
@@ -443,19 +449,25 @@ impl RenderableObject for InputNumber {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            // Look up the font attributes. If missing, show an error.
-            let font_attributes = match pool.object_by_id(self.font_attributes) {
-                Some(Object::FontAttributes(fa)) => fa,
-                _ => {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        format!(
-                            "Missing FontAttributes for InputNumber ID {:?}",
-                            self.id.value()
-                        ),
-                    );
-                    return;
-                }
+            // Look up the font attributes. A NULL reference is legal
+            // (ISO 11783-6) and falls back to default font attributes; a
+            // dangling one is an error.
+            let default_font = default_font_attributes();
+            let font_attributes = match self.font_attributes.0 {
+                None => &default_font,
+                Some(id) => match pool.object_by_id(id) {
+                    Some(Object::FontAttributes(fa)) => fa,
+                    _ => {
+                        ui.colored_label(
+                            egui::Color32::RED,
+                            format!(
+                                "Missing FontAttributes for InputNumber ID {:?}",
+                                self.id.value()
+                            ),
+                        );
+                        return;
+                    }
+                },
             };
 
             // Get the background colour from the pool.
@@ -659,15 +671,18 @@ impl RenderableObject for OutputString {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        let font_attributes = match pool.object_by_id(self.font_attributes) {
-            Some(Object::FontAttributes(f)) => f,
-            _ => {
-                ui.colored_label(
-                    Color32::RED,
-                    format!("Missing font attributes: {:?}", self.font_attributes),
-                );
-                return;
-            }
+        // A NULL font attributes reference is legal (ISO 11783-6) and falls
+        // back to default font attributes; a dangling one is an error.
+        let default_font = default_font_attributes();
+        let font_attributes = match self.font_attributes.0 {
+            None => &default_font,
+            Some(id) => match pool.object_by_id(id) {
+                Some(Object::FontAttributes(f)) => f,
+                _ => {
+                    ui.colored_label(Color32::RED, format!("Missing font attributes: {:?}", id));
+                    return;
+                }
+            },
         };
         let background_colour = pool.color_by_index(self.background_colour).convert();
 
@@ -828,19 +843,25 @@ impl RenderableObject for OutputNumber {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            // 1. Get the font attributes
-            let font_attributes = match pool.object_by_id(self.font_attributes) {
-                Some(Object::FontAttributes(fa)) => fa,
-                _ => {
-                    ui.colored_label(
-                        Color32::RED,
-                        format!(
-                            "Missing FontAttributes for OutputNumber ID {:?}",
-                            self.id.value()
-                        ),
-                    );
-                    return;
-                }
+            // 1. Get the font attributes. A NULL reference is legal
+            //    (ISO 11783-6) and falls back to default font attributes; a
+            //    dangling one is an error.
+            let default_font = default_font_attributes();
+            let font_attributes = match self.font_attributes.0 {
+                None => &default_font,
+                Some(id) => match pool.object_by_id(id) {
+                    Some(Object::FontAttributes(fa)) => fa,
+                    _ => {
+                        ui.colored_label(
+                            Color32::RED,
+                            format!(
+                                "Missing FontAttributes for OutputNumber ID {:?}",
+                                self.id.value()
+                            ),
+                        );
+                        return;
+                    }
+                },
             };
 
             // 2. Convert the pool color indices to `egui::Color32`
@@ -1024,7 +1045,12 @@ impl RenderableObject for OutputLine {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let line_attributes = match pool.object_by_id(self.line_attributes) {
+            // A NULL line attributes reference is legal (ISO 11783-6) and
+            // means there is nothing to draw.
+            let Some(line_attributes_id) = self.line_attributes.0 else {
+                return;
+            };
+            let line_attributes = match pool.object_by_id(line_attributes_id) {
                 Some(Object::LineAttributes(attr)) => attr,
                 _ => {
                     // If we don't have valid line attributes, just show an error and return
@@ -1032,7 +1058,7 @@ impl RenderableObject for OutputLine {
                         Color32::RED,
                         format!(
                             "Missing or invalid LineAttributes ID: {:?}",
-                            self.line_attributes
+                            line_attributes_id
                         ),
                     );
                     return;
@@ -1092,16 +1118,17 @@ impl RenderableObject for OutputRectangle {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        // Paint the border of the rectangle
-        let line_attributes = match pool.object_by_id(self.line_attributes) {
-            Some(Object::LineAttributes(l)) => l,
-            _ => {
-                ui.colored_label(
-                    Color32::RED,
-                    format!("Missing line attributes: {:?}", self.line_attributes),
-                );
-                return;
-            }
+        // Resolve the border. A NULL line attributes reference is legal
+        // (ISO 11783-6) and means the rectangle has no border.
+        let line_attributes = match self.line_attributes.0 {
+            None => None,
+            Some(id) => match pool.object_by_id(id) {
+                Some(Object::LineAttributes(l)) => Some(l),
+                _ => {
+                    ui.colored_label(Color32::RED, format!("Missing line attributes: {:?}", id));
+                    return;
+                }
+            },
         };
         // Paint the fill of the rectangle
         if let Some(fill) = self.fill_attributes.into() {
@@ -1121,16 +1148,18 @@ impl RenderableObject for OutputRectangle {
             // TODO: implement fill pattern for infill
         }
 
-        ui.painter().rect_stroke(
-            rect,
-            0.0,
-            egui::Stroke::new(
-                line_attributes.line_width,
-                pool.color_by_index(line_attributes.line_colour).convert(),
-            ),
-            egui::StrokeKind::Inside,
-        );
-        // TODO: implement line art for border
+        if let Some(line_attributes) = line_attributes {
+            ui.painter().rect_stroke(
+                rect,
+                0.0,
+                egui::Stroke::new(
+                    line_attributes.line_width,
+                    pool.color_by_index(line_attributes.line_colour).convert(),
+                ),
+                egui::StrokeKind::Inside,
+            );
+            // TODO: implement line art for border
+        }
     }
 }
 
@@ -1157,18 +1186,20 @@ impl RenderableObject for OutputPolygon {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let line_attributes = match pool.object_by_id(self.line_attributes) {
-                Some(Object::LineAttributes(attr)) => attr,
-                _ => {
-                    ui.colored_label(
-                        Color32::RED,
-                        format!(
-                            "Missing or invalid LineAttributes ID: {:?}",
-                            self.line_attributes
-                        ),
-                    );
-                    return;
-                }
+            // A NULL line attributes reference is legal (ISO 11783-6): the
+            // polygon then has a fill but no outline.
+            let line_attributes = match self.line_attributes.0 {
+                None => None,
+                Some(id) => match pool.object_by_id(id) {
+                    Some(Object::LineAttributes(attr)) => Some(attr),
+                    _ => {
+                        ui.colored_label(
+                            Color32::RED,
+                            format!("Missing or invalid LineAttributes ID: {:?}", id),
+                        );
+                        return;
+                    }
+                },
             };
 
             if self.points.len() < 2 {
@@ -1207,6 +1238,9 @@ impl RenderableObject for OutputPolygon {
                 }
             }
 
+            let Some(line_attributes) = line_attributes else {
+                return;
+            };
             if line_attributes.line_width == 0 {
                 return;
             }

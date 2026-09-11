@@ -179,7 +179,7 @@ fn default_input_boolean() -> InputBoolean {
         id: ObjectId::new(0).unwrap(),
         background_colour: 0,
         width: 0,
-        foreground_colour: ObjectId::new(0).unwrap(),
+        foreground_colour: NullableObjectId::NULL,
         variable_reference: NullableObjectId::NULL,
         value: false,
         enabled: true,
@@ -193,7 +193,7 @@ fn default_input_string() -> InputString {
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: NullableObjectId::NULL,
         input_attributes: NullableObjectId::NULL,
         options: InputStringOptions {
             transparent: false,
@@ -217,7 +217,7 @@ fn default_input_number() -> InputNumber {
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: NullableObjectId::NULL,
         options: NumberOptions {
             transparent: false,
             display_leading_zeros: false,
@@ -266,7 +266,7 @@ fn default_output_string() -> OutputString {
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: NullableObjectId::NULL,
         options: OutputStringOptions {
             transparent: false,
             auto_wrap: false,
@@ -288,7 +288,7 @@ fn default_output_number() -> OutputNumber {
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: NullableObjectId::NULL,
         options: NumberOptions {
             transparent: false,
             display_leading_zeros: false,
@@ -312,7 +312,7 @@ fn default_output_number() -> OutputNumber {
 fn default_output_line() -> OutputLine {
     OutputLine {
         id: ObjectId::new(0).unwrap(),
-        line_attributes: ObjectId::new(0).unwrap(),
+        line_attributes: NullableObjectId::NULL,
         width: 0,
         height: 0,
         line_direction: LineDirection::TopLeftToBottomRight,
@@ -323,7 +323,7 @@ fn default_output_line() -> OutputLine {
 fn default_output_rectangle() -> OutputRectangle {
     OutputRectangle {
         id: ObjectId::new(0).unwrap(),
-        line_attributes: ObjectId::new(0).unwrap(),
+        line_attributes: NullableObjectId::NULL,
         width: 0,
         height: 0,
         line_suppression: 0,
@@ -335,7 +335,7 @@ fn default_output_rectangle() -> OutputRectangle {
 fn default_output_ellipse() -> OutputEllipse {
     OutputEllipse {
         id: ObjectId::new(0).unwrap(),
-        line_attributes: ObjectId::new(0).unwrap(),
+        line_attributes: NullableObjectId::NULL,
         width: 0,
         height: 0,
         ellipse_type: 0,
@@ -351,7 +351,7 @@ fn default_output_polygon() -> OutputPolygon {
         id: ObjectId::new(0).unwrap(),
         width: 0,
         height: 0,
-        line_attributes: ObjectId::new(0).unwrap(),
+        line_attributes: NullableObjectId::NULL,
         fill_attributes: NullableObjectId::NULL,
         polygon_type: 0,
         points: vec![
@@ -473,7 +473,7 @@ fn default_string_variable() -> StringVariable {
     }
 }
 
-fn default_font_attributes() -> FontAttributes {
+pub fn default_font_attributes() -> FontAttributes {
     FontAttributes {
         id: ObjectId::new(0).unwrap(),
         font_colour: 0,
