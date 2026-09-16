@@ -117,6 +117,15 @@ impl From<ObjectPool> for EditorProject {
 }
 
 impl EditorProject {
+    /// Start an empty, unsaved pool with a usable editing canvas.
+    pub fn new_pool() -> Self {
+        let mut project = Self::from(ObjectPool::default());
+        project.mask_size = 500;
+        project.saved_content.replace(None);
+        project.dirty.set(true);
+        project
+    }
+
     /// Get the current object pool
     pub fn get_pool(&self) -> &ObjectPool {
         &self.pool
@@ -448,7 +457,7 @@ impl EditorProject {
             Err(error) => {
                 log::error!("Failed to execute UI operation: {error:?}");
                 self.last_operation_error
-                    .replace(Some(format!("Could not apply edit: {error:?}")));
+                    .replace(Some(error.to_string()));
                 false
             }
         }

@@ -48,6 +48,7 @@ enum FileDialogReason {
 
 #[derive(Clone)]
 enum PendingAction {
+    NewPool,
     OpenProject,
     ImportPool,
     #[cfg(not(target_arch = "wasm32"))]
@@ -711,6 +712,23 @@ impl DesignerApp {
 
     fn perform_action(&mut self, action: PendingAction, ctx: &egui::Context) {
         match action {
+            PendingAction::NewPool => {
+                self.project = Some(EditorProject::new_pool());
+                self.project_display_name = "Untitled.aitp".to_owned();
+                self.new_object_dialog = None;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.project_path = None;
+                    self.ai_state.conversation.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.ai_state.request_state = AiRequestState::Idle;
+                    self.ai_state.active_proposal = None;
+                    self.ai_state.request_revision = None;
+                }
+                if self.discard_on_replace {
+                    self.clear_recovery();
+                    self.discard_on_replace = false;
+                }
+            }
             PendingAction::OpenProject => self.open_file_dialog(FileDialogReason::LoadProject, ctx),
             PendingAction::ImportPool => self.open_file_dialog(FileDialogReason::LoadPool, ctx),
             #[cfg(not(target_arch = "wasm32"))]
@@ -873,6 +891,11 @@ impl DesignerApp {
                 ui.add_space(40.0);
                 ui.heading("AgIsoTerminalDesigner");
                 ui.add_space(20.0);
+
+                if ui.button("New Object Pool").clicked() {
+                    self.request_action(PendingAction::NewPool, ctx);
+                }
+                ui.add_space(16.0);
 
                 ui.label("Open an existing designer project:");
                 if ui.button("Open Project (.aitp)").clicked() {
@@ -1552,6 +1575,10 @@ impl eframe::App for DesignerApp {
 
                 ui.menu_button("File", |ui| {
                     ui.label("Project Files");
+                    if ui.button("New Object Pool").clicked() {
+                        self.request_action(PendingAction::NewPool, ctx);
+                        ui.close();
+                    }
                     if ui.button("Open Project (.aitp)").clicked() {
                         self.request_action(PendingAction::OpenProject, ctx);
                         ui.close();
@@ -1672,10 +1699,14 @@ impl eframe::App for DesignerApp {
                             pool,
                         );
                     } else {
-                        ui.colored_label(
-                            egui::Color32::RED,
-                            "No working set, please add a new working set...",
-                        );
+                        ui.label("This pool has no Working Set.");
+                        if ui.button("Create Working Set").clicked() {
+                            let object_type = ObjectType::WorkingSet;
+                            self.new_object_dialog = Some((
+                                object_type,
+                                pool.generate_smart_name_for_new_object(object_type),
+                            ));
+                        }
                     }
                     let auxiliary_objects = pool.get_pool().objects_by_types(&[
                         ObjectType::AuxiliaryFunctionType1,

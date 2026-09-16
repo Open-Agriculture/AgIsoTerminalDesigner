@@ -238,6 +238,26 @@ pub enum OperationError {
     InvalidObjectOrder,
 }
 
+impl std::fmt::Display for OperationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ObjectNotFound(id) => write!(f, "Object {id} could not be found."),
+            Self::ObjectAlreadyExists(id) => write!(f, "Object ID {id} is already in use. Choose a different ID."),
+            Self::ObjectNameNotFound(name) => write!(f, "No object named “{name}” could be found."),
+            Self::DuplicateObjectName(name) => write!(f, "The name “{name}” is already in use. Choose a different name."),
+            Self::AmbiguousObjectName(name) => write!(f, "More than one object is named “{name}”. Use a unique name."),
+            Self::CircularReference { parent, child } => write!(f, "Object {child} cannot be added to object {parent} because this would create a circular reference."),
+            Self::InvalidReference { parent_type, child_type } => write!(f, "A {parent_type} cannot reference a {child_type}."),
+            Self::PropertyError { object_id, property, reason } => write!(f, "Could not change {} on object {object_id}.\n{reason}", property.replace('_', " ")),
+            Self::DeleteReferencedObject(id) => write!(f, "Object {id} is still referenced by other objects. Remove those references before deleting it."),
+            Self::UnsupportedSchemaVersion { expected, actual } => write!(f, "Operation format version {actual} is not supported. Expected version {expected}."),
+            Self::ReferencePropertyRequiresReferenceOperation { object_id, property } => write!(f, "The {} property on object {object_id} must be changed using an object reference operation.", property.replace('_', " ")),
+            Self::PropertyIsNotObjectReference { object_id, property } => write!(f, "The {} property on object {object_id} is not an object reference.", property.replace('_', " ")),
+            Self::InvalidObjectOrder => write!(f, "The object order must include every object exactly once."),
+        }
+    }
+}
+
 /// Resolve the operation-layer symbolic target to the ISOBUS identity.
 pub fn resolve_target(
     target: &ObjectTarget,
@@ -484,7 +504,7 @@ impl Operation {
                     |e| OperationError::PropertyError {
                         object_id,
                         property: property.clone(),
-                        reason: format!("{:?}", e),
+                        reason: e.to_string(),
                     },
                 )?;
 
@@ -493,14 +513,14 @@ impl Operation {
                     .map_err(|e| OperationError::PropertyError {
                         object_id,
                         property: property.clone(),
-                        reason: format!("{:?}", e),
+                        reason: e.to_string(),
                     })?;
 
                 crate::object_properties::set_property(pool, id, property, value.clone()).map_err(
                     |e| OperationError::PropertyError {
                         object_id,
                         property: property.clone(),
-                        reason: format!("{:?}", e),
+                        reason: e.to_string(),
                     },
                 )?;
                 context.affected_objects.insert(id);
@@ -534,7 +554,7 @@ impl Operation {
                     .map_err(|e| OperationError::PropertyError {
                         object_id,
                         property: property.clone(),
-                        reason: format!("{e:?}"),
+                        reason: e.to_string(),
                     })?;
                 let value = match reference {
                     Some(target) => {
@@ -548,14 +568,14 @@ impl Operation {
                     |e| OperationError::PropertyError {
                         object_id,
                         property: property.clone(),
-                        reason: format!("{e:?}"),
+                        reason: e.to_string(),
                     },
                 )?;
                 crate::object_properties::set_property(pool, id, property, value).map_err(|e| {
                     OperationError::PropertyError {
                         object_id,
                         property: property.clone(),
-                        reason: format!("{e:?}"),
+                        reason: e.to_string(),
                     }
                 })?;
                 context.affected_objects.insert(id);
@@ -587,13 +607,13 @@ impl Operation {
                     .map_err(|e| OperationError::PropertyError {
                         object_id: *object_id,
                         property: property.clone(),
-                        reason: format!("{e:?}"),
+                        reason: e.to_string(),
                     })?;
                 crate::object_properties::set_property(pool, id, property, value.clone()).map_err(
                     |e| OperationError::PropertyError {
                         object_id: *object_id,
                         property: property.clone(),
-                        reason: format!("{e:?}"),
+                        reason: e.to_string(),
                     },
                 )?;
                 context.affected_objects.insert(id);
@@ -1275,7 +1295,7 @@ fn replace_references(
         .map_err(|error| OperationError::PropertyError {
             object_id: object.id().value(),
             property: "object reference".to_owned(),
-            reason: format!("{error:?}"),
+            reason: error.to_string(),
         })?;
 
     with_positioned_children!(

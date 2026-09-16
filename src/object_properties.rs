@@ -147,6 +147,16 @@ pub enum PropertyAccessError {
     },
 }
 
+impl std::fmt::Display for PropertyAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PropertyNotFound(property) => write!(f, "Property {property} does not exist on this object."),
+            Self::UnsupportedObjectType => write!(f, "Editing properties of this object type is not supported."),
+            Self::InvalidValue { reason, .. } => write!(f, "Invalid value: {reason}"),
+        }
+    }
+}
+
 /// Error from pool-level property access (includes object context)
 #[derive(Debug, Clone)]
 pub enum PropertyError {
@@ -174,6 +184,27 @@ pub enum PropertyError {
         object_id: ObjectId,
         reference_id: ObjectId,
     },
+}
+
+impl std::fmt::Display for PropertyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ObjectNotFound(id) => write!(f, "Object {} could not be found.", id.value()),
+            Self::PropertyNotFound { property, .. } => write!(f, "The {} property does not exist on this object.", property.replace('_', " ")),
+            Self::UnsupportedObjectType { object_type, .. } => write!(f, "Editing properties of {object_type} objects is not supported."),
+            Self::InvalidValue { property, reason, .. } => {
+                if property == "active_mask" && reason == "invalid type: null, expected u16" {
+                    write!(f, "An active mask is required. Select a mask instead of clearing this value.")
+                } else if reason == "invalid type: null, expected u16" {
+                    write!(f, "A value is required. Enter a whole number between 0 and 65535, or select an object if this is a reference.")
+                } else {
+                    write!(f, "Invalid value: {reason}")
+                }
+            }
+            Self::OutOfRange { value, min, max, .. } => write!(f, "The value {value} must be between {min} and {max}."),
+            Self::InvalidObjectReference { reference_id, .. } => write!(f, "Object {} is not a valid reference for this property. Select a compatible object.", reference_id.value()),
+        }
+    }
 }
 
 /// Trait for property access on individual object types
