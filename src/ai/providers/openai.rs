@@ -18,7 +18,7 @@ impl AiProvider for OpenAiProvider {
    if let Some(effort) = request.settings.reasoning_effort { body["reasoning"] = json!({"effort":effort}); }
    let response = client.post("https://api.openai.com/v1/responses").bearer_auth(key).json(&body).timeout(timeout).send().await.map_err(|e| if e.is_timeout() { AiProviderError::Timeout } else { AiProviderError::Http(e.to_string()) })?;
    let status = response.status(); let value: Value = response.json().await.map_err(|e| AiProviderError::InvalidResponse(e.to_string()))?;
-   if !status.is_success() { return Err(match status.as_u16() { 401 => AiProviderError::Unauthorized, 429 => AiProviderError::RateLimited, _ => AiProviderError::Http(value.get("error").and_then(|e| e.get("message")).and_then(Value::as_str).unwrap_or("unknown API error").to_owned()) }); }
+   if !status.is_success() { return Err(parse_api_error(status.as_u16(), &value)); }
    parse_response(value)
   })
  }
@@ -49,4 +49,50 @@ fn parse_response(value: Value) -> Result<AiProviderResponse, AiProviderError> {
  }
  if content.is_empty() { return Err(AiProviderError::InvalidResponse("response contained no text or function calls".into())); }
  Ok(AiProviderResponse { content })
+}
+
+fn parse_api_error(status: u16, value: &Value) -> AiProviderError {
+    let error = &value["error"];
+    let message = error["message"].as_str().unwrap_or("No error details returned by OpenAI").to_owned();
+    match status {
+        401 => AiProviderError::Unauthorized,
+        429 if ["code", "type"].iter().any(|field| error[*field].as_str() == Some("insufficient_quota")) => {
+            AiProviderError::QuotaExceeded(message)
+        }
+        429 => AiProviderError::RateLimited(message),
+        _ => AiProviderError::Http(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quota_errors_explain_billing_instead_of_rate_limits() {
+        for field in ["code", "type"] {
+            let mut value = json!({"error": {"message": "You exceeded your current quota."}});
+            value["error"][field] = json!("insufficient_quota");
+            let error = parse_api_error(429, &value);
+            assert!(matches!(error, AiProviderError::QuotaExceeded(_)));
+            assert!(error.to_string().contains("API billing"));
+            assert!(error.to_string().contains("You exceeded your current quota."));
+        }
+    }
+
+    #[test]
+    fn rate_limits_preserve_server_details() {
+        let error = parse_api_error(429, &json!({"error": {
+            "code": "rate_limit_exceeded",
+            "message": "Tokens per minute exceeded. Please try again in 20s."
+        }}));
+        assert!(matches!(error, AiProviderError::RateLimited(_)));
+        assert!(error.to_string().contains("Please try again in 20s."));
+    }
+
+    #[test]
+    fn missing_error_details_do_not_panic() {
+        assert!(matches!(parse_api_error(429, &json!({})), AiProviderError::RateLimited(_)));
+        assert!(matches!(parse_api_error(401, &json!({})), AiProviderError::Unauthorized));
+    }
 }

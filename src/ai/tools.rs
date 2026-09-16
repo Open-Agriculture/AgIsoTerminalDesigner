@@ -48,7 +48,39 @@ pub fn tool_definitions() -> Vec<Value> {
 fn function(name: &str, description: &str, parameters: Value) -> Value { json!({"type":"function","name":name,"description":description,"parameters":parameters,"strict":false}) }
 /// Mirrors the public serde transaction envelope. Operation payloads remain the source of truth
 /// and are deserialized by `OperationTransaction`; skipped restoration variants are excluded.
-fn transaction_schema() -> Value { json!({"type":"object","properties":{"schema_version":{"type":"integer","const":2},"description":{"type":["string","null"]},"operations":{"type":"array","minItems":1,"items":{"type":"object","properties":{"type":{"type":"string","enum":["CreateObject","DeleteObject","SetProperty","SetObjectReference","ChangeObjectId","ReorderObjects","AddChild","RemoveChild","SetChildPosition","SetChildren","SetObjectList","SetMacroReferences","SetObjectLabels","RenameObject"]},"data":{"type":"object","description":"Payload for the selected public Operation variant. Object references use {id:number} or {name:string}."}},"required":["type","data"]}}},"required":["schema_version","operations"],"additionalProperties":false}) }
+fn transaction_schema() -> Value {
+    let id = json!({"type":"integer","minimum":0,"maximum":65534});
+    let target = json!({"anyOf":[object_schema(json!({"id":id}), &["id"]), object_schema(json!({"name":{"type":"string"}}), &["name"])]});
+    let nullable_target = json!({"anyOf":[target,{"type":"null"}]});
+    let coordinate = json!({"type":"integer","minimum":-32768,"maximum":32767});
+    let string = json!({"type":"string"});
+    let variants = vec![
+        operation_schema("CreateObject", json!({"object_id":{"anyOf":[id,{"type":"null"}]},"object_type":{"type":"string","enum":ObjectType::values().into_iter().map(|v|format!("{v:?}")).collect::<Vec<_>>()},"name":string}), &["object_type","name"]),
+        operation_schema("DeleteObject", json!({"object_id":id}), &["object_id"]),
+        operation_schema("SetProperty", json!({"object":target,"property":string,"value":{"description":"Use the property's type and valid range from get_object_schema."}}), &["object","property","value"]),
+        operation_schema("SetObjectReference", json!({"object":target,"property":string,"reference":nullable_target}), &["object","property","reference"]),
+        operation_schema("ChangeObjectId", json!({"old_id":id,"new_id":id}), &["old_id","new_id"]),
+        operation_schema("ReorderObjects", json!({"object_ids":{"type":"array","items":id}}), &["object_ids"]),
+        operation_schema("AddChild", json!({"parent":target,"child":target,"x":coordinate,"y":coordinate}), &["parent","child","x","y"]),
+        operation_schema("RemoveChild", json!({"parent_id":id,"child_id":id}), &["parent_id","child_id"]),
+        operation_schema("SetChildPosition", json!({"parent_id":id,"child_id":id,"x":coordinate,"y":coordinate}), &["parent_id","child_id","x","y"]),
+        operation_schema("SetChildren", json!({"parent":target,"children":{"type":"array","items":object_schema(json!({"child":target,"x":coordinate,"y":coordinate}), &["child","x","y"])}}), &["parent","children"]),
+        operation_schema("SetObjectList", json!({"object":target,"objects":{"anyOf":[
+            object_schema(json!({"kind":{"const":"Required","type":"string"},"objects":{"type":"array","items":target}}), &["kind","objects"]),
+            object_schema(json!({"kind":{"const":"Nullable","type":"string"},"objects":{"type":"array","items":nullable_target}}), &["kind","objects"])
+        ]}}), &["object","objects"]),
+        operation_schema("SetMacroReferences", json!({"object":target,"macro_refs":{"type":"array","items":object_schema(json!({"event_id":{"type":"string","description":"Event name from get_object_schema possible_events."},"macro_object":target}), &["event_id","macro_object"])}}), &["object","macro_refs"]),
+        operation_schema("SetObjectLabels", json!({"object_id":id,"labels":{"type":"array","items":object_schema(json!({"id":id,"font_type":{"type":"integer","minimum":0,"maximum":255},"string_variable_reference":{"anyOf":[id,{"type":"null"}]},"graphic_representation":{"anyOf":[id,{"type":"null"}]}}), &["id","font_type","string_variable_reference","graphic_representation"])}}), &["object_id","labels"]),
+        operation_schema("RenameObject", json!({"object":target,"name":string}), &["object","name"]),
+    ];
+    object_schema(json!({"schema_version":{"type":"integer","const":2},"description":{"type":["string","null"]},"operations":{"type":"array","minItems":1,"items":{"anyOf":variants}}}), &["schema_version","operations"])
+}
+fn object_schema(properties: Value, required: &[&str]) -> Value {
+    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+}
+fn operation_schema(name: &str, properties: Value, required: &[&str]) -> Value {
+    object_schema(json!({"type":{"type":"string","const":name},"data":object_schema(properties, required)}), &["type","data"])
+}
 pub fn get_design_context(
     state: &AiDesignState,
     request: DesignContextRequest,
@@ -125,4 +157,41 @@ pub fn get_objects(
                 .ok_or(AiToolError::ObjectNotFound(id.value()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn example(schema: &Value) -> Value {
+        if let Some(value) = schema.get("const") { return value.clone(); }
+        if let Some(values) = schema.get("enum") { return values[0].clone(); }
+        if let Some(variants) = schema.get("anyOf") { return example(&variants[0]); }
+        match schema["type"].as_str() {
+            Some("object") => {
+                let mut result = json!({});
+                for field in schema["required"].as_array().unwrap() {
+                    let field = field.as_str().unwrap();
+                    result[field] = example(&schema["properties"][field]);
+                }
+                result
+            }
+            Some("array") => json!([example(&schema["items"])]),
+            Some("integer") => json!(schema["minimum"].as_i64().unwrap_or(0)),
+            Some("string") => json!("OnActivate"),
+            _ => Value::Null,
+        }
+    }
+
+    #[test]
+    fn every_advertised_operation_payload_deserializes() {
+        let schema = transaction_schema();
+        let variants = schema["properties"]["operations"]["items"]["anyOf"].as_array().unwrap();
+        assert_eq!(variants.len(), 14);
+        for variant in variants {
+            let payload = example(variant);
+            let result = serde_json::from_value::<crate::operations::Operation>(payload.clone());
+            assert!(result.is_ok(), "{payload}: {result:?}");
+        }
+    }
 }
