@@ -6,6 +6,13 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+pub fn model_id(settings: &crate::ai::AiSettings) -> &str {
+    match settings.role {
+        crate::ai::task_state::AiModelRole::Fast => &settings.model,
+        crate::ai::task_state::AiModelRole::Strong => "gpt-5.6-sol",
+    }
+}
+
 #[derive(Default)]
 struct CacheComparison {
     request: Weak<Mutex<crate::ai::debug_trace::AiDebugState>>,
@@ -34,12 +41,15 @@ struct TransportState {
     continuation: Continuation,
     // Once the endpoint rejects non-stored continuation, avoid repeated probes.
     unsupported: bool,
+    generation: u64,
 }
 impl TransportState {
     fn for_request(&mut self, request: &AiTurnRequest) -> Continuation {
-        if request.conversation.debug.lock().unwrap().provider_rounds <= 1
+        if self.generation != request.conversation.replay_generation
+            || request.conversation.debug.lock().unwrap().provider_rounds <= 1
             || !Weak::ptr_eq(&self.request, &Arc::downgrade(&request.conversation.debug))
         {
+            self.generation = request.conversation.replay_generation;
             self.request = Arc::downgrade(&request.conversation.debug);
             self.continuation = Continuation::default();
         }
@@ -55,7 +65,7 @@ impl Continuation {
             body["previous_response_id"] = json!(self.response_id);
             return (body, 0);
         }
-        // Preserve opaque reasoning and assistant phase in the adapter's replay;
+        // Preserve assistant phase and tool-call continuity, without reasoning blobs;
         // domain tools never see provider response IDs or provider output items.
         let mut input = Vec::new();
         let mut historical_bytes = 0;
@@ -83,6 +93,7 @@ impl Continuation {
     fn accept(&mut self, request: &AiTurnRequest, value: &Value) {
         self.response_id = value["id"].as_str().map(str::to_owned);
         let mut output = value["output"].as_array().cloned().unwrap_or_default();
+        output.retain(|item| item["type"] != "reasoning");
         for item in &mut output {
             // IDs refer to non-stored objects; replay their contents instead.
             if let Some(map) = item.as_object_mut() {
@@ -146,7 +157,7 @@ impl AiProvider for OpenAiProvider {
         Box::pin(async move {
             let (mut continuation, mut native) = {
                 let mut state = transport.lock().unwrap();
-                (state.for_request(&request), !state.unsupported)
+                (state.for_request(&request), false)
             };
             loop {
                 let (mut body, historical_bytes) = continuation.body(&request, native);
@@ -237,9 +248,17 @@ impl AiProvider for OpenAiProvider {
 pub(crate) fn request_body(request: &AiTurnRequest) -> Value {
     request_body_with_input(request, to_openai_input(&request.conversation))
 }
-fn request_body_with_input(request: &AiTurnRequest, input: Vec<Value>) -> Value {
-    let mut body = json!({"model":request.settings.model,"max_output_tokens":request.settings.max_output_tokens,"instructions":request.instructions,"input":input,"tools":request.tools,"store":false,"include":["reasoning.encrypted_content"],"prompt_cache_key":format!("AgIsoTerminalDesigner:prompt-v2:tools-v2:{}", request.settings.model),"parallel_tool_calls":true});
-    if let Some(effort) = &request.settings.reasoning_effort {
+fn request_body_with_input(request: &AiTurnRequest, mut input: Vec<Value>) -> Value {
+    if let Some(state) = &request.conversation.task_state {
+        input.push(json!({"role":"user","content":[{"type":"input_text","text":format!("Task state: {}",serde_json::to_string(state).unwrap())}]}));
+    }
+    let mut body = json!({"model":model_id(&request.settings),"max_output_tokens":request.settings.max_output_tokens,"instructions":request.instructions,"input":input,"tools":request.tools,"store":false,"prompt_cache_key":format!("AgIsoTerminalDesigner:{}:{:?}:tools-v3", model_id(&request.settings), request.settings.phase),"parallel_tool_calls":true});
+    let effort = if request.settings.role == crate::ai::task_state::AiModelRole::Strong {
+        &request.settings.strong_reasoning_effort
+    } else {
+        &request.settings.reasoning_effort
+    };
+    if let Some(effort) = effort {
         body["reasoning"] = json!({"effort":effort});
     }
     body
@@ -267,7 +286,12 @@ fn deduplicate_reads(items: &mut [Value]) {
         if item["type"] == "function_call"
             && matches!(
                 item["name"].as_str(),
-                Some("get_design_context" | "get_objects" | "get_object_schema")
+                Some(
+                    "get_design_context"
+                        | "get_objects"
+                        | "get_object_schema"
+                        | "inspect_design_region"
+                )
             )
         {
             reads.insert(item["call_id"].as_str().unwrap_or_default().to_owned());
@@ -711,98 +735,61 @@ mod phase53_transport_tests {
         }
     }
     #[test]
-    fn native_continuation_transmits_only_new_outputs_and_resets_between_requests() {
-        let (endpoint, server) = server(vec![
-            (200, response("R1", &["get_design_context"])),
-            (200, response("R2", &["get_objects", "get_object_schema"])),
-            (200, response("R3", &["propose_transaction"])),
-            (200, response("R4", &[])),
-            (200, response("R5", &[])),
-        ]);
-        let provider = provider(endpoint);
-        let mut request = request();
-        for round in 1..=4 {
-            advance(&provider, &mut request, round);
-        }
-        assert!(request
-            .conversation
-            .messages
-            .iter()
-            .any(|m| m.role == AiRole::User));
-        assert_eq!(request.conversation.debug.lock().unwrap().rounds.len(), 4);
-        for round in &request.conversation.debug.lock().unwrap().rounds[1..] {
-            assert_eq!(round.historical_replay_bytes, 0);
-            assert!(round.new_input_bytes > 0);
-            assert!(round.continuation.starts_with("previous_response_id"));
-        }
-        request.conversation.compact();
-        advance(&provider, &mut request, 1);
-        let bodies = server.join().unwrap();
-        assert!(bodies[0].get("previous_response_id").is_none());
-        for (round, (id, count)) in [("R1", 1), ("R2", 2), ("R3", 1)].iter().enumerate() {
-            let body = &bodies[round + 1];
-            assert_eq!(body["previous_response_id"], *id);
-            let input = body["input"].as_array().unwrap();
-            assert_eq!(input.len(), *count);
-            assert!(input.iter().all(|v| v["type"] == "function_call_output"
-                && v["call_id"].as_str().unwrap().starts_with(id)));
-        }
-        assert!(bodies[4].get("previous_response_id").is_none());
-        for body in &bodies {
-            assert_eq!(body["store"], false);
-            for key in ["instructions", "tools", "prompt_cache_key"] {
-                assert_eq!(body[key], bodies[0][key]);
-            }
-        }
-    }
-    #[test]
-    fn rejected_continuation_retries_once_with_full_context_and_no_storage_change() {
-        let mut first = response("R1", &["get_design_context"]);
-        first["output"].as_array_mut().unwrap().insert(
-            0,
-            json!({"id":"reasoning","type":"reasoning","summary":[],"encrypted_content":"opaque"}),
-        );
-        let (endpoint, server) = server(vec![
-            (200, first),
-            (
-                400,
-                json!({"error":{"param":"previous_response_id","message":"Previous response not found"}}),
-            ),
-            (200, response("R2", &["get_objects"])),
-            (200, response("R3", &[])),
-        ]);
+    fn store_false_uses_local_replay_without_probe_or_reasoning_accumulation() {
+        let responses = (1..=3)
+            .map(|i| {
+                let mut v = response(&format!("R{i}"), &["get_objects"]);
+                v["output"].as_array_mut().unwrap().insert(
+                    0,
+                    json!({"type":"reasoning","encrypted_content":"opaque".repeat(4096)}),
+                );
+                (200, v)
+            })
+            .collect();
+        let (endpoint, server) = server(responses);
         let provider = provider(endpoint);
         let mut request = request();
         for round in 1..=3 {
             advance(&provider, &mut request, round);
         }
         let bodies = server.join().unwrap();
-        assert_eq!(bodies[1]["previous_response_id"], "R1");
-        for body in &bodies[2..] {
+        assert_eq!(bodies.len(), 3);
+        for body in &bodies {
             assert!(body.get("previous_response_id").is_none());
-            assert_eq!(body["input"][0]["role"], "user");
             assert_eq!(body["store"], false);
-            let items = body["input"].as_array().unwrap();
-            assert!(items.iter().any(|v| v["encrypted_content"] == "opaque"));
-            assert!(items
-                .iter()
-                .any(|v| v["type"] == "function_call" && v["call_id"] == "R1_0"));
-            assert!(items
-                .iter()
-                .any(|v| v["type"] == "function_call_output" && v["call_id"] == "R1_0"));
+            assert!(!body.to_string().contains("opaque"));
         }
-        let debug = request.conversation.debug.lock().unwrap();
-        assert_eq!(debug.rounds.last().unwrap().continuation, "local replay");
-        assert!(debug.rounds.last().unwrap().historical_replay_bytes > 0);
-        assert_eq!(debug.user_request.tokens.input_tokens, 300);
-        assert!(!continuation_rejected(
-            429,
-            &json!({"error":{"param":"previous_response_id"}})
-        ));
-        assert!(!continuation_rejected(
-            400,
-            &json!({"error":{"param":"tools"}})
-        ));
+        let items = bodies[2]["input"].as_array().unwrap();
+        for id in ["R1_0", "R2_0"] {
+            assert!(items
+                .iter()
+                .any(|v| v["type"] == "function_call" && v["call_id"] == id));
+            assert!(items
+                .iter()
+                .any(|v| v["type"] == "function_call_output" && v["call_id"] == id));
+        }
+        assert_eq!(
+            request
+                .conversation
+                .debug
+                .lock()
+                .unwrap()
+                .user_request
+                .request_count,
+            3
+        );
+    }
+    #[test]
+    fn native_continuation_abstraction_is_retained() {
+        let mut c = Continuation::default();
+        let mut r = request();
+        c.accept(&r, &response("R1", &[]));
+        r.conversation
+            .push(AiMessage::text(AiRole::Assistant, "done"));
+        r.conversation.push(AiMessage::text(AiRole::User, "next"));
+        let (body, bytes) = c.body(&r, true);
+        assert_eq!(body["previous_response_id"], "R1");
+        assert_eq!(bytes, 0);
     }
     #[test]
     #[ignore = "Live API probe: requires OPENAI_API_KEY and incurs a small API charge"]

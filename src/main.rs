@@ -262,6 +262,12 @@ impl DesignerApp {
 impl DesignerApp {
     #[cfg(not(target_arch = "wasm32"))]
     fn poll_ai(&mut self, ctx: &egui::Context) {
+        if matches!(self.ai_state.request_state, AiRequestState::Running { .. })
+            && self.ai_state.request_revision != self.project.as_ref().map(|p|p.revision()) {
+            self.ai_state.conversation.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.ai_state.request_state = AiRequestState::Idle;
+            self.ai_state.last_error = Some("Project changed during inspection. Send the request again to inspect the current revision.".into());
+        }
         for event in self.ai_channel.1.try_iter() {
             let current = match &self.ai_state.request_state { AiRequestState::Running { request_id } => request_id.clone(), _ => continue };
             match event {
@@ -286,6 +292,8 @@ impl DesignerApp {
         self.ai_state.active_proposal = None;
         self.ai_state.last_error = None;
         self.ai_state.request_state = AiRequestState::Running { request_id: request_id.clone() };
+        self.ai_state.request_revision = Some(project.revision());
+        self.ai_state.conversation.cancelled = Default::default();
         let settings = self.ai_state.settings.clone();
         let state=project.ai_design_state(); let conversation=self.ai_state.conversation.clone(); let sender=self.ai_channel.0.clone(); let repaint=ctx.clone();
         std::thread::spawn(move || match OpenAiProvider::from_environment() {

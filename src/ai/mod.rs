@@ -1,5 +1,9 @@
 //! Provider-neutral AI domain layer. It only reads snapshots and proposes transactions.
 pub mod backend;
+pub mod task_state;
+pub mod design_inspection;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod evaluation;
 pub mod debug_trace;
 pub use debug_trace::{AiTokenUsage, AiUsageStats};
 pub mod conversation;

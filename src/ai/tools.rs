@@ -124,6 +124,26 @@ pub fn tool_definitions() -> Vec<Value> {
         function("analyze_design", "Returns deterministic visual design-quality diagnostics. It is read-only and does not replace domain validation.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["active_mask","proposal"]}},"additionalProperties":false})),
     ]
 }
+pub fn phase_tool_definitions(phase: super::task_state::AiTaskPhase) -> Vec<Value> {
+    use super::task_state::AiTaskPhase;
+    let mut tools: Vec<_> = tool_definitions()
+        .into_iter()
+        .filter(|t| match t["name"].as_str().unwrap_or("") {
+            "propose_transaction" => phase != AiTaskPhase::Inspect,
+            "get_design_context" => phase == AiTaskPhase::Inspect,
+            "analyze_design" => phase == AiTaskPhase::Review,
+            _ => true,
+        })
+        .collect();
+    if matches!(phase, AiTaskPhase::Inspect | AiTaskPhase::Repair) {
+        tools.push(function("inspect_design_region", "Focused nearby style examples, path, local geometry and absolute geometry relative to root. Forward display edges only; existing style references are resolved. Ranked by distance to region center then path.", json!({"type":"object","properties":{"root_id":{"type":"integer","minimum":0,"maximum":65534},"region":{"type":"string","enum":["top","bottom","left","right","center","top_left","top_right","bottom_left","bottom_right","all"]},"types":{"type":"array","items":{"type":"string"}},"purpose":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":30}},"required":["root_id"],"additionalProperties":false})));
+    }
+    if phase == AiTaskPhase::Inspect {
+        tools.push(function("finish_inspection", "Local facts are sufficient; expose transaction proposal tools next round. No mutation.", json!({"type":"object","properties":{"summary":{"type":"string","maxLength":512}},"additionalProperties":false})));
+    }
+    tools.push(function("request_stronger_model", "Request stronger reasoning for a concrete blocker. The harness chooses the model; no mutation.", json!({"type":"object","properties":{"reason":{"type":"string","minLength":1,"maxLength":512}},"required":["reason"],"additionalProperties":false})));
+    tools
+}
 fn function(name: &str, description: &str, parameters: Value) -> Value {
     json!({"type":"function","name":name,"description":description,"parameters":parameters,"strict":false})
 }

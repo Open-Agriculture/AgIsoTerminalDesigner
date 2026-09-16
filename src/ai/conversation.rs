@@ -3,6 +3,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, Default)]
 pub struct Conversation {
     pub messages: Vec<AiMessage>,
+    pub replay_generation: u64,
+    pub task_state: Option<super::task_state::AiTaskState>,
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub debug: std::sync::Arc<std::sync::Mutex<super::debug_trace::AiDebugState>>,
 }
 impl Conversation {

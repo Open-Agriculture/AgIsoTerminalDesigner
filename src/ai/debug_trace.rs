@@ -56,6 +56,8 @@ pub struct AiTraceEntry {
 }
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AiProviderRoundStats {
+    pub model: String,
+    pub phase: String,
     pub round: usize,
     #[serde(flatten)]
     pub tokens: AiTokenUsage,
@@ -83,6 +85,11 @@ pub struct AiToolStats {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AiDebugState {
     pub rounds: Vec<AiProviderRoundStats>,
+    pub current_model: String,
+    pub latency_ms: u64,
+    pub failure_class: Option<super::task_state::AiFailureClass>,
+    pub model_usage: std::collections::BTreeMap<String, AiUsageStats>,
+    pub task: Option<super::task_state::AiTaskState>,
     pub largest_tool_results: Vec<(String, usize)>,
     pub tools: std::collections::BTreeMap<String, AiToolStats>,
     #[serde(skip)]
@@ -97,6 +104,10 @@ pub struct AiDebugState {
 impl AiDebugState {
     pub fn begin_request(&mut self) {
         self.rounds.clear();
+        self.model_usage.clear();
+        self.latency_ms = 0;
+        self.failure_class = None;
+        self.task = None;
         self.largest_tool_results.clear();
         self.tools.clear();
         self.previous_prefix = None;
@@ -110,6 +121,12 @@ impl AiDebugState {
         );
     }
     pub fn record_usage(&mut self, usage: AiTokenUsage) {
+        let model = self
+            .model_usage
+            .entry(self.current_model.clone())
+            .or_default();
+        model.request_count += 1;
+        model.tokens.add(&usage);
         self.user_request.request_count += 1;
         self.conversation.request_count += 1;
         self.user_request.tokens.add(&usage);
@@ -126,14 +143,23 @@ impl AiDebugState {
         self.last_api = usage;
     }
     pub fn record_request(&mut self, body: &Value) {
+        if let Some(model) = body["model"].as_str() {
+            self.current_model = model.into();
+        }
         let instructions = body["instructions"].to_string();
         let tools = body["tools"].to_string();
         let mut stats = AiProviderRoundStats {
+            model: self.current_model.clone(),
+            phase: self
+                .task
+                .as_ref()
+                .map(|t| format!("{:?}", t.phase))
+                .unwrap_or_default(),
             round: self.provider_rounds,
             continuation: body["previous_response_id"]
                 .as_str()
                 .map(|id| format!("previous_response_id: {id}"))
-                .unwrap_or_else(|| "local replay".into()),
+                .unwrap_or_else(|| "local replay (store=false configuration)".into()),
             request_bytes: body.to_string().len(),
             instructions_bytes: instructions.len(),
             tool_definitions_bytes: tools.len(),
@@ -210,6 +236,10 @@ impl AiDebugState {
             serde_json::json!(self.conversation.tokens.uncached_input_tokens());
         value["last_api"]["uncached_input_tokens"] =
             serde_json::json!(self.last_api.uncached_input_tokens());
+        for (name, usage) in &self.model_usage {
+            value["model_usage"][name]["tokens"]["uncached_input_tokens"] =
+                serde_json::json!(usage.tokens.uncached_input_tokens());
+        }
         value["warnings"] = serde_json::json!(self.warnings());
         sanitize(&mut value);
         serde_json::to_string_pretty(&value).unwrap()
@@ -305,6 +335,19 @@ pub fn debug_ui(ui: &mut egui::Ui, debug: &AiDebugState, settings: &mut super::A
     ui.collapsing("AI Debug", |ui| {
         if ui.button("Copy debug output").clicked() {
             ui.ctx().copy_text(debug.export());
+        }
+        ui.horizontal(|ui| {
+            ui.label("AI mode");
+            for (mode, label) in [(super::task_state::AiModelMode::Automatic,"Automatic"),(super::task_state::AiModelMode::Fast,"Luna"),(super::task_state::AiModelMode::Strong,"Sol")] {
+                ui.selectable_value(&mut settings.mode, mode, label);
+            }
+        });
+        ui.label(format!("Current model: {} · provider latency {} ms",debug.current_model,debug.latency_ms));
+        if let Some(task) = &debug.task {
+            ui.label(format!("Phase {:?} · inspection rounds {} · proposals {} · validation failures {} · escalation {:?}",task.phase,task.inspection_rounds,task.proposal_attempts,task.validation_failures,task.escalation));
+        }
+        for (name, usage) in &debug.model_usage {
+            ui.label(format!("{name}: {} calls · input {} · cached {} · uncached {} · output {} · total {}",usage.request_count,usage.tokens.input_tokens,usage.tokens.cached_input_tokens,usage.tokens.uncached_input_tokens(),usage.tokens.output_tokens,usage.tokens.total_tokens));
         }
         ui.horizontal(|ui| {
             ui.label("Max output tokens");

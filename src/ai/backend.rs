@@ -10,6 +10,10 @@ pub enum AiProviderKind {
 pub struct AiSettings {
     pub provider: AiProviderKind,
     pub model: String,
+    pub mode: super::task_state::AiModelMode,
+    pub role: super::task_state::AiModelRole,
+    pub phase: super::task_state::AiTaskPhase,
+    pub strong_reasoning_effort: Option<String>,
     pub reasoning_effort: Option<String>,
     pub max_output_tokens: u32,
 }
@@ -17,7 +21,11 @@ impl Default for AiSettings {
     fn default() -> Self {
         Self {
             provider: AiProviderKind::OpenAI,
-            model: "gpt-5.6".into(),
+            model: "gpt-5.6-luna".into(),
+            mode: Default::default(),
+            role: Default::default(),
+            phase: Default::default(),
+            strong_reasoning_effort: Some("medium".into()),
             reasoning_effort: Some("medium".into()),
             max_output_tokens: 8192,
         }
@@ -58,7 +66,7 @@ pub trait AiProvider: Send + Sync {
         request: AiTurnRequest,
     ) -> AiProviderFuture<Result<AiProviderResponse, AiProviderError>>;
 }
-pub const SYSTEM_INSTRUCTIONS: &str = "You assist an ISO 11783 VT object-pool designer. Inspect active-mask top-level structure first, then drill into relevant root_id subtrees; page only when needed. Do not request parent/reverse-reference lists for local layout or style tasks. Use nearby objects/styles as examples instead (include_nearby_style). Batch known IDs in get_objects and needed types in get_object_schema object_types; request independent inspections together. Aim for context, one batched inspection, then a proposal. Do not repeat successful reads or guess properties. All edits use propose_transaction and remain staged, never applied. Names are symbolic; IDs identify objects. Positions belong to parent-child relationships. Use SetObjectReference for references and preserve variable/macro links unless the task requires changes. Submit related edits atomically. Review staged previews for overlap, clipping, alignment, spacing and readability. Only propose corrections when needed; corrections target the staged candidate. Finish with a concise summary.";
+pub const SYSTEM_INSTRUCTIONS: &str = "You assist an ISO 11783 VT object-pool designer. Explicit user targets override UI selection. Inspect the requested target top-level structure first, use inspect_design_region for nearby styles, reuse existing FontAttributes/FillAttributes/LineAttributes instead of duplicating them. Call finish_inspection when ready; proposal tools are exposed afterwards. Request stronger reasoning only for a concrete blocker. Inspect active-mask top-level structure first, then drill into relevant root_id subtrees; page only when needed. Do not request parent/reverse-reference lists for local layout or style tasks. Use nearby objects/styles as examples instead (include_nearby_style). Batch known IDs in get_objects and needed types in get_object_schema object_types; request independent inspections together. Aim for context, one batched inspection, then a proposal. Do not repeat successful reads or guess properties. All edits use propose_transaction and remain staged, never applied. Names are symbolic; IDs identify objects. Positions belong to parent-child relationships. Use SetObjectReference for references and preserve variable/macro links unless the task requires changes. Submit related edits atomically. Review staged previews for overlap, clipping, alignment, spacing and readability. Only propose corrections when needed; corrections target the staged candidate. Finish with a concise summary.";
 
 pub fn assistant_message(content: Vec<AiContent>) -> AiMessage {
     AiMessage {

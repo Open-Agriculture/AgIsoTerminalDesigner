@@ -1,5 +1,8 @@
 //! Application-facing orchestration state. It owns snapshots, never an EditorProject.
 use super::backend::{assistant_message, SYSTEM_INSTRUCTIONS};
+use super::task_state::{
+    AiEscalationReason, AiFailureClass, AiModelMode, AiModelRole, AiTaskPhase, AiTaskState,
+};
 use super::{
     analyze_design, get_design_context, get_object_schema, get_objects, propose_transaction,
     AiContent, AiDesignState, AiMessage, AiProposal, AiProvider, AiProviderError, AiRole,
@@ -28,6 +31,7 @@ pub struct AiAssistantState {
     pub active_proposal: Option<AiProposal>,
     pub last_error: Option<String>,
     pub settings: AiSettings,
+    pub request_revision: Option<u64>,
 }
 impl Default for AiAssistantState {
     fn default() -> Self {
@@ -37,6 +41,7 @@ impl Default for AiAssistantState {
             active_proposal: None,
             last_error: None,
             settings: AiSettings::default(),
+            request_revision: None,
         }
     }
 }
@@ -88,42 +93,164 @@ pub fn run_request(
         }
     }
 }
-fn run_loop(
+pub(crate) fn run_loop(
     provider: &dyn AiProvider,
     state: &AiDesignState,
     conversation: &mut Conversation,
-    settings: AiSettings,
+    mut settings: AiSettings,
 ) -> Result<Option<AiProposal>, AiProviderError> {
     let runtime =
         tokio::runtime::Runtime::new().map_err(|e| AiProviderError::Http(e.to_string()))?;
     conversation.debug.lock().unwrap().begin_request();
     let mut cache = ReadToolCache::default();
-    let summary = serde_json::to_string(&super::snapshot::project_summary(state)).unwrap();
-    let mut proposal = None;
+    let goal = conversation
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == AiRole::User)
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|c| {
+                    if let AiContent::Text(t) = c {
+                        Some(t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let mut task = AiTaskState::new(state, goal.clone());
+    if super::task_state::explicit_ids(&goal).len() == 1 && task.explicit_target.is_none() {
+        conversation.push(AiMessage::text(AiRole::Assistant,"The explicitly requested object does not exist in this project revision. Please provide its current ID."));
+        return Ok(None);
+    }
+    settings.role = if settings.mode == AiModelMode::Strong {
+        AiModelRole::Strong
+    } else {
+        AiModelRole::Fast
+    };
+    let mut summary = super::snapshot::project_summary(state);
+    if let Some(target) = &task.explicit_target {
+        summary.selected_object = None;
+        if target.object_type.ends_with("Mask") {
+            summary.project.active_mask = Some(target.clone());
+        }
+    }
+    let summary = serde_json::to_string(&summary).unwrap();
+    // A single explicitly named mask bounds forward inspection. Multiple explicit
+    // targets deliberately remain unbound for legitimate cross-mask work.
+    let target_subtree = task
+        .explicit_target
+        .as_ref()
+        .filter(|t| t.object_type.ends_with("Mask"))
+        .map(|target| {
+            let root = ag_iso_stack::object_pool::ObjectId::new(target.id).ok();
+            let mut ids: std::collections::BTreeSet<u16> = super::snapshot::context_layout(
+                &state.pool,
+                &state.object_info,
+                root,
+                super::snapshot::MAX_SNAPSHOT_DEPTH,
+            )
+            .take(8192)
+            .map(|p| p.object.id)
+            .collect();
+            ids.insert(target.id);
+            ids
+        });
+    let mut pending_escalation = None;
+    let mut handoff: Option<(usize, Value)> = None;
+    let mut proposal: Option<AiProposal> = None;
     let mut calls = 0;
     let mut repairs: usize = 0;
     for round in 0..MAX_TOOL_ROUNDS {
+        if conversation
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            conversation.debug.lock().unwrap().failure_class = Some(AiFailureClass::StaleProject);
+            return Err(AiProviderError::Cancelled);
+        }
+        if let Some(reason) = pending_escalation.take() {
+            if settings.mode == AiModelMode::Automatic && settings.role == AiModelRole::Fast {
+                settings.role = AiModelRole::Strong;
+                task.escalation = Some(reason);
+                let mut packet = task.handoff();
+                if let Some(base) = &proposal {
+                    let value = serde_json::to_value(&base.transaction).unwrap();
+                    packet["staged_base"] = if value.to_string().len() <= 16_384 {
+                        value
+                    } else {
+                        json!({"proposal_id":base.proposal_id,"operation_count":base.summary.operation_count,"transaction_omitted":true})
+                    };
+                    packet["repair_semantics"] = json!("A valid base is staged. propose_transaction supplies a correction against that candidate.");
+                }
+                conversation
+                    .debug
+                    .lock()
+                    .unwrap()
+                    .trace("Model escalation", &packet);
+                handoff = Some((conversation.messages.len(), packet));
+                conversation.replay_generation += 1;
+                repairs = 0;
+            }
+        }
+        settings.phase = task.phase;
         let instructions = format!("{SYSTEM_INSTRUCTIONS}\nProject: {summary}");
+        let mut provider_conversation = conversation.clone();
+        if let Some((cursor, packet)) = &handoff {
+            provider_conversation.messages = vec![
+                AiMessage::text(AiRole::User, &goal),
+                AiMessage::text(AiRole::User, packet.to_string()),
+            ];
+            provider_conversation
+                .messages
+                .extend_from_slice(&conversation.messages[*cursor..]);
+        }
+        provider_conversation.task_state = Some(task.clone());
+        let exposed_tools = super::tools::phase_tool_definitions(task.phase);
+        let allowed: Vec<String> = exposed_tools
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect();
+        let progress_before = task.progress();
         let usage_count = {
             let mut debug = conversation.debug.lock().unwrap();
             debug.provider_rounds = round + 1;
+            debug.current_model = super::providers::openai::model_id(&settings).into();
+            debug.task = Some(task.clone());
             debug.user_request.request_count
         };
+        let started = std::time::Instant::now();
         let response = runtime.block_on(provider.run_turn(AiTurnRequest {
             instructions,
-            conversation: conversation.clone(),
-            tools: super::tools::tool_definitions(),
+            conversation: provider_conversation,
+            tools: exposed_tools,
             settings: settings.clone(),
         }));
         {
             let mut debug = conversation.debug.lock().unwrap();
+            debug.latency_ms += started.elapsed().as_millis() as u64;
             if debug.user_request.request_count == usage_count {
                 if let Ok(response) = &response {
                     debug.record_usage(response.usage.clone());
                 }
             }
         }
-        let response = response?;
+        let response = response.map_err(|error| {
+            conversation.debug.lock().unwrap().failure_class =
+                Some(AiFailureClass::ProviderTransport);
+            error
+        })?;
+        if conversation
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            conversation.debug.lock().unwrap().failure_class = Some(AiFailureClass::StaleProject);
+            return Err(AiProviderError::Cancelled);
+        }
         let tool_calls: Vec<_> = response
             .content
             .iter()
@@ -147,7 +274,7 @@ fn run_loop(
         }
         let mut results = Vec::new();
         let mut stop_reason = None;
-        for call in tool_calls {
+        for mut call in tool_calls {
             if stop_reason.is_some() {
                 results.push(AiContent::ToolResult(AiToolResult { call_id: call.call_id, result: json!({"success":false,"error":"Assistant stopped at its safety limit; this call was not executed."}) }));
                 continue;
@@ -158,12 +285,103 @@ fn run_loop(
                 debug.trace(format!("← Tool call {}", call.name), &call.arguments);
             }
             let cache_hits_before = cache.1;
-            let (mut result, proposed, repair) = cache.execute(state, &call, proposal.as_ref());
+            // Resolve implicit scope without changing the UI selection.
+            if call.name == "get_design_context" && task.explicit_target.is_some() {
+                if call.arguments.get("root_id").is_none()
+                    && call.arguments["scope"] != "EntirePool"
+                {
+                    call.arguments["root_id"] = json!(task.target_root);
+                }
+                call.arguments["include_selection"] = json!(false);
+            }
+            let outside_target = target_subtree.as_ref().is_some_and(|ids| {
+                if matches!(
+                    call.name.as_str(),
+                    "get_design_context" | "inspect_design_region"
+                ) {
+                    call.arguments["scope"] == "EntirePool"
+                        || call.arguments["root_id"]
+                            .as_u64()
+                            .is_some_and(|id| !ids.contains(&(id as u16)))
+                } else if call.name == "get_objects" {
+                    call.arguments["ids"].as_array().is_some_and(|requested| {
+                        requested.iter().filter_map(Value::as_u64).any(|id| {
+                            !ids.contains(&(id as u16))
+                                && ag_iso_stack::object_pool::ObjectId::new(id as u16)
+                                    .ok()
+                                    .and_then(|id| state.pool.object_by_id(id))
+                                    .is_some_and(|o| {
+                                        format!("{:?}", o.object_type()).ends_with("Mask")
+                                    })
+                        })
+                    })
+                } else {
+                    false
+                }
+            });
+            let (mut result, proposed, repair) = if outside_target {
+                (
+                    json!({"success":false,"error":"Forward inspection is bounded to the explicit request mask. Use its descendants; unrelated UI selection is not a target."}),
+                    None,
+                    false,
+                )
+            } else if !allowed.contains(&call.name) {
+                (
+                    json!({"success":false,"error":"Tool unavailable in this phase. Call finish_inspection before proposing."}),
+                    None,
+                    false,
+                )
+            } else if call.name == "finish_inspection" {
+                task.phase = AiTaskPhase::Propose;
+                (json!({"success":true,"phase":"Propose"}), None, false)
+            } else if call.name == "request_stronger_model" {
+                if call.arguments["reason"]
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty() && s.len() <= 512)
+                {
+                    pending_escalation = Some(AiEscalationReason::ModelRequestedHelp);
+                    (
+                        json!({"success":true,"escalation_available":settings.mode == AiModelMode::Automatic && settings.role == AiModelRole::Fast}),
+                        None,
+                        false,
+                    )
+                } else {
+                    (
+                        json!({"success":false,"error":"A short concrete reason is required"}),
+                        None,
+                        false,
+                    )
+                }
+            } else {
+                cache.execute(state, &call, proposal.as_ref())
+            };
+            if result["success"] == false {
+                conversation.debug.lock().unwrap().failure_class =
+                    Some(if result["failure_class"] == "ModelDecision" {
+                        AiFailureClass::ModelDecision
+                    } else if repair {
+                        AiFailureClass::DomainValidation
+                    } else if !allowed.contains(&call.name) {
+                        AiFailureClass::ModelDecision
+                    } else {
+                        AiFailureClass::ToolExecution
+                    });
+            }
+            if allowed.contains(&call.name) {
+                task.observe(&call, &result);
+            }
+            if repair
+                && task.repeated_validation_failure()
+                && settings.role == AiModelRole::Fast
+                && settings.mode == AiModelMode::Automatic
+            {
+                pending_escalation = Some(AiEscalationReason::RepeatedValidationFailure);
+            }
             if repair {
                 repairs += 1;
                 result["repair_attempts_remaining"] =
                     json!(MAX_PROPOSAL_REPAIR_ATTEMPTS.saturating_sub(repairs.saturating_sub(1)));
-                if repairs > MAX_PROPOSAL_REPAIR_ATTEMPTS {
+                if repairs > MAX_PROPOSAL_REPAIR_ATTEMPTS && pending_escalation.is_none() {
                     let diagnostic = result["diagnostics"]
                         .as_str()
                         .unwrap_or("Unknown validation failure");
@@ -201,6 +419,25 @@ fn run_loop(
             role: AiRole::Tool,
             content: results,
         });
+        if let Some(hint) = task.inspection_finished(progress_before) {
+            task.harness_hint = Some(hint.into());
+            conversation
+                .debug
+                .lock()
+                .unwrap()
+                .trace("Harness hint", &json!({"hint":hint}));
+        }
+        if task.stuck() {
+            if settings.role == AiModelRole::Fast && settings.mode == AiModelMode::Automatic {
+                pending_escalation = Some(AiEscalationReason::InspectionLoop);
+                task.phase = AiTaskPhase::Propose;
+            } else {
+                stop_reason = Some(
+                    "Inspection stopped because repeated reads made no useful progress.".into(),
+                );
+            }
+        }
+        conversation.debug.lock().unwrap().task = Some(task.clone());
         if let Some(reason) = stop_reason {
             let outcome = if proposal.is_some() {
                 "The previous valid proposal is still staged for review. No changes have been applied."
@@ -230,6 +467,13 @@ struct ReadToolCache(
 impl ReadToolCache {
     fn key(state: &AiDesignState, call: &AiToolCall) -> Option<(u64, String, String)> {
         let args = match call.name.as_str() {
+            "inspect_design_region" => serde_json::to_value(
+                serde_json::from_value::<super::design_inspection::InspectDesignRegionRequest>(
+                    call.arguments.clone(),
+                )
+                .ok()?,
+            )
+            .ok()?,
             "get_design_context" => serde_json::to_value(
                 serde_json::from_value::<DesignContextRequest>(call.arguments.clone()).ok()?,
             )
@@ -299,6 +543,16 @@ fn execute_tool(
 ) -> (Value, Option<AiProposal>, bool) {
     let parse = |error: String| (json!({"success":false,"error":error}), None, false);
     match call.name.as_str() {
+        "inspect_design_region" => match serde_json::from_value::<
+            super::design_inspection::InspectDesignRegionRequest,
+        >(call.arguments.clone())
+        .map_err(|e| e.to_string())
+        .and_then(|r| {
+            super::design_inspection::inspect_design_region(state, r).map_err(|e| format!("{e:?}"))
+        }) {
+            Ok(v) => (json!({"success":true,"region":v}), None, false),
+            Err(e) => parse(e),
+        },
         "get_design_context" => {
             match serde_json::from_value::<DesignContextRequest>(call.arguments.clone())
                 .map_err(|e| e.to_string())
@@ -357,15 +611,24 @@ fn execute_tool(
             Err(e) => parse(format!("{e:?}")),
         },
         "propose_transaction" => {
-            match serde_json::from_value(call.arguments.clone())
-                .map_err(|e| e.to_string())
-                .and_then(|tx| {
-                    match proposal {
-                        Some(base) => super::propose_refinement(state, base, tx),
-                        None => propose_transaction(state, tx),
-                    }
-                    .map_err(|e| serde_json::to_string(&e).unwrap_or_else(|_| format!("{e:?}")))
-                }) {
+            let tx = match serde_json::from_value::<crate::operations::OperationTransaction>(
+                call.arguments.clone(),
+            ) {
+                Ok(tx) => tx,
+                Err(error) => {
+                    return (
+                        json!({"success":false,"diagnostics":error.to_string(),"failure_class":"ModelDecision"}),
+                        None,
+                        true,
+                    )
+                }
+            };
+            match match proposal {
+                Some(base) => super::propose_refinement(state, base, tx),
+                None => propose_transaction(state, tx),
+            }
+            .map_err(|e| serde_json::to_string(&e).unwrap_or_else(|_| format!("{e:?}")))
+            {
                 Ok(p) => {
                     let analysis =
                         analyze_design(state, Some(&p), DesignAnalysisScope::Proposal).ok();
@@ -420,7 +683,7 @@ mod tests {
             run_loop(&provider, &state, &mut conversation, AiSettings::default()).unwrap();
         assert!(proposal.is_none());
         assert_eq!(provider.0.load(Ordering::SeqCst), MAX_TOOL_ROUNDS);
-        assert_eq!(conversation.messages.len(), MAX_TOOL_ROUNDS * 2 + 1);
+        assert!(conversation.messages.len() <= MAX_TOOL_ROUNDS * 2 + 3);
         assert!(
             matches!(&conversation.messages.last().unwrap().content[0], AiContent::Text(text) if text.contains("No changes have been proposed"))
         );
@@ -436,7 +699,7 @@ mod tests {
         ) -> super::super::AiProviderFuture<Result<super::super::AiProviderResponse, AiProviderError>>
         {
             let round = self.calls.fetch_add(1, Ordering::SeqCst);
-            let arguments = if self.valid_first && round == 0 {
+            let arguments = if self.valid_first && round == 1 {
                 json!({"schema_version":2,"operations":[{"type":"RenameObject","data":{"object":{"id":10},"name":"Renamed"}}]})
             } else {
                 json!({"schema_version":2,"operations":[{"type":"SetProperty","data":{}}]})
@@ -445,7 +708,12 @@ mod tests {
                 Ok(super::super::AiProviderResponse {
                     content: vec![AiContent::ToolCall(AiToolCall {
                         call_id: format!("proposal_{round}"),
-                        name: "propose_transaction".into(),
+                        name: if round == 0 {
+                            "finish_inspection"
+                        } else {
+                            "propose_transaction"
+                        }
+                        .into(),
                         arguments,
                     })],
                     usage: Default::default(),
@@ -472,12 +740,20 @@ mod tests {
             button.mut_id().set_value(10).unwrap();
             state.pool.add(button);
             let mut conversation = Conversation::default();
-            let proposal =
-                run_loop(&provider, &state, &mut conversation, AiSettings::default()).unwrap();
+            let proposal = run_loop(
+                &provider,
+                &state,
+                &mut conversation,
+                AiSettings {
+                    mode: AiModelMode::Fast,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             assert_eq!(proposal.is_some(), valid_first);
             assert_eq!(
                 provider.calls.load(Ordering::SeqCst),
-                3 + usize::from(valid_first)
+                4 + usize::from(valid_first)
             );
             assert!(
                 matches!(&conversation.messages.last().unwrap().content[0], AiContent::Text(text) if text.contains("missing field `object`") && text.contains("No changes"))
@@ -516,7 +792,7 @@ mod efficiency_tests {
                 }
                 _ => ("", json!({})),
             };
-            let content = if round < 3 {
+            let mut content = if round < 3 {
                 vec![AiContent::ToolCall(AiToolCall {
                     call_id: format!("call_{round}"),
                     name: name.into(),
@@ -525,6 +801,13 @@ mod efficiency_tests {
             } else {
                 vec![AiContent::Text("Staged for review".into())]
             };
+            if round == 1 {
+                content.push(AiContent::ToolCall(AiToolCall {
+                    call_id: "finish".into(),
+                    name: "finish_inspection".into(),
+                    arguments: json!({}),
+                }));
+            }
             let total_tokens = [1000, 1400, 800, 50][round];
             Box::pin(async move {
                 Ok(super::super::AiProviderResponse {
@@ -568,7 +851,7 @@ mod efficiency_tests {
                 .flat_map(|m| &m.content)
                 .filter(|c| matches!(c, AiContent::ToolResult(_)))
                 .count(),
-            3
+            4
         );
         assert_eq!(
             conversation
@@ -838,7 +1121,7 @@ mod phase52_workflows {
                 .unwrap()
                 .record_request(&body);
             self.bodies.lock().unwrap().push(body);
-            let content = if let Some((name, args)) = self.calls.get(step) {
+            let mut content = if let Some((name, args)) = self.calls.get(step) {
                 vec![AiContent::ToolCall(AiToolCall {
                     call_id: format!("call_{step}"),
                     name: (*name).into(),
@@ -847,6 +1130,17 @@ mod phase52_workflows {
             } else {
                 vec![AiContent::Text("Staged for review".into())]
             };
+            if self
+                .calls
+                .get(step + 1)
+                .is_some_and(|(name, _)| *name == "propose_transaction")
+            {
+                content.push(AiContent::ToolCall(AiToolCall {
+                    call_id: format!("finish_{step}"),
+                    name: "finish_inspection".into(),
+                    arguments: json!({}),
+                }));
+            }
             Box::pin(async move {
                 Ok(super::super::AiProviderResponse {
                     content,
@@ -931,5 +1225,386 @@ mod phase52_workflows {
             }
             assert!(totals[1] < totals[0]);
         }
+    }
+}
+
+#[cfg(test)]
+mod phase54_tests {
+    use super::*;
+    use std::sync::Mutex;
+    struct Script {
+        rounds: Mutex<Vec<Vec<(&'static str, Value)>>>,
+        requests: Mutex<Vec<AiTurnRequest>>,
+    }
+    impl AiProvider for Script {
+        fn run_turn(
+            &self,
+            request: AiTurnRequest,
+        ) -> super::super::AiProviderFuture<Result<super::super::AiProviderResponse, AiProviderError>>
+        {
+            let mut requests = self.requests.lock().unwrap();
+            let index = requests.len();
+            requests.push(request);
+            let mut rounds = self.rounds.lock().unwrap();
+            let calls = if rounds.is_empty() {
+                vec![]
+            } else {
+                rounds.remove(0)
+            };
+            let content = if calls.is_empty() {
+                vec![AiContent::Text("Done".into())]
+            } else {
+                calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (name, args))| {
+                        AiContent::ToolCall(AiToolCall {
+                            call_id: format!("r{index}_{i}"),
+                            name: name.into(),
+                            arguments: args,
+                        })
+                    })
+                    .collect()
+            };
+            Box::pin(async move {
+                Ok(super::super::AiProviderResponse {
+                    content,
+                    usage: super::super::AiTokenUsage {
+                        input_tokens: 100,
+                        cached_input_tokens: 40,
+                        output_tokens: 10,
+                        total_tokens: 110,
+                        ..Default::default()
+                    },
+                })
+            })
+        }
+    }
+    fn tx(valid: bool) -> Value {
+        if valid {
+            json!({"schema_version":2,"operations":[{"type":"RenameObject","data":{"object":{"id":10},"name":"Renamed"}}]})
+        } else {
+            json!({"schema_version":2,"operations":[{"type":"SetProperty","data":{}}]})
+        }
+    }
+    fn fixture() -> AiDesignState {
+        let mut state = super::super::efficiency_tests::pool(0, 0);
+        let mut button = crate::default_object(ObjectType::Button);
+        button.mut_id().set_value(10).unwrap();
+        state.pool.add(button);
+        state
+    }
+    fn script(rounds: Vec<Vec<(&'static str, Value)>>) -> Script {
+        Script {
+            rounds: Mutex::new(rounds),
+            requests: Mutex::new(vec![]),
+        }
+    }
+    #[test]
+    fn normal_and_forced_modes_lazy_tools_and_usage() {
+        for mode in [
+            AiModelMode::Automatic,
+            AiModelMode::Fast,
+            AiModelMode::Strong,
+        ] {
+            let provider = script(vec![
+                vec![
+                    ("get_objects", json!({"ids":[10]})),
+                    ("finish_inspection", json!({})),
+                ],
+                vec![("propose_transaction", tx(true))],
+            ]);
+            let mut c = Conversation::default();
+            let p = run_loop(
+                &provider,
+                &fixture(),
+                &mut c,
+                AiSettings {
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(p.is_some());
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            let expected = if mode == AiModelMode::Strong {
+                AiModelRole::Strong
+            } else {
+                AiModelRole::Fast
+            };
+            assert!(requests.iter().all(|r| r.settings.role == expected));
+            assert!(!requests[0]
+                .tools
+                .iter()
+                .any(|v| v["name"] == "propose_transaction"));
+            assert!(requests[1]
+                .tools
+                .iter()
+                .any(|v| v["name"] == "propose_transaction"));
+            assert!(
+                serde_json::to_string(&requests[0].tools).unwrap().len()
+                    < serde_json::to_string(&super::super::tools::tool_definitions())
+                        .unwrap()
+                        .len()
+            );
+            let d = c.debug.lock().unwrap();
+            assert_eq!(d.model_usage.len(), 1);
+            let u = d.model_usage.values().next().unwrap();
+            assert_eq!(u.request_count, 3);
+            assert_eq!(u.tokens.input_tokens, 300);
+            assert_eq!(u.tokens.cached_input_tokens, 120);
+            assert_eq!(u.tokens.uncached_input_tokens(), 180);
+            assert_eq!(u.tokens.output_tokens, 30);
+            assert_eq!(u.tokens.total_tokens, 330);
+        }
+    }
+    #[test]
+    fn validation_escalates_once_with_compact_handoff_and_shared_cache() {
+        let provider = script(vec![
+            vec![
+                ("get_objects", json!({"ids":[10]})),
+                ("finish_inspection", json!({})),
+            ],
+            vec![("propose_transaction", tx(false))],
+            vec![("propose_transaction", tx(false))],
+            vec![
+                ("get_objects", json!({"ids":[10]})),
+                ("propose_transaction", tx(true)),
+            ],
+        ]);
+        let mut c = Conversation::default();
+        assert!(
+            run_loop(&provider, &fixture(), &mut c, AiSettings::default())
+                .unwrap()
+                .is_some()
+        );
+        let r = provider.requests.lock().unwrap();
+        assert!(r[..3].iter().all(|r| r.settings.role == AiModelRole::Fast));
+        assert!(r[3..]
+            .iter()
+            .all(|r| r.settings.role == AiModelRole::Strong));
+        assert_eq!(r[3].conversation.messages.len(), 2);
+        assert!(r[3]
+            .conversation
+            .messages
+            .iter()
+            .all(|m| m.content.iter().all(|c| matches!(c, AiContent::Text(_)))));
+        let d = c.debug.lock().unwrap();
+        assert_eq!(
+            d.task.as_ref().unwrap().escalation,
+            Some(AiEscalationReason::RepeatedValidationFailure)
+        );
+        assert_eq!(d.tools["get_objects"].cache_hits, 1);
+        assert_eq!(
+            d.entries
+                .iter()
+                .filter(|e| e.label == "Model escalation")
+                .count(),
+            1
+        );
+        assert_eq!(d.user_request.tokens.input_tokens, 500);
+    }
+    #[test]
+    fn repeated_inspection_warns_before_escalating() {
+        let mut rounds = vec![vec![("get_object_schema", json!({"object_type":"Button"}))]; 4];
+        rounds.push(vec![("propose_transaction", tx(true))]);
+        let provider = script(rounds);
+        let mut c = Conversation::default();
+        assert!(
+            run_loop(&provider, &fixture(), &mut c, AiSettings::default())
+                .unwrap()
+                .is_some()
+        );
+        let r = provider.requests.lock().unwrap();
+        assert!(r[2]
+            .conversation
+            .task_state
+            .as_ref()
+            .unwrap()
+            .harness_hint
+            .is_some());
+        assert_eq!(r[4].settings.role, AiModelRole::Strong);
+        assert_eq!(
+            c.debug.lock().unwrap().task.as_ref().unwrap().escalation,
+            Some(AiEscalationReason::InspectionLoop)
+        );
+    }
+    #[test]
+    fn focused_cache_normalizes_defaults_and_rejects_unrelated_mask_reads() {
+        let mut state = fixture();
+        let mut other = crate::default_object(ObjectType::DataMask);
+        other.mut_id().set_value(3).unwrap();
+        state.pool.add(other);
+        let mut cache = ReadToolCache::default();
+        let call = AiToolCall {
+            call_id: "a".into(),
+            name: "inspect_design_region".into(),
+            arguments: json!({"root_id":2}),
+        };
+        assert_eq!(cache.execute(&state, &call, None).0["success"], true);
+        let normalized = AiToolCall {
+            arguments: serde_json::to_value(
+                super::super::design_inspection::InspectDesignRegionRequest {
+                    root_id: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+            ..call
+        };
+        cache.execute(&state, &normalized, None);
+        assert_eq!(cache.1, 1);
+        state.revision += 1;
+        cache.execute(&state, &normalized, None);
+        assert_eq!(cache.1, 1);
+        let provider = script(vec![vec![
+            ("inspect_design_region", json!({"root_id":3})),
+            ("finish_inspection", json!({})),
+        ]]);
+        let mut c = Conversation::default();
+        c.push(AiMessage::text(AiRole::User, "Modify DataMask 2"));
+        run_loop(&provider, &state, &mut c, AiSettings::default()).unwrap();
+        let requests = provider.requests.lock().unwrap();
+        assert!(requests[1]
+            .conversation
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|v| matches!(v,AiContent::ToolResult(r) if r.result["success"]==false)));
+        assert!(!c
+            .debug
+            .lock()
+            .unwrap()
+            .task
+            .as_ref()
+            .unwrap()
+            .inspected_roots
+            .contains(&3));
+    }
+    #[test]
+    fn cancellation_and_transport_errors_do_not_trigger_quality_escalation() {
+        struct Unavailable;
+        impl AiProvider for Unavailable {
+            fn run_turn(
+                &self,
+                _: AiTurnRequest,
+            ) -> super::super::AiProviderFuture<
+                Result<super::super::AiProviderResponse, AiProviderError>,
+            > {
+                Box::pin(async { Err(AiProviderError::Timeout) })
+            }
+        }
+        let mut c = Conversation::default();
+        assert!(matches!(
+            run_loop(&Unavailable, &fixture(), &mut c, AiSettings::default()),
+            Err(AiProviderError::Timeout)
+        ));
+        let d = c.debug.lock().unwrap();
+        assert_eq!(d.failure_class, Some(AiFailureClass::ProviderTransport));
+        assert_eq!(d.task.as_ref().unwrap().validation_failures, 0);
+        assert!(d.task.as_ref().unwrap().escalation.is_none());
+        drop(d);
+        c.cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let provider = script(vec![]);
+        assert!(matches!(
+            run_loop(&provider, &fixture(), &mut c, AiSettings::default()),
+            Err(AiProviderError::Cancelled)
+        ));
+        assert!(provider.requests.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn explicit_help_respects_forced_modes() {
+        for mode in [
+            AiModelMode::Automatic,
+            AiModelMode::Fast,
+            AiModelMode::Strong,
+        ] {
+            let provider = script(vec![
+                vec![
+                    (
+                        "request_stronger_model",
+                        json!({"reason":"Conflicting relationship constraints"}),
+                    ),
+                    ("finish_inspection", json!({})),
+                ],
+                vec![("propose_transaction", tx(true))],
+            ]);
+            let mut c = Conversation::default();
+            assert!(run_loop(
+                &provider,
+                &fixture(),
+                &mut c,
+                AiSettings {
+                    mode,
+                    ..Default::default()
+                }
+            )
+            .unwrap()
+            .is_some());
+            let d = c.debug.lock().unwrap();
+            assert_eq!(
+                d.task.as_ref().unwrap().escalation.is_some(),
+                mode == AiModelMode::Automatic
+            );
+            let r = provider.requests.lock().unwrap();
+            assert_eq!(
+                r[1].settings.role,
+                if mode == AiModelMode::Fast {
+                    AiModelRole::Fast
+                } else {
+                    AiModelRole::Strong
+                }
+            );
+        }
+    }
+    #[test]
+    fn explicit_target_overrides_selection_without_mutating_it() {
+        let state = fixture();
+        let original = state.selected;
+        let provider = script(vec![
+            vec![
+                ("get_design_context", json!({"scope":"Selection"})),
+                ("finish_inspection", json!({})),
+            ],
+            vec![("propose_transaction", tx(true))],
+        ]);
+        let mut c = Conversation::default();
+        c.push(AiMessage::text(AiRole::User, "Modify DataMask 2"));
+        run_loop(&provider, &state, &mut c, AiSettings::default()).unwrap();
+        assert_eq!(state.selected, original);
+        let r = provider.requests.lock().unwrap();
+        let result = r[1]
+            .conversation
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|c| {
+                if let AiContent::ToolResult(r) = c {
+                    Some(&r.result)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(
+            result["context"].get("selection").is_none()
+                || result["context"]["selection"].is_null()
+        );
+        assert_eq!(result["context"]["objects"][0]["id"], 2);
+        assert_eq!(
+            c.debug
+                .lock()
+                .unwrap()
+                .task
+                .as_ref()
+                .unwrap()
+                .explicit_target
+                .as_ref()
+                .unwrap()
+                .id,
+            2
+        );
     }
 }
