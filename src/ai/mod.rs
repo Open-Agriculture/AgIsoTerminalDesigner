@@ -39,3 +39,6 @@ pub use design_analysis::{analyze_design, DesignAnalysis, DesignAnalysisError, D
 mod efficiency_tests;
 
 mod wire;
+
+#[cfg(test)]
+mod phase53_tests;

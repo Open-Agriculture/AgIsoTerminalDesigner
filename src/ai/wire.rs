@@ -85,9 +85,7 @@ pub fn context(value: super::snapshot::DesignSnapshot) -> Value {
         placement["parent"] = placement["parent"]["id"].clone();
         let fields = placement.as_object_mut().unwrap();
         fields.remove("object");
-        // Context placements are direct parent-relative edges, not traversal paths.
-        fields.remove("path");
-        fields.remove("depth");
+        // Keep the actual root path: shared objects can have multiple placements.
         placement
             .as_object_mut()
             .unwrap()
@@ -188,7 +186,7 @@ mod tests {
         assert!(compact["objects"][1].get("properties").is_none());
         assert_eq!(compact["layout"][0]["parent"], 2);
         assert!(compact["layout"][0]["width"].is_number());
-        assert_eq!(compact["next_offset"], 50);
+        assert_eq!(compact["next_layout_offset"], 50);
         println!(
             "Context rich {before} -> compact {} bytes",
             compact.to_string().len()

@@ -1,6 +1,6 @@
 use super::AiDesignState;
 use crate::ai::snapshot::{
-    active_mask, object_snapshot, selected_ids, DesignContextRequest, DesignSnapshot,
+    active_mask, object_snapshot_sections, selected_ids, DesignContextRequest, DesignSnapshot,
     SnapshotScope, MAX_SNAPSHOT_OBJECTS,
 };
 use ag_iso_stack::object_pool::ObjectId;
@@ -30,12 +30,18 @@ pub struct GetObjectsRequest {
     pub include_children: bool,
     pub include_parents: bool,
     pub include_macros: bool,
+    pub parent_offset: usize,
+    pub parent_limit: usize,
+    pub include_nearby_style: bool,
     pub detail_offset: usize,
     pub detail_limit: usize,
     pub property_offset: usize,
     pub property_limit: usize,
 }
 
+pub const DEFAULT_PARENT_LIMIT: usize = 8;
+pub const MAX_PARENT_LIMIT: usize = 20;
+pub const MAX_NEARBY_STYLE: usize = 8;
 pub const MAX_GET_OBJECTS: usize = 20;
 pub const MAX_DETAIL_ITEMS: usize = 100;
 pub const MAX_PROPERTY_ITEMS: usize = 4096;
@@ -46,7 +52,10 @@ impl Default for GetObjectsRequest {
             include_properties: true,
             include_references: true,
             include_children: false,
-            include_parents: true,
+            include_parents: false,
+            parent_offset: 0,
+            parent_limit: DEFAULT_PARENT_LIMIT,
+            include_nearby_style: false,
             include_macros: false,
             detail_offset: 0,
             detail_limit: MAX_DETAIL_ITEMS,
@@ -62,6 +71,14 @@ pub struct ObjectDetails {
     pub truncated: bool,
     pub next_detail_offset: Option<usize>,
     pub next_property_offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parents_truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_parent_offset: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nearby_style: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,8 +117,8 @@ impl GetObjectSchemaRequest {
 /// Provider-facing definitions for precisely the four Phase 3 domain tools.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
-        function("get_design_context", "Compact layout overview. Page with offset; use root_id to inspect deeper subtrees. Properties opt-in; prefer get_objects for details. Layout uses parent-relative coordinates; page placements with layout_offset.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["ActiveMask","Selection","EntirePool"]},"include_selection":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"layout_offset":{"type":"integer","minimum":0},"root_id":{"type":"integer","minimum":0,"maximum":65534},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"depth":{"type":"integer","minimum":0,"maximum":8},"max_objects":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
-        function("get_objects", "Batch known IDs (up to 20) for full properties. Optional relationships page with detail_offset/detail_limit; follow next_detail_offset. Long property strings/arrays page in characters/items with property_offset/property_limit; follow next_property_offset.", json!({"type":"object","properties":{"ids":{"type":"array","maxItems":20,"items":{"type":"integer","minimum":0,"maximum":65534}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean"},"include_macros":{"type":"boolean"},"detail_offset":{"type":"integer","minimum":0},"detail_limit":{"type":"integer","minimum":1,"maximum":100},"property_offset":{"type":"integer","minimum":0},"property_limit":{"type":"integer","minimum":1,"maximum":4096}},"required":["ids"],"additionalProperties":false})),
+        function("get_design_context", "Forward layout overview, depth 1 by default: direct children with geometry first. Drill into root_id for relevant subtrees; page with layout_offset only when needed. Objects contain only summaries first needed on that layout page. EntirePool pages objects with offset. Coordinates are parent-relative; path identifies occurrences. Properties opt-in.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["ActiveMask","Selection","EntirePool"]},"include_selection":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"layout_offset":{"type":"integer","minimum":0},"root_id":{"type":"integer","minimum":0,"maximum":65534},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"depth":{"type":"integer","minimum":0,"maximum":8},"max_objects":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
+        function("get_objects", "Batch relevant IDs (up to 20), requesting only required sections. Parents are reverse references and may be large: leave include_parents false unless reverse usage is needed; shared variables/styles may have many parents. Parents page independently with parent_offset/parent_limit (default 8, max 20). include_nearby_style returns up to 8 descendant style examples with resolved styles; page with detail_offset. Children/macros page with detail_offset/detail_limit. Long properties page with property_offset/property_limit.", json!({"type":"object","properties":{"ids":{"type":"array","maxItems":20,"items":{"type":"integer","minimum":0,"maximum":65534}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean","default":false},"parent_offset":{"type":"integer","minimum":0},"parent_limit":{"type":"integer","minimum":1,"maximum":20},"include_nearby_style":{"type":"boolean"},"include_macros":{"type":"boolean"},"detail_offset":{"type":"integer","minimum":0},"detail_limit":{"type":"integer","minimum":1,"maximum":100},"property_offset":{"type":"integer","minimum":0},"property_limit":{"type":"integer","minimum":1,"maximum":4096}},"required":["ids"],"additionalProperties":false})),
         function("get_object_schema", "Writable properties and relationship rules. Batch all needed types (up to 10) in object_types; object_type accepts a single type.", json!({"type":"object","properties":{"object_type":{"type":"string"},"object_types":{"type":"array","minItems":1,"maxItems":MAX_SCHEMA_TYPES_PER_CALL,"items":{"type":"string"}}},"anyOf":[{"required":["object_type"]},{"required":["object_types"]}],"additionalProperties":false})),
         function("propose_transaction", "Validates and stages one atomic design change without modifying the user's project. All edits must be submitted through this tool.", compact_transaction_schema()),
         function("analyze_design", "Returns deterministic visual design-quality diagnostics. It is read-only and does not replace domain validation.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["active_mask","proposal"]}},"additionalProperties":false})),
@@ -259,25 +276,63 @@ pub fn get_design_context(
         request.scope
     };
     let depth = request.depth.min(crate::ai::snapshot::MAX_CONTEXT_DEPTH);
-    let (mut ids, depth_limited) = selected_ids(&state.pool, root, scope, depth);
-    if request.include_selection {
-        if let Some(selected) = state.selected {
-            if !ids.contains(&selected) {
-                ids.push(selected);
+    let (all_ids, depth_limited) = selected_ids(&state.pool, root, scope, depth);
+    let total_matching_objects = all_ids.len();
+    let limit = request.max_objects.clamp(1, MAX_SNAPSHOT_OBJECTS);
+    let mut layout = Vec::new();
+    let mut earlier = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    let mut layout_more = false;
+    // EntirePool retains explicit object pagination. Scoped reads page placements,
+    // with a dictionary containing only identities first needed on this page.
+    let object_paging = scope == SnapshotScope::EntirePool || request.offset > 0;
+    let next_offset;
+    if object_paging {
+        ids.extend(all_ids.iter().skip(request.offset).take(limit).copied());
+        next_offset = (request.offset.saturating_add(ids.len()) < total_matching_objects)
+            .then_some(request.offset.saturating_add(ids.len()));
+        if scope != SnapshotScope::EntirePool {
+            layout =
+                crate::ai::snapshot::context_layout(&state.pool, &state.object_info, root, depth)
+                    .filter(|p| ids.iter().any(|id| id.value() == p.object.id))
+                    .skip(request.layout_offset)
+                    .take(limit + 1)
+                    .collect();
+            layout_more = layout.len() > limit;
+            layout.truncate(limit);
+        }
+    } else {
+        next_offset = None;
+        if let Some(root) = root {
+            earlier.insert(root.value());
+            if request.layout_offset == 0 {
+                ids.push(root);
             }
         }
+        for (index, placement) in
+            crate::ai::snapshot::context_layout(&state.pool, &state.object_info, root, depth)
+                .enumerate()
+        {
+            if index < request.layout_offset {
+                earlier.insert(placement.object.id);
+                continue;
+            }
+            if layout.len() == limit {
+                layout_more = true;
+                break;
+            }
+            if earlier.insert(placement.object.id) {
+                ids.push(ObjectId::new(placement.object.id).unwrap());
+            }
+            layout.push(placement);
+        }
     }
-    let total_matching_objects = ids.len();
-    let limit = request.max_objects.clamp(1, MAX_SNAPSHOT_OBJECTS);
-    let ids: Vec<_> = ids.into_iter().skip(request.offset).take(limit).collect();
-    let next_offset = (request.offset.saturating_add(ids.len()) < total_matching_objects)
-        .then_some(request.offset.saturating_add(ids.len()));
     let mut properties_truncated = false;
     let objects: Vec<_> = ids
         .iter()
         .filter_map(|id| {
             let mut object = if request.include_properties || request.include_references {
-                object_snapshot(&state.pool, &state.object_info, *id)?
+                object_snapshot_sections(&state.pool, &state.object_info, *id, false)?
             } else {
                 let summary = crate::ai::snapshot::summary(&state.pool, &state.object_info, *id)?;
                 crate::ai::snapshot::ObjectSnapshot {
@@ -309,75 +364,25 @@ pub fn get_design_context(
             Some(object)
         })
         .collect();
-    // Page all incoming placements for returned objects, including parents outside
-    // this object page. Coordinates are explicitly parent-relative.
-    let mut layout = Vec::new();
-    let mut placement_index = 0usize;
-    let mut layout_more = false;
-    'objects: for id in &ids {
-        let mut parents = state.pool.parent_objects(*id);
-        parents.sort_by_key(|p| p.id().value());
-        parents.dedup_by_key(|p| p.id());
-        for parent in parents {
-            for placement in crate::operations::object_refs(parent)
-                .unwrap_or_default()
-                .iter()
-                .filter(|p| p.id == *id)
-            {
-                if placement_index < request.layout_offset {
-                    placement_index += 1;
-                    continue;
-                }
-                if layout.len() == limit {
-                    layout_more = true;
-                    break 'objects;
-                }
-                let child =
-                    crate::ai::snapshot::summary(&state.pool, &state.object_info, *id).unwrap();
-                let child_object = state.pool.object_by_id(*id).unwrap();
-                let dimension = |name| {
-                    crate::object_properties::get_object_property(child_object, name)
-                        .ok()
-                        .and_then(|v| v.as_u64())
-                        .and_then(|v| u16::try_from(v).ok())
-                };
-                layout.push(crate::ai::snapshot::LayoutInstance {
-                    object: child,
-                    parent: crate::ai::snapshot::summary(
-                        &state.pool,
-                        &state.object_info,
-                        parent.id(),
-                    )
-                    .unwrap(),
-                    x: placement.offset.x.into(),
-                    y: placement.offset.y.into(),
-                    width: dimension("width"),
-                    height: dimension("height"),
-                    depth: 1,
-                    path: vec![parent.id().value(), id.value()],
-                });
-            }
-        }
-    }
     let summary = crate::ai::snapshot::project_summary(state);
     Ok(DesignSnapshot {
-        schema_version: 4,
+        schema_version: 5,
         project: summary.project,
-        selection: summary.selected_object,
+        selection: request
+            .include_selection
+            .then_some(summary.selected_object)
+            .flatten(),
         returned_objects: objects.len(),
         total_matching_objects,
         next_offset,
         depth_limited,
-        truncated: depth_limited
-            || next_offset.is_some()
-            || request.offset > 0
-            || layout_more
-            || request.layout_offset > 0
-            || properties_truncated,
+        truncated: depth_limited || next_offset.is_some() || layout_more || properties_truncated,
         next_layout_offset: layout_more
             .then_some(request.layout_offset.saturating_add(layout.len())),
         layout_coordinates: "parent_relative".into(),
         properties_truncated,
+        objects_truncated: next_offset.is_some(),
+        layout_truncated: layout_more,
         objects,
         layout,
     })
@@ -395,8 +400,13 @@ pub fn get_objects(
     ids.into_iter()
         .map(|id| {
             let id = ObjectId::new(id).map_err(|_| AiToolError::ObjectNotFound(id))?;
-            let mut object = object_snapshot(&state.pool, &state.object_info, id)
-                .ok_or(AiToolError::ObjectNotFound(id.value()))?;
+            let mut object = object_snapshot_sections(
+                &state.pool,
+                &state.object_info,
+                id,
+                request.include_parents,
+            )
+            .ok_or(AiToolError::ObjectNotFound(id.value()))?;
             if !request.include_properties {
                 object.properties.clear();
             }
@@ -431,7 +441,15 @@ pub fn get_objects(
                 limit,
                 &mut more,
             );
-            page(&mut object.parents, request.detail_offset, limit, &mut more);
+            let parent_count = request.include_parents.then_some(object.parents.len());
+            let parent_limit = request.parent_limit.clamp(1, MAX_PARENT_LIMIT);
+            let mut parents_more = false;
+            page(
+                &mut object.parents,
+                request.parent_offset,
+                parent_limit,
+                &mut parents_more,
+            );
             page(
                 &mut object.macro_references,
                 request.detail_offset,
@@ -449,8 +467,16 @@ pub fn get_objects(
                 }
             }
             Ok(ObjectDetails {
+                parent_count,
+                parents_truncated: request.include_parents.then_some(parents_more),
+                next_parent_offset: parents_more
+                    .then_some(request.parent_offset.saturating_add(parent_limit)),
+                nearby_style: request
+                    .include_nearby_style
+                    .then(|| nearby_style(state, id, request.detail_offset)),
                 object,
-                truncated: more
+                truncated: parents_more
+                    || more
                     || request.detail_offset > 0
                     || property_more
                     || request.property_offset > 0,
@@ -460,6 +486,56 @@ pub fn get_objects(
             })
         })
         .collect()
+}
+
+/// Inspect a container's display descendants, never its reverse users. This is
+/// intentionally a bounded sample; detail_offset pages further examples.
+fn nearby_style(state: &AiDesignState, root: ObjectId, offset: usize) -> Value {
+    use crate::object_properties::get_object_property;
+    let mut examples = Vec::new();
+    let mut more = false;
+    for placement in
+        crate::ai::snapshot::context_layout(&state.pool, &state.object_info, Some(root), 2)
+            .skip(offset)
+            .take(MAX_NEARBY_STYLE + 1)
+    {
+        if examples.len() == MAX_NEARBY_STYLE {
+            more = true;
+            break;
+        }
+        let object = state
+            .pool
+            .object_by_id(ObjectId::new(placement.object.id).unwrap())
+            .unwrap();
+        let mut example = json!({"id":placement.object.id,"type":placement.object.object_type,
+            "x":placement.x,"y":placement.y,"path":placement.path});
+        for name in ["width", "height", "background_colour", "justification"] {
+            if let Ok(value) = get_object_property(object, name) {
+                example[name] = value;
+            }
+        }
+        for name in ["font_attributes", "line_attributes", "fill_attributes"] {
+            if let Ok(value) = get_object_property(object, name) {
+                if let Ok(id) =
+                    serde_json::from_value::<ag_iso_stack::object_pool::NullableObjectId>(value)
+                {
+                    if let Some(style) = id.0.and_then(|id| state.pool.object_by_id(id)) {
+                        let mut resolved = json!({"id":style.id().value()});
+                        for descriptor in
+                            crate::object_properties::get_property_descriptors(style.object_type())
+                        {
+                            if let Ok(v) = get_object_property(style, descriptor.name) {
+                                resolved[descriptor.name] = v;
+                            }
+                        }
+                        example[name] = resolved;
+                    }
+                }
+            }
+        }
+        examples.push(example);
+    }
+    json!({"examples":examples,"truncated":more,"next_offset":more.then_some(offset.saturating_add(MAX_NEARBY_STYLE))})
 }
 
 /// Long scalar strings and arrays remain accessible without unbounded tool payloads.

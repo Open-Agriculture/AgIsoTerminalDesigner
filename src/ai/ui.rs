@@ -504,7 +504,7 @@ mod efficiency_tests {
             let (name, arguments) = match round {
                 0 => ("get_design_context", json!({})),
                 1 => {
-                    assert!(request.conversation.messages.iter().flat_map(|m| &m.content).any(|c| matches!(c, AiContent::ToolResult(r) if r.result["context"]["objects"][0]["id"] == 10)));
+                    assert!(request.conversation.messages.iter().flat_map(|m| &m.content).any(|c| matches!(c, AiContent::ToolResult(r) if r.result["context"]["selection"]["id"] == 10)));
                     ("get_objects", json!({"ids":[10]}))
                 }
                 2 => {

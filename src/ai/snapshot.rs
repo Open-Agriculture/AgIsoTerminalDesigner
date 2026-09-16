@@ -25,6 +25,8 @@ pub struct DesignSnapshot {
     pub next_layout_offset: Option<usize>,
     pub layout_coordinates: String,
     pub properties_truncated: bool,
+    pub objects_truncated: bool,
+    pub layout_truncated: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectSnapshot {
@@ -118,7 +120,7 @@ impl Default for DesignContextRequest {
         Self {
             scope: SnapshotScope::ActiveMask,
             include_selection: true,
-            depth: MAX_CONTEXT_DEPTH,
+            depth: 1,
             offset: 0,
             layout_offset: 0,
             root_id: None,
@@ -166,10 +168,19 @@ fn reference(
         object_type: found.map(|v| v.object_type),
     }
 }
+#[cfg(test)]
 pub(crate) fn object_snapshot(
     pool: &ObjectPool,
     info: &HashMap<ObjectId, ObjectInfo>,
     id: ObjectId,
+) -> Option<ObjectSnapshot> {
+    object_snapshot_sections(pool, info, id, true)
+}
+pub(crate) fn object_snapshot_sections(
+    pool: &ObjectPool,
+    info: &HashMap<ObjectId, ObjectInfo>,
+    id: ObjectId,
+    include_parents: bool,
 ) -> Option<ObjectSnapshot> {
     let object = pool.object_by_id(id)?;
     let s = summary(pool, info, id)?;
@@ -230,11 +241,14 @@ pub(crate) fn object_snapshot(
             }
         })
         .collect();
-    let mut parents: Vec<_> = pool
-        .parent_objects(id)
-        .into_iter()
-        .filter_map(|p| summary(pool, info, p.id()))
-        .collect();
+    let mut parents: Vec<_> = if include_parents {
+        pool.parent_objects(id)
+    } else {
+        Vec::new()
+    }
+    .into_iter()
+    .filter_map(|p| summary(pool, info, p.id()))
+    .collect();
     parents.sort_by_key(|p| p.id);
     parents.dedup_by_key(|p| p.id);
     Some(ObjectSnapshot {
@@ -330,6 +344,75 @@ pub(crate) fn layout_instances(
     }
     result
 }
+/// Forward display edges only: never styles, variables, or reverse usage.
+pub(crate) fn display_children(object: &Object) -> Vec<(ObjectId, i32, i32)> {
+    let mut children: Vec<_> = object_refs(object)
+        .unwrap_or_default()
+        .iter()
+        .map(|p| (p.id, i32::from(p.offset.x), i32::from(p.offset.y)))
+        .collect();
+    if let Object::ObjectPointer(pointer) = object {
+        if let Some(id) = pointer.value.0 {
+            children.push((id, 0, 0));
+        }
+    }
+    children
+}
+
+/// Breadth first, parent-relative placements. Ancestors are path-local so shared
+/// objects and repeated edges remain distinct while cycles stop at their edge.
+pub(crate) fn context_layout<'a>(
+    pool: &'a ObjectPool,
+    info: &'a HashMap<ObjectId, ObjectInfo>,
+    root: Option<ObjectId>,
+    max_depth: usize,
+) -> impl Iterator<Item = LayoutInstance> + 'a {
+    let mut queue = std::collections::VecDeque::new();
+    if let Some(root) = root {
+        queue.push_back((root, vec![root.value()], 0));
+    }
+    let mut pending = std::collections::VecDeque::new();
+    std::iter::from_fn(move || loop {
+        if let Some(item) = pending.pop_front() {
+            return Some(item);
+        }
+        let (id, path, depth) = queue.pop_front()?;
+        if depth >= max_depth {
+            continue;
+        }
+        let Some(parent_object) = pool.object_by_id(id) else {
+            continue;
+        };
+        for (child_id, x, y) in display_children(parent_object) {
+            if path.contains(&child_id.value()) {
+                continue;
+            }
+            let Some(child) = summary(pool, info, child_id) else {
+                continue;
+            };
+            let child_object = pool.object_by_id(child_id).unwrap();
+            let dimension = |name| {
+                get_object_property(child_object, name)
+                    .ok()
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| u16::try_from(v).ok())
+            };
+            let mut child_path = path.clone();
+            child_path.push(child_id.value());
+            pending.push_back(LayoutInstance {
+                object: child,
+                parent: summary(pool, info, id).unwrap(),
+                x,
+                y,
+                width: dimension("width"),
+                height: dimension("height"),
+                depth: depth + 1,
+                path: child_path.clone(),
+            });
+            queue.push_back((child_id, child_path, depth + 1));
+        }
+    })
+}
 pub(crate) fn selected_ids(
     pool: &ObjectPool,
     root: Option<ObjectId>,
@@ -346,9 +429,9 @@ pub(crate) fn selected_ids(
     };
     let mut ids = Vec::new();
     let mut seen = HashSet::new();
-    let mut stack = vec![(root, 0usize)];
+    let mut stack = std::collections::VecDeque::from([(root, 0usize)]);
     let mut truncated = false;
-    while let Some((id, level)) = stack.pop() {
+    while let Some((id, level)) = stack.pop_front() {
         if !seen.insert(id) {
             continue;
         }
@@ -356,15 +439,12 @@ pub(crate) fn selected_ids(
         if level >= depth {
             truncated |= pool
                 .object_by_id(id)
-                .and_then(object_refs)
-                .is_some_and(|children| !children.is_empty());
+                .is_some_and(|object| !display_children(object).is_empty());
             continue;
         }
         if let Some(object) = pool.object_by_id(id) {
-            if let Some(children) = object_refs(object) {
-                for child in children.iter().rev() {
-                    stack.push((child.id, level + 1));
-                }
+            for (child, _, _) in display_children(object) {
+                stack.push_back((child, level + 1));
             }
         }
     }

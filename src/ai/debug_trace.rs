@@ -16,6 +16,9 @@ pub struct AiTokenUsage {
     pub total_tokens: u64,
 }
 impl AiTokenUsage {
+    pub fn uncached_input_tokens(&self) -> u64 {
+        self.input_tokens.saturating_sub(self.cached_input_tokens)
+    }
     pub fn from_response(value: &Value) -> Self {
         let v = &value["usage"];
         Self {
@@ -57,6 +60,10 @@ pub struct AiProviderRoundStats {
     #[serde(flatten)]
     pub tokens: AiTokenUsage,
     pub usage_reported: bool,
+    pub uncached_input_tokens: u64,
+    pub continuation: String,
+    pub new_input_bytes: usize,
+    pub historical_replay_bytes: usize,
     pub request_bytes: usize,
     pub instructions_bytes: usize,
     pub messages_bytes: usize,
@@ -76,6 +83,7 @@ pub struct AiToolStats {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AiDebugState {
     pub rounds: Vec<AiProviderRoundStats>,
+    pub largest_tool_results: Vec<(String, usize)>,
     pub tools: std::collections::BTreeMap<String, AiToolStats>,
     #[serde(skip)]
     previous_prefix: Option<(String, String)>,
@@ -89,6 +97,7 @@ pub struct AiDebugState {
 impl AiDebugState {
     pub fn begin_request(&mut self) {
         self.rounds.clear();
+        self.largest_tool_results.clear();
         self.tools.clear();
         self.previous_prefix = None;
         self.last_api = AiTokenUsage::default();
@@ -111,6 +120,7 @@ impl AiDebugState {
             .filter(|r| r.round == self.provider_rounds)
         {
             round.tokens = usage.clone();
+            round.uncached_input_tokens = usage.uncached_input_tokens();
             round.usage_reported = true;
         }
         self.last_api = usage;
@@ -120,6 +130,10 @@ impl AiDebugState {
         let tools = body["tools"].to_string();
         let mut stats = AiProviderRoundStats {
             round: self.provider_rounds,
+            continuation: body["previous_response_id"]
+                .as_str()
+                .map(|id| format!("previous_response_id: {id}"))
+                .unwrap_or_else(|| "local replay".into()),
             request_bytes: body.to_string().len(),
             instructions_bytes: instructions.len(),
             tool_definitions_bytes: tools.len(),
@@ -153,6 +167,11 @@ impl AiDebugState {
         self.rounds.push(stats);
     }
     pub fn record_tool(&mut self, name: &str, cache_hit: bool, result: &Value) {
+        self.largest_tool_results
+            .push((name.to_owned(), result.to_string().len()));
+        self.largest_tool_results
+            .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        self.largest_tool_results.truncate(5);
         let stats = self.tools.entry(name.to_owned()).or_default();
         stats.calls += 1;
         stats.cache_hits += usize::from(cache_hit);
@@ -185,6 +204,12 @@ impl AiDebugState {
     /// Export exactly the bounded, sanitized diagnostics; never headers or image bytes.
     pub fn export(&self) -> String {
         let mut value = serde_json::to_value(self).unwrap();
+        value["user_request"]["tokens"]["uncached_input_tokens"] =
+            serde_json::json!(self.user_request.tokens.uncached_input_tokens());
+        value["conversation"]["tokens"]["uncached_input_tokens"] =
+            serde_json::json!(self.conversation.tokens.uncached_input_tokens());
+        value["last_api"]["uncached_input_tokens"] =
+            serde_json::json!(self.last_api.uncached_input_tokens());
         value["warnings"] = serde_json::json!(self.warnings());
         sanitize(&mut value);
         serde_json::to_string_pretty(&value).unwrap()
@@ -291,9 +316,10 @@ pub fn debug_ui(ui: &mut egui::Ui, debug: &AiDebugState, settings: &mut super::A
             ("Conversation total", &debug.conversation.tokens),
         ] {
             ui.label(format!(
-                "{label}: input {} (cached {}), output {} (reasoning {}), total {}",
+                "{label}: input {} (cached {}, uncached {}), output {} (reasoning {}), total {}",
                 usage.input_tokens,
                 usage.cached_input_tokens,
+                usage.uncached_input_tokens(),
                 usage.output_tokens,
                 usage.reasoning_tokens,
                 usage.total_tokens
@@ -314,12 +340,16 @@ pub fn debug_ui(ui: &mut egui::Ui, debug: &AiDebugState, settings: &mut super::A
         }
         ui.collapsing("Provider rounds (exact tokens; serialized bytes)", |ui| {
             for round in &debug.rounds {
-                ui.collapsing(format!("Round {} · input {} · cached {} · output {} · {} bytes", round.round, round.tokens.input_tokens, round.tokens.cached_input_tokens, round.tokens.output_tokens, round.request_bytes), |ui| {
+                ui.collapsing(format!("Round {} · input {} · cached {} · uncached {} · output {} · {} bytes", round.round, round.tokens.input_tokens, round.tokens.cached_input_tokens, round.tokens.uncached_input_tokens(), round.tokens.output_tokens, round.request_bytes), |ui| {
+                    ui.label(format!("Continuation: {} · New input bytes: {} · Historical replay bytes: {}", round.continuation, round.new_input_bytes, round.historical_replay_bytes));
                     ui.label(format!("Reasoning {} · total {} · usage reported {}", round.tokens.reasoning_tokens, round.tokens.total_tokens, round.usage_reported));
                     ui.label(format!("Instructions {} · messages {} · tools {} (proposal {}) · results {} · images {} bytes", round.instructions_bytes, round.messages_bytes, round.tool_definitions_bytes, round.propose_transaction_bytes, round.tool_results_bytes, round.images_bytes));
                     ui.label(format!("Instructions changed: {} · tools changed: {}", round.instructions_changed, round.tools_changed));
                 });
             }
+        });
+        ui.collapsing("Largest tool results", |ui| {
+            for (name, bytes) in &debug.largest_tool_results { ui.label(format!("{name}: {bytes} bytes")); }
         });
         for (name, stats) in &debug.tools {
             ui.label(format!("{name}: {} calls · {} cache hits · {} result bytes", stats.calls, stats.cache_hits, stats.result_bytes));
