@@ -1,4 +1,5 @@
 //! Bounded, in-memory developer diagnostics. Never persists or records HTTP headers.
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::VecDeque;
 
@@ -6,7 +7,7 @@ pub const MAX_TRACE_ENTRIES: usize = 100;
 pub const MAX_RAW_TRACE_BYTES_PER_ENTRY: usize = 16 * 1024;
 pub const AI_TOKEN_WARNING_THRESHOLD: u64 = 50_000;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct AiTokenUsage {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
@@ -37,12 +38,12 @@ impl AiTokenUsage {
         self.total_tokens += other.total_tokens;
     }
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct AiUsageStats {
     pub request_count: u64,
     pub tokens: AiTokenUsage,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AiTraceEntry {
     pub round: usize,
     pub label: String,
@@ -50,8 +51,34 @@ pub struct AiTraceEntry {
     pub payload: String,
     pub truncated: bool,
 }
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AiProviderRoundStats {
+    pub round: usize,
+    #[serde(flatten)]
+    pub tokens: AiTokenUsage,
+    pub usage_reported: bool,
+    pub request_bytes: usize,
+    pub instructions_bytes: usize,
+    pub messages_bytes: usize,
+    pub tool_definitions_bytes: usize,
+    pub propose_transaction_bytes: usize,
+    pub tool_results_bytes: usize,
+    pub images_bytes: usize,
+    pub instructions_changed: bool,
+    pub tools_changed: bool,
+}
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AiToolStats {
+    pub calls: usize,
+    pub cache_hits: usize,
+    pub result_bytes: usize,
+}
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct AiDebugState {
+    pub rounds: Vec<AiProviderRoundStats>,
+    pub tools: std::collections::BTreeMap<String, AiToolStats>,
+    #[serde(skip)]
+    previous_prefix: Option<(String, String)>,
     pub last_api: AiTokenUsage,
     pub user_request: AiUsageStats,
     pub conversation: AiUsageStats,
@@ -61,6 +88,9 @@ pub struct AiDebugState {
 }
 impl AiDebugState {
     pub fn begin_request(&mut self) {
+        self.rounds.clear();
+        self.tools.clear();
+        self.previous_prefix = None;
         self.last_api = AiTokenUsage::default();
         self.user_request = AiUsageStats::default();
         self.tool_calls = 0;
@@ -75,7 +105,89 @@ impl AiDebugState {
         self.conversation.request_count += 1;
         self.user_request.tokens.add(&usage);
         self.conversation.tokens.add(&usage);
+        if let Some(round) = self
+            .rounds
+            .last_mut()
+            .filter(|r| r.round == self.provider_rounds)
+        {
+            round.tokens = usage.clone();
+            round.usage_reported = true;
+        }
         self.last_api = usage;
+    }
+    pub fn record_request(&mut self, body: &Value) {
+        let instructions = body["instructions"].to_string();
+        let tools = body["tools"].to_string();
+        let mut stats = AiProviderRoundStats {
+            round: self.provider_rounds,
+            request_bytes: body.to_string().len(),
+            instructions_bytes: instructions.len(),
+            tool_definitions_bytes: tools.len(),
+            propose_transaction_bytes: body["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| t["name"] == "propose_transaction")
+                .map(|t| t.to_string().len())
+                .sum(),
+            ..Default::default()
+        };
+        if let Some((old_instructions, old_tools)) = &self.previous_prefix {
+            stats.instructions_changed = old_instructions != &instructions;
+            stats.tools_changed = old_tools != &tools;
+        }
+        self.previous_prefix = Some((instructions, tools));
+        for item in body["input"].as_array().into_iter().flatten() {
+            let bytes = item.to_string().len();
+            if item["type"] == "function_call_output" {
+                stats.tool_results_bytes += bytes;
+            } else if item["content"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|p| p["type"] == "input_image"))
+            {
+                stats.images_bytes += bytes;
+            } else {
+                stats.messages_bytes += bytes;
+            }
+        }
+        self.rounds.push(stats);
+    }
+    pub fn record_tool(&mut self, name: &str, cache_hit: bool, result: &Value) {
+        let stats = self.tools.entry(name.to_owned()).or_default();
+        stats.calls += 1;
+        stats.cache_hits += usize::from(cache_hit);
+        stats.result_bytes += result.to_string().len();
+    }
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for name in ["get_objects", "get_object_schema"] {
+            if let Some(stats) = self.tools.get(name).filter(|s| s.calls > 1) {
+                warnings.push(format!(
+                    "{} {name} calls; independent reads could potentially be batched.",
+                    stats.calls
+                ));
+            }
+        }
+        if self
+            .rounds
+            .iter()
+            .any(|r| r.instructions_changed || r.tools_changed)
+        {
+            warnings.push("Instructions or tool definitions changed between rounds; reusable prefix may be shorter.".into());
+        }
+        if self.user_request.tokens.input_tokens > 0
+            && self.user_request.tokens.cached_input_tokens == 0
+        {
+            warnings.push("Provider reported zero cached input tokens. This alone does not establish a cache-miss reason.".into());
+        }
+        warnings
+    }
+    /// Export exactly the bounded, sanitized diagnostics; never headers or image bytes.
+    pub fn export(&self) -> String {
+        let mut value = serde_json::to_value(self).unwrap();
+        value["warnings"] = serde_json::json!(self.warnings());
+        sanitize(&mut value);
+        serde_json::to_string_pretty(&value).unwrap()
     }
     pub fn trace(&mut self, label: impl Into<String>, value: &Value) {
         // Calculate size before redaction, but retain only sanitized, bounded text.
@@ -166,6 +278,9 @@ fn sanitize(value: &mut Value) {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn debug_ui(ui: &mut egui::Ui, debug: &AiDebugState, settings: &mut super::AiSettings) {
     ui.collapsing("AI Debug", |ui| {
+        if ui.button("Copy debug output").clicked() {
+            ui.ctx().copy_text(debug.export());
+        }
         ui.horizontal(|ui| {
             ui.label("Max output tokens");
             ui.add(egui::DragValue::new(&mut settings.max_output_tokens).range(1024..=32768));
@@ -197,6 +312,19 @@ pub fn debug_ui(ui: &mut egui::Ui, debug: &AiDebugState, settings: &mut super::A
                 ),
             );
         }
+        ui.collapsing("Provider rounds (exact tokens; serialized bytes)", |ui| {
+            for round in &debug.rounds {
+                ui.collapsing(format!("Round {} · input {} · cached {} · output {} · {} bytes", round.round, round.tokens.input_tokens, round.tokens.cached_input_tokens, round.tokens.output_tokens, round.request_bytes), |ui| {
+                    ui.label(format!("Reasoning {} · total {} · usage reported {}", round.tokens.reasoning_tokens, round.tokens.total_tokens, round.usage_reported));
+                    ui.label(format!("Instructions {} · messages {} · tools {} (proposal {}) · results {} · images {} bytes", round.instructions_bytes, round.messages_bytes, round.tool_definitions_bytes, round.propose_transaction_bytes, round.tool_results_bytes, round.images_bytes));
+                    ui.label(format!("Instructions changed: {} · tools changed: {}", round.instructions_changed, round.tools_changed));
+                });
+            }
+        });
+        for (name, stats) in &debug.tools {
+            ui.label(format!("{name}: {} calls · {} cache hits · {} result bytes", stats.calls, stats.cache_hits, stats.result_bytes));
+        }
+        for warning in debug.warnings() { ui.label(warning); }
         ui.collapsing("Traffic (serialized bytes, not tokens)", |ui| {
             egui::ScrollArea::vertical()
                 .max_height(260.)
@@ -221,4 +349,57 @@ pub fn debug_ui(ui: &mut egui::Ui, debug: &AiDebugState, settings: &mut super::A
                 });
         });
     });
+}
+
+#[cfg(test)]
+mod phase52_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn six_rounds_have_exact_usage_sizes_order_and_safe_export() {
+        let mut debug = AiDebugState::default();
+        debug.begin_request();
+        for round in 1..=6 {
+            debug.provider_rounds = round;
+            let body = json!({"instructions":"stable", "tools":[{"name":"propose_transaction"}],"input":[
+                {"role":"user","content":[{"type":"input_text","text":"edit"}]},
+                {"type":"function_call_output","output":"result"},
+                {"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}
+            ]});
+            debug.record_request(&body);
+            let response = json!({"usage":{"input_tokens":round*100,"input_tokens_details":{"cached_tokens":round*10},"output_tokens":20,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":round*100+20}});
+            debug.record_usage(AiTokenUsage::from_response(&response));
+            let stats = debug.rounds.last().unwrap();
+            assert_eq!(stats.request_bytes, body.to_string().len());
+            assert_eq!(
+                stats.instructions_bytes,
+                body["instructions"].to_string().len()
+            );
+            assert_eq!(
+                stats.tool_definitions_bytes,
+                body["tools"].to_string().len()
+            );
+            assert_eq!(stats.messages_bytes, body["input"][0].to_string().len());
+            assert_eq!(stats.tool_results_bytes, body["input"][1].to_string().len());
+            assert_eq!(stats.images_bytes, body["input"][2].to_string().len());
+            assert!(!stats.instructions_changed && !stats.tools_changed);
+            debug.trace("request", &body);
+        }
+        debug.record_tool("get_objects", false, &json!({"success":true}));
+        debug.record_tool("get_objects", true, &json!({"success":true}));
+        debug.trace("credential", &json!({"api_key":"sk-test-key"}));
+        let export = debug.export();
+        assert!(!export.contains("sk-test-key"));
+        assert!(!export.contains("AAAA"));
+        let value: Value = serde_json::from_str(&export).unwrap();
+        assert_eq!(value["rounds"].as_array().unwrap().len(), 6);
+        assert_eq!(value["rounds"][5]["round"], 6);
+        assert_eq!(value["user_request"]["tokens"]["input_tokens"], 2100);
+        assert_eq!(value["user_request"]["tokens"]["total_tokens"], 2220);
+        assert_eq!(value["user_request"]["tokens"]["cached_input_tokens"], 210);
+        assert_eq!(value["tools"]["get_objects"]["cache_hits"], 1);
+        debug.begin_request();
+        assert!(debug.rounds.is_empty() && debug.tools.is_empty());
+        assert_eq!(debug.conversation.tokens.total_tokens, 2220);
+    }
 }

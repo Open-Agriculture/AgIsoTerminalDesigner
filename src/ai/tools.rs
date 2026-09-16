@@ -66,7 +66,35 @@ pub struct ObjectDetails {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetObjectSchemaRequest {
-    pub object_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub object_types: Vec<String>,
+}
+pub const MAX_SCHEMA_TYPES_PER_CALL: usize = 10;
+impl GetObjectSchemaRequest {
+    pub fn types(self) -> Result<Vec<String>, String> {
+        let mut types = self.object_types;
+        if let Some(ty) = self.object_type {
+            types.push(ty);
+        }
+        if types.is_empty() || types.len() > MAX_SCHEMA_TYPES_PER_CALL {
+            return Err(format!(
+                "Request 1–{MAX_SCHEMA_TYPES_PER_CALL} object types"
+            ));
+        }
+        types.sort();
+        types.dedup();
+        for name in &types {
+            if !ObjectType::values()
+                .iter()
+                .any(|v| format!("{v:?}") == *name)
+            {
+                return Err(format!("unknown object type: {name}"));
+            }
+        }
+        Ok(types)
+    }
 }
 
 /// Provider-facing definitions for precisely the four Phase 3 domain tools.
@@ -74,8 +102,8 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         function("get_design_context", "Compact layout overview. Page with offset; use root_id to inspect deeper subtrees. Properties opt-in; prefer get_objects for details. Layout uses parent-relative coordinates; page placements with layout_offset.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["ActiveMask","Selection","EntirePool"]},"include_selection":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"layout_offset":{"type":"integer","minimum":0},"root_id":{"type":"integer","minimum":0,"maximum":65534},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"depth":{"type":"integer","minimum":0,"maximum":8},"max_objects":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
         function("get_objects", "Batch known IDs (up to 20) for full properties. Optional relationships page with detail_offset/detail_limit; follow next_detail_offset. Long property strings/arrays page in characters/items with property_offset/property_limit; follow next_property_offset.", json!({"type":"object","properties":{"ids":{"type":"array","maxItems":20,"items":{"type":"integer","minimum":0,"maximum":65534}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean"},"include_macros":{"type":"boolean"},"detail_offset":{"type":"integer","minimum":0},"detail_limit":{"type":"integer","minimum":1,"maximum":100},"property_offset":{"type":"integer","minimum":0},"property_limit":{"type":"integer","minimum":1,"maximum":4096}},"required":["ids"],"additionalProperties":false})),
-        function("get_object_schema", "Returns writable properties, reference types, child relationships and supported events for one ISOBUS VT object type. Use before guessing valid fields.", json!({"type":"object","properties":{"object_type":{"type":"string","enum":ObjectType::values().into_iter().map(|v| format!("{v:?}")).collect::<Vec<_>>() }},"required":["object_type"],"additionalProperties":false})),
-        function("propose_transaction", "Validates and stages one atomic design change without modifying the user's project. All edits must be submitted through this tool.", transaction_schema()),
+        function("get_object_schema", "Writable properties and relationship rules. Batch all needed types (up to 10) in object_types; object_type accepts a single type.", json!({"type":"object","properties":{"object_type":{"type":"string"},"object_types":{"type":"array","minItems":1,"maxItems":MAX_SCHEMA_TYPES_PER_CALL,"items":{"type":"string"}}},"anyOf":[{"required":["object_type"]},{"required":["object_types"]}],"additionalProperties":false})),
+        function("propose_transaction", "Validates and stages one atomic design change without modifying the user's project. All edits must be submitted through this tool.", compact_transaction_schema()),
         function("analyze_design", "Returns deterministic visual design-quality diagnostics. It is read-only and does not replace domain validation.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["active_mask","proposal"]}},"additionalProperties":false})),
     ]
 }
@@ -165,6 +193,39 @@ fn transaction_schema() -> Value {
         json!({"schema_version":{"type":"integer","const":2},"description":{"type":["string","null"]},"operations":{"type":"array","minItems":1,"items":{"anyOf":variants}}}),
         &["schema_version", "operations"],
     )
+}
+/// Factor the repeated public ObjectTarget schema without changing its constraints.
+fn compact_transaction_schema() -> Value {
+    let mut schema = transaction_schema();
+    let target = schema["properties"]["operations"]["items"]["anyOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["properties"]["type"]["const"] == "SetProperty")
+        .unwrap()["properties"]["data"]["properties"]["object"]
+        .clone();
+    fn replace(value: &mut Value, target: &Value) {
+        if value == target {
+            *value = json!({"$ref":"#/$defs/ObjectTarget"});
+            return;
+        }
+        match value {
+            Value::Object(map) => {
+                for v in map.values_mut() {
+                    replace(v, target);
+                }
+            }
+            Value::Array(array) => {
+                for v in array {
+                    replace(v, target);
+                }
+            }
+            _ => {}
+        }
+    }
+    replace(&mut schema, &target);
+    schema["$defs"] = json!({"ObjectTarget":target});
+    schema
 }
 fn object_schema(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
@@ -467,4 +528,49 @@ mod tests {
             assert!(result.is_ok(), "{payload}: {result:?}");
         }
     }
+}
+
+#[cfg(test)]
+mod phase52_schema_tests {
+    use super::*;
+    #[test]
+    fn factored_public_operation_schema_is_identical_when_expanded() {
+        let original = transaction_schema();
+        let mut compact = compact_transaction_schema();
+        assert!(compact.to_string().len() < original.to_string().len());
+        let target = compact["$defs"]["ObjectTarget"].clone();
+        compact.as_object_mut().unwrap().remove("$defs");
+        fn expand(value: &mut Value, target: &Value) {
+            if value
+                .get("$ref")
+                .is_some_and(|v| v == "#/$defs/ObjectTarget")
+            {
+                *value = target.clone();
+                return;
+            }
+            match value {
+                Value::Object(map) => {
+                    for v in map.values_mut() {
+                        expand(v, target);
+                    }
+                }
+                Value::Array(array) => {
+                    for v in array {
+                        expand(v, target);
+                    }
+                }
+                _ => {}
+            }
+        }
+        expand(&mut compact, &target);
+        assert_eq!(compact, original);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn phase51_tool_definitions() -> Vec<Value> {
+    let mut tools = tool_definitions();
+    tools[2] = function("get_object_schema", "Returns writable properties, reference types, child relationships and supported events for one ISOBUS VT object type. Use before guessing valid fields.", json!({"type":"object","properties":{"object_type":{"type":"string","enum":ObjectType::values().into_iter().map(|v| format!("{v:?}")).collect::<Vec<_>>() }},"required":["object_type"],"additionalProperties":false}));
+    tools[3]["parameters"] = transaction_schema();
+    tools
 }

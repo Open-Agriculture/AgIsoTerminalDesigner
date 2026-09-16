@@ -123,7 +123,7 @@ impl Default for DesignContextRequest {
             layout_offset: 0,
             root_id: None,
             include_properties: false,
-            include_references: false,
+            include_references: true,
             max_objects: MAX_SNAPSHOT_OBJECTS,
         }
     }

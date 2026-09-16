@@ -37,3 +37,5 @@ pub use preview::{render_proposal_preview, render_preview_ui, AiPreview, Preview
 pub use design_analysis::{analyze_design, DesignAnalysis, DesignAnalysisError, DesignAnalysisScope, DesignDiagnostic, DesignDiagnosticSeverity, DiagnosticRegion};
 #[cfg(test)]
 mod efficiency_tests;
+
+mod wire;

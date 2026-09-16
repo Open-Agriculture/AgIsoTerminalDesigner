@@ -2,15 +2,67 @@ use super::conversation::{AiContent, AiMessage, AiRole, Conversation};
 use std::{future::Future, pin::Pin};
 
 pub type AiProviderFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-#[derive(Debug, Clone)] pub enum AiProviderKind { OpenAI }
-#[derive(Debug, Clone)] pub struct AiSettings { pub provider: AiProviderKind, pub model: String, pub reasoning_effort: Option<String>, pub max_output_tokens: u32 }
-impl Default for AiSettings { fn default() -> Self { Self { provider: AiProviderKind::OpenAI, model: "gpt-5.6".into(), reasoning_effort: Some("medium".into()), max_output_tokens: 8192 } } }
-#[derive(Debug, Clone)] pub struct AiTurnRequest { pub instructions: String, pub conversation: Conversation, pub tools: Vec<serde_json::Value>, pub settings: AiSettings }
-#[derive(Debug, Clone)] pub struct AiProviderResponse { pub content: Vec<AiContent>, pub usage: super::AiTokenUsage }
-#[derive(Debug, Clone)] pub enum AiProviderError { MissingApiKey, Http(String), Unauthorized, RateLimited(String), QuotaExceeded(String), Timeout, InvalidResponse(String), Cancelled }
-impl std::fmt::Display for AiProviderError { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", match self { Self::MissingApiKey => "OpenAI API key not configured".into(), Self::Http(e) => format!("OpenAI request failed: {e}"), Self::Unauthorized => "OpenAI rejected the API key".into(), Self::RateLimited(e) => format!("OpenAI rate limit reached: {e}"), Self::QuotaExceeded(e) => format!("OpenAI API quota exceeded. Check API billing, credits, and usage limits for the project associated with your API key. {e}"), Self::Timeout => "OpenAI request timed out".into(), Self::InvalidResponse(e) => format!("OpenAI returned an invalid response: {e}"), Self::Cancelled => "Assistant request was cancelled".into() }) } }
+#[derive(Debug, Clone)]
+pub enum AiProviderKind {
+    OpenAI,
+}
+#[derive(Debug, Clone)]
+pub struct AiSettings {
+    pub provider: AiProviderKind,
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    pub max_output_tokens: u32,
+}
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            provider: AiProviderKind::OpenAI,
+            model: "gpt-5.6".into(),
+            reasoning_effort: Some("medium".into()),
+            max_output_tokens: 8192,
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct AiTurnRequest {
+    pub instructions: String,
+    pub conversation: Conversation,
+    pub tools: Vec<serde_json::Value>,
+    pub settings: AiSettings,
+}
+#[derive(Debug, Clone)]
+pub struct AiProviderResponse {
+    pub content: Vec<AiContent>,
+    pub usage: super::AiTokenUsage,
+}
+#[derive(Debug, Clone)]
+pub enum AiProviderError {
+    MissingApiKey,
+    Http(String),
+    Unauthorized,
+    RateLimited(String),
+    QuotaExceeded(String),
+    Timeout,
+    InvalidResponse(String),
+    Cancelled,
+}
+impl std::fmt::Display for AiProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", match self { Self::MissingApiKey => "OpenAI API key not configured".into(), Self::Http(e) => format!("OpenAI request failed: {e}"), Self::Unauthorized => "OpenAI rejected the API key".into(), Self::RateLimited(e) => format!("OpenAI rate limit reached: {e}"), Self::QuotaExceeded(e) => format!("OpenAI API quota exceeded. Check API billing, credits, and usage limits for the project associated with your API key. {e}"), Self::Timeout => "OpenAI request timed out".into(), Self::InvalidResponse(e) => format!("OpenAI returned an invalid response: {e}"), Self::Cancelled => "Assistant request was cancelled".into() })
+    }
+}
 impl std::error::Error for AiProviderError {}
-pub trait AiProvider: Send + Sync { fn run_turn(&self, request: AiTurnRequest) -> AiProviderFuture<Result<AiProviderResponse, AiProviderError>>; }
-pub const SYSTEM_INSTRUCTIONS: &str = "You are an assistant for an ISO 11783 VT object-pool designer. Object names are symbolic references, while ObjectId remains the real identity. The project may contain many objects. Start with the active mask and selection; retrieve only relevant context. Batch known IDs in get_objects and request schemas only for types you need. Follow pagination when needed. Inspect context and schemas before guessing. All edits must use propose_transaction; it only stages a change, so never say it is applied. Never modify raw object JSON or invent unsupported properties. Position belongs to parent-child relationships. Use SetObjectReference for object-reference properties and preserve references unless asked otherwise. Submit related edits in one transaction. After a staged proposal you may receive its rendered preview and deterministic design diagnostics. Inspect overlap, clipping, alignment, spacing, readability and requested emphasis. If changes are genuinely needed, submit a normal corrective propose_transaction; it is prepared against the staged candidate. Do not change variable or macro references unless needed for the user's request, and say no visual changes are required when appropriate.";
+pub trait AiProvider: Send + Sync {
+    fn run_turn(
+        &self,
+        request: AiTurnRequest,
+    ) -> AiProviderFuture<Result<AiProviderResponse, AiProviderError>>;
+}
+pub const SYSTEM_INSTRUCTIONS: &str = "You assist an ISO 11783 VT object-pool designer. Inspect the active mask and selection first; retrieve only relevant context and follow pagination. Batch known IDs in get_objects and needed types in get_object_schema object_types; request independent inspections together. Aim for context, one batched inspection, then a proposal. Do not repeat successful reads or guess properties. All edits use propose_transaction and remain staged, never applied. Names are symbolic; IDs identify objects. Positions belong to parent-child relationships. Use SetObjectReference for references and preserve variable/macro links unless the task requires changes. Submit related edits atomically. Review staged previews for overlap, clipping, alignment, spacing and readability. Only propose corrections when needed; corrections target the staged candidate. Finish with a concise summary.";
 
-pub fn assistant_message(content: Vec<AiContent>) -> AiMessage { AiMessage { role: AiRole::Assistant, content } }
+pub fn assistant_message(content: Vec<AiContent>) -> AiMessage {
+    AiMessage {
+        role: AiRole::Assistant,
+        content,
+    }
+}
