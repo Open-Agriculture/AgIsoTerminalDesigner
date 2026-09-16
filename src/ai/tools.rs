@@ -1,7 +1,7 @@
 use super::AiDesignState;
 use crate::ai::snapshot::{
-    active_mask, layout_instances, object_snapshot, selected_ids, DesignContextRequest,
-    DesignSnapshot, ProjectSnapshot, SnapshotScope, MAX_SNAPSHOT_OBJECTS,
+    active_mask, object_snapshot, selected_ids, DesignContextRequest, DesignSnapshot,
+    SnapshotScope, MAX_SNAPSHOT_OBJECTS,
 };
 use ag_iso_stack::object_pool::ObjectId;
 use ag_iso_stack::object_pool::ObjectType;
@@ -21,7 +21,7 @@ pub enum AiToolError {
     RequestTooLarge,
     InvalidScope,
 }
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GetObjectsRequest {
     pub ids: Vec<u16>,
@@ -30,22 +30,58 @@ pub struct GetObjectsRequest {
     pub include_children: bool,
     pub include_parents: bool,
     pub include_macros: bool,
+    pub detail_offset: usize,
+    pub detail_limit: usize,
+    pub property_offset: usize,
+    pub property_limit: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct GetObjectSchemaRequest { pub object_type: String }
+pub const MAX_GET_OBJECTS: usize = 20;
+pub const MAX_DETAIL_ITEMS: usize = 100;
+pub const MAX_PROPERTY_ITEMS: usize = 4096;
+impl Default for GetObjectsRequest {
+    fn default() -> Self {
+        Self {
+            ids: Vec::new(),
+            include_properties: true,
+            include_references: true,
+            include_children: false,
+            include_parents: true,
+            include_macros: false,
+            detail_offset: 0,
+            detail_limit: MAX_DETAIL_ITEMS,
+            property_offset: 0,
+            property_limit: MAX_PROPERTY_ITEMS,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct ObjectDetails {
+    #[serde(flatten)]
+    pub object: crate::ai::snapshot::ObjectSnapshot,
+    pub truncated: bool,
+    pub next_detail_offset: Option<usize>,
+    pub next_property_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetObjectSchemaRequest {
+    pub object_type: String,
+}
 
 /// Provider-facing definitions for precisely the four Phase 3 domain tools.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
-        function("get_design_context", "Returns a semantic overview of the current VT design, including active mask, selection, object relationships and layout. Use this first when inspecting or modifying a design.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["ActiveMask","Selection","EntirePool"]},"include_selection":{"type":"boolean"},"depth":{"type":"integer","minimum":0,"maximum":16},"max_objects":{"type":"integer","minimum":1,"maximum":200}},"additionalProperties":false})),
-        function("get_objects", "Returns requested objects by ObjectId with their semantic properties and relationships.", json!({"type":"object","properties":{"ids":{"type":"array","items":{"type":"integer","minimum":1}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean"},"include_macros":{"type":"boolean"}},"required":["ids"],"additionalProperties":false})),
+        function("get_design_context", "Compact layout overview. Page with offset; use root_id to inspect deeper subtrees. Properties opt-in; prefer get_objects for details. Layout uses parent-relative coordinates; page placements with layout_offset.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["ActiveMask","Selection","EntirePool"]},"include_selection":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"layout_offset":{"type":"integer","minimum":0},"root_id":{"type":"integer","minimum":0,"maximum":65534},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"depth":{"type":"integer","minimum":0,"maximum":8},"max_objects":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
+        function("get_objects", "Batch known IDs (up to 20) for full properties. Optional relationships page with detail_offset/detail_limit; follow next_detail_offset. Long property strings/arrays page in characters/items with property_offset/property_limit; follow next_property_offset.", json!({"type":"object","properties":{"ids":{"type":"array","maxItems":20,"items":{"type":"integer","minimum":0,"maximum":65534}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean"},"include_macros":{"type":"boolean"},"detail_offset":{"type":"integer","minimum":0},"detail_limit":{"type":"integer","minimum":1,"maximum":100},"property_offset":{"type":"integer","minimum":0},"property_limit":{"type":"integer","minimum":1,"maximum":4096}},"required":["ids"],"additionalProperties":false})),
         function("get_object_schema", "Returns writable properties, reference types, child relationships and supported events for one ISOBUS VT object type. Use before guessing valid fields.", json!({"type":"object","properties":{"object_type":{"type":"string","enum":ObjectType::values().into_iter().map(|v| format!("{v:?}")).collect::<Vec<_>>() }},"required":["object_type"],"additionalProperties":false})),
         function("propose_transaction", "Validates and stages one atomic design change without modifying the user's project. All edits must be submitted through this tool.", transaction_schema()),
         function("analyze_design", "Returns deterministic visual design-quality diagnostics. It is read-only and does not replace domain validation.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["active_mask","proposal"]}},"additionalProperties":false})),
     ]
 }
-fn function(name: &str, description: &str, parameters: Value) -> Value { json!({"type":"function","name":name,"description":description,"parameters":parameters,"strict":false}) }
+fn function(name: &str, description: &str, parameters: Value) -> Value {
+    json!({"type":"function","name":name,"description":description,"parameters":parameters,"strict":false})
+}
 /// Mirrors the public serde transaction envelope. Operation payloads remain the source of truth
 /// and are deserialized by `OperationTransaction`; skipped restoration variants are excluded.
 fn transaction_schema() -> Value {
@@ -55,47 +91,114 @@ fn transaction_schema() -> Value {
     let coordinate = json!({"type":"integer","minimum":-32768,"maximum":32767});
     let string = json!({"type":"string"});
     let variants = vec![
-        operation_schema("CreateObject", json!({"object_id":{"anyOf":[id,{"type":"null"}]},"object_type":{"type":"string","enum":ObjectType::values().into_iter().map(|v|format!("{v:?}")).collect::<Vec<_>>()},"name":string}), &["object_type","name"]),
+        operation_schema(
+            "CreateObject",
+            json!({"object_id":{"anyOf":[id,{"type":"null"}]},"object_type":{"type":"string","enum":ObjectType::values().into_iter().map(|v|format!("{v:?}")).collect::<Vec<_>>()},"name":string}),
+            &["object_type", "name"],
+        ),
         operation_schema("DeleteObject", json!({"object_id":id}), &["object_id"]),
-        operation_schema("SetProperty", json!({"object":target,"property":string,"value":{"description":"Use the property's type and valid range from get_object_schema."}}), &["object","property","value"]),
-        operation_schema("SetObjectReference", json!({"object":target,"property":string,"reference":nullable_target}), &["object","property","reference"]),
-        operation_schema("ChangeObjectId", json!({"old_id":id,"new_id":id}), &["old_id","new_id"]),
-        operation_schema("ReorderObjects", json!({"object_ids":{"type":"array","items":id}}), &["object_ids"]),
-        operation_schema("AddChild", json!({"parent":target,"child":target,"x":coordinate,"y":coordinate}), &["parent","child","x","y"]),
-        operation_schema("RemoveChild", json!({"parent_id":id,"child_id":id}), &["parent_id","child_id"]),
-        operation_schema("SetChildPosition", json!({"parent_id":id,"child_id":id,"x":coordinate,"y":coordinate}), &["parent_id","child_id","x","y"]),
-        operation_schema("SetChildren", json!({"parent":target,"children":{"type":"array","items":object_schema(json!({"child":target,"x":coordinate,"y":coordinate}), &["child","x","y"])}}), &["parent","children"]),
-        operation_schema("SetObjectList", json!({"object":target,"objects":{"anyOf":[
-            object_schema(json!({"kind":{"const":"Required","type":"string"},"objects":{"type":"array","items":target}}), &["kind","objects"]),
-            object_schema(json!({"kind":{"const":"Nullable","type":"string"},"objects":{"type":"array","items":nullable_target}}), &["kind","objects"])
-        ]}}), &["object","objects"]),
-        operation_schema("SetMacroReferences", json!({"object":target,"macro_refs":{"type":"array","items":object_schema(json!({"event_id":{"type":"string","description":"Event name from get_object_schema possible_events."},"macro_object":target}), &["event_id","macro_object"])}}), &["object","macro_refs"]),
-        operation_schema("SetObjectLabels", json!({"object_id":id,"labels":{"type":"array","items":object_schema(json!({"id":id,"font_type":{"type":"integer","minimum":0,"maximum":255},"string_variable_reference":{"anyOf":[id,{"type":"null"}]},"graphic_representation":{"anyOf":[id,{"type":"null"}]}}), &["id","font_type","string_variable_reference","graphic_representation"])}}), &["object_id","labels"]),
-        operation_schema("RenameObject", json!({"object":target,"name":string}), &["object","name"]),
+        operation_schema(
+            "SetProperty",
+            json!({"object":target,"property":string,"value":{"description":"Use the property's type and valid range from get_object_schema."}}),
+            &["object", "property", "value"],
+        ),
+        operation_schema(
+            "SetObjectReference",
+            json!({"object":target,"property":string,"reference":nullable_target}),
+            &["object", "property", "reference"],
+        ),
+        operation_schema(
+            "ChangeObjectId",
+            json!({"old_id":id,"new_id":id}),
+            &["old_id", "new_id"],
+        ),
+        operation_schema(
+            "ReorderObjects",
+            json!({"object_ids":{"type":"array","items":id}}),
+            &["object_ids"],
+        ),
+        operation_schema(
+            "AddChild",
+            json!({"parent":target,"child":target,"x":coordinate,"y":coordinate}),
+            &["parent", "child", "x", "y"],
+        ),
+        operation_schema(
+            "RemoveChild",
+            json!({"parent_id":id,"child_id":id}),
+            &["parent_id", "child_id"],
+        ),
+        operation_schema(
+            "SetChildPosition",
+            json!({"parent_id":id,"child_id":id,"x":coordinate,"y":coordinate}),
+            &["parent_id", "child_id", "x", "y"],
+        ),
+        operation_schema(
+            "SetChildren",
+            json!({"parent":target,"children":{"type":"array","items":object_schema(json!({"child":target,"x":coordinate,"y":coordinate}), &["child","x","y"])}}),
+            &["parent", "children"],
+        ),
+        operation_schema(
+            "SetObjectList",
+            json!({"object":target,"objects":{"anyOf":[
+                object_schema(json!({"kind":{"const":"Required","type":"string"},"objects":{"type":"array","items":target}}), &["kind","objects"]),
+                object_schema(json!({"kind":{"const":"Nullable","type":"string"},"objects":{"type":"array","items":nullable_target}}), &["kind","objects"])
+            ]}}),
+            &["object", "objects"],
+        ),
+        operation_schema(
+            "SetMacroReferences",
+            json!({"object":target,"macro_refs":{"type":"array","items":object_schema(json!({"event_id":{"type":"string","description":"Event name from get_object_schema possible_events."},"macro_object":target}), &["event_id","macro_object"])}}),
+            &["object", "macro_refs"],
+        ),
+        operation_schema(
+            "SetObjectLabels",
+            json!({"object_id":id,"labels":{"type":"array","items":object_schema(json!({"id":id,"font_type":{"type":"integer","minimum":0,"maximum":255},"string_variable_reference":{"anyOf":[id,{"type":"null"}]},"graphic_representation":{"anyOf":[id,{"type":"null"}]}}), &["id","font_type","string_variable_reference","graphic_representation"])}}),
+            &["object_id", "labels"],
+        ),
+        operation_schema(
+            "RenameObject",
+            json!({"object":target,"name":string}),
+            &["object", "name"],
+        ),
     ];
-    object_schema(json!({"schema_version":{"type":"integer","const":2},"description":{"type":["string","null"]},"operations":{"type":"array","minItems":1,"items":{"anyOf":variants}}}), &["schema_version","operations"])
+    object_schema(
+        json!({"schema_version":{"type":"integer","const":2},"description":{"type":["string","null"]},"operations":{"type":"array","minItems":1,"items":{"anyOf":variants}}}),
+        &["schema_version", "operations"],
+    )
 }
 fn object_schema(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
 fn operation_schema(name: &str, properties: Value, required: &[&str]) -> Value {
-    object_schema(json!({"type":{"type":"string","const":name},"data":object_schema(properties, required)}), &["type","data"])
+    object_schema(
+        json!({"type":{"type":"string","const":name},"data":object_schema(properties, required)}),
+        &["type", "data"],
+    )
 }
 pub fn get_design_context(
     state: &AiDesignState,
     request: DesignContextRequest,
 ) -> Result<DesignSnapshot, AiToolError> {
-    let root = match request.scope {
-        SnapshotScope::ActiveMask => active_mask(&state.pool),
-        SnapshotScope::Selection => state.selected,
-        SnapshotScope::EntirePool => None,
+    let root = if let Some(id) = request.root_id {
+        let object_id = ObjectId::new(id).map_err(|_| AiToolError::ObjectNotFound(id))?;
+        if state.pool.object_by_id(object_id).is_none() {
+            return Err(AiToolError::ObjectNotFound(id));
+        }
+        Some(object_id)
+    } else {
+        match request.scope {
+            SnapshotScope::ActiveMask => active_mask(&state.pool),
+            SnapshotScope::Selection => state.selected,
+            SnapshotScope::EntirePool => None,
+        }
     };
-    let (mut ids, mut truncated) = selected_ids(
-        &state.pool,
-        root,
-        request.scope,
-        request.depth.min(crate::ai::snapshot::MAX_SNAPSHOT_DEPTH),
-    );
+    let scope = if request.root_id.is_some() {
+        SnapshotScope::Selection
+    } else {
+        request.scope
+    };
+    let depth = request.depth.min(crate::ai::snapshot::MAX_CONTEXT_DEPTH);
+    let (mut ids, depth_limited) = selected_ids(&state.pool, root, scope, depth);
     if request.include_selection {
         if let Some(selected) = state.selected {
             if !ids.contains(&selected) {
@@ -103,60 +206,222 @@ pub fn get_design_context(
             }
         }
     }
-    let limit = request.max_objects.min(MAX_SNAPSHOT_OBJECTS);
-    if ids.len() > limit {
-        ids.truncate(limit);
-        truncated = true;
-    }
-    let active_id = active_mask(&state.pool);
-    let active =
-        active_id.and_then(|id| crate::ai::snapshot::summary(&state.pool, &state.object_info, id));
-    let selection = state
-        .selected
-        .and_then(|id| crate::ai::snapshot::summary(&state.pool, &state.object_info, id));
-    let objects = ids
-        .into_iter()
-        .filter_map(|id| object_snapshot(&state.pool, &state.object_info, id))
+    let total_matching_objects = ids.len();
+    let limit = request.max_objects.clamp(1, MAX_SNAPSHOT_OBJECTS);
+    let ids: Vec<_> = ids.into_iter().skip(request.offset).take(limit).collect();
+    let next_offset = (request.offset.saturating_add(ids.len()) < total_matching_objects)
+        .then_some(request.offset.saturating_add(ids.len()));
+    let mut properties_truncated = false;
+    let objects: Vec<_> = ids
+        .iter()
+        .filter_map(|id| {
+            let mut object = if request.include_properties || request.include_references {
+                object_snapshot(&state.pool, &state.object_info, *id)?
+            } else {
+                let summary = crate::ai::snapshot::summary(&state.pool, &state.object_info, *id)?;
+                crate::ai::snapshot::ObjectSnapshot {
+                    id: summary.id,
+                    name: summary.name,
+                    object_type: summary.object_type,
+                    properties: Default::default(),
+                    references: Default::default(),
+                    positioned_children: Vec::new(),
+                    object_list: None,
+                    macro_references: Vec::new(),
+                    parents: Vec::new(),
+                }
+            };
+            if !request.include_properties {
+                object.properties.clear();
+            } else {
+                properties_truncated |=
+                    page_properties(&mut object.properties, 0, MAX_PROPERTY_ITEMS);
+            }
+            if !request.include_references {
+                object.references.clear();
+            }
+            // Relationships and full child lists are available through paginated get_objects.
+            object.positioned_children.clear();
+            object.object_list = None;
+            object.parents.clear();
+            object.macro_references.clear();
+            Some(object)
+        })
         .collect();
-    let layout = layout_instances(
-        &state.pool,
-        &state.object_info,
-        active_id,
-        request.depth.min(crate::ai::snapshot::MAX_SNAPSHOT_DEPTH),
-    );
+    // Page all incoming placements for returned objects, including parents outside
+    // this object page. Coordinates are explicitly parent-relative.
+    let mut layout = Vec::new();
+    let mut placement_index = 0usize;
+    let mut layout_more = false;
+    'objects: for id in &ids {
+        let mut parents = state.pool.parent_objects(*id);
+        parents.sort_by_key(|p| p.id().value());
+        parents.dedup_by_key(|p| p.id());
+        for parent in parents {
+            for placement in crate::operations::object_refs(parent)
+                .unwrap_or_default()
+                .iter()
+                .filter(|p| p.id == *id)
+            {
+                if placement_index < request.layout_offset {
+                    placement_index += 1;
+                    continue;
+                }
+                if layout.len() == limit {
+                    layout_more = true;
+                    break 'objects;
+                }
+                let child =
+                    crate::ai::snapshot::summary(&state.pool, &state.object_info, *id).unwrap();
+                let child_object = state.pool.object_by_id(*id).unwrap();
+                let dimension = |name| {
+                    crate::object_properties::get_object_property(child_object, name)
+                        .ok()
+                        .and_then(|v| v.as_u64())
+                        .and_then(|v| u16::try_from(v).ok())
+                };
+                layout.push(crate::ai::snapshot::LayoutInstance {
+                    object: child,
+                    parent: crate::ai::snapshot::summary(
+                        &state.pool,
+                        &state.object_info,
+                        parent.id(),
+                    )
+                    .unwrap(),
+                    x: placement.offset.x.into(),
+                    y: placement.offset.y.into(),
+                    width: dimension("width"),
+                    height: dimension("height"),
+                    depth: 1,
+                    path: vec![parent.id().value(), id.value()],
+                });
+            }
+        }
+    }
+    let summary = crate::ai::snapshot::project_summary(state);
     Ok(DesignSnapshot {
-        schema_version: 3,
-        project: ProjectSnapshot {
-            revision: state.revision,
-            vt_version: format!("{:?}", state.vt_version),
-            mask_width: state.mask_size,
-            mask_height: state.mask_size,
-            object_count: state.pool.objects().len(),
-            active_mask: active,
-        },
-        selection,
+        schema_version: 4,
+        project: summary.project,
+        selection: summary.selected_object,
+        returned_objects: objects.len(),
+        total_matching_objects,
+        next_offset,
+        depth_limited,
+        truncated: depth_limited
+            || next_offset.is_some()
+            || request.offset > 0
+            || layout_more
+            || request.layout_offset > 0
+            || properties_truncated,
+        next_layout_offset: layout_more
+            .then_some(request.layout_offset.saturating_add(layout.len())),
+        layout_coordinates: "parent_relative".into(),
+        properties_truncated,
         objects,
         layout,
-        truncated,
     })
 }
 pub fn get_objects(
     state: &AiDesignState,
     request: GetObjectsRequest,
-) -> Result<Vec<crate::ai::snapshot::ObjectSnapshot>, AiToolError> {
-    if request.ids.len() > MAX_SNAPSHOT_OBJECTS {
+) -> Result<Vec<ObjectDetails>, AiToolError> {
+    if request.ids.len() > MAX_GET_OBJECTS {
         return Err(AiToolError::RequestTooLarge);
     }
-    let mut ids = request.ids;
+    let mut ids = request.ids.clone();
     ids.sort_unstable();
     ids.dedup();
     ids.into_iter()
         .map(|id| {
             let id = ObjectId::new(id).map_err(|_| AiToolError::ObjectNotFound(id))?;
-            object_snapshot(&state.pool, &state.object_info, id)
-                .ok_or(AiToolError::ObjectNotFound(id.value()))
+            let mut object = object_snapshot(&state.pool, &state.object_info, id)
+                .ok_or(AiToolError::ObjectNotFound(id.value()))?;
+            if !request.include_properties {
+                object.properties.clear();
+            }
+            if !request.include_references {
+                object.references.clear();
+            }
+            if !request.include_children {
+                object.positioned_children.clear();
+                object.object_list = None;
+            }
+            if !request.include_parents {
+                object.parents.clear();
+            }
+            if !request.include_macros {
+                object.macro_references.clear();
+            }
+            let property_limit = request.property_limit.clamp(1, MAX_PROPERTY_ITEMS);
+            let property_more = page_properties(
+                &mut object.properties,
+                request.property_offset,
+                property_limit,
+            );
+            let limit = request.detail_limit.clamp(1, MAX_DETAIL_ITEMS);
+            let mut more = false;
+            fn page<T>(v: &mut Vec<T>, offset: usize, limit: usize, more: &mut bool) {
+                *more |= v.len() > offset.saturating_add(limit);
+                *v = v.drain(..).skip(offset).take(limit).collect();
+            }
+            page(
+                &mut object.positioned_children,
+                request.detail_offset,
+                limit,
+                &mut more,
+            );
+            page(&mut object.parents, request.detail_offset, limit, &mut more);
+            page(
+                &mut object.macro_references,
+                request.detail_offset,
+                limit,
+                &mut more,
+            );
+            if let Some(list) = &mut object.object_list {
+                match list {
+                    crate::ai::snapshot::ObjectListSnapshot::Required(v) => {
+                        page(v, request.detail_offset, limit, &mut more)
+                    }
+                    crate::ai::snapshot::ObjectListSnapshot::Nullable(v) => {
+                        page(v, request.detail_offset, limit, &mut more)
+                    }
+                }
+            }
+            Ok(ObjectDetails {
+                object,
+                truncated: more
+                    || request.detail_offset > 0
+                    || property_more
+                    || request.property_offset > 0,
+                next_property_offset: property_more
+                    .then_some(request.property_offset.saturating_add(property_limit)),
+                next_detail_offset: more.then_some(request.detail_offset.saturating_add(limit)),
+            })
         })
         .collect()
+}
+
+/// Long scalar strings and arrays remain accessible without unbounded tool payloads.
+fn page_properties(
+    properties: &mut std::collections::BTreeMap<String, Value>,
+    offset: usize,
+    limit: usize,
+) -> bool {
+    let mut more = false;
+    for value in properties.values_mut() {
+        match value {
+            Value::String(text) => {
+                more |= text.chars().count() > offset.saturating_add(limit);
+                *text = text.chars().skip(offset).take(limit).collect();
+            }
+            Value::Array(items) => {
+                more |= items.len() > offset.saturating_add(limit);
+                *items = items.drain(..).skip(offset).take(limit).collect();
+            }
+            _ => {}
+        }
+    }
+    more
 }
 
 #[cfg(test)]
@@ -164,9 +429,15 @@ mod tests {
     use super::*;
 
     fn example(schema: &Value) -> Value {
-        if let Some(value) = schema.get("const") { return value.clone(); }
-        if let Some(values) = schema.get("enum") { return values[0].clone(); }
-        if let Some(variants) = schema.get("anyOf") { return example(&variants[0]); }
+        if let Some(value) = schema.get("const") {
+            return value.clone();
+        }
+        if let Some(values) = schema.get("enum") {
+            return values[0].clone();
+        }
+        if let Some(variants) = schema.get("anyOf") {
+            return example(&variants[0]);
+        }
         match schema["type"].as_str() {
             Some("object") => {
                 let mut result = json!({});
@@ -186,7 +457,9 @@ mod tests {
     #[test]
     fn every_advertised_operation_payload_deserializes() {
         let schema = transaction_schema();
-        let variants = schema["properties"]["operations"]["items"]["anyOf"].as_array().unwrap();
+        let variants = schema["properties"]["operations"]["items"]["anyOf"]
+            .as_array()
+            .unwrap();
         assert_eq!(variants.len(), 14);
         for variant in variants {
             let payload = example(variant);

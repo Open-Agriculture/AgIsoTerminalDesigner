@@ -16,7 +16,7 @@ use ag_iso_terminal_designer::InteractiveMaskRenderer;
 use ag_iso_terminal_designer::RenderableObject;
 use ag_iso_terminal_designer::{EditorProject, Operation};
 #[cfg(not(target_arch = "wasm32"))]
-use ag_iso_terminal_designer::ai::{AiContent, AiMessage, AiRole, AiSettings};
+use ag_iso_terminal_designer::ai::{AiContent, AiMessage, AiRole};
 #[cfg(not(target_arch = "wasm32"))]
 use ag_iso_terminal_designer::ai::ui::{AiAssistantState, AiRequestState, AiWorkerEvent};
 #[cfg(not(target_arch = "wasm32"))]
@@ -272,7 +272,7 @@ impl DesignerApp {
                     self.ai_state.last_error = None;
                     ctx.request_repaint();
                 }
-                AiWorkerEvent::Failed { request_id, error } if request_id == current => { self.ai_state.request_state=AiRequestState::Error; self.ai_state.last_error=Some(error); ctx.request_repaint(); }
+                AiWorkerEvent::Failed { request_id, error, conversation } if request_id == current => { self.ai_state.conversation=conversation; self.ai_state.request_state=AiRequestState::Error; self.ai_state.last_error=Some(error); ctx.request_repaint(); }
                 _ => {}
             }
         }
@@ -286,10 +286,11 @@ impl DesignerApp {
         self.ai_state.active_proposal = None;
         self.ai_state.last_error = None;
         self.ai_state.request_state = AiRequestState::Running { request_id: request_id.clone() };
+        let settings = self.ai_state.settings.clone();
         let state=project.ai_design_state(); let conversation=self.ai_state.conversation.clone(); let sender=self.ai_channel.0.clone(); let repaint=ctx.clone();
         std::thread::spawn(move || match OpenAiProvider::from_environment() {
-            Ok(provider) => { ag_iso_terminal_designer::ai::ui::run_request(&provider, state, conversation, AiSettings::default(), request_id, sender); repaint.request_repaint(); }
-            Err(error) => { let _=sender.send(AiWorkerEvent::Failed { request_id, error:error.to_string() }); repaint.request_repaint(); }
+            Ok(provider) => { ag_iso_terminal_designer::ai::ui::run_request(&provider, state, conversation, settings, request_id, sender); repaint.request_repaint(); }
+            Err(error) => { let _=sender.send(AiWorkerEvent::Failed { request_id, error:error.to_string(), conversation }); repaint.request_repaint(); }
         });
     }
     /// Open a file dialog
@@ -1393,6 +1394,10 @@ impl eframe::App for DesignerApp {
                             for content in &message.content { match content { AiContent::Text(text) => { ui.label(format!("{prefix}: {text}")); }, AiContent::ToolCall(call) => { ui.label(format!("Assistant called {}", call.name)); }, AiContent::ToolResult(_) => {}, AiContent::Image(_) => { ui.label("Assistant reviewed a staged preview"); } } }
                         }
                     });
+                    if ui.add_enabled(!matches!(self.ai_state.request_state, AiRequestState::Running { .. }), egui::Button::new("Clear conversation")).clicked() {
+                        self.ai_state.conversation = Default::default();
+                    }
+                    ag_iso_terminal_designer::ai::debug_trace::debug_ui(ui, &self.ai_state.conversation.debug.lock().unwrap(), &mut self.ai_state.settings);
                     if let Some(error) = &self.ai_state.last_error { ui.colored_label(egui::Color32::RED, error); }
                     match &self.ai_state.request_state {
                         AiRequestState::Running { .. } => { ui.label("Working…"); if ui.button("Cancel").clicked() { cancel=true; } }

@@ -14,14 +14,36 @@ impl AiProvider for OpenAiProvider {
  fn run_turn(&self, request: AiTurnRequest) -> AiProviderFuture<Result<AiProviderResponse, AiProviderError>> {
   let client = self.client.clone(); let key = self.api_key.clone(); let timeout = self.timeout;
   Box::pin(async move {
-   let mut body = json!({"model":request.settings.model,"instructions":request.instructions,"input":to_openai_input(&request.conversation),"tools":request.tools,"store":false,"parallel_tool_calls":true});
-   if let Some(effort) = request.settings.reasoning_effort { body["reasoning"] = json!({"effort":effort}); }
+   let body = request_body(&request);
+   {
+    let input = body["input"].as_array().unwrap();
+    let mut messages = 0; let mut tool_results = 0; let mut images = 0;
+    for item in input {
+        let bytes = item.to_string().len();
+        if item["type"] == "function_call_output" { tool_results += bytes; }
+        else if item["content"][0]["type"] == "input_image" { images += bytes; }
+        else { messages += bytes; }
+    }
+    let mut debug = request.conversation.debug.lock().unwrap();
+    debug.trace(format!("→ OpenAI request (system {}, messages {}, schemas {}, tool results {}, images {} bytes)", body["instructions"].to_string().len(), messages, body["tools"].to_string().len(), tool_results, images), &body);
+   }
    let response = client.post("https://api.openai.com/v1/responses").bearer_auth(key).json(&body).timeout(timeout).send().await.map_err(|e| if e.is_timeout() { AiProviderError::Timeout } else { AiProviderError::Http(e.to_string()) })?;
    let status = response.status(); let value: Value = response.json().await.map_err(|e| AiProviderError::InvalidResponse(e.to_string()))?;
+   {
+    let mut debug = request.conversation.debug.lock().unwrap();
+    debug.trace("← OpenAI response", &value);
+    // Record before parsing content so incomplete/malformed responses still count.
+    if value.get("usage").is_some_and(|v| !v.is_null()) { debug.record_usage(crate::ai::AiTokenUsage::from_response(&value)); }
+   }
    if !status.is_success() { return Err(parse_api_error(status.as_u16(), &value)); }
    parse_response(value)
   })
  }
+}
+pub(crate) fn request_body(request: &AiTurnRequest) -> Value {
+    let mut body = json!({"model":request.settings.model,"max_output_tokens":request.settings.max_output_tokens,"instructions":request.instructions,"input":to_openai_input(&request.conversation),"tools":request.tools,"store":false,"parallel_tool_calls":true});
+    if let Some(effort) = &request.settings.reasoning_effort { body["reasoning"] = json!({"effort":effort}); }
+    body
 }
 fn to_openai_input(conversation: &crate::ai::Conversation) -> Vec<Value> {
  conversation.messages.iter().flat_map(|message| message.content.iter().map(move |content| match content {
@@ -48,7 +70,7 @@ fn parse_response(value: Value) -> Result<AiProviderResponse, AiProviderError> {
   }
  }
  if content.is_empty() { return Err(AiProviderError::InvalidResponse("response contained no text or function calls".into())); }
- Ok(AiProviderResponse { content })
+ Ok(AiProviderResponse { usage: crate::ai::AiTokenUsage::from_response(&value), content })
 }
 
 fn parse_api_error(status: u16, value: &Value) -> AiProviderError {
@@ -94,5 +116,54 @@ mod tests {
     fn missing_error_details_do_not_panic() {
         assert!(matches!(parse_api_error(429, &json!({})), AiProviderError::RateLimited(_)));
         assert!(matches!(parse_api_error(401, &json!({})), AiProviderError::Unauthorized));
+    }
+}
+
+#[cfg(test)]
+mod efficiency_tests {
+    use super::*;
+    use crate::ai::*;
+    #[test]
+    fn parses_actual_usage_and_missing_fields() {
+        let response = parse_response(json!({"output":[{"type":"message","content":[{"type":"output_text","text":"Done"}]}],"usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":600},"output_tokens":200,"output_tokens_details":{"reasoning_tokens":80},"total_tokens":1200}})).unwrap();
+        assert_eq!(response.usage, AiTokenUsage { input_tokens:1000, cached_input_tokens:600, output_tokens:200, reasoning_tokens:80, total_tokens:1200 });
+        assert_eq!(AiTokenUsage::from_response(&json!({})), AiTokenUsage::default());
+        assert_eq!(AiTokenUsage::from_response(&json!({"usage":{"input_tokens":10}})).cached_input_tokens, 0);
+    }
+    #[test]
+    fn initial_request_is_independent_of_pool_properties() {
+        let state = crate::ai::efficiency_tests::pool(387, 2000);
+        let mut request = AiTurnRequest { instructions: format!("{}\nProject: {}", crate::ai::backend::SYSTEM_INSTRUCTIONS, serde_json::to_string(&project_summary(&state)).unwrap()), conversation: Conversation::default(), tools: crate::ai::tools::tool_definitions(), settings: AiSettings::default() };
+        request.conversation.push(AiMessage::text(AiRole::User, "Make the selected label wider"));
+        let compact = request_body(&request).to_string().len();
+        let smaller = crate::ai::efficiency_tests::pool(2, 1);
+        let small_summary = serde_json::to_string(&project_summary(&smaller)).unwrap().len();
+        assert!(serde_json::to_string(&project_summary(&state)).unwrap().len() <= small_summary + 3);
+        // Legacy semantic retrieval: 200 full objects plus the active layout.
+        let (ids, _) = crate::ai::snapshot::selected_ids(&state.pool, crate::ai::snapshot::active_mask(&state.pool), SnapshotScope::ActiveMask, 16);
+        let old = json!({"objects":ids.into_iter().take(200).filter_map(|id| crate::ai::snapshot::object_snapshot(&state.pool, &state.object_info, id)).collect::<Vec<_>>(), "layout":crate::ai::snapshot::layout_instances(&state.pool, &state.object_info, crate::ai::snapshot::active_mask(&state.pool), 16)});
+        request.conversation.push(AiMessage::text(AiRole::User, old.to_string()));
+        let legacy = request_body(&request).to_string().len();
+        println!("387-label synthetic pool: compact initial body {compact} bytes; body with legacy semantic context {legacy} bytes; reduction {:.1}%", 100. * (1. - compact as f64 / legacy as f64));
+        assert!(legacy > compact * 20);
+        assert_eq!(request_body(&request)["max_output_tokens"], 8192);
+        let body = request_body(&request).to_string();
+        assert!(!body.contains("Authorization"));
+        assert!(!body.contains("api_key"));
+    }
+}
+
+#[cfg(test)]
+mod image_history_tests {
+    use super::*;
+    #[test]
+    fn image_is_sent_during_turn_but_not_after_compaction() {
+        let mut conversation = crate::ai::Conversation::default();
+        conversation.push(crate::ai::AiMessage { role:AiRole::User, content:vec![AiContent::Image(crate::ai::AiImage { mime_type:"image/png".into(), bytes:vec![1,2,3] })] });
+        assert!(serde_json::to_string(&to_openai_input(&conversation)).unwrap().contains("data:image/png;base64,AQID"));
+        conversation.compact();
+        let after = serde_json::to_string(&to_openai_input(&conversation)).unwrap();
+        assert!(!after.contains("base64"));
+        assert!(after.contains("Visual review"));
     }
 }

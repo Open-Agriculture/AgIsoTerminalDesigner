@@ -1,5 +1,7 @@
 //! Provider-neutral AI domain layer. It only reads snapshots and proposes transactions.
 pub mod backend;
+pub mod debug_trace;
+pub use debug_trace::{AiTokenUsage, AiUsageStats};
 pub mod conversation;
 pub mod proposal;
 pub mod preview;
@@ -33,3 +35,5 @@ pub use snapshot::*;
 pub use tools::{get_design_context, get_objects, AiDomainTool, AiToolError, GetObjectsRequest};
 pub use preview::{render_proposal_preview, render_preview_ui, AiPreview, PreviewError, RenderedPreview};
 pub use design_analysis::{analyze_design, DesignAnalysis, DesignAnalysisError, DesignAnalysisScope, DesignDiagnostic, DesignDiagnosticSeverity, DiagnosticRegion};
+#[cfg(test)]
+mod efficiency_tests;

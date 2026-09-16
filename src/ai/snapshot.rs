@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-pub const MAX_SNAPSHOT_OBJECTS: usize = 200;
+pub const MAX_SNAPSHOT_OBJECTS: usize = 50;
+pub const MAX_CONTEXT_DEPTH: usize = 8;
 pub const MAX_SNAPSHOT_DEPTH: usize = 16;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesignSnapshot {
@@ -17,6 +18,13 @@ pub struct DesignSnapshot {
     pub objects: Vec<ObjectSnapshot>,
     pub layout: Vec<LayoutInstance>,
     pub truncated: bool,
+    pub returned_objects: usize,
+    pub total_matching_objects: usize,
+    pub next_offset: Option<usize>,
+    pub depth_limited: bool,
+    pub next_layout_offset: Option<usize>,
+    pub layout_coordinates: String,
+    pub properties_truncated: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectSnapshot {
@@ -38,11 +46,17 @@ pub struct ObjectSnapshot {
     pub id: u16,
     pub name: String,
     pub object_type: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub properties: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub references: BTreeMap<String, ObjectReferenceSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub positioned_children: Vec<PositionedChildSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_list: Option<ObjectListSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub macro_references: Vec<MacroReferenceSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<ObjectSummary>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,13 +107,23 @@ pub struct DesignContextRequest {
     pub include_selection: bool,
     pub depth: usize,
     pub max_objects: usize,
+    pub offset: usize,
+    pub layout_offset: usize,
+    pub root_id: Option<u16>,
+    pub include_properties: bool,
+    pub include_references: bool,
 }
 impl Default for DesignContextRequest {
     fn default() -> Self {
         Self {
             scope: SnapshotScope::ActiveMask,
             include_selection: true,
-            depth: MAX_SNAPSHOT_DEPTH,
+            depth: MAX_CONTEXT_DEPTH,
+            offset: 0,
+            layout_offset: 0,
+            root_id: None,
+            include_properties: false,
+            include_references: false,
             max_objects: MAX_SNAPSHOT_OBJECTS,
         }
     }
@@ -330,7 +354,10 @@ pub(crate) fn selected_ids(
         }
         ids.push(id);
         if level >= depth {
-            truncated = true;
+            truncated |= pool
+                .object_by_id(id)
+                .and_then(object_refs)
+                .is_some_and(|children| !children.is_empty());
             continue;
         }
         if let Some(object) = pool.object_by_id(id) {
@@ -344,3 +371,27 @@ pub(crate) fn selected_ids(
     (ids, truncated)
 }
 pub type PoolSnapshot = DesignSnapshot;
+
+/// Constant-size context: no traversal or property serialization.
+#[derive(Debug, Clone, Serialize)]
+pub struct AiProjectSummary {
+    #[serde(flatten)]
+    pub project: ProjectSnapshot,
+    pub selected_object: Option<ObjectSummary>,
+}
+pub fn project_summary(state: &super::AiDesignState) -> AiProjectSummary {
+    AiProjectSummary {
+        project: ProjectSnapshot {
+            revision: state.revision,
+            vt_version: format!("{:?}", state.vt_version),
+            mask_width: state.mask_size,
+            mask_height: state.mask_size,
+            object_count: state.pool.objects().len(),
+            active_mask: active_mask(&state.pool)
+                .and_then(|id| summary(&state.pool, &state.object_info, id)),
+        },
+        selected_object: state
+            .selected
+            .and_then(|id| summary(&state.pool, &state.object_info, id)),
+    }
+}
