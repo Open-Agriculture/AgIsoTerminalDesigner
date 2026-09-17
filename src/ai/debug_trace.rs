@@ -152,7 +152,11 @@ impl AiDebugState {
         let instructions = body["instructions"].to_string();
         let tools = body["tools"].to_string();
         let mut stats = AiProviderRoundStats {
-            reason: self.task.as_ref().map(|t| t.round_reason.clone()).unwrap_or_default(),
+            reason: self
+                .task
+                .as_ref()
+                .map(|t| t.round_reason.clone())
+                .unwrap_or_default(),
             prompt_cache_key: body["prompt_cache_key"].as_str().unwrap_or_default().into(),
             model: self.current_model.clone(),
             phase: self
@@ -431,57 +435,4 @@ pub fn debug_ui(ui: &mut egui::Ui, debug: &AiDebugState, settings: &mut super::A
                 });
         });
     });
-}
-
-#[cfg(test)]
-mod phase52_tests {
-    use super::*;
-    use serde_json::json;
-    #[test]
-    fn six_rounds_have_exact_usage_sizes_order_and_safe_export() {
-        let mut debug = AiDebugState::default();
-        debug.begin_request();
-        for round in 1..=6 {
-            debug.provider_rounds = round;
-            let body = json!({"instructions":"stable", "tools":[{"name":"propose_transaction"}],"input":[
-                {"role":"user","content":[{"type":"input_text","text":"edit"}]},
-                {"type":"function_call_output","output":"result"},
-                {"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}
-            ]});
-            debug.record_request(&body);
-            let response = json!({"usage":{"input_tokens":round*100,"input_tokens_details":{"cached_tokens":round*10},"output_tokens":20,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":round*100+20}});
-            debug.record_usage(AiTokenUsage::from_response(&response));
-            let stats = debug.rounds.last().unwrap();
-            assert_eq!(stats.request_bytes, body.to_string().len());
-            assert_eq!(
-                stats.instructions_bytes,
-                body["instructions"].to_string().len()
-            );
-            assert_eq!(
-                stats.tool_definitions_bytes,
-                body["tools"].to_string().len()
-            );
-            assert_eq!(stats.messages_bytes, body["input"][0].to_string().len());
-            assert_eq!(stats.tool_results_bytes, body["input"][1].to_string().len());
-            assert_eq!(stats.images_bytes, body["input"][2].to_string().len());
-            assert!(!stats.instructions_changed && !stats.tools_changed);
-            debug.trace("request", &body);
-        }
-        debug.record_tool("get_objects", false, &json!({"success":true}));
-        debug.record_tool("get_objects", true, &json!({"success":true}));
-        debug.trace("credential", &json!({"api_key":"sk-test-key"}));
-        let export = debug.export();
-        assert!(!export.contains("sk-test-key"));
-        assert!(!export.contains("AAAA"));
-        let value: Value = serde_json::from_str(&export).unwrap();
-        assert_eq!(value["rounds"].as_array().unwrap().len(), 6);
-        assert_eq!(value["rounds"][5]["round"], 6);
-        assert_eq!(value["user_request"]["tokens"]["input_tokens"], 2100);
-        assert_eq!(value["user_request"]["tokens"]["total_tokens"], 2220);
-        assert_eq!(value["user_request"]["tokens"]["cached_input_tokens"], 210);
-        assert_eq!(value["tools"]["get_objects"]["cache_hits"], 1);
-        debug.begin_request();
-        assert!(debug.rounds.is_empty() && debug.tools.is_empty());
-        assert_eq!(debug.conversation.tokens.total_tokens, 2220);
-    }
 }

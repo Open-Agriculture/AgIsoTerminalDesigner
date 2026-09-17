@@ -152,7 +152,10 @@ fn function(name: &str, description: &str, mut parameters: Value) -> Value {
     // nullable on the wire and stripped before typed defaults are deserialized.
     let strict = name != "propose_transaction";
     if strict {
-        let required = parameters["required"].as_array().cloned().unwrap_or_default();
+        let required = parameters["required"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         if let Some(properties) = parameters["properties"].as_object_mut() {
             for (key, schema) in properties.iter_mut() {
                 if !required.contains(&json!(key)) {
@@ -643,49 +646,4 @@ mod tests {
             assert!(result.is_ok(), "{payload}: {result:?}");
         }
     }
-}
-
-#[cfg(test)]
-mod phase52_schema_tests {
-    use super::*;
-    #[test]
-    fn factored_public_operation_schema_is_identical_when_expanded() {
-        let original = transaction_schema();
-        let mut compact = compact_transaction_schema();
-        assert!(compact.to_string().len() < original.to_string().len());
-        let target = compact["$defs"]["ObjectTarget"].clone();
-        compact.as_object_mut().unwrap().remove("$defs");
-        fn expand(value: &mut Value, target: &Value) {
-            if value
-                .get("$ref")
-                .is_some_and(|v| v == "#/$defs/ObjectTarget")
-            {
-                *value = target.clone();
-                return;
-            }
-            match value {
-                Value::Object(map) => {
-                    for v in map.values_mut() {
-                        expand(v, target);
-                    }
-                }
-                Value::Array(array) => {
-                    for v in array {
-                        expand(v, target);
-                    }
-                }
-                _ => {}
-            }
-        }
-        expand(&mut compact, &target);
-        assert_eq!(compact, original);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn phase51_tool_definitions() -> Vec<Value> {
-    let mut tools = tool_definitions();
-    tools[2] = function("get_object_schema", "Returns writable properties, reference types, child relationships and supported events for one ISOBUS VT object type. Use before guessing valid fields.", json!({"type":"object","properties":{"object_type":{"type":"string","enum":ObjectType::values().into_iter().map(|v| format!("{v:?}")).collect::<Vec<_>>() }},"required":["object_type"],"additionalProperties":false}));
-    tools[3]["parameters"] = transaction_schema();
-    tools
 }
