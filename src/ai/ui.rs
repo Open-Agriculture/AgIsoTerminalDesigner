@@ -97,7 +97,16 @@ pub(crate) fn run_loop(
     provider: &dyn AiProvider,
     state: &AiDesignState,
     conversation: &mut Conversation,
+    settings: AiSettings,
+) -> Result<Option<AiProposal>, AiProviderError> {
+    run_loop_with_budget(provider, state, conversation, settings, MAX_TOOL_ROUNDS)
+}
+fn run_loop_with_budget(
+    provider: &dyn AiProvider,
+    state: &AiDesignState,
+    conversation: &mut Conversation,
     mut settings: AiSettings,
+    max_rounds: usize,
 ) -> Result<Option<AiProposal>, AiProviderError> {
     let runtime =
         tokio::runtime::Runtime::new().map_err(|e| AiProviderError::Http(e.to_string()))?;
@@ -122,12 +131,36 @@ pub(crate) fn run_loop(
                 .join("\n")
         })
         .unwrap_or_default();
-    let mut task = AiTaskState::new(state, goal.clone());
+    let resume = super::task_state::continuation_instruction(&goal).filter(|_| {
+        conversation
+            .task_state
+            .as_ref()
+            .is_some_and(|t| !t.is_complete)
+    });
+    let mut task = if let Some(instruction) = resume.as_ref() {
+        let mut task = conversation.task_state.clone().unwrap();
+        if !instruction.is_empty() {
+            task.continuation_instructions.push(instruction.clone());
+        }
+        task.revalidate(state);
+        task.checkpoint = false;
+        task
+    } else {
+        conversation.pending_proposal = None;
+        AiTaskState::new(state, goal.clone())
+    };
+    let goal = task.goal.clone();
+    // Tiny local targets can be established without spending a provider round.
+    if super::snapshot::project_summary(state).project.object_count <= 4 {
+        task.refresh_target(state);
+    }
+    task.capture_fingerprints(state);
+    conversation.task_state = Some(task.clone());
     if super::task_state::explicit_ids(&goal).len() == 1 && task.explicit_target.is_none() {
         conversation.push(AiMessage::text(AiRole::Assistant,"The explicitly requested object does not exist in this project revision. Please provide its current ID."));
         return Ok(None);
     }
-    settings.role = if settings.mode == AiModelMode::Strong {
+    settings.role = if settings.mode == AiModelMode::Strong || task.escalation.is_some() {
         AiModelRole::Strong
     } else {
         AiModelRole::Fast
@@ -161,11 +194,23 @@ pub(crate) fn run_loop(
             ids
         });
     let mut pending_escalation = None;
-    let mut handoff: Option<(usize, Value)> = None;
-    let mut proposal: Option<AiProposal> = None;
+    let mut handoff: Option<(usize, Value)> = resume
+        .as_ref()
+        .map(|_| (conversation.messages.len(), task.handoff()));
+    if resume.is_some() {
+        conversation.replay_generation += 1;
+    }
+    let mut proposal: Option<AiProposal> = conversation.pending_proposal.clone();
+    if proposal
+        .as_ref()
+        .is_some_and(|p| p.base_revision != state.revision)
+    {
+        proposal = proposal.and_then(|p| propose_transaction(state, p.transaction).ok());
+    }
+    let mut phase_rounds = [0usize; 4];
     let mut calls = 0;
     let mut repairs: usize = 0;
-    for round in 0..MAX_TOOL_ROUNDS {
+    for round in 0..max_rounds.min(MAX_TOOL_ROUNDS) {
         if conversation
             .cancelled
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -198,6 +243,33 @@ pub(crate) fn run_loop(
             }
         }
         settings.phase = task.phase;
+        let phase_index = match task.phase {
+            AiTaskPhase::Inspect => 0,
+            AiTaskPhase::Propose => 1,
+            AiTaskPhase::Repair => 2,
+            AiTaskPhase::Review => 3,
+        };
+        let soft_budget = [2, 2, 2, 1][phase_index];
+        if phase_rounds[phase_index] >= soft_budget {
+            task.harness_hint = Some(match task.phase {
+                AiTaskPhase::Inspect => "Inspection budget reached. Finish inspection unless one specific missing fact blocks the proposal.",
+                AiTaskPhase::Propose => "Proposal budget reached. Submit the transaction using loaded schemas now.",
+                AiTaskPhase::Repair => "Repair only the reported validation errors; do not restart exploration.",
+                AiTaskPhase::Review => "Finish the review and summarize the staged proposal.",
+            }.into());
+        }
+        phase_rounds[phase_index] += 1;
+        task.round_reason = match task.phase {
+            AiTaskPhase::Inspect if task.inspection_rounds == 0 => "initial inspection",
+            AiTaskPhase::Inspect => "design planning",
+            AiTaskPhase::Propose => "proposal",
+            AiTaskPhase::Repair => "validation repair",
+            AiTaskPhase::Review => "proposal review",
+        }
+        .into();
+        task.provider_rounds_used += 1;
+        conversation.task_state = Some(task.clone());
+        conversation.pending_proposal = proposal.clone();
         let instructions = format!("{SYSTEM_INSTRUCTIONS}\nProject: {summary}");
         let mut provider_conversation = conversation.clone();
         if let Some((cursor, packet)) = &handoff {
@@ -264,17 +336,26 @@ pub(crate) fn run_loop(
             .collect();
         conversation.push(assistant_message(response.content));
         if tool_calls.is_empty() {
+            task.is_complete = proposal.is_some() || task.tool_calls_used == 0;
+            task.checkpoint = !task.is_complete;
+            conversation.task_state = Some(task.clone());
+            conversation.pending_proposal = proposal.clone();
+            conversation.debug.lock().unwrap().task = Some(task.clone());
             return Ok(proposal);
         }
         calls += tool_calls.len();
+        task.tool_calls_used += tool_calls.len();
         if calls > MAX_TOOL_CALLS_PER_REQUEST {
-            return Err(AiProviderError::InvalidResponse(format!(
-                "tool-call limit ({MAX_TOOL_CALLS_PER_REQUEST}) exceeded"
-            )));
+            break;
         }
         let mut results = Vec::new();
         let mut stop_reason = None;
         for mut call in tool_calls {
+            if let Some(args) = call.arguments.as_object_mut() {
+                if call.name != "propose_transaction" {
+                    args.retain(|_, value| !value.is_null());
+                }
+            }
             if stop_reason.is_some() {
                 results.push(AiContent::ToolResult(AiToolResult { call_id: call.call_id, result: json!({"success":false,"error":"Assistant stopped at its safety limit; this call was not executed."}) }));
                 continue;
@@ -319,7 +400,27 @@ pub(crate) fn run_loop(
                     false
                 }
             });
-            let (mut result, proposed, repair) = if outside_target {
+            let empty_read = task.screen_is_empty
+                && match call.name.as_str() {
+                    "get_design_context" | "inspect_design_region" => {
+                        call.arguments["scope"] != "EntirePool"
+                            && call.arguments["root_id"]
+                                .as_u64()
+                                .is_none_or(|id| Some(id as u16) == task.target_root)
+                    }
+                    "get_objects" => call.arguments["ids"].as_array().is_some_and(|ids| {
+                        ids.iter()
+                            .all(|id| id.as_u64().map(|id| id as u16) == task.target_root)
+                    }),
+                    _ => false,
+                };
+            let (mut result, proposed, repair) = if empty_read {
+                (
+                    json!({"success":true,"target":task.target_root,"screen_is_empty":true,"direct_child_count":0,"hint":"No local styles or children exist. Finish inspection with required_object_types."}),
+                    None,
+                    false,
+                )
+            } else if outside_target {
                 (
                     json!({"success":false,"error":"Forward inspection is bounded to the explicit request mask. Use its descendants; unrelated UI selection is not a target."}),
                     None,
@@ -332,8 +433,33 @@ pub(crate) fn run_loop(
                     false,
                 )
             } else if call.name == "finish_inspection" {
-                task.phase = AiTaskPhase::Propose;
-                (json!({"success":true,"phase":"Propose"}), None, false)
+                let types = call.arguments["required_object_types"].as_array();
+                if let Some(types) =
+                    types.filter(|types| types.len() <= super::tools::MAX_SCHEMA_TYPES_PER_CALL)
+                {
+                    let schema_call = AiToolCall {
+                        call_id: call.call_id.clone(),
+                        name: "get_object_schema".into(),
+                        arguments: json!({"object_types":types}),
+                    };
+                    let mut result = if types.is_empty() {
+                        json!({"success":true,"schemas":[]})
+                    } else {
+                        cache.execute(state, &schema_call, None).0
+                    };
+                    if result["success"] == true {
+                        task.observe(&schema_call, &result);
+                        task.phase = AiTaskPhase::Propose;
+                        result["phase"] = json!("Propose");
+                    }
+                    (result, None, false)
+                } else {
+                    (
+                        json!({"success":false,"error":"Provide required_object_types: at most 10 canonical types used by your plan (empty for schema-free operations)."}),
+                        None,
+                        false,
+                    )
+                }
             } else if call.name == "request_stronger_model" {
                 if call.arguments["reason"]
                     .as_str()
@@ -355,6 +481,18 @@ pub(crate) fn run_loop(
             } else {
                 cache.execute(state, &call, proposal.as_ref())
             };
+            let normalized = (call.name == "propose_transaction"
+                && call.arguments.get("schema_version").is_none())
+                || (call.name == "get_object_schema"
+                    && call.arguments["object_types"].as_array().is_some_and(|a| {
+                        a.len() > super::tools::MAX_SCHEMA_TYPES_PER_CALL
+                            || a.iter().collect::<std::collections::HashSet<_>>().len() != a.len()
+                    }));
+            if normalized {
+                task.normalization_count += 1;
+                conversation.debug.lock().unwrap().failure_class =
+                    Some(AiFailureClass::HarnessNormalization);
+            }
             if result["success"] == false {
                 conversation.debug.lock().unwrap().failure_class =
                     Some(if result["failure_class"] == "ModelDecision" {
@@ -430,15 +568,27 @@ pub(crate) fn run_loop(
         if task.stuck() {
             if settings.role == AiModelRole::Fast && settings.mode == AiModelMode::Automatic {
                 pending_escalation = Some(AiEscalationReason::InspectionLoop);
-                task.phase = AiTaskPhase::Propose;
             } else {
                 stop_reason = Some(
                     "Inspection stopped because repeated reads made no useful progress.".into(),
                 );
             }
         }
+        if !task.screen_is_empty
+            && task.target_root.is_some_and(|id| {
+                task.inspected_roots.contains(&id) || task.relevant_objects.contains(&id)
+            })
+        {
+            task.refresh_target(state);
+        }
+        task.capture_fingerprints(state);
+        conversation.task_state = Some(task.clone());
+        conversation.pending_proposal = proposal.clone();
         conversation.debug.lock().unwrap().task = Some(task.clone());
         if let Some(reason) = stop_reason {
+            task.checkpoint = true;
+            conversation.task_state = Some(task.clone());
+            conversation.debug.lock().unwrap().task = Some(task.clone());
             let outcome = if proposal.is_some() {
                 "The previous valid proposal is still staged for review. No changes have been applied."
             } else {
@@ -446,16 +596,21 @@ pub(crate) fn run_loop(
             };
             conversation.push(AiMessage::text(
                 AiRole::Assistant,
-                format!("{reason}\n{outcome}"),
+                format!(
+                    "{reason}\n{outcome} AI task paused before completion. Continue to resume."
+                ),
             ));
             return Ok(proposal);
         }
     }
-    conversation.push(AiMessage::text(AiRole::Assistant, if proposal.is_some() {
-  "I reached the assistant's tool-round limit. The staged proposal is available for review, but I may not have completed all checks. No changes have been applied."
- } else {
-  "I reached the assistant's tool-round limit before finishing. No changes have been proposed. Try asking for a smaller step, or ask me to continue."
- }));
+    task.checkpoint = true;
+    conversation.task_state = Some(task.clone());
+    conversation.pending_proposal = proposal.clone();
+    conversation.debug.lock().unwrap().task = Some(task);
+    conversation.push(AiMessage::text(
+        AiRole::Assistant,
+        "AI task paused before completion. Continue to resume from the current state.",
+    ));
     Ok(proposal)
 }
 /// Typed defaults are normalized before keying. The cache belongs to one loop only.
@@ -499,6 +654,36 @@ impl ReadToolCache {
         call: &AiToolCall,
         proposal: Option<&AiProposal>,
     ) -> (Value, Option<AiProposal>, bool) {
+        if call.name == "get_object_schema" {
+            let names = call.arguments["object_types"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .chain(call.arguments.get("object_type"));
+            let invalid: Vec<_> = names
+                .filter_map(Value::as_str)
+                .filter(|name| {
+                    !ObjectType::values()
+                        .iter()
+                        .any(|ty| format!("{ty:?}") == *name)
+                })
+                .collect();
+            if !invalid.is_empty() {
+                let suggestions: Vec<_> = invalid
+                    .iter()
+                    .filter_map(|name| match *name {
+                        "NumericOutput" => Some("OutputNumber"),
+                        "SoftKey" => Some("Key"),
+                        _ => None,
+                    })
+                    .collect();
+                return (
+                    json!({"success":false,"invalid_types":invalid,"suggestions":suggestions}),
+                    None,
+                    false,
+                );
+            }
+        }
         if call.name == "get_object_schema" && call.arguments.get("object_types").is_some() {
             let types = serde_json::from_value::<super::tools::GetObjectSchemaRequest>(
                 call.arguments.clone(),
@@ -611,8 +796,15 @@ fn execute_tool(
             Err(e) => parse(format!("{e:?}")),
         },
         "propose_transaction" => {
+            let mut arguments = call.arguments.clone();
+            if let Some(args) = arguments.as_object_mut() {
+                args.insert(
+                    "schema_version".into(),
+                    json!(crate::operations::CURRENT_OPERATION_SCHEMA_VERSION),
+                );
+            }
             let tx = match serde_json::from_value::<crate::operations::OperationTransaction>(
-                call.arguments.clone(),
+                arguments,
             ) {
                 Ok(tx) => tx,
                 Err(error) => {
@@ -682,10 +874,10 @@ mod tests {
         let proposal =
             run_loop(&provider, &state, &mut conversation, AiSettings::default()).unwrap();
         assert!(proposal.is_none());
-        assert_eq!(provider.0.load(Ordering::SeqCst), MAX_TOOL_ROUNDS);
+        assert!(provider.0.load(Ordering::SeqCst) <= MAX_TOOL_ROUNDS);
         assert!(conversation.messages.len() <= MAX_TOOL_ROUNDS * 2 + 3);
         assert!(
-            matches!(&conversation.messages.last().unwrap().content[0], AiContent::Text(text) if text.contains("No changes have been proposed"))
+            matches!(&conversation.messages.last().unwrap().content[0], AiContent::Text(text) if text.contains("Continue to resume"))
         );
     }
     struct InvalidProposalProvider {
@@ -699,7 +891,9 @@ mod tests {
         ) -> super::super::AiProviderFuture<Result<super::super::AiProviderResponse, AiProviderError>>
         {
             let round = self.calls.fetch_add(1, Ordering::SeqCst);
-            let arguments = if self.valid_first && round == 1 {
+            let arguments = if round == 0 {
+                json!({"required_object_types":[]})
+            } else if self.valid_first && round == 1 {
                 json!({"schema_version":2,"operations":[{"type":"RenameObject","data":{"object":{"id":10},"name":"Renamed"}}]})
             } else {
                 json!({"schema_version":2,"operations":[{"type":"SetProperty","data":{}}]})

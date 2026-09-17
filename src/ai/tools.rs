@@ -95,7 +95,7 @@ impl GetObjectSchemaRequest {
         if let Some(ty) = self.object_type {
             types.push(ty);
         }
-        if types.is_empty() || types.len() > MAX_SCHEMA_TYPES_PER_CALL {
+        if types.is_empty() {
             return Err(format!(
                 "Request 1–{MAX_SCHEMA_TYPES_PER_CALL} object types"
             ));
@@ -119,7 +119,7 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         function("get_design_context", "Forward layout overview, depth 1 by default: direct children with geometry first. Drill into root_id for relevant subtrees; page with layout_offset only when needed. Objects contain only summaries first needed on that layout page. EntirePool pages objects with offset. Coordinates are parent-relative; path identifies occurrences. Properties opt-in.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["ActiveMask","Selection","EntirePool"]},"include_selection":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"layout_offset":{"type":"integer","minimum":0},"root_id":{"type":"integer","minimum":0,"maximum":65534},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"depth":{"type":"integer","minimum":0,"maximum":8},"max_objects":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
         function("get_objects", "Batch relevant IDs (up to 20), requesting only required sections. Parents are reverse references and may be large: leave include_parents false unless reverse usage is needed; shared variables/styles may have many parents. Parents page independently with parent_offset/parent_limit (default 8, max 20). include_nearby_style returns up to 8 descendant style examples with resolved styles; page with detail_offset. Children/macros page with detail_offset/detail_limit. Long properties page with property_offset/property_limit.", json!({"type":"object","properties":{"ids":{"type":"array","maxItems":20,"items":{"type":"integer","minimum":0,"maximum":65534}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean","default":false},"parent_offset":{"type":"integer","minimum":0},"parent_limit":{"type":"integer","minimum":1,"maximum":20},"include_nearby_style":{"type":"boolean"},"include_macros":{"type":"boolean"},"detail_offset":{"type":"integer","minimum":0},"detail_limit":{"type":"integer","minimum":1,"maximum":100},"property_offset":{"type":"integer","minimum":0},"property_limit":{"type":"integer","minimum":1,"maximum":4096}},"required":["ids"],"additionalProperties":false})),
-        function("get_object_schema", "Writable properties and relationship rules. Batch all needed types (up to 10) in object_types; object_type accepts a single type.", json!({"type":"object","properties":{"object_type":{"type":"string"},"object_types":{"type":"array","minItems":1,"maxItems":MAX_SCHEMA_TYPES_PER_CALL,"items":{"type":"string"}}},"anyOf":[{"required":["object_type"]},{"required":["object_types"]}],"additionalProperties":false})),
+        function("get_object_schema", "Writable properties and relationship rules. Batch all needed types (up to 10) in object_types; object_type accepts a single type.", json!({"type":"object","properties":{"object_type":canonical_object_type_schema(),"object_types":{"type":"array","maxItems":MAX_SCHEMA_TYPES_PER_CALL,"items":canonical_object_type_schema()}},"anyOf":[{"required":["object_type"]},{"required":["object_types"]}],"additionalProperties":false})),
         function("propose_transaction", "Validates and stages one atomic design change without modifying the user's project. All edits must be submitted through this tool.", compact_transaction_schema()),
         function("analyze_design", "Returns deterministic visual design-quality diagnostics. It is read-only and does not replace domain validation.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["active_mask","proposal"]}},"additionalProperties":false})),
     ]
@@ -139,13 +139,32 @@ pub fn phase_tool_definitions(phase: super::task_state::AiTaskPhase) -> Vec<Valu
         tools.push(function("inspect_design_region", "Focused nearby style examples, path, local geometry and absolute geometry relative to root. Forward display edges only; existing style references are resolved. Ranked by distance to region center then path.", json!({"type":"object","properties":{"root_id":{"type":"integer","minimum":0,"maximum":65534},"region":{"type":"string","enum":["top","bottom","left","right","center","top_left","top_right","bottom_left","bottom_right","all"]},"types":{"type":"array","items":{"type":"string"}},"purpose":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":30}},"required":["root_id"],"additionalProperties":false})));
     }
     if phase == AiTaskPhase::Inspect {
-        tools.push(function("finish_inspection", "Local facts are sufficient; expose transaction proposal tools next round. No mutation.", json!({"type":"object","properties":{"summary":{"type":"string","maxLength":512}},"additionalProperties":false})));
+        tools.push(function("finish_inspection", "Design plan is ready. List only types actually used by the planned transaction; the harness loads their schemas before Propose.", json!({"type":"object","properties":{"summary":{"type":"string","maxLength":512},"required_object_types":{"type":"array","maxItems":MAX_SCHEMA_TYPES_PER_CALL,"items":canonical_object_type_schema()}},"required":["required_object_types"],"additionalProperties":false})));
     }
     tools.push(function("request_stronger_model", "Request stronger reasoning for a concrete blocker. The harness chooses the model; no mutation.", json!({"type":"object","properties":{"reason":{"type":"string","minLength":1,"maxLength":512}},"required":["reason"],"additionalProperties":false})));
     tools
 }
-fn function(name: &str, description: &str, parameters: Value) -> Value {
-    json!({"type":"function","name":name,"description":description,"parameters":parameters,"strict":false})
+pub fn canonical_object_type_schema() -> Value {
+    json!({"type":"string","enum":ObjectType::values().into_iter().map(|v| format!("{v:?}")).collect::<Vec<_>>()})
+}
+fn function(name: &str, description: &str, mut parameters: Value) -> Value {
+    // Strict function calling requires every property required. Optional inputs are
+    // nullable on the wire and stripped before typed defaults are deserialized.
+    let strict = name != "propose_transaction";
+    if strict {
+        let required = parameters["required"].as_array().cloned().unwrap_or_default();
+        if let Some(properties) = parameters["properties"].as_object_mut() {
+            for (key, schema) in properties.iter_mut() {
+                if !required.contains(&json!(key)) {
+                    *schema = json!({"anyOf":[schema.clone(), {"type":"null"}]});
+                }
+            }
+            let keys: Vec<_> = properties.keys().cloned().collect();
+            parameters["required"] = json!(keys);
+        }
+        parameters.as_object_mut().unwrap().remove("anyOf");
+    }
+    json!({"type":"function","name":name,"description":description,"parameters":parameters,"strict":strict})
 }
 /// Mirrors the public serde transaction envelope. Operation payloads remain the source of truth
 /// and are deserialized by `OperationTransaction`; skipped restoration variants are excluded.
@@ -158,7 +177,7 @@ fn transaction_schema() -> Value {
     let variants = vec![
         operation_schema(
             "CreateObject",
-            json!({"object_id":{"anyOf":[id,{"type":"null"}]},"object_type":{"type":"string","enum":ObjectType::values().into_iter().map(|v|format!("{v:?}")).collect::<Vec<_>>()},"name":string}),
+            json!({"object_id":{"anyOf":[id,{"type":"null"}]},"object_type":canonical_object_type_schema(),"name":string}),
             &["object_type", "name"],
         ),
         operation_schema("DeleteObject", json!({"object_id":id}), &["object_id"]),
@@ -227,8 +246,8 @@ fn transaction_schema() -> Value {
         ),
     ];
     object_schema(
-        json!({"schema_version":{"type":"integer","const":2},"description":{"type":["string","null"]},"operations":{"type":"array","minItems":1,"items":{"anyOf":variants}}}),
-        &["schema_version", "operations"],
+        json!({"description":{"type":["string","null"]},"operations":{"type":"array","minItems":1,"items":{"anyOf":variants}}}),
+        &["operations"],
     )
 }
 /// Factor the repeated public ObjectTarget schema without changing its constraints.

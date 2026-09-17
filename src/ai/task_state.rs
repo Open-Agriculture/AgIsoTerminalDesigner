@@ -38,10 +38,24 @@ pub enum AiFailureClass {
     ProviderTransport,
     StaleProject,
     ToolExecution,
+    HarnessNormalization,
 }
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AiTaskState {
     pub goal: String,
+    pub continuation_instructions: Vec<String>,
+    pub expected_revision: u64,
+    pub is_complete: bool,
+    pub checkpoint: bool,
+    pub screen_is_empty: bool,
+    pub provider_rounds_used: usize,
+    pub tool_calls_used: usize,
+    pub normalization_count: usize,
+    pub round_reason: String,
+    #[serde(skip)]
+    pub schema_definitions: std::collections::BTreeMap<String, Value>,
+    #[serde(skip)]
+    pub object_fingerprints: std::collections::BTreeMap<u16, Value>,
     pub explicit_target: Option<ObjectSummary>,
     pub target_root: Option<u16>,
     pub inspected_roots: BTreeSet<u16>,
@@ -94,7 +108,9 @@ impl AiTaskState {
     pub fn new(state: &AiDesignState, goal: String) -> Self {
         let explicit_target = explicit_target(state, &goal);
         Self {
-            target_root: explicit_target.as_ref().map(|s| s.id),
+            expected_revision: state.revision,
+            target_root: explicit_target.as_ref().map(|s| s.id).or_else(||
+                explicit_ids(&goal).is_empty().then(|| super::snapshot::active_mask(&state.pool).map(|id| id.value())).flatten()),
             explicit_target,
             goal: goal.chars().take(4096).collect(),
             ..Default::default()
@@ -131,6 +147,15 @@ impl AiTaskState {
         }
         if let Some(root) = call.arguments["root_id"].as_u64() {
             self.inspected_roots.insert(root as u16);
+        }
+        if call.name == "get_object_schema" || call.name == "finish_inspection" {
+            let schemas = result["schemas"].as_array().cloned().unwrap_or_else(|| result.get("schema").cloned().into_iter().collect());
+            for schema in schemas {
+                if let Some(name) = schema["object_type"].as_str().or_else(|| schema["type"].as_str()) {
+                    self.loaded_schemas.insert(name.to_owned());
+                    self.schema_definitions.insert(name.to_owned(), schema);
+                }
+            }
         }
         if call.name == "get_object_schema" {
             if let Ok(r) = serde_json::from_value::<super::tools::GetObjectSchemaRequest>(
@@ -169,6 +194,8 @@ impl AiTaskState {
         if call.name == "inspect_design_region" {
             collect(&result["region"]["objects"], &mut self.style_examples);
         }
+        // Exact schema definitions are retained once, not duplicated as observations.
+        if matches!(call.name.as_str(), "get_object_schema" | "finish_inspection") { return; }
         let observation = json!({"tool":call.name,"arguments":call.arguments,"result":result});
         if !self.observations.contains(&observation) && observation.to_string().len() <= 16_384 {
             self.observations.push(observation);
@@ -218,8 +245,78 @@ impl AiTaskState {
             .latest_candidate
             .as_ref()
             .filter(|v| v.to_string().len() <= 16_384);
-        json!({"task":self,"observations":self.observations,"latest_candidate":candidate,
+        json!({"task":self,"schemas":self.schema_definitions,"observations":self.observations,"latest_candidate":candidate,
             "candidate_omitted":self.latest_candidate.is_some() && candidate.is_none(),"diagnostics":self.diagnostics,
             "instruction":"Continue from these observations. Do not restart exploration unless a specific missing fact prevents repair."})
+    }
+}
+
+/// Conservative continuation recognition; arbitrary new instructions replace the task.
+pub fn continuation_instruction(message: &str) -> Option<String> {
+    let text = message.trim();
+    let lower = text.to_ascii_lowercase();
+    for prefix in ["continue", "go on", "keep going", "proceed", "resume"] {
+        if lower == prefix || lower == format!("{prefix}.") {
+            return Some(String::new());
+        }
+        if lower.starts_with(&format!("{prefix},")) {
+            return Some(text[prefix.len()+1..].trim().to_owned());
+        }
+    }
+    None
+}
+impl AiTaskState {
+    pub fn refresh_target(&mut self, state: &AiDesignState) {
+        if let Some(root) = self.target_root.and_then(|id| ag_iso_stack::object_pool::ObjectId::new(id).ok()) {
+            self.screen_is_empty = state.pool.object_by_id(root).is_some_and(|o|
+                format!("{:?}", o.object_type()).ends_with("Mask")) &&
+                super::snapshot::context_layout(&state.pool, &state.object_info, Some(root), 1).next().is_none();
+            if self.screen_is_empty {
+                self.inspected_roots.insert(root.value());
+                self.relevant_objects.insert(root.value());
+                self.harness_hint = Some("Target is empty. Use defaults and finish_inspection with a minimal design vocabulary; no further local exploration is needed.".into());
+            }
+        }
+    }
+    pub fn capture_fingerprints(&mut self, state: &AiDesignState) {
+        for id in self.relevant_objects.iter().copied().chain(self.target_root) {
+            if let Some(value) = ag_iso_stack::object_pool::ObjectId::new(id).ok().and_then(|id|
+                super::snapshot::object_snapshot_sections(&state.pool, &state.object_info, id, false)) {
+                self.object_fingerprints.insert(id, serde_json::to_value(value).unwrap());
+            }
+        }
+    }
+    pub fn revalidate(&mut self, state: &AiDesignState) {
+        if self.expected_revision == state.revision { return; }
+        let changed: BTreeSet<_> = self.object_fingerprints.iter().filter_map(|(id, old)| {
+            let current = ag_iso_stack::object_pool::ObjectId::new(*id).ok().and_then(|id|
+                super::snapshot::object_snapshot_sections(&state.pool, &state.object_info, id, false))
+                .and_then(|v| serde_json::to_value(v).ok());
+            (current.as_ref() != Some(old)).then_some(*id)
+        }).collect();
+        if !changed.is_empty() {
+            self.inspected_roots.retain(|id| !changed.contains(id));
+            self.relevant_objects.retain(|id| !changed.contains(id));
+            self.style_examples.retain(|id| !changed.contains(id));
+            self.observations.retain(|v| {
+                fn mentions(value: &Value, ids: &BTreeSet<u16>) -> bool {
+                    match value {
+                        Value::Object(map) => map.iter().any(|(key, v)|
+                            ((key == "id" || key == "root_id") && v.as_u64().is_some_and(|id| ids.contains(&(id as u16)))) || mentions(v, ids)),
+                        Value::Array(items) => items.iter().any(|v| mentions(v, ids)),
+                        _ => false,
+                    }
+                }
+                !mentions(v, &changed)
+            });
+            self.phase = AiTaskPhase::Inspect;
+            self.inspection_rounds = 0;
+            self.stagnant_rounds = 0;
+            self.warned = false;
+            self.harness_hint = Some(format!("Project changed. Reinspect changed objects {changed:?}; reuse other facts and schemas. Revalidate the retained candidate before proposing."));
+        }
+        self.explicit_target = explicit_target(state, &self.goal);
+        self.expected_revision = state.revision;
+        self.refresh_target(state);
     }
 }

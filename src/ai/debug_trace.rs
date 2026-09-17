@@ -56,6 +56,9 @@ pub struct AiTraceEntry {
 }
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AiProviderRoundStats {
+    pub reason: String,
+    pub prompt_cache_key: String,
+    pub prompt_cache_diagnostics: Option<Value>,
     pub model: String,
     pub phase: String,
     pub round: usize,
@@ -149,6 +152,8 @@ impl AiDebugState {
         let instructions = body["instructions"].to_string();
         let tools = body["tools"].to_string();
         let mut stats = AiProviderRoundStats {
+            reason: self.task.as_ref().map(|t| t.round_reason.clone()).unwrap_or_default(),
+            prompt_cache_key: body["prompt_cache_key"].as_str().unwrap_or_default().into(),
             model: self.current_model.clone(),
             phase: self
                 .task
@@ -344,6 +349,9 @@ pub fn debug_ui(ui: &mut egui::Ui, debug: &AiDebugState, settings: &mut super::A
         });
         ui.label(format!("Current model: {} · provider latency {} ms",debug.current_model,debug.latency_ms));
         if let Some(task) = &debug.task {
+            ui.label(format!("Task: {}", task.goal));
+            ui.label(format!("Status: {} · target {:?} · resume available {} · checkpoint {}", if task.is_complete { "complete" } else if task.checkpoint { "paused" } else { "running" }, task.target_root, !task.is_complete, task.checkpoint));
+            ui.label(format!("Schemas: {} · harness normalizations {}", task.loaded_schemas.iter().cloned().collect::<Vec<_>>().join(", "), task.normalization_count));
             ui.label(format!("Phase {:?} · inspection rounds {} · proposals {} · validation failures {} · escalation {:?}",task.phase,task.inspection_rounds,task.proposal_attempts,task.validation_failures,task.escalation));
         }
         for (name, usage) in &debug.model_usage {
@@ -383,6 +391,7 @@ pub fn debug_ui(ui: &mut egui::Ui, debug: &AiDebugState, settings: &mut super::A
         }
         ui.collapsing("Provider rounds (exact tokens; serialized bytes)", |ui| {
             for round in &debug.rounds {
+                ui.label(format!("Why another round: {}", round.reason));
                 ui.collapsing(format!("Round {} · input {} · cached {} · uncached {} · output {} · {} bytes", round.round, round.tokens.input_tokens, round.tokens.cached_input_tokens, round.tokens.uncached_input_tokens(), round.tokens.output_tokens, round.request_bytes), |ui| {
                     ui.label(format!("Continuation: {} · New input bytes: {} · Historical replay bytes: {}", round.continuation, round.new_input_bytes, round.historical_replay_bytes));
                     ui.label(format!("Reasoning {} · total {} · usage reported {}", round.tokens.reasoning_tokens, round.tokens.total_tokens, round.usage_reported));

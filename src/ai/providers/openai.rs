@@ -237,6 +237,10 @@ impl AiProvider for OpenAiProvider {
                     };
                 }
                 let response = parse_response(value.clone())?;
+                if let Some(round) = request.conversation.debug.lock().unwrap().rounds.last_mut() {
+                    round.prompt_cache_diagnostics = value.get("prompt_cache_diagnostics").cloned()
+                        .or_else(|| value["usage"].get("prompt_cache_diagnostics").cloned());
+                }
                 continuation.accept(&request, &value);
                 transport.lock().unwrap().continuation = continuation;
                 return Ok(response);
@@ -252,7 +256,7 @@ fn request_body_with_input(request: &AiTurnRequest, mut input: Vec<Value>) -> Va
     if let Some(state) = &request.conversation.task_state {
         input.push(json!({"role":"user","content":[{"type":"input_text","text":format!("Task state: {}",serde_json::to_string(state).unwrap())}]}));
     }
-    let mut body = json!({"model":model_id(&request.settings),"max_output_tokens":request.settings.max_output_tokens,"instructions":request.instructions,"input":input,"tools":request.tools,"store":false,"prompt_cache_key":format!("AgIsoTerminalDesigner:{}:{:?}:tools-v3", model_id(&request.settings), request.settings.phase),"parallel_tool_calls":true});
+    let mut body = json!({"model":model_id(&request.settings),"max_output_tokens":request.settings.max_output_tokens,"instructions":request.instructions,"input":input,"tools":request.tools,"store":false,"prompt_cache_key":format!("AgIsoTerminalDesigner:{}:v4", model_id(&request.settings)),"parallel_tool_calls":true});
     let effort = if request.settings.role == crate::ai::task_state::AiModelRole::Strong {
         &request.settings.strong_reasoning_effort
     } else {
