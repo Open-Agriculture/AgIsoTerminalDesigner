@@ -112,13 +112,15 @@ pub fn inspect_design_region(
         let mut style = json!({});
         for name in [
             "background_colour",
+            "border_colour",
+            "transparency_colour",
             "justification",
             "options",
             "horizontal_justification",
             "vertical_justification",
         ] {
             if let Ok(v) = get_object_property(object, name) {
-                style[name] = v;
+                style[name] = super::visual_intent::enrich(&state.pool, object.object_type(), name, v);
             }
         }
         let mut refs = json!({});
@@ -141,7 +143,7 @@ pub fn inspect_design_region(
                             ) {
                                 if let Ok(v) = get_object_property(attribute, d.name) {
                                     if v.to_string().len() <= 256 {
-                                        resolved[d.name] = v;
+                                        resolved[d.name] = super::visual_intent::enrich(&state.pool, attribute.object_type(), d.name, v);
                                     }
                                 }
                             }

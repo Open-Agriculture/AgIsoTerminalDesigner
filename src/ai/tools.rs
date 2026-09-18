@@ -117,6 +117,7 @@ impl GetObjectSchemaRequest {
 /// Provider-facing definitions for precisely the four Phase 3 domain tools.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
+        function("resolve_colours", "Resolve up to 16 semantic names, RGB requests, or explicit indices against the effective rendering palette.", json!({"type":"object","properties":{"queries":{"type":"array","minItems":1,"maxItems":16,"items":super::visual_intent::colour_schema()}},"required":["queries"],"additionalProperties":false})),
         function("get_design_context", "Forward layout overview, depth 1 by default: direct children with geometry first. Drill into root_id for relevant subtrees; page with layout_offset only when needed. Objects contain only summaries first needed on that layout page. EntirePool pages objects with offset. Coordinates are parent-relative; path identifies occurrences. Properties opt-in.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["ActiveMask","Selection","EntirePool"]},"include_selection":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"layout_offset":{"type":"integer","minimum":0},"root_id":{"type":"integer","minimum":0,"maximum":65534},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"depth":{"type":"integer","minimum":0,"maximum":8},"max_objects":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
         function("get_objects", "Batch relevant IDs (up to 20), requesting only required sections. Parents are reverse references and may be large: leave include_parents false unless reverse usage is needed; shared variables/styles may have many parents. Parents page independently with parent_offset/parent_limit (default 8, max 20). include_nearby_style returns up to 8 descendant style examples with resolved styles; page with detail_offset. Children/macros page with detail_offset/detail_limit. Long properties page with property_offset/property_limit.", json!({"type":"object","properties":{"ids":{"type":"array","maxItems":20,"items":{"type":"integer","minimum":0,"maximum":65534}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean","default":false},"parent_offset":{"type":"integer","minimum":0},"parent_limit":{"type":"integer","minimum":1,"maximum":20},"include_nearby_style":{"type":"boolean"},"include_macros":{"type":"boolean"},"detail_offset":{"type":"integer","minimum":0},"detail_limit":{"type":"integer","minimum":1,"maximum":100},"property_offset":{"type":"integer","minimum":0},"property_limit":{"type":"integer","minimum":1,"maximum":4096}},"required":["ids"],"additionalProperties":false})),
         function("get_object_schema", "Writable properties and relationship rules. Batch all needed types (up to 10) in object_types; object_type accepts a single type.", json!({"type":"object","properties":{"object_type":canonical_object_type_schema(),"object_types":{"type":"array","maxItems":MAX_SCHEMA_TYPES_PER_CALL,"items":canonical_object_type_schema()}},"anyOf":[{"required":["object_type"]},{"required":["object_types"]}],"additionalProperties":false})),
@@ -139,7 +140,7 @@ pub fn phase_tool_definitions(phase: super::task_state::AiTaskPhase) -> Vec<Valu
         tools.push(function("inspect_design_region", "Focused nearby style examples, path, local geometry and absolute geometry relative to root. Forward display edges only; existing style references are resolved. Ranked by distance to region center then path.", json!({"type":"object","properties":{"root_id":{"type":"integer","minimum":0,"maximum":65534},"region":{"type":"string","enum":["top","bottom","left","right","center","top_left","top_right","bottom_left","bottom_right","all"]},"types":{"type":"array","items":{"type":"string"}},"purpose":{"type":"string"},"max_results":{"type":"integer","minimum":1,"maximum":30}},"required":["root_id"],"additionalProperties":false})));
     }
     if phase == AiTaskPhase::Inspect {
-        tools.push(function("finish_inspection", "Design plan is ready. List only types actually used by the planned transaction; the harness loads their schemas before Propose.", json!({"type":"object","properties":{"summary":{"type":"string","maxLength":512},"required_object_types":{"type":"array","maxItems":MAX_SCHEMA_TYPES_PER_CALL,"items":canonical_object_type_schema()}},"required":["required_object_types"],"additionalProperties":false})));
+        tools.push(function("finish_inspection", "Design plan is ready. List only types actually used by the planned transaction; the harness loads their schemas before Propose.", json!({"type":"object","properties":{"theme":super::visual_intent::theme_schema(),"summary":{"type":"string","maxLength":512},"required_object_types":{"type":"array","maxItems":MAX_SCHEMA_TYPES_PER_CALL,"items":canonical_object_type_schema()}},"required":["required_object_types"],"additionalProperties":false})));
     }
     tools.push(function("request_stronger_model", "Request stronger reasoning for a concrete blocker. The harness chooses the model; no mutation.", json!({"type":"object","properties":{"reason":{"type":"string","minLength":1,"maxLength":512}},"required":["reason"],"additionalProperties":false})));
     tools
@@ -178,6 +179,7 @@ fn transaction_schema() -> Value {
     let coordinate = json!({"type":"integer","minimum":-32768,"maximum":32767});
     let string = json!({"type":"string"});
     let variants = vec![
+        operation_schema("CreateIcon", json!({"icon":{"type":"string","enum":super::icon_recipes::ICONS},"name":string,"object_id":id,"width":{"type":"integer","minimum":8,"maximum":128},"height":{"type":"integer","minimum":8,"maximum":128},"foreground":super::visual_intent::colour_schema(),"background":super::visual_intent::colour_schema(),"transparent":{"type":"boolean"},"parent":target,"x":coordinate,"y":coordinate}), &["icon","name","width","height","foreground","transparent"]),
         operation_schema(
             "CreateObject",
             json!({"object_id":{"anyOf":[id,{"type":"null"}]},"object_type":canonical_object_type_schema(),"name":string}),
@@ -186,7 +188,7 @@ fn transaction_schema() -> Value {
         operation_schema("DeleteObject", json!({"object_id":id}), &["object_id"]),
         operation_schema(
             "SetProperty",
-            json!({"object":target,"property":string,"value":{"description":"Use the property's type and valid range from get_object_schema."}}),
+            json!({"object":target,"property":string,"theme_role":{"type":"string","enum":["background","primary_text","secondary_text","accent","danger"]},"value":{"description":"Colour properties accept an integer, {name: canonical_name}, or {rgb: #RRGGBB}. Other properties use their schema type."}}),
             &["object", "property", "value"],
         ),
         operation_schema(
@@ -551,9 +553,9 @@ fn nearby_style(state: &AiDesignState, root: ObjectId, offset: usize) -> Value {
             .unwrap();
         let mut example = json!({"id":placement.object.id,"type":placement.object.object_type,
             "x":placement.x,"y":placement.y,"path":placement.path});
-        for name in ["width", "height", "background_colour", "justification"] {
+        for name in ["width", "height", "background_colour", "border_colour", "justification"] {
             if let Ok(value) = get_object_property(object, name) {
-                example[name] = value;
+                example[name] = super::visual_intent::enrich(&state.pool, object.object_type(), name, value);
             }
         }
         for name in ["font_attributes", "line_attributes", "fill_attributes"] {
@@ -567,7 +569,7 @@ fn nearby_style(state: &AiDesignState, root: ObjectId, offset: usize) -> Value {
                             crate::object_properties::get_property_descriptors(style.object_type())
                         {
                             if let Ok(v) = get_object_property(style, descriptor.name) {
-                                resolved[descriptor.name] = v;
+                                resolved[descriptor.name] = super::visual_intent::enrich(&state.pool, style.object_type(), descriptor.name, v);
                             }
                         }
                         example[name] = resolved;
@@ -639,9 +641,14 @@ mod tests {
         let variants = schema["properties"]["operations"]["items"]["anyOf"]
             .as_array()
             .unwrap();
-        assert_eq!(variants.len(), 14);
+        assert_eq!(variants.len(), 15);
         for variant in variants {
             let payload = example(variant);
+            if payload["type"] == "CreateIcon" {
+                let ops=super::super::icon_recipes::compile(&Default::default(), &payload["data"]).unwrap();
+                for op in ops { assert!(serde_json::from_value::<crate::operations::Operation>(op).is_ok()); }
+                continue;
+            }
             let result = serde_json::from_value::<crate::operations::Operation>(payload.clone());
             assert!(result.is_ok(), "{payload}: {result:?}");
         }

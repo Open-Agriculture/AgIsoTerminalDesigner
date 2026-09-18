@@ -50,3 +50,7 @@ pub use snapshot::*;
 pub use tools::{get_design_context, get_objects, AiDomainTool, AiToolError, GetObjectsRequest};
 
 mod wire;
+
+pub mod visual_intent;
+pub mod icon_recipes;
+pub mod visual_diagnostics;

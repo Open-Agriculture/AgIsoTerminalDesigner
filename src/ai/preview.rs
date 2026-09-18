@@ -9,7 +9,7 @@ use std::io::Cursor;
 
 pub const MAX_AI_PREVIEW_WIDTH: u32 = 800;
 pub const MAX_AI_PREVIEW_HEIGHT: u32 = 600;
-#[derive(Debug, Clone)] pub struct RenderedPreview { pub proposal_id: String, pub width: u32, pub height: u32, pub image: AiImage, pub diagnostics: Vec<DesignDiagnostic>, pub mask_id: u16 }
+#[derive(Debug, Clone)] pub struct RenderedPreview { pub proposal_id: String, pub width: u32, pub height: u32, pub image: AiImage, pub diagnostics: Vec<DesignDiagnostic>, pub mask_id: u16, pub colour_summary: serde_json::Value }
 pub type AiPreview = RenderedPreview;
 #[derive(Debug, Clone)] pub enum PreviewError { NoActiveMask, MissingMask, Encode(String), Analysis(String) }
 
@@ -32,5 +32,5 @@ pub fn render_proposal_preview(state: &AiDesignState, proposal: &AiProposal) -> 
     for item in layout_instances(pool,info,Some(mask),super::snapshot::MAX_SNAPSHOT_DEPTH) { let (Some(iw),Some(ih))=(item.width,item.height) else {continue}; let x=(item.x as f32*sx).max(0.) as u32; let y=(item.y as f32*sy).max(0.) as u32; let rw=(f32::from(iw)*sx).max(1.) as u32; let rh=(f32::from(ih)*sy).max(1.) as u32; for px in x..x.saturating_add(rw).min(width) { for py in y..y.saturating_add(rh).min(height) { if px==x || py==y || px+1==x.saturating_add(rw).min(width) || py+1==y.saturating_add(rh).min(height) { pixels.put_pixel(px,py,Rgba([50,90,130,255])); } } } }
     let mut bytes=Vec::new(); pixels.write_to(&mut Cursor::new(&mut bytes),ImageFormat::Png).map_err(|e|PreviewError::Encode(e.to_string()))?;
     let diagnostics=analyze_design(state,Some(proposal),DesignAnalysisScope::Proposal).map_err(|e|PreviewError::Analysis(format!("{e:?}")))?.diagnostics;
-    Ok(RenderedPreview { proposal_id:proposal.proposal_id.clone(),width,height,image:AiImage{mime_type:"image/png".into(),bytes},diagnostics,mask_id:mask.value() })
+    Ok(RenderedPreview { proposal_id:proposal.proposal_id.clone(),width,height,image:AiImage{mime_type:"image/png".into(),bytes},diagnostics,mask_id:mask.value(),colour_summary:super::visual_diagnostics::colour_summary(pool) })
 }

@@ -216,7 +216,7 @@ impl RenderableObject for WorkingSet {
         ui.painter().rect_filled(
             ui.available_rect_before_wrap(),
             0.0,
-            pool.color_by_index(self.background_colour).convert(),
+            crate::effective_colour::colour(pool, self.background_colour).convert(),
         );
 
         render_object_refs(ui, pool, &self.object_refs);
@@ -228,7 +228,7 @@ impl RenderableObject for DataMask {
         ui.painter().rect_filled(
             ui.available_rect_before_wrap(),
             0.0,
-            pool.color_by_index(self.background_colour).convert(),
+            crate::effective_colour::colour(pool, self.background_colour).convert(),
         );
 
         render_object_refs(ui, pool, &self.object_refs);
@@ -240,7 +240,7 @@ impl RenderableObject for AlarmMask {
         ui.painter().rect_filled(
             ui.available_rect_before_wrap(),
             0.0,
-            pool.color_by_index(self.background_colour).convert(),
+            crate::effective_colour::colour(pool, self.background_colour).convert(),
         );
 
         render_object_refs(ui, pool, &self.object_refs);
@@ -327,7 +327,7 @@ impl RenderableObject for Button {
         let background_color = if transparent_background {
             egui::Color32::TRANSPARENT
         } else {
-            let color = pool.color_by_index(self.background_colour).convert();
+            let color = crate::effective_colour::colour(pool, self.background_colour).convert();
             if is_pressed_state {
                 darken_color(color, 0.2)
             } else if is_hovered_state {
@@ -340,7 +340,7 @@ impl RenderableObject for Button {
         let border_color = if suppress_border {
             egui::Color32::TRANSPARENT
         } else {
-            let color = pool.color_by_index(self.border_colour).convert();
+            let color = crate::effective_colour::colour(pool, self.border_colour).convert();
             if is_pressed_state {
                 lighten_color(color, 0.1)
             } else if is_hovered_state {
@@ -392,14 +392,14 @@ impl RenderableObject for InputBoolean {
         let rect = create_relative_rect(ui, position, egui::Vec2::new(side, side));
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let background_color = pool.color_by_index(self.background_colour).convert();
+            let background_color = crate::effective_colour::colour(pool, self.background_colour).convert();
             ui.painter().rect_filled(rect, 0.0, background_color);
 
             // If the boolean is true, we display a checkmark in the center
             if is_true {
                 let fg_color = match pool.object_by_id(self.foreground_colour) {
                     Some(Object::FontAttributes(font_attr)) => {
-                        pool.color_by_index(font_attr.font_colour).convert()
+                        crate::effective_colour::colour(pool, font_attr.font_colour).convert()
                     }
                     // Fall back if missing or the ID is invalid.
                     _ => egui::Color32::BLACK,
@@ -466,7 +466,7 @@ impl RenderableObject for InputNumber {
             };
 
             // Get the background colour from the pool.
-            let background_colour = pool.color_by_index(self.background_colour).convert();
+            let background_colour = crate::effective_colour::colour(pool, self.background_colour).convert();
             // Fill the background if the NumberOptions do not specify transparency.
             if !self.options.transparent {
                 ui.painter().rect_filled(rect, 0.0, background_colour);
@@ -528,7 +528,7 @@ impl RenderableObject for InputNumber {
                     let galley = fonts.layout_no_wrap(
                         zero_padded.clone(),
                         font_id.clone(),
-                        pool.color_by_index(font_attributes.font_colour).convert(),
+                        crate::effective_colour::colour(pool, font_attributes.font_colour).convert(),
                     );
                     if galley.size().x >= rect.width() {
                         number_string = zero_padded;
@@ -540,7 +540,7 @@ impl RenderableObject for InputNumber {
             }
 
             // Get the font colour.
-            let font_colour = pool.color_by_index(font_attributes.font_colour).convert();
+            let font_colour = crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
 
             // Choose the font family and height according to the font size:
             let (font_family, font_height) = match font_attributes.font_size {
@@ -676,7 +676,7 @@ impl RenderableObject for OutputString {
                 return;
             }
         };
-        let background_colour = pool.color_by_index(self.background_colour).convert();
+        let background_colour = crate::effective_colour::colour(pool, self.background_colour).convert();
 
         let transparent = self.options.transparent;
         let auto_wrap = self.options.auto_wrap;
@@ -737,7 +737,7 @@ impl RenderableObject for OutputString {
 
         let processed_text = lines.join("\n");
 
-        let font_colour = pool.color_by_index(font_attributes.font_colour).convert();
+        let font_colour = crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
         let fonts = ui.fonts(|fonts| fonts.clone());
         let font_height;
         let font_family;
@@ -851,8 +851,8 @@ impl RenderableObject for OutputNumber {
             };
 
             // 2. Convert the pool color indices to `egui::Color32`
-            let background_colour = pool.color_by_index(self.background_colour).convert();
-            let font_colour = pool.color_by_index(font_attributes.font_colour).convert();
+            let background_colour = crate::effective_colour::colour(pool, self.background_colour).convert();
+            let font_colour = crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
 
             // 3. Determine if we need to fill the background or remain transparent
             if !self.options.transparent {
@@ -1050,7 +1050,7 @@ impl RenderableObject for OutputLine {
                 return;
             }
 
-            let colour = pool.color_by_index(line_attributes.line_colour).convert();
+            let colour = crate::effective_colour::colour(pool, line_attributes.line_colour).convert();
             let stroke_width = line_attributes.line_width as f32;
             let stroke = egui::Stroke::new(stroke_width, colour);
             // TODO: implement line art
@@ -1122,7 +1122,7 @@ impl RenderableObject for OutputRectangle {
             ui.painter().rect_filled(
                 rect,
                 0.0,
-                pool.color_by_index(fill_attributes.fill_colour).convert(),
+                crate::effective_colour::colour(pool, fill_attributes.fill_colour).convert(),
             );
             // TODO: implement fill type for infill
             // TODO: implement fill pattern for infill
@@ -1133,7 +1133,7 @@ impl RenderableObject for OutputRectangle {
             0.0,
             egui::Stroke::new(
                 line_attributes.line_width,
-                pool.color_by_index(line_attributes.line_colour).convert(),
+                crate::effective_colour::colour(pool, line_attributes.line_colour).convert(),
             ),
             egui::StrokeKind::Inside,
         );
@@ -1206,7 +1206,7 @@ impl RenderableObject for OutputPolygon {
                     fill_polygon_even_odd(
                         ui.painter(),
                         &points,
-                        pool.color_by_index(fill_attributes.fill_colour).convert(),
+                        crate::effective_colour::colour(pool, fill_attributes.fill_colour).convert(),
                         rect,
                     );
                     // TODO: implement fill type for infill
@@ -1220,7 +1220,7 @@ impl RenderableObject for OutputPolygon {
 
             let stroke = egui::Stroke::new(
                 line_attributes.line_width,
-                pool.color_by_index(line_attributes.line_colour).convert(),
+                crate::effective_colour::colour(pool, line_attributes.line_colour).convert(),
             );
 
             if is_open_polygon {
@@ -1287,6 +1287,8 @@ impl RenderableObject for PictureGraphic {
         Object::PictureGraphic(self.clone())
             .write()
             .hash(&mut hasher);
+        // Palette/map edits must invalidate cached indexed picture textures too.
+        for index in 0..=255 { crate::effective_colour::colour(pool, index).as_rgba().hash(&mut hasher); }
         let hash = hasher.finish();
 
         let changed: bool = ui.data_mut(|data| {
@@ -1318,17 +1320,17 @@ impl RenderableObject for PictureGraphic {
                 match self.format {
                     PictureGraphicFormat::Monochrome => {
                         for bit in 0..8 {
-                            colors.push(pool.color_by_index((raw >> (7 - bit)) & 0x01).convert());
+                            colors.push(crate::effective_colour::colour(pool, (raw >> (7 - bit)) & 0x01).convert());
                         }
                     }
                     PictureGraphicFormat::FourBit => {
                         for segment in 0..2 {
                             let shift = 4 - (segment * 4);
-                            colors.push(pool.color_by_index((raw >> shift) & 0x0F).convert());
+                            colors.push(crate::effective_colour::colour(pool, (raw >> shift) & 0x0F).convert());
                         }
                     }
                     PictureGraphicFormat::EightBit => {
-                        colors.push(pool.color_by_index(raw).convert());
+                        colors.push(crate::effective_colour::colour(pool, raw).convert());
                     }
                 }
 
@@ -1338,7 +1340,7 @@ impl RenderableObject for PictureGraphic {
                         break;
                     }
                     if !(self.options.transparent
-                        && color == pool.color_by_index(self.transparency_colour).convert())
+                        && color == crate::effective_colour::colour(pool, self.transparency_colour).convert())
                     {
                         image.pixels[idx] = color;
                     }
@@ -1393,7 +1395,7 @@ impl RenderableObject for AuxiliaryFunctionType2 {
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             // Draw background colour
-            let background_colour = pool.color_by_index(self.background_colour).convert();
+            let background_colour = crate::effective_colour::colour(pool, self.background_colour).convert();
             ui.painter().rect_filled(rect, 0.0, background_colour);
 
             // Render child objects (the function designator content)
@@ -1408,7 +1410,7 @@ impl RenderableObject for AuxiliaryInputType2 {
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             // Draw background colour
-            let background_colour = pool.color_by_index(self.background_colour).convert();
+            let background_colour = crate::effective_colour::colour(pool, self.background_colour).convert();
             ui.painter().rect_filled(rect, 0.0, background_colour);
 
             // Render child objects (the input designator content)

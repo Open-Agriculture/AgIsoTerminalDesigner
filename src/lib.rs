@@ -15,6 +15,8 @@ mod smart_naming;
 
 // New operation system and AI integration
 pub mod ai;
+pub mod isobus_colour;
+pub mod effective_colour;
 pub mod object_properties;
 pub mod operations;
 pub mod pool_validation;

@@ -43,6 +43,8 @@ pub enum AiFailureClass {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AiTaskState {
     pub goal: String,
+    pub requested_theme: Value,
+    pub resolved_theme: Value,
     pub continuation_instructions: Vec<String>,
     pub expected_revision: u64,
     pub is_complete: bool,
@@ -288,6 +290,7 @@ impl AiTaskState {
     }
     pub fn revalidate(&mut self, state: &AiDesignState) {
         if self.expected_revision == state.revision { return; }
+        if let Ok(theme) = super::visual_intent::resolve_theme(&state.pool, &self.requested_theme) { self.resolved_theme=theme; }
         let changed: BTreeSet<_> = self.object_fingerprints.iter().filter_map(|(id, old)| {
             let current = ag_iso_stack::object_pool::ObjectId::new(*id).ok().and_then(|id|
                 super::snapshot::object_snapshot_sections(&state.pool, &state.object_info, id, false))

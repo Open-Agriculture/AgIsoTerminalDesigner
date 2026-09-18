@@ -414,7 +414,7 @@ fn run_loop_with_budget(
                     }),
                     _ => false,
                 };
-            let (mut result, proposed, repair) = if empty_read {
+            let (mut result, mut proposed, repair) = if empty_read {
                 (
                     json!({"success":true,"target":task.target_root,"screen_is_empty":true,"direct_child_count":0,"hint":"No local styles or children exist. Finish inspection with required_object_types."}),
                     None,
@@ -447,6 +447,12 @@ fn run_loop_with_budget(
                     } else {
                         cache.execute(state, &schema_call, None).0
                     };
+                    if result["success"] == true {
+                        match super::visual_intent::resolve_theme(&state.pool, &call.arguments["theme"]) {
+                            Ok(theme) => { task.requested_theme=call.arguments["theme"].clone(); task.resolved_theme=theme.clone(); result["resolved_theme"]=theme; },
+                            Err(diagnostic) => {result=json!({"success":false,"diagnostics":[diagnostic]});}
+                        }
+                    }
                     if result["success"] == true {
                         task.observe(&schema_call, &result);
                         task.phase = AiTaskPhase::Propose;
@@ -481,6 +487,12 @@ fn run_loop_with_budget(
             } else {
                 cache.execute(state, &call, proposal.as_ref())
             };
+            if let Some(candidate) = proposed.as_ref() {
+                let candidate_theme=super::visual_intent::resolve_theme(&candidate.prepared.pool, &task.requested_theme).unwrap_or_else(|_|task.resolved_theme.clone());
+                let mut mismatches = super::visual_intent::theme_mismatches(candidate, &candidate_theme);
+                mismatches.extend(super::visual_intent::explicit_theme_mismatches(&candidate.prepared.pool, &result["colour_resolutions"], &candidate_theme));
+                if !mismatches.is_empty() { result=json!({"success":false,"diagnostics":mismatches,"failure_class":"HarnessNormalization"}); proposed=None; } else {task.resolved_theme=candidate_theme.clone();result["resolved_theme"]=candidate_theme;}
+            }
             let normalized = (call.name == "propose_transaction"
                 && call.arguments.get("schema_version").is_none())
                 || (call.name == "get_object_schema"
@@ -495,7 +507,9 @@ fn run_loop_with_budget(
             }
             if result["success"] == false {
                 conversation.debug.lock().unwrap().failure_class =
-                    Some(if result["failure_class"] == "ModelDecision" {
+                    Some(if result["failure_class"] == "HarnessNormalization" {
+                        AiFailureClass::HarnessNormalization
+                    } else if result["failure_class"] == "ModelDecision" {
                         AiFailureClass::ModelDecision
                     } else if repair {
                         AiFailureClass::DomainValidation
@@ -728,6 +742,12 @@ fn execute_tool(
 ) -> (Value, Option<AiProposal>, bool) {
     let parse = |error: String| (json!({"success":false,"error":error}), None, false);
     match call.name.as_str() {
+        "resolve_colours" => {
+            let Some(queries)=call.arguments["queries"].as_array().filter(|q| !q.is_empty() && q.len()<=16) else {return parse("Provide 1..16 queries".into())};
+            let pool=proposal.map(|p|&p.prepared.pool).unwrap_or(&state.pool);
+            let results:Vec<_>=queries.iter().map(|q|match super::visual_intent::resolve(pool,q){Ok(c)=>json!({"query":q,"resolved":c}),Err(e)=>json!({"query":q,"diagnostic":e})}).collect();
+            (json!({"success":true,"results":results,"source":crate::effective_colour::source(pool)}),None,false)
+        },
         "inspect_design_region" => match serde_json::from_value::<
             super::design_inspection::InspectDesignRegionRequest,
         >(call.arguments.clone())
@@ -803,6 +823,10 @@ fn execute_tool(
                     json!(crate::operations::CURRENT_OPERATION_SCHEMA_VERSION),
                 );
             }
+            let candidate_state=proposal.map(|p|AiDesignState { pool:p.prepared.pool.clone(), object_info:p.prepared.object_info.clone(), ..state.clone() });
+            let (arguments, colour_resolutions)=match super::visual_intent::compile(candidate_state.as_ref().unwrap_or(state),arguments) {
+                Ok(v)=>v, Err(e)=>return (json!({"success":false,"diagnostics":[e],"failure_class":"HarnessNormalization"}),None,false),
+            };
             let tx = match serde_json::from_value::<crate::operations::OperationTransaction>(
                 arguments,
             ) {
@@ -824,7 +848,7 @@ fn execute_tool(
                 Ok(p) => {
                     let analysis =
                         analyze_design(state, Some(&p), DesignAnalysisScope::Proposal).ok();
-                    let summary = json!({"success":true,"proposal_id":p.proposal_id,"base_revision":p.base_revision,"description":p.transaction.description,"operation_count":p.summary.operation_count,"affected_objects":p.summary.affected_objects,"refinement_round":p.refinement_round,"design_diagnostics":analysis.map(|v|v.diagnostics)});
+                    let summary = json!({"success":true,"proposal_id":p.proposal_id,"base_revision":p.base_revision,"description":p.transaction.description,"operation_count":p.summary.operation_count,"affected_objects":p.summary.affected_objects,"refinement_round":p.refinement_round,"design_diagnostics":analysis.map(|v|v.diagnostics),"colour_resolutions":colour_resolutions,"actual_colours":super::visual_diagnostics::colour_summary(&p.prepared.pool),"shared_style_impact":super::visual_diagnostics::shared_style_impact(state,&p)});
                     (summary, Some(p), false)
                 }
                 Err(e) => (json!({"success":false,"diagnostics":e}), None, true),
@@ -838,6 +862,40 @@ fn execute_tool(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    struct StylingProvider { calls: AtomicUsize, mismatch: bool }
+    impl AiProvider for StylingProvider {
+        fn run_turn(&self, request:AiTurnRequest)->super::super::AiProviderFuture<Result<super::super::AiProviderResponse,AiProviderError>> {
+            let round=self.calls.fetch_add(1,Ordering::SeqCst);
+            assert_eq!(request.settings.role,AiModelRole::Fast);
+            if round>0 { assert_eq!(request.conversation.task_state.as_ref().unwrap().resolved_theme["background"]["index"],15); }
+            if self.mismatch && round==2 {
+                let result=request.conversation.messages.iter().flat_map(|m|&m.content).filter_map(|c|if let AiContent::ToolResult(r)=c{Some(r)}else{None}).last().unwrap();
+                assert!(result.result.to_string().contains("STYLE_INTENT_MISMATCH"));
+                assert!(request.conversation.pending_proposal.is_none());
+            }
+            let content=if round==0 { vec![AiContent::ToolCall(AiToolCall{call_id:format!("style_{round}"),name:"finish_inspection".into(),arguments:json!({"required_object_types":["DataMask","PictureGraphic"],"theme":{"background":{"name":"dark_blue"},"accent":{"name":"cyan"},"primary_text":{"name":"white"}}})})] }
+            else if round==1 || self.mismatch&&round==2 {
+                let value=if self.mismatch&&round==1 {json!(6)}else{json!({"name":"dark navy"})};
+                vec![AiContent::ToolCall(AiToolCall{call_id:format!("style_{round}"),name:"propose_transaction".into(),arguments:json!({"operations":[{"type":"SetProperty","data":{"object":{"id":2},"property":"background_colour","value":value}},{"type":"CreateIcon","data":{"icon":"wifi","name":"WiFi icon","width":24,"height":24,"foreground":{"name":"cyan"},"transparent":true,"parent":{"id":2},"x":20,"y":20}}]})})]
+            } else {vec![AiContent::Text("Modern navy screen with cyan WiFi icon staged.".into())]};
+            Box::pin(async move{Ok(super::super::AiProviderResponse{content,usage:Default::default()})})
+        }
+    }
+    #[test]
+    fn modern_screen_semantic_theme_resolves_and_repairs_without_escalation() {
+        for mismatch in [false,true] {
+            let mut state=AiDesignState{revision:1,pool:Default::default(),object_info:Default::default(),vt_version:ag_iso_stack::object_pool::vt_version::VtVersion::Version6,mask_size:480,selected:None};
+            let mut ws=crate::default_object(ObjectType::WorkingSet);ws.mut_id().set_value(1).unwrap();
+            if let ag_iso_stack::object_pool::object::Object::WorkingSet(w)=&mut ws{w.active_mask=ag_iso_stack::object_pool::ObjectId::new(2).unwrap();}state.pool.add(ws);
+            let mut mask=crate::default_object(ObjectType::DataMask);mask.mut_id().set_value(2).unwrap();state.pool.add(mask);
+            let mut conversation=Conversation::default();conversation.push(AiMessage::text(AiRole::User,"Make the screen more modern, for example by changing colours and adding icons."));
+            let provider=StylingProvider{calls:AtomicUsize::new(0),mismatch};
+            let p=run_loop(&provider,&state,&mut conversation,AiSettings::default()).unwrap().unwrap();
+            assert_eq!(crate::object_properties::get_object_property(p.prepared.pool.object_by_id(ag_iso_stack::object_pool::ObjectId::new(2).unwrap()).unwrap(),"background_colour").unwrap(),json!(15));
+            assert_eq!(state.pool.objects().len(),2);
+            assert!(conversation.task_state.as_ref().unwrap().escalation.is_none());
+        }
+    }
     struct RepeatingProvider(AtomicUsize);
     impl AiProvider for RepeatingProvider {
         fn run_turn(

@@ -13,6 +13,8 @@ use serde_json::Value;
 pub struct ObjectSchemaSnapshot {
     pub object_type: String,
     pub properties: Vec<PropertySchemaSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colour_palette: Option<Value>,
     pub supports_positioned_children: bool,
     pub allowed_positioned_children: Vec<String>,
     pub object_list: Option<ObjectListSchemaSnapshot>,
@@ -45,10 +47,10 @@ pub fn get_object_schema(
     object_type: ObjectType,
 ) -> Result<ObjectSchemaSnapshot, super::tools::AiToolError> {
     let object = default_object(object_type);
-    let properties = get_property_descriptors(object_type)
+    let properties: Vec<PropertySchemaSnapshot> = get_property_descriptors(object_type)
         .into_iter()
         .map(|d| {
-            let semantic = match d.semantic {
+            let semantic = match &d.semantic {
                 PropertySemantic::Normal => PropertySemanticSnapshot::Normal,
                 PropertySemantic::Colour => PropertySemanticSnapshot::Colour,
                 PropertySemantic::Enum => PropertySemanticSnapshot::Enum,
@@ -67,7 +69,11 @@ pub fn get_object_schema(
                 writable: d.writable,
                 semantic,
                 default_value: get_object_property(&object, d.name).unwrap_or(Value::Null),
-                valid_range: d.valid_range,
+                valid_range: if matches!(d.semantic, PropertySemantic::Colour) {
+                    Some((Value::from(0), Value::from(255)))
+                } else {
+                    d.valid_range
+                },
             }
         })
         .collect();
@@ -77,9 +83,14 @@ pub fn get_object_schema(
         nullable: matches!(v, crate::operations::ObjectReferenceList::Nullable(_)),
     });
     let events = get_possible_events(&object);
+    let colour_palette = properties
+        .iter()
+        .any(|property| matches!(property.semantic, PropertySemanticSnapshot::Colour))
+        .then(|| serde_json::json!({"encoding":"Semantic name or #RRGGBB resolves against the effective renderer palette; explicit integer indices remain exact.","lookup":"resolve_colours","source":crate::effective_colour::source(&state.pool)}));
     Ok(ObjectSchemaSnapshot {
         object_type: format!("{:?}", object_type),
         properties,
+        colour_palette,
         supports_positioned_children,
         allowed_positioned_children: allowed.into_iter().map(|t| format!("{:?}", t)).collect(),
         object_list: list,

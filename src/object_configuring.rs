@@ -52,9 +52,7 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
         };
         let label = human_readable_property_name(editor.property);
         ui.push_id(editor.property, |ui| match editor.editor {
-            EditorKind::Colour => {
-                render_number(ui, &label, &value, 0.0..=255.0, id, editor.property, design)
-            }
+            EditorKind::Colour => render_colour(ui, &label, &value, id, editor.property, design),
             EditorKind::ObjectReference => {
                 render_reference(ui, &label, &value, property, id, editor.property, design)
             }
@@ -82,6 +80,90 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
         ui.separator();
         render_macro_references(ui, object, id, design);
     }
+}
+
+/// Commit a palette selection through the same undoable operation as other properties.
+fn render_colour(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    id: ObjectId,
+    property: &str,
+    design: &EditorProject,
+) {
+    use crate::isobus_colour::{self, FIRST_PROPRIETARY};
+    let Some(current) = value.as_u64().and_then(|v| u8::try_from(v).ok()) else {
+        return;
+    };
+    ui.label(label);
+    ui.horizontal(|ui| {
+        if let Some([r, g, b]) = isobus_colour::standard_rgb(current) {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+        }
+        ui.menu_button(isobus_colour::label(current), |ui| {
+            ui.label("ISOBUS standard palette (8-bit index)");
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    for (title, start, end) in [
+                        ("Basic colours", 0, 15),
+                        ("Colour cube", 16, FIRST_PROPRIETARY - 1),
+                        (
+                            "Manufacturer-specific (appearance undefined)",
+                            FIRST_PROPRIETARY,
+                            255,
+                        ),
+                    ] {
+                        ui.label(title);
+                        egui::Grid::new(title)
+                            .spacing(egui::vec2(3.0, 3.0))
+                            .show(ui, |ui| {
+                                for index in start..=end {
+                                    let mut button = egui::Button::new(index.to_string())
+                                        .min_size(egui::vec2(32.0, 24.0));
+                                    if let Some([r, g, b]) = isobus_colour::standard_rgb(index) {
+                                        let text_colour =
+                                            if 299 * r as u32 + 587 * g as u32 + 114 * b as u32
+                                                > 128_000
+                                            {
+                                                egui::Color32::BLACK
+                                            } else {
+                                                egui::Color32::WHITE
+                                            };
+                                        button = egui::Button::new(
+                                            egui::RichText::new(index.to_string())
+                                                .color(text_colour),
+                                        )
+                                        .fill(egui::Color32::from_rgb(r, g, b))
+                                        .min_size(egui::vec2(32.0, 24.0));
+                                    }
+                                    if index == current {
+                                        button = button.stroke(egui::Stroke::new(
+                                            2.0,
+                                            ui.visuals().selection.stroke.color,
+                                        ));
+                                    }
+                                    if ui
+                                        .add(button)
+                                        .on_hover_text(isobus_colour::label(index))
+                                        .clicked()
+                                    {
+                                        if index != current {
+                                            queue(design, id, property, serde_json::json!(index));
+                                        }
+                                        ui.close();
+                                    }
+                                    if (index as usize - start as usize + 1) % 8 == 0 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                    }
+                });
+        });
+    });
 }
 
 /// Convert a snake_case property identifier to a title-cased editor label.
