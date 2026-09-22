@@ -977,6 +977,67 @@ fn render_number(
     });
 }
 
+/// Enum-backed option bits keep their serialized enum representation when edited.
+fn flag_choices(field: &str) -> Vec<serde_json::Value> {
+    let variants: &[&str] = match field {
+        "state" => &["Released", "Latched"],
+        "color" => &["ForegroundBackground", "LineFontFill"],
+        "deflection_direction" => &["AntiClockwise", "Clockwise"],
+        "bar_graph_type" => &["Filled", "NotFilled"],
+        "axis_orientation" => &["Vertical", "Horizontal"],
+        "grow_direction" => &["GrowLeftDown", "GrowRightUp"],
+        "data_code_type" => &["Raw", "RunLength"],
+        "animation_sequence" => &["SingleShot", "Loop"],
+        "disabled_behaviour" => &["Pause", "ResetToFirst", "DefaultObject", "Blank"],
+        "function_type" => {
+            use ag_iso_stack::object_pool::object_attributes::AuxiliaryFunctionType;
+            return (0..=31)
+                .map(|value| serde_json::to_value(AuxiliaryFunctionType::from(value)).unwrap())
+                .collect();
+        }
+        _ => &[],
+    };
+    variants.iter().map(|value| serde_json::json!(value)).collect()
+}
+
+fn render_flag_field(
+    ui: &mut egui::Ui,
+    field: &str,
+    value: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let label = human_readable_property_name(field);
+    if let Some(mut enabled) = value.as_bool() {
+        return ui
+            .checkbox(&mut enabled, label)
+            .changed()
+            .then_some(enabled.into());
+    }
+    let choices = flag_choices(field);
+    let choice_label = |value: &serde_json::Value| {
+        value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Reserved {}", value["Reserved"]))
+    };
+    if choices.len() == 2 {
+        let mut enabled = value == &choices[1];
+        return ui
+            .checkbox(&mut enabled, format!("{label}: {}", choice_label(&choices[1])))
+            .on_hover_text(format!("Unchecked: {}", choice_label(&choices[0])))
+            .changed()
+            .then(|| choices[usize::from(enabled)].clone());
+    }
+    let mut updated = None;
+    ui.label(label);
+    for choice in choices {
+        let mut selected = value == &choice;
+        if ui.checkbox(&mut selected, choice_label(&choice)).changed() && selected {
+            updated = Some(choice);
+        }
+    }
+    updated
+}
+
 /// Render bit-mask and object-style options as individual checkboxes rather
 /// than leaking their JSON encoding into the UI.
 fn render_flag_set(
@@ -1011,13 +1072,12 @@ fn render_flag_set(
     } else if let Some(fields) = value.as_object() {
         ui.label(label);
         for (field, value) in fields {
-            let Some(mut enabled) = value.as_bool() else {
-                render_json(ui, label, value, id, property, design);
-                return;
-            };
-            if ui.checkbox(&mut enabled, field).changed() {
+            let edited = ui
+                .push_id(field, |ui| render_flag_field(ui, field, value))
+                .inner;
+            if let Some(edited) = edited {
                 let mut updated = fields.clone();
-                updated.insert(field.clone(), enabled.into());
+                updated.insert(field.clone(), edited);
                 queue(design, id, property, serde_json::Value::Object(updated));
             }
         }
@@ -1182,6 +1242,50 @@ mod tests {
                 macro_object: ObjectTarget::id(reference.macro_id.into()),
             })
             .collect()
+    }
+
+    #[test]
+    fn every_enum_flag_has_checkbox_choices_that_validate() {
+        for object_type in (0..=u8::MAX).filter_map(|value| ObjectType::try_from(value).ok()) {
+            let object = object(object_type, 1);
+            let id = object.id();
+            let mut pool = ObjectPool::default();
+            pool.add(object.clone());
+            for editor in property_editor_descriptors(object_type) {
+                if !matches!(editor.editor, EditorKind::FlagSet) {
+                    continue;
+                }
+                let value = get_object_property(&object, editor.property).unwrap();
+                if value.is_u64() {
+                    continue;
+                }
+                let fields = value
+                    .as_object()
+                    .expect("flags must be a bit mask or object");
+                for (field, current) in fields {
+                    if current.is_boolean() {
+                        continue;
+                    }
+                    let choices = flag_choices(field);
+                    assert!(
+                        choices.contains(current),
+                        "{object_type:?}.{}.{field}: {current}",
+                        editor.property
+                    );
+                    for choice in choices {
+                        let mut updated = fields.clone();
+                        updated.insert(field.clone(), choice);
+                        crate::object_properties::validate_property(
+                            &pool,
+                            id,
+                            editor.property,
+                            &serde_json::Value::Object(updated),
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
     }
 
     #[test]
