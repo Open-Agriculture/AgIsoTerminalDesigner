@@ -772,18 +772,20 @@ fn execute_tool(
 ) -> (Value, Option<AiProposal>, bool) {
     let parse = |error: String| (json!({"success":false,"error":error}), None, false);
     match call.name.as_str() {
-        "list_graphic_assets" => {
-            let source = proposal.map(|p| &p.components).unwrap_or(&state.components);
-            match crate::graphics::integration::catalog(
-                source,
+        "list_graphics" => {
+            let catalog = crate::graphics::integration::catalog(
+                proposal
+                    .map(|p| &p.canonical_pool)
+                    .unwrap_or_else(|| state.canonical_pool.as_ref().unwrap_or(&state.pool)),
                 proposal.map(|p| &p.graphics).unwrap_or(&state.graphics),
+                proposal
+                    .map(|p| &p.prepared.object_info)
+                    .unwrap_or(&state.object_info),
                 call.arguments["query"].as_str().unwrap_or(""),
                 call.arguments["status"].as_str().unwrap_or("all"),
                 call.arguments["limit"].as_u64().unwrap_or(20).min(50) as usize,
-            ) {
-                Ok(catalog) => (json!({"success":true,"graphics":catalog}), None, false),
-                Err(e) => (json!({"success":false,"diagnostic":e}), None, false),
-            }
+            );
+            (json!({"success":true,"graphics":catalog}), None, false)
         }
         "list_components" => {
             let query = call.arguments["query"]

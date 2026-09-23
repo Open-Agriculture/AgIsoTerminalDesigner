@@ -40,17 +40,7 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
     render_identity(ui, id, object_type, design);
     ui.separator();
     if let Object::PictureGraphic(picture) = object {
-        let binding = design
-            .graphic_library()
-            .picture_graphic_bindings
-            .get(&id.value());
-        let current_format = binding
-            .map(|b| {
-                b.format.unwrap_or(
-                    ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::EightBit,
-                )
-            })
-            .unwrap_or(picture.format);
+        let current_format = picture.format;
         ui.horizontal(|ui| {
             ui.label("Format:");
             use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
@@ -60,10 +50,6 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                 (PictureGraphicFormat::EightBit, "8-bit colour"),
             ] {
                 if ui.radio(current_format == format, label).clicked() && current_format != format {
-                    if binding.is_some() {
-                        design.request_graphic_format(id.value(), format);
-                        continue;
-                    }
                     let mut converted = picture.clone();
                     crate::graphics::convert_picture_graphic_format(&mut converted, format);
                     let value = serde_json::to_value(converted).unwrap();
@@ -73,15 +59,9 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                 }
             }
         });
-        let mut transparent = binding
-            .map(|b| b.transparent.unwrap_or(true))
-            .unwrap_or(picture.options.transparent);
-        let mut colour = binding
-            .map(|b| b.transparency_colour.unwrap_or(1))
-            .unwrap_or(picture.transparency_colour);
-        let mut flashing = binding
-            .and_then(|b| b.flashing)
-            .unwrap_or(picture.options.flashing);
+        let mut transparent = picture.options.transparent;
+        let mut colour = picture.transparency_colour;
+        let mut flashing = picture.options.flashing;
         let mut changed = false;
         ui.horizontal(|ui| {
             changed |= ui
@@ -99,30 +79,23 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
         });
         changed |= ui.checkbox(&mut flashing, "Flashing").changed();
         if changed {
-            if binding.is_some() {
-                design.request_graphic_options(id.value(), transparent, colour, flashing);
-            } else {
-                let mut options = picture.options.clone();
-                options.transparent = transparent;
-                options.flashing = flashing;
-                queue(
-                    design,
-                    id,
-                    "options",
-                    serde_json::to_value(options).unwrap(),
-                );
-                queue(design, id, "transparency_colour", serde_json::json!(colour));
-            }
+            let mut options = picture.options.clone();
+            options.transparent = transparent;
+            options.flashing = flashing;
+            queue(
+                design,
+                id,
+                "options",
+                serde_json::to_value(options).unwrap(),
+            );
+            queue(design, id, "transparency_colour", serde_json::json!(colour));
         }
         if ui
-            .add_enabled(binding.is_none(), egui::Button::new("Load Image"))
+            .button("Load Image")
             .on_hover_text("Load an image file (PNG, JPG, BMP, etc.)")
             .clicked()
         {
             design.request_image_load(id);
-        }
-        if binding.is_some() {
-            ui.label("Project graphic assigned. Remove its assignment in Graphics to restore or load a raw image.");
         }
     }
     for editor in property_editor_descriptors(object_type) {

@@ -13,13 +13,6 @@ pub enum ComponentMasterScope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ComponentIntent {
-    AssignGraphicAsset {
-        object_id: u16,
-        asset_id: crate::graphics::GraphicAssetId,
-    },
-    RemoveGraphicAssignment {
-        object_id: u16,
-    },
     InstantiateComponent {
         #[serde(default)]
         instance_id: Option<ComponentInstanceId>,
@@ -52,18 +45,9 @@ impl ComponentService {
         project: &mut EditorProject,
         intents: &[ComponentIntent],
     ) -> ComponentResult<()> {
-        project.edit_source("Component actions", |pool, source, graphics| {
+        project.edit_source("Component actions", |pool, source, graphics, _| {
             for intent in intents {
                 match intent {
-                    ComponentIntent::AssignGraphicAsset {
-                        object_id,
-                        asset_id,
-                    } => {
-                        graphics.set_binding(*object_id, Some(*asset_id));
-                    }
-                    ComponentIntent::RemoveGraphicAssignment { object_id } => {
-                        graphics.set_binding(*object_id, None);
-                    }
                     ComponentIntent::InstantiateComponent {
                         instance_id,
                         component_id,
@@ -334,33 +318,7 @@ impl ComponentService {
         id: ComponentInstanceId,
     ) -> ComponentResult<()> {
         let materialized = materialize_project(project)?;
-        let owners = crate::graphics::integration::assignments(
-            project.component_source(),
-            project.graphic_library(),
-        )?;
-        // Strip only graphic overrides to recover the authored node bytes. The
-        // detached ordinary binding continues to override these same raw bytes.
-        let mut raw_source = project.component_source().clone();
-        let graphic_parameters: std::collections::BTreeSet<_> = raw_source
-            .definitions
-            .values()
-            .flat_map(|d| &d.parameters)
-            .filter(|p| p.kind == ComponentParameterKind::Graphic)
-            .map(|p| p.id)
-            .collect();
-        for d in raw_source.definitions.values_mut() {
-            d.parameters.retain(|p| !graphic_parameters.contains(&p.id));
-        }
-        for i in &mut raw_source.instances {
-            i.overrides.retain(|p, _| !graphic_parameters.contains(p));
-        }
-        let raw = materialize_source(
-            project.get_pool(),
-            &raw_source,
-            project.vt_version,
-            &project.component_object_info(),
-        )?;
-        project.edit_source("Detach component instance", |pool, source, graphics| {
+        project.edit_source("Detach component instance", |pool, source, _graphics, _| {
             let instance = instance_mut(source, id)?.clone();
             for object_id in instance.compiled_ids.values() {
                 pool.add(
@@ -370,26 +328,6 @@ impl ComponentService {
                         .unwrap()
                         .clone(),
                 );
-            }
-            for (asset, owner) in &owners {
-                if let crate::graphics::PictureGraphicSource::ComponentNode {
-                    instance_id,
-                    node_id,
-                } = owner
-                {
-                    if *instance_id == id.0 {
-                        let object_id = instance.compiled_ids[&ComponentNodeId(*node_id)];
-                        let object = pool
-                            .object_mut_by_id(
-                                ag_iso_stack::object_pool::ObjectId::new(object_id).unwrap(),
-                            )
-                            .unwrap();
-                        *object = raw.pool.object_by_id(object.id()).unwrap().clone();
-                        graphics
-                            .picture_graphic_bindings
-                            .insert(object_id, (*asset).into());
-                    }
-                }
             }
             let root = instance.compiled_ids[&source.definitions[&instance.component_id].root_node];
             let EditorParentRef::Primitive(parent) = instance.parent;

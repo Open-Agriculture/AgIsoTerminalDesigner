@@ -14,6 +14,12 @@ pub struct ObjectInfo {
     /// Optional name for the object.
     /// This is used to give the object a name throughout the editor that is more human-readable
     pub name: Option<String>,
+
+    /// Optional semantic description used by graphics discovery.
+    pub description: Option<String>,
+
+    /// Searchable semantic tags used by graphics discovery.
+    pub tags: Vec<String>,
 }
 
 impl ObjectInfo {
@@ -21,6 +27,8 @@ impl ObjectInfo {
         ObjectInfo {
             unique_id: Uuid::new_v4(),
             name: None,
+            description: None,
+            tags: vec![],
         }
     }
 

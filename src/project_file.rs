@@ -40,6 +40,12 @@ pub struct ObjectMetadata {
 
     /// Notes or comments about the object
     pub notes: Option<String>,
+
+    #[serde(default)]
+    pub description: Option<String>,
+
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// Project-level settings
@@ -71,6 +77,8 @@ impl ProjectFile {
             let metadata = ObjectMetadata {
                 name: info.name.clone(),
                 notes: None, // Future feature
+                description: info.description.clone(),
+                tags: info.tags.clone(),
             };
             object_metadata.insert(id.value(), metadata);
         }

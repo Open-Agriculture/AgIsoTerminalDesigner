@@ -1373,30 +1373,8 @@ impl eframe::App for DesignerApp {
         }
 
         if let Some(project) = &mut self.project {
-            if let Some((id, transparent, colour, flashing)) =
-                project.take_graphic_options_request()
-            {
-                if let Err(e) =
-                    ag_iso_terminal_designer::graphics::integration::GraphicService::set_options(
-                        project,
-                        id,
-                        transparent,
-                        colour,
-                        flashing,
-                    )
-                {
-                    self.error_message = Some(e.to_string());
-                }
-            }
-            if let Some((id, format)) = project.take_graphic_format_request() {
-                if let Err(e) =
-                    ag_iso_terminal_designer::graphics::integration::GraphicService::set_format(
-                        project, id, format,
-                    )
-                {
-                    self.error_message = Some(e.to_string());
-                }
-            }
+            project.take_graphic_options_request();
+            project.take_graphic_format_request();
         }
         // Check for image load requests
         if let Some(pool) = &self.project {
@@ -1526,19 +1504,6 @@ impl eframe::App for DesignerApp {
                         for action in &proposal.component_intents {
                             use ag_iso_terminal_designer::components::ComponentIntent;
                             match action {
-                                ComponentIntent::AssignGraphicAsset {
-                                    object_id,
-                                    asset_id,
-                                } => {
-                                    ui.label(format!(
-                                        "Assign graphic {asset_id} to PictureGraphic {object_id}"
-                                    ));
-                                }
-                                ComponentIntent::RemoveGraphicAssignment { object_id } => {
-                                    ui.label(format!(
-                                        "Remove graphic assignment from PictureGraphic {object_id}"
-                                    ));
-                                }
                                 ComponentIntent::InstantiateComponent {
                                     component_id,
                                     x,

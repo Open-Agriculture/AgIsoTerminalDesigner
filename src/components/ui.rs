@@ -261,9 +261,9 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                     let accepts_picture = crate::object_properties::get_property_descriptors(node.object_type).iter().any(|d| d.name == property && matches!(&d.semantic, crate::PropertySemantic::ObjectReference { allowed_types, .. } if allowed_types.contains(&ag_iso_stack::object_pool::ObjectType::PictureGraphic)));
                                     if accepts_picture {
                                         egui::ComboBox::from_id_salt((node.id, property, "reuse_graphic")).selected_text("Use existing PictureGraphic").show_ui(ui, |ui| {
-                                            for asset in project.graphic_library().assets.values() {
-                                                if let Ok(target) = crate::graphics::integration::GraphicService::reuse_target(project, asset.id) {
-                                                    if ui.selectable_label(false, &asset.name).clicked() { *reference = ComponentReference::ExternalObject(target); }
+                                            for picture in project.get_pool().objects_by_type(ag_iso_stack::object_pool::ObjectType::PictureGraphic) {
+                                                if ui.selectable_label(false, project.get_object_info(picture).get_name(picture)).clicked() {
+                                                    *reference = ComponentReference::ExternalObject(crate::ObjectTarget::id(picture.id().value()));
                                                 }
                                             }
                                         });
@@ -481,7 +481,7 @@ fn value_editor(
 fn manual_parameter_form(
     ui: &mut egui::Ui,
     definition: &mut ComponentDefinition,
-    project: &EditorProject,
+    project: &mut EditorProject,
 ) {
     ui.collapsing("Add Parameter", |ui| {
         let key = ui.id().with("parameter_draft");

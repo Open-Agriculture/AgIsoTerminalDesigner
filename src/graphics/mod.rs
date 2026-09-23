@@ -21,17 +21,6 @@ impl std::fmt::Display for GraphicAssetId {
         self.0.fmt(f)
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PictureGraphicSource {
-    Primitive {
-        object_id: u16,
-    },
-    ComponentNode {
-        instance_id: uuid::Uuid,
-        node_id: uuid::Uuid,
-    },
-}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GraphicAsset {
     pub id: GraphicAssetId,
@@ -78,10 +67,19 @@ impl GraphicAsset {
         )
     }
 }
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GraphicLibrary {
+    /// Uploaded source images waiting to be converted into PictureGraphic objects.
+    pub assets: BTreeMap<GraphicAssetId, GraphicAsset>,
+    /// Legacy development-project input. It is migrated during load and never
+    /// emitted again, leaving persisted projects with only available assets.
+    #[serde(default, rename = "picture_graphic_bindings", skip_serializing)]
+    pub(crate) legacy_bindings: BTreeMap<u16, LegacyPictureGraphicBinding>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PictureGraphicBinding {
+pub(crate) struct LegacyPictureGraphicBinding {
     pub asset_id: GraphicAssetId,
-    /// None uses the loader's EightBit default. Never alters canonical raw data.
     pub format: Option<PictureGraphicFormat>,
     #[serde(default)]
     pub transparent: Option<bool>,
@@ -89,40 +87,6 @@ pub struct PictureGraphicBinding {
     pub transparency_colour: Option<u8>,
     #[serde(default)]
     pub flashing: Option<bool>,
-}
-impl From<GraphicAssetId> for PictureGraphicBinding {
-    fn from(asset_id: GraphicAssetId) -> Self {
-        Self {
-            asset_id,
-            format: None,
-            transparent: None,
-            transparency_colour: None,
-            flashing: None,
-        }
-    }
-}
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct GraphicLibrary {
-    pub assets: BTreeMap<GraphicAssetId, GraphicAsset>,
-    /// Ordinary source bindings. Component bindings are declared parameter values,
-    /// resolved into the same ownership index by the project materializer.
-    pub picture_graphic_bindings: BTreeMap<u16, PictureGraphicBinding>,
-}
-impl GraphicLibrary {
-    pub(crate) fn set_binding(&mut self, object_id: u16, asset: Option<GraphicAssetId>) {
-        if let Some(asset) = asset {
-            if self
-                .picture_graphic_bindings
-                .get(&object_id)
-                .is_none_or(|b| b.asset_id != asset)
-            {
-                self.picture_graphic_bindings
-                    .insert(object_id, asset.into());
-            }
-        } else {
-            self.picture_graphic_bindings.remove(&object_id);
-        }
-    }
 }
 fn decode(content: &[u8]) -> Result<image::DynamicImage, String> {
     let img = image::load_from_memory(content).map_err(|e| e.to_string())?;

@@ -725,9 +725,7 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
 }
 fn validate_value(parameter: &ComponentParameter, value: &Value) -> ComponentResult<()> {
     let valid = match parameter.kind {
-        ComponentParameterKind::Graphic => {
-            serde_json::from_value::<crate::graphics::GraphicAssetId>(value.clone()).is_ok()
-        }
+        ComponentParameterKind::Graphic => value.as_u64().is_some_and(|id| id < 65535),
         ComponentParameterKind::Text => value.is_string(),
         ComponentParameterKind::Number => value.is_number(),
         ComponentParameterKind::Boolean => value.is_boolean(),

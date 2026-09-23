@@ -234,7 +234,7 @@ impl EditorProject {
         description: &str,
         edit: impl FnOnce(&mut ObjectPool, &mut ComponentSource) -> ComponentResult<()>,
     ) -> ComponentResult<()> {
-        self.edit_source(description, |pool, source, _| edit(pool, source))
+        self.edit_source(description, |pool, source, _, _| edit(pool, source))
     }
     pub(crate) fn edit_source(
         &mut self,
@@ -243,11 +243,17 @@ impl EditorProject {
             &mut ObjectPool,
             &mut ComponentSource,
             &mut crate::graphics::GraphicLibrary,
+            &mut HashMap<ObjectId, ObjectInfo>,
         ) -> ComponentResult<()>,
     ) -> ComponentResult<()> {
         let before = self.component_checkpoint();
         let mut after = before.clone();
-        edit(&mut after.pool, &mut after.source, &mut after.graphics)?;
+        edit(
+            &mut after.pool,
+            &mut after.source,
+            &mut after.graphics,
+            &mut after.info,
+        )?;
         prepare_compiled_ids(&after.pool, &mut after.source)?;
         materialize_source_with_graphics(
             &after.pool,
@@ -843,9 +849,45 @@ impl EditorProject {
 
     /// Load a project from file data
     pub fn load_project(data: Vec<u8>) -> Result<Self, String> {
-        let project = ProjectFile::from_bytes(&data)
+        let mut project = ProjectFile::from_bytes(&data)
             .map_err(|e| format!("Failed to parse project file: {}", e))?;
-        let pool = project.load_pool()?;
+        let mut pool = project.load_pool()?;
+        for (object_id, binding) in std::mem::take(&mut project.graphics.legacy_bindings) {
+            let asset = project
+                .graphics
+                .assets
+                .get(&binding.asset_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "Legacy graphic binding references missing asset {}",
+                        binding.asset_id
+                    )
+                })?;
+            let picture = ObjectId::new(object_id)
+                .ok()
+                .and_then(|id| pool.object_mut_by_id(id));
+            let Some(ag_iso_stack::object_pool::object::Object::PictureGraphic(picture)) = picture
+            else {
+                return Err(format!(
+                    "Legacy graphic binding target {object_id} is not a PictureGraphic"
+                ));
+            };
+            crate::graphics::apply_image_bytes_to_picture_graphic(picture, &asset.original_bytes)?;
+            if let Some(transparent) = binding.transparent {
+                picture.options.transparent = transparent;
+            }
+            if let Some(colour) = binding.transparency_colour {
+                picture.transparency_colour = colour;
+            }
+            if let Some(flashing) = binding.flashing {
+                picture.options.flashing = flashing;
+            }
+            if let Some(format) = binding.format {
+                crate::graphics::convert_picture_graphic_format(picture, format);
+            }
+            project.graphics.assets.remove(&binding.asset_id);
+        }
         let settings = project.get_settings();
 
         let mut editor_project = EditorProject::from(pool);
@@ -863,6 +905,8 @@ impl EditorProject {
                 if let Some(name) = &meta.name {
                     info.set_name(name.clone());
                 }
+                info.description = meta.description.clone();
+                info.tags = meta.tags.clone();
             }
         }
         drop(object_info);
