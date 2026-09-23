@@ -14,8 +14,44 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
     }
     let key = ui.id().with("component_search");
     let mut search = ui.data_mut(|d| d.get_temp::<String>(key).unwrap_or_default());
-    ui.text_edit_singleline(&mut search);
+    ui.add(egui::TextEdit::singleline(&mut search).hint_text("Search by name or ID…"));
     ui.data_mut(|d| d.insert_temp(key, search.clone()));
+    let find_id = ui.make_persistent_id("find_component");
+    if ui.button("Find component…").clicked() {
+        crate::object_picker::open(ui.ctx(), find_id);
+    }
+    if let Some(id) =
+        crate::object_picker::window(ui.ctx(), find_id, "Find component", |ui, query| {
+            let mut selected = None;
+            let mut count = 0;
+            for definition in project.component_source().definitions.values() {
+                if !crate::object_picker::matches(&definition.name, definition.id, query) {
+                    continue;
+                }
+                count += 1;
+                let preview = definition_preview(ui.ctx(), project, definition);
+                ui.push_id(definition.id, |ui| {
+                    if crate::object_picker::row(
+                        ui,
+                        &definition.name,
+                        &definition.id.to_string(),
+                        false,
+                        |ui, rect| {
+                            paint_definition_preview(ui, rect, &preview, definition.root_node)
+                        },
+                    ) {
+                        selected = Some(definition.id);
+                    }
+                });
+            }
+            if count == 0 {
+                ui.label("No matching components.");
+            }
+            selected
+        })
+    {
+        open_editor(ui, &project.component_source().definitions[&id]);
+    }
     let mut error = None;
     if ui.button("Create from selection…").clicked() {
         if let Some(id) = project.get_selected().0 {
@@ -41,49 +77,59 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
             definition.name,
             definition.tags.join(" ")
         );
-        if !text.to_lowercase().contains(&search.to_lowercase()) {
+        if !crate::object_picker::matches(&text, definition.id, &search) {
             continue;
         }
-        egui::CollapsingHeader::new(format!("{} / {}", category, definition.name))
-            .id_salt(definition.id)
-            .show(ui, |ui| {
-                ui.label(&definition.description);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Instantiate").clicked() {
-                        let parent = project.get_selected().0.map(|id| id.value());
-                        if let Some(parent) = parent {
-                            if let Err(e) = ComponentService::instantiate_component(
-                                project,
-                                definition.id,
-                                parent,
-                                0,
-                                0,
-                                Default::default(),
-                            ) {
-                                error = Some(e.to_string());
-                            }
-                        } else {
-                            error = Some("Select an ordinary positioned parent first".into());
-                        }
-                    }
-                    if ui.button("Edit master").clicked() {
-                        open_editor(ui, &definition);
-                    }
-                    if ui.button("Duplicate").clicked() {
-                        if let Err(e) =
-                            ComponentService::duplicate_definition(project, definition.id)
-                        {
-                            error = Some(e.to_string());
-                        }
-                    }
-                    if ui.button("Delete").clicked() {
-                        if let Err(e) = ComponentService::delete_definition(project, definition.id)
-                        {
-                            error = Some(e.to_string());
-                        }
-                    }
-                });
+        let preview = definition_preview(ui.ctx(), project, &definition);
+        egui::collapsing_header::CollapsingState::load_with_default_open(
+            ui.ctx(),
+            ui.id().with(definition.id),
+            false,
+        )
+        .show_header(ui, |ui| {
+            crate::object_picker::preview(ui, |ui, rect| {
+                paint_definition_preview(ui, rect, &preview, definition.root_node)
             });
+            ui.vertical(|ui| {
+                ui.label(format!("{} / {}", category, definition.name));
+                ui.weak(definition.id.to_string());
+            });
+        })
+        .body(|ui| {
+            ui.label(&definition.description);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Instantiate").clicked() {
+                    let parent = project.get_selected().0.map(|id| id.value());
+                    if let Some(parent) = parent {
+                        if let Err(e) = ComponentService::instantiate_component(
+                            project,
+                            definition.id,
+                            parent,
+                            0,
+                            0,
+                            Default::default(),
+                        ) {
+                            error = Some(e.to_string());
+                        }
+                    } else {
+                        error = Some("Select an ordinary positioned parent first".into());
+                    }
+                }
+                if ui.button("Edit master").clicked() {
+                    open_editor(ui, &definition);
+                }
+                if ui.button("Duplicate").clicked() {
+                    if let Err(e) = ComponentService::duplicate_definition(project, definition.id) {
+                        error = Some(e.to_string());
+                    }
+                }
+                if ui.button("Delete").clicked() {
+                    if let Err(e) = ComponentService::delete_definition(project, definition.id) {
+                        error = Some(e.to_string());
+                    }
+                }
+            });
+        });
     }
     ui.separator();
     let instances = project.component_source().instances.clone();
@@ -125,6 +171,70 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
     capture_dialog(ui.ctx(), project);
     edit_dialog(ui.ctx(), project);
 }
+type DefinitionPreview = Result<
+    std::sync::Arc<(
+        ag_iso_stack::object_pool::ObjectPool,
+        std::collections::BTreeMap<ComponentNodeId, u16>,
+    )>,
+    String,
+>;
+
+fn definition_preview(
+    ctx: &egui::Context,
+    project: &EditorProject,
+    definition: &ComponentDefinition,
+) -> DefinitionPreview {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    project.revision().hash(&mut hash);
+    serde_json::to_vec(definition)
+        .unwrap_or_default()
+        .hash(&mut hash);
+    let hash = hash.finish();
+    let key = egui::Id::new(("component_preview", definition.id));
+    if let Some((old_hash, preview)) =
+        ctx.data_mut(|data| data.get_temp::<(u64, DefinitionPreview)>(key))
+    {
+        if old_hash == hash {
+            return preview;
+        }
+    }
+    let preview = super::materialize::preview_definition(project, definition)
+        .map(std::sync::Arc::new)
+        .map_err(|error| error.to_string());
+    ctx.data_mut(|data| data.insert_temp(key, (hash, preview.clone())));
+    preview
+}
+
+fn paint_definition_preview(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    preview: &DefinitionPreview,
+    node: ComponentNodeId,
+) {
+    match preview {
+        Ok(preview) => {
+            let (pool, ids) = preview.as_ref();
+            if let Some(object) = ids
+                .get(&node)
+                .and_then(|id| ag_iso_stack::object_pool::ObjectId::new(*id).ok())
+                .and_then(|id| pool.object_by_id(id))
+            {
+                crate::object_picker::object_preview(ui, rect, pool, object);
+            }
+        }
+        Err(_) => {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No preview",
+                egui::FontId::proportional(10.0),
+                egui::Color32::DARK_GRAY,
+            );
+        }
+    }
+}
+
 fn open_editor(ui: &mut egui::Ui, definition: &ComponentDefinition) {
     ui.data_mut(|d| {
         d.insert_temp(
@@ -258,15 +368,40 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                 }
                                 for (property, reference) in &mut node.references {
                                     ui.label(format!("Reference: {property}"));
-                                    let accepts_picture = crate::object_properties::get_property_descriptors(node.object_type).iter().any(|d| d.name == property && matches!(&d.semantic, crate::PropertySemantic::ObjectReference { allowed_types, .. } if allowed_types.contains(&ag_iso_stack::object_pool::ObjectType::PictureGraphic)));
-                                    if accepts_picture {
-                                        egui::ComboBox::from_id_salt((node.id, property, "reuse_graphic")).selected_text("Use existing PictureGraphic").show_ui(ui, |ui| {
-                                            for picture in project.get_pool().objects_by_type(ag_iso_stack::object_pool::ObjectType::PictureGraphic) {
-                                                if ui.selectable_label(false, project.get_object_info(picture).get_name(picture)).clicked() {
-                                                    *reference = ComponentReference::ExternalObject(crate::ObjectTarget::id(picture.id().value()));
-                                                }
+                                    if let Some(descriptor) =
+                                        crate::object_properties::get_property_descriptors(
+                                            node.object_type,
+                                        )
+                                        .into_iter()
+                                        .find(|d| d.name == property)
+                                    {
+                                        if let crate::PropertySemantic::ObjectReference {
+                                            allowed_types,
+                                        } = descriptor.semantic
+                                        {
+                                            if let Some(selected) = crate::object_picker::button(
+                                                ui,
+                                                (node.id, property, "external_reference"),
+                                                "Choose external object…",
+                                                project,
+                                                None,
+                                                true,
+                                                |object| {
+                                                    allowed_types.is_empty()
+                                                        || allowed_types
+                                                            .contains(&object.object_type())
+                                                },
+                                            ) {
+                                                *reference = selected.0.map_or(
+                                                    ComponentReference::Null,
+                                                    |id| {
+                                                        ComponentReference::ExternalObject(
+                                                            crate::ObjectTarget::id(id.value()),
+                                                        )
+                                                    },
+                                                );
                                             }
-                                        });
+                                        }
                                     }
 
                                     let mut value = serde_json::to_value(&*reference).unwrap();
@@ -496,20 +631,49 @@ fn manual_parameter_form(
         });
         ui.label("Name");
         ui.text_edit_singleline(&mut draft.0);
-        egui::ComboBox::from_id_salt("parameter_node")
-            .selected_text(
+        let picker_id = ui.make_persistent_id("parameter_node");
+        if ui
+            .button(
                 definition
                     .nodes
                     .iter()
-                    .find(|n| n.id == draft.1)
-                    .map(|n| n.name.as_str())
-                    .unwrap_or("Choose node"),
+                    .find(|node| node.id == draft.1)
+                    .map_or("Choose node…", |node| node.name.as_str()),
             )
-            .show_ui(ui, |ui| {
+            .clicked()
+        {
+            crate::object_picker::open(ui.ctx(), picker_id);
+        }
+        if let Some(node) = crate::object_picker::window(
+            ui.ctx(),
+            picker_id,
+            "Choose component node",
+            |ui, query| {
+                let preview = definition_preview(ui.ctx(), project, definition);
+                let mut selected = None;
                 for node in &definition.nodes {
-                    ui.selectable_value(&mut draft.1, node.id, &node.name);
+                    if !crate::object_picker::matches(&node.name, node.id, query) {
+                        continue;
+                    }
+                    ui.push_id(node.id, |ui| {
+                        if crate::object_picker::row(
+                            ui,
+                            &node.name,
+                            &node.id.to_string(),
+                            node.id == draft.1,
+                            |ui, rect| {
+                                paint_definition_preview(ui, rect, &preview, node.id);
+                            },
+                        ) {
+                            selected = Some(node.id);
+                        }
+                    });
                 }
-            });
+                selected
+            },
+        ) {
+            draft.1 = node;
+        }
         if let Some(node) = definition.nodes.iter().find(|n| n.id == draft.1) {
             egui::ComboBox::from_id_salt("parameter_property")
                 .selected_text(if draft.2.is_empty() {
@@ -663,6 +827,41 @@ pub fn inspector(
             let mut value = serde_json::from_str(&draft).unwrap_or_default();
             crate::graphics::ui::select(ui, project, &mut value);
             draft = value.to_string();
+        } else if parameter.kind == ComponentParameterKind::ObjectReference {
+            if let Some(node) = definition
+                .nodes
+                .iter()
+                .find(|node| node.id == parameter.target_node)
+            {
+                if let Some(descriptor) =
+                    crate::object_properties::get_property_descriptors(node.object_type)
+                        .into_iter()
+                        .find(|d| d.name == parameter.property)
+                {
+                    if let crate::PropertySemantic::ObjectReference { allowed_types } =
+                        descriptor.semantic
+                    {
+                        if let Some(selected) = crate::object_picker::button(
+                            ui,
+                            (id, parameter.id, "override_reference"),
+                            "Choose referenced object…",
+                            project,
+                            None,
+                            true,
+                            |object| {
+                                allowed_types.is_empty()
+                                    || allowed_types.contains(&object.object_type())
+                            },
+                        ) {
+                            draft = serde_json::to_string(
+                                &selected.0.map(|id| crate::ObjectTarget::id(id.value())),
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+            }
+            ui.label(&draft);
         } else {
             ui.text_edit_singleline(&mut draft);
         }

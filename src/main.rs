@@ -1904,38 +1904,36 @@ impl eframe::App for DesignerApp {
                             .response
                             .on_hover_text("Sort objects");
 
-                            let filter_shortcut =
-                                egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::F);
-
-                            let response = ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut filter_text)
-                                        .hint_text("Filter object by name...")
-                                        .desired_width(ui.available_width()),
-                                )
-                                .on_hover_text(format!(
-                                    "Search shortcut ({})",
-                                    ctx.format_shortcut(&filter_shortcut)
-                                ));
+                            if ui
+                                .button("Find…")
+                                .on_hover_text("Find an object with previews (Ctrl+F)")
+                                .clicked()
+                            {
+                                ag_iso_terminal_designer::object_picker::open(
+                                    ctx,
+                                    egui::Id::new("find_project_object"),
+                                );
+                            }
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut filter_text)
+                                    .hint_text("Filter by name or ID…")
+                                    .desired_width(ui.available_width()),
+                            );
                             if response.changed() {
                                 ui.data_mut(|data| {
                                     data.insert_temp(filter_id, filter_text.clone())
                                 });
-                            } else if ctx.input_mut(|i| i.consume_shortcut(&filter_shortcut)) {
-                                response.request_focus();
                             }
                         });
                     });
 
                     let filter_text = filter_text.to_lowercase();
                     for object in pool.get_pool().objects() {
-                        if filter_text.is_empty()
-                            || pool
-                                .get_object_info(object)
-                                .get_name(object)
-                                .to_lowercase()
-                                .contains(&filter_text)
-                        {
+                        if ag_iso_terminal_designer::object_picker::matches(
+                            &pool.get_object_info(object).get_name(object),
+                            object.id().value(),
+                            &filter_text,
+                        ) {
                             render_selectable_object(ui, object, pool);
                         }
                     }
@@ -2064,6 +2062,23 @@ impl eframe::App for DesignerApp {
                 }
                 ui.allocate_space(ui.available_size());
             });
+
+            let search_id = egui::Id::new("find_project_object");
+            let shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F);
+            if ctx.input_mut(|input| input.consume_shortcut(&shortcut)) {
+                ag_iso_terminal_designer::object_picker::open(ctx, search_id);
+            }
+            if let Some(selected) = ag_iso_terminal_designer::object_picker::object_window(
+                ctx,
+                search_id,
+                "Find object",
+                pool,
+                pool.get_selected().0,
+                false,
+                |_| true,
+            ) {
+                pool.get_mut_selected().set(selected);
+            }
 
             if pool.commit_queued("Edit object pool") {
                 ctx.request_repaint();

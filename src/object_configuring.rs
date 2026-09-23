@@ -98,12 +98,11 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             {
                 design.request_image_load(id);
             }
-            ui.menu_button("Choose Available…", |ui| {
-                if let Some(asset) = crate::graphics::ui::available_picker(ui, design) {
-                    design.request_graphic_assignment(asset, id);
-                    ui.close();
-                }
-            });
+            if let Some(asset) =
+                crate::graphics::ui::available_button(ui, ("choose_available", id.value()), design)
+            {
+                design.request_graphic_assignment(asset, id);
+            }
         });
     }
     for editor in property_editor_descriptors(object_type) {
@@ -378,26 +377,34 @@ fn render_object_selector(
         || format!("{}: Missing object", selected.value()),
         |object| object_selector_label(design, object),
     );
-    let mut replacement = None;
-    egui::ComboBox::from_id_salt(salt)
-        .selected_text(selected_text)
-        .show_ui(ui, |ui| {
-            for candidate in design.get_pool().objects_by_types(allowed_types) {
-                let valid = candidate_is_valid(design, parent, candidate.id());
-                ui.add_enabled_ui(valid, |ui| {
-                    if ui
-                        .selectable_label(
-                            candidate.id() == selected,
-                            object_selector_label(design, candidate),
-                        )
-                        .clicked()
-                    {
-                        replacement = Some(candidate.id());
-                    }
-                });
-            }
-        });
-    replacement.filter(|replacement| *replacement != selected)
+    child_picker(
+        ui,
+        salt,
+        &selected_text,
+        design,
+        parent,
+        Some(selected),
+        allowed_types,
+        false,
+    )
+    .and_then(|id| id.0)
+    .filter(|id| *id != selected)
+}
+
+fn child_picker(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    label: &str,
+    design: &EditorProject,
+    parent: ObjectId,
+    selected: Option<ObjectId>,
+    allowed: &[ObjectType],
+    allow_none: bool,
+) -> Option<NullableObjectId> {
+    crate::object_picker::button(ui, salt, label, design, selected, allow_none, |candidate| {
+        allowed.contains(&candidate.object_type())
+            && candidate_is_valid(design, parent, candidate.id())
+    })
 }
 
 fn parent_dimensions(object: &Object, design: &EditorProject) -> (u16, u16) {
@@ -532,26 +539,25 @@ fn render_positioned_children(
 
     ui.horizontal(|ui| {
         ui.label("Add object:");
-        egui::ComboBox::from_id_salt(("add_positioned_child", parent_id.value()))
-            .selected_text("Select existing object")
-            .show_ui(ui, |ui| {
-                for candidate in design.get_pool().objects_by_types(&allowed) {
-                    let valid = candidate_is_valid(design, parent_id, candidate.id());
-                    ui.add_enabled_ui(valid, |ui| {
-                        if ui
-                            .selectable_label(false, object_label(design, candidate))
-                            .clicked()
-                        {
-                            design.queue_operation(Operation::AddChild {
-                                parent: ObjectTarget::id(parent_id.value()),
-                                child: ObjectTarget::id(candidate.id().value()),
-                                x: 0,
-                                y: 0,
-                            });
-                        }
-                    });
-                }
+        if let Some(Some(child)) = child_picker(
+            ui,
+            ("add_positioned_child", parent_id.value()),
+            "Select existing object…",
+            design,
+            parent_id,
+            None,
+            &allowed,
+            false,
+        )
+        .map(|id| id.0)
+        {
+            design.queue_operation(Operation::AddChild {
+                parent: ObjectTarget::id(parent_id.value()),
+                child: ObjectTarget::id(child.value()),
+                x: 0,
+                y: 0,
             });
+        }
     });
 }
 
@@ -631,30 +637,27 @@ fn render_object_list(
                                 .map_or_else(|| "None".to_owned(), |id| id.value().to_string()),
                         );
                         let mut selected = object_id;
-                        egui::ComboBox::from_id_salt(("nullable_object", index))
-                            .selected_text(object_id.0.map_or_else(
-                                || "None".to_owned(),
-                                |id| {
-                                    design.get_pool().object_by_id(id).map_or_else(
-                                        || format!("{}: Missing object", id.value()),
-                                        |object| object_label(design, object),
-                                    )
-                                },
-                            ))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut selected, NullableObjectId::NULL, "None");
-                                for candidate in design.get_pool().objects_by_types(&allowed) {
-                                    let valid =
-                                        candidate_is_valid(design, parent_id, candidate.id());
-                                    ui.add_enabled_ui(valid, |ui| {
-                                        ui.selectable_value(
-                                            &mut selected,
-                                            NullableObjectId(Some(candidate.id())),
-                                            object_label(design, candidate),
-                                        );
-                                    });
-                                }
-                            });
+                        let label = object_id.0.map_or_else(
+                            || "None".to_owned(),
+                            |id| {
+                                design.get_pool().object_by_id(id).map_or_else(
+                                    || format!("#{}: Missing object", id.value()),
+                                    |object| object_label(design, object),
+                                )
+                            },
+                        );
+                        if let Some(value) = child_picker(
+                            ui,
+                            ("nullable_object", index),
+                            &label,
+                            design,
+                            parent_id,
+                            object_id.0,
+                            &allowed,
+                            true,
+                        ) {
+                            selected = value;
+                        }
                         if selected != object_id {
                             replacement = Some((index, selected));
                         }
@@ -713,24 +716,18 @@ fn render_add_object(
 ) {
     ui.horizontal(|ui| {
         ui.label("Add object:");
-        egui::ComboBox::from_id_salt(("add_object_list_item", parent_id.value()))
-            .selected_text("Select existing object")
-            .show_ui(ui, |ui| {
-                if allow_none && ui.selectable_label(false, "None").clicked() {
-                    add(None);
-                }
-                for candidate in design.get_pool().objects_by_types(allowed) {
-                    let valid = candidate_is_valid(design, parent_id, candidate.id());
-                    ui.add_enabled_ui(valid, |ui| {
-                        if ui
-                            .selectable_label(false, object_label(design, candidate))
-                            .clicked()
-                        {
-                            add(Some(candidate.id()));
-                        }
-                    });
-                }
-            });
+        if let Some(id) = child_picker(
+            ui,
+            ("add_object_list_item", parent_id.value()),
+            "Select existing object…",
+            design,
+            parent_id,
+            None,
+            allowed,
+            allow_none,
+        ) {
+            add(id.0);
+        }
     });
 }
 
@@ -809,25 +806,28 @@ fn render_add_macro_reference(
                 }
             });
         if let Some(event_id) = selected_event {
-            egui::ComboBox::from_id_salt(("new_macro_object", id.value()))
-                .selected_text("Select macro")
-                .show_ui(ui, |ui| {
-                    for candidate in design.get_pool().objects_by_type(ObjectType::Macro) {
-                        if candidate.id().value() <= u8::MAX.into()
-                            && ui
-                                .selectable_label(false, object_label(design, candidate))
-                                .clicked()
-                        {
-                            let mut updated = references.to_vec();
-                            updated.push(MacroRef {
-                                event_id,
-                                macro_id: candidate.id().value() as u8,
-                            });
-                            queue_macro_references(design, id, updated);
-                            ui.data_mut(|data| data.remove::<Event>(event_key));
-                        }
-                    }
+            if let Some(Some(candidate)) = crate::object_picker::button(
+                ui,
+                ("new_macro_object", id.value()),
+                "Select macro…",
+                design,
+                None,
+                false,
+                |candidate| {
+                    candidate.object_type() == ObjectType::Macro
+                        && candidate.id().value() <= u8::MAX.into()
+                },
+            )
+            .map(|id| id.0)
+            {
+                let mut updated = references.to_vec();
+                updated.push(MacroRef {
+                    event_id,
+                    macro_id: candidate.value() as u8,
                 });
+                queue_macro_references(design, id, updated);
+                ui.data_mut(|data| data.remove::<Event>(event_key));
+            }
         }
     });
 }
@@ -863,19 +863,22 @@ fn render_macro_references(
                     || format!("{} - Missing macro", reference.macro_id),
                     |object| object_label(design, object),
                 );
-                egui::ComboBox::from_id_salt(("macro_object", index))
-                    .selected_text(selected_text)
-                    .show_ui(ui, |ui| {
-                        for candidate in design.get_pool().objects_by_type(ObjectType::Macro) {
-                            if candidate.id().value() <= u8::MAX.into() {
-                                ui.selectable_value(
-                                    &mut edited.macro_id,
-                                    candidate.id().value() as u8,
-                                    object_label(design, candidate),
-                                );
-                            }
-                        }
-                    });
+                if let Some(Some(candidate)) = crate::object_picker::button(
+                    ui,
+                    ("macro_object", index),
+                    &selected_text,
+                    design,
+                    macro_object.map(|object| object.id()),
+                    false,
+                    |candidate| {
+                        candidate.object_type() == ObjectType::Macro
+                            && candidate.id().value() <= u8::MAX.into()
+                    },
+                )
+                .map(|id| id.0)
+                {
+                    edited.macro_id = candidate.value() as u8;
+                }
                 if let Some(macro_object) = macro_object {
                     if ui.link("View").clicked() {
                         select_object(design, macro_object.id());
@@ -1356,32 +1359,41 @@ fn render_reference(
     };
     let selected = value.as_u64();
     ui.horizontal(|ui| {
-        let label_response = ui.label(label);
-        egui::ComboBox::from_id_salt(label)
-            .selected_text(selected.map_or_else(|| "None".to_owned(), |value| value.to_string()))
-            .show_ui(ui, |ui| {
-                if selected.is_some() && ui.selectable_label(false, "None").clicked() {
-                    queue(design, id, property, serde_json::Value::Null);
-                }
-                for candidate in design.get_pool().objects_by_types(allowed_types) {
-                    if ui
-                        .selectable_label(
-                            selected == Some(u64::from(candidate.id().value())),
-                            format!("{}: {:?}", candidate.id().value(), candidate.object_type()),
-                        )
-                        .clicked()
-                    {
-                        queue(
-                            design,
-                            id,
-                            property,
-                            serde_json::Value::from(candidate.id().value()),
-                        );
-                    }
-                }
-            })
-            .response
-            .labelled_by(label_response.id);
+        ui.label(label);
+        let selected_id = selected.and_then(|id| ObjectId::new(id as u16).ok());
+        let label = selected_id
+            .and_then(|id| design.get_pool().object_by_id(id))
+            .map(|object| object_selector_label(design, object))
+            .unwrap_or_else(|| "None".into());
+        let allow_none = design.get_pool().object_by_id(id).is_some_and(|object| {
+            crate::object_properties::property_accepts_null(object, property)
+        });
+        if let Some(reference) = crate::object_picker::button(
+            ui,
+            (id.value(), property),
+            &label,
+            design,
+            selected_id,
+            allow_none,
+            |candidate| {
+                (allowed_types.is_empty() || allowed_types.contains(&candidate.object_type()))
+                    && crate::pool_validation::would_create_circular_reference(
+                        design.get_pool(),
+                        id,
+                        candidate.id(),
+                    )
+                    .is_ok()
+            },
+        ) {
+            queue(
+                design,
+                id,
+                property,
+                reference
+                    .0
+                    .map_or(serde_json::Value::Null, |id| serde_json::json!(id.value())),
+            );
+        }
     });
 }
 

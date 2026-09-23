@@ -1,5 +1,6 @@
 use super::{integration::GraphicService, preview, GraphicAssetId};
-use crate::EditorProject;
+use crate::object_picker::checkerboard;
+use crate::{object_picker, EditorProject};
 use ag_iso_stack::object_pool::{object::Object, NullableObjectId, ObjectId, ObjectType};
 use eframe::egui;
 
@@ -30,21 +31,6 @@ enum Action {
 }
 
 const CARD_WIDTH: f32 = 100.0;
-
-fn checkerboard(painter: &egui::Painter, rect: egui::Rect) {
-    const TILE: f32 = 6.0;
-    for row in 0..(rect.height() / TILE).ceil() as usize {
-        for column in 0..(rect.width() / TILE).ceil() as usize {
-            let tile = egui::Rect::from_min_size(
-                rect.min + egui::vec2(column as f32 * TILE, row as f32 * TILE),
-                egui::vec2(TILE, TILE),
-            )
-            .intersect(rect);
-            let shade = if (row + column) % 2 == 0 { 190 } else { 235 };
-            painter.rect_filled(tile, 0.0, egui::Color32::from_gray(shade));
-        }
-    }
-}
 
 fn thumbnail_grid<T>(
     ui: &mut egui::Ui,
@@ -79,15 +65,11 @@ fn graphics_card(
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(CARD_WIDTH, 86.0), egui::Sense::click());
         checkerboard(ui.painter(), rect);
-        if let Some(texture) = texture {
-            let size = texture.size_vec2();
-            let scale = (rect.width() / size.x).min(rect.height() / size.y);
-            ui.painter().image(
-                texture.id(),
-                egui::Rect::from_center_size(rect.center(), size * scale),
-                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+        if let Some(texture) = &texture {
+            object_picker::texture(ui, rect, texture);
+            object_picker::hover_preview(response.clone(), |ui, rect| {
+                object_picker::texture(ui, rect, texture);
+            });
         } else {
             ui.painter().text(
                 rect.center(),
@@ -140,69 +122,46 @@ fn graphics_card(
     action
 }
 
-/// Choose a waiting upload without mutating the project during inspector rendering.
-pub fn available_picker(ui: &mut egui::Ui, project: &EditorProject) -> Option<GraphicAssetId> {
-    let mut selected = None;
-    if project.graphic_library().assets.is_empty() {
-        ui.label("No available graphics. Upload one in the Graphics panel.");
+/// Waiting uploads use the same searchable window and preview rows as objects.
+pub fn available_button(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    project: &EditorProject,
+) -> Option<GraphicAssetId> {
+    let id = ui.make_persistent_id(salt);
+    if ui.button("Choose Available…").clicked() {
+        object_picker::open(ui.ctx(), id);
     }
-    egui::ScrollArea::vertical()
-        .max_height(320.0)
-        .show(ui, |ui| {
-            for asset in project.graphic_library().assets.values() {
-                ui.push_id(asset.id, |ui| {
-                    ui.horizontal(|ui| {
-                        if let Some(texture) = preview::asset_texture(ui.ctx(), asset) {
-                            picker_preview(ui, &texture);
-                        }
-                        if ui.selectable_label(false, &asset.name).clicked() {
-                            selected = Some(asset.id);
-                        }
-                    });
-                });
+    object_picker::window(ui.ctx(), id, "Choose available graphic", |ui, query| {
+        available_picker(ui, project, query)
+    })
+}
+
+fn available_picker(
+    ui: &mut egui::Ui,
+    project: &EditorProject,
+    query: &str,
+) -> Option<GraphicAssetId> {
+    let mut selected = None;
+    let mut count = 0;
+    for asset in project.graphic_library().assets.values() {
+        if !object_picker::matches(&asset.name, asset.id, query) {
+            continue;
+        }
+        count += 1;
+        ui.push_id(asset.id, |ui| {
+            let texture = preview::asset_texture(ui.ctx(), asset);
+            if object_picker::row(ui, &asset.name, &asset.id.to_string(), false, |ui, rect| {
+                if let Some(texture) = &texture {
+                    object_picker::texture(ui, rect, texture);
+                }
+            }) {
+                selected = Some(asset.id);
             }
         });
-    selected
-}
-
-fn picker_preview(ui: &mut egui::Ui, texture: &egui::TextureHandle) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-    checkerboard(ui.painter(), rect);
-    egui::Image::new(texture).paint_at(ui, rect);
-}
-
-fn picture_picker(ui: &mut egui::Ui, project: &EditorProject) -> Option<ObjectId> {
-    let mut selected = None;
-    let pictures = picture_graphics(project);
-    if pictures.is_empty() {
-        ui.label("No PictureGraphics in this project.");
     }
-    for object in pictures {
-        let Object::PictureGraphic(picture) = object else {
-            continue;
-        };
-        ui.push_id(object.id().value(), |ui| {
-            ui.horizontal(|ui| {
-                if let Some(texture) =
-                    preview::picture_texture(ui.ctx(), picture, project.get_pool())
-                {
-                    picker_preview(ui, &texture);
-                }
-                if ui
-                    .selectable_label(
-                        false,
-                        format!(
-                            "{}  #{}",
-                            project.get_object_info(object).get_name(object),
-                            object.id().value()
-                        ),
-                    )
-                    .clicked()
-                {
-                    selected = Some(object.id());
-                }
-            });
-        });
+    if count == 0 {
+        ui.label("No matching available graphics.");
     }
     selected
 }
@@ -328,6 +287,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
         let result = match action {
             Action::Assign => {
                 assigning = Some(id);
+                object_picker::open(ui.ctx(), assign_key);
                 Ok(())
             }
             Action::Create => GraphicService::create_picture_graphic_from_asset(project, id)
@@ -347,19 +307,16 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
     }
     if let Some(asset_id) = assigning {
         if project.graphic_library().assets.contains_key(&asset_id) {
-            let mut open = true;
-            let mut selected = None;
-            egui::Window::new("Assign to PictureGraphic")
-                .id(assign_key)
-                .open(&mut open)
-                .collapsible(false)
-                .show(ui.ctx(), |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(320.0)
-                        .show(ui, |ui| {
-                            selected = picture_picker(ui, project);
-                        });
-                });
+            let selected = object_picker::object_window(
+                ui.ctx(),
+                assign_key,
+                "Assign to PictureGraphic",
+                project,
+                None,
+                false,
+                |object| object.object_type() == ObjectType::PictureGraphic,
+            )
+            .and_then(|id| id.0);
             if let Some(id) = selected {
                 match GraphicService::convert_asset_into_picture_graphic(
                     project,
@@ -373,7 +330,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
                     Err(value) => error = Some(value.to_string()),
                 }
             }
-            if !open {
+            if !object_picker::is_open(ui.ctx(), assign_key) {
                 assigning = None;
             }
         } else {
@@ -400,29 +357,45 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
 
 /// Shared picker for component references, retaining create-from-asset behavior.
 pub fn select(ui: &mut egui::Ui, project: &mut EditorProject, value: &mut serde_json::Value) {
-    egui::ComboBox::from_id_salt(ui.next_auto_id())
-        .selected_text(value.as_u64().map_or_else(
-            || "Select PictureGraphic".to_owned(),
-            |id| format!("PictureGraphic {id}"),
+    enum Choice {
+        Picture(ObjectId),
+        Asset(GraphicAssetId),
+    }
+    let key = ui.next_auto_id().with("select_graphic");
+    if ui
+        .button(value.as_u64().map_or_else(
+            || "Select PictureGraphic…".to_owned(),
+            |id| format!("PictureGraphic #{id}"),
         ))
-        .show_ui(ui, |ui| {
-            if let Some(id) = picture_picker(ui, project) {
-                *value = serde_json::json!(id.value());
+        .clicked()
+    {
+        object_picker::open(ui.ctx(), key);
+    }
+    let choice = object_picker::window(ui.ctx(), key, "Select graphic", |ui, query| {
+        ui.strong("PICTURE GRAPHICS");
+        let picture = object_picker::objects(
+            ui,
+            project,
+            query,
+            value.as_u64().and_then(|id| ObjectId::new(id as u16).ok()),
+            false,
+            |object| object.object_type() == ObjectType::PictureGraphic,
+        )
+        .and_then(|id| id.0)
+        .map(Choice::Picture);
+        ui.separator();
+        ui.strong("AVAILABLE — creates a PictureGraphic");
+        picture.or_else(|| available_picker(ui, project, query).map(Choice::Asset))
+    });
+    match choice {
+        Some(Choice::Picture(id)) => *value = serde_json::json!(id.value()),
+        Some(Choice::Asset(asset)) => {
+            if let Ok(id) = GraphicService::create_picture_graphic_from_asset(project, asset) {
+                *value = serde_json::json!(id);
             }
-            ui.separator();
-            ui.strong("AVAILABLE");
-            let mut selected = None;
-            for asset in project.graphic_library().assets.values() {
-                if ui.selectable_label(false, &asset.name).clicked() {
-                    selected = Some(asset.id);
-                }
-            }
-            if let Some(id) = selected {
-                if let Ok(id) = GraphicService::create_picture_graphic_from_asset(project, id) {
-                    *value = serde_json::json!(id);
-                }
-            }
-        });
+        }
+        None => {}
+    }
 }
 
 #[cfg(test)]

@@ -1049,6 +1049,11 @@ pub fn get_object_property(object: &Object, property: &str) -> Result<Value, Pro
     dispatch_property!(object, get_property, property)
 }
 
+/// Query the field's existing deserializer without changing the object.
+pub(crate) fn property_accepts_null(object: &Object, property: &str) -> bool {
+    dispatch_property!(&mut object.clone(), set_property, property, Value::Null).is_ok()
+}
+
 /// Set a property on an object in the pool
 pub fn set_property(
     pool: &mut ObjectPool,

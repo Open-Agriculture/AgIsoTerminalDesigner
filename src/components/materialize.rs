@@ -57,6 +57,39 @@ pub fn prepare_compiled_ids(
     Ok(())
 }
 
+/// Compile a standalone preview using the same node compiler and ID allocation
+/// as instances. No instance or history entry is added to the user's project.
+pub(crate) fn preview_definition(
+    project: &EditorProject,
+    definition: &ComponentDefinition,
+) -> ComponentResult<(ObjectPool, std::collections::BTreeMap<ComponentNodeId, u16>)> {
+    validate_definition(definition)?;
+    let mut source = ComponentSource::default();
+    source.definitions.insert(definition.id, definition.clone());
+    source.instances.push(ComponentInstance {
+        id: ComponentInstanceId::default(),
+        component_id: definition.id,
+        parent: EditorParentRef::Primitive(0),
+        child_index: None,
+        x: 0,
+        y: 0,
+        overrides: Default::default(),
+        compiled_ids: Default::default(),
+    });
+    prepare_compiled_ids(project.get_pool(), &mut source)?;
+    let instance = &source.instances[0];
+    let mut pool = project.get_pool().clone();
+    compile_nodes(
+        &mut pool,
+        project.get_pool(),
+        &project.component_object_info(),
+        definition,
+        instance,
+        project.vt_version,
+    )?;
+    Ok((pool, instance.compiled_ids.clone()))
+}
+
 pub fn materialize_project(project: &EditorProject) -> ComponentResult<MaterializedProject> {
     materialize_source_with_graphics(
         project.get_pool(),
@@ -809,4 +842,44 @@ pub fn source_map(source: &ComponentSource) -> MaterializedSourceMap {
         }
     }
     map
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use ag_iso_stack::object_pool::{object::Object, ObjectType};
+
+    #[test]
+    fn standalone_preview_uses_normal_compiler_without_project_mutations() {
+        let mut pool = ObjectPool::default();
+        let mut button = crate::default_object(ObjectType::Button);
+        button.mut_id().set_value(100).unwrap();
+        if let Object::Button(button) = &mut button {
+            button.width = 140;
+            button.height = 40;
+        }
+        pool.add(button);
+        let mut mask = crate::default_object(ObjectType::DataMask);
+        mask.mut_id().set_value(2).unwrap();
+        if let Object::DataMask(mask) = &mut mask {
+            mask.object_refs.push(ag_iso_stack::object_pool::ObjectRef {
+                id: ObjectId::new(100).unwrap(),
+                offset: Default::default(),
+            });
+        }
+        pool.add(mask);
+        let project = EditorProject::from(pool);
+        let plan = plan_component_capture(&project, 100, "Preview Button".into()).unwrap();
+        let before = project.save_project().unwrap();
+        let revision = project.revision();
+        let (preview, nodes) = preview_definition(&project, &plan.definition).unwrap();
+        assert_eq!(nodes.len(), plan.definition.nodes.len());
+        let root = preview
+            .object_by_id(ObjectId::new(nodes[&plan.definition.root_node]).unwrap())
+            .unwrap();
+        assert_eq!(preview.content_size(root), (140, 40));
+        assert_eq!(project.save_project().unwrap(), before);
+        assert_eq!(project.revision(), revision);
+        assert!(!project.undo_available());
+    }
 }
