@@ -42,6 +42,25 @@ pub(crate) fn consume_into_picture_graphic(
     Ok(asset)
 }
 
+/// Recover the current graphic; consumed uploads intentionally retain no source binding.
+pub(crate) fn recover_picture_graphic(
+    picture: &ag_iso_stack::object_pool::object::PictureGraphic,
+    pool: &ObjectPool,
+    info: Option<&crate::ObjectInfo>,
+) -> Result<GraphicAsset, String> {
+    let object = Object::PictureGraphic(picture.clone());
+    let name = info
+        .map(|info| info.get_name(&object))
+        .unwrap_or_else(|| format!("PictureGraphic {}", picture.id.value()));
+    let bytes = super::preview::picture_png(picture, pool)?;
+    let mut asset =
+        GraphicAsset::from_upload(&format!("PictureGraphic-{}.png", picture.id.value()), bytes)?;
+    asset.name = name;
+    asset.description = info.and_then(|info| info.description.clone());
+    asset.tags = info.map(|info| info.tags.clone()).unwrap_or_default();
+    Ok(asset)
+}
+
 impl GraphicService {
     pub fn upload(
         project: &mut EditorProject,

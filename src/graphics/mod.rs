@@ -6,6 +6,7 @@ use ag_iso_stack::object_pool::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 pub mod integration;
+pub mod preview;
 pub mod ui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

@@ -90,13 +90,21 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             );
             queue(design, id, "transparency_colour", serde_json::json!(colour));
         }
-        if ui
-            .button("Load Image")
-            .on_hover_text("Load an image file (PNG, JPG, BMP, etc.)")
-            .clicked()
-        {
-            design.request_image_load(id);
-        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("Load Image")
+                .on_hover_text("Load an image file (PNG, JPG, BMP, etc.)")
+                .clicked()
+            {
+                design.request_image_load(id);
+            }
+            ui.menu_button("Choose Available…", |ui| {
+                if let Some(asset) = crate::graphics::ui::available_picker(ui, design) {
+                    design.request_graphic_assignment(asset, id);
+                    ui.close();
+                }
+            });
+        });
     }
     for editor in property_editor_descriptors(object_type) {
         if object_type == ObjectType::PictureGraphic

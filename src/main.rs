@@ -2068,6 +2068,9 @@ impl eframe::App for DesignerApp {
             if pool.commit_queued("Edit object pool") {
                 ctx.request_repaint();
             }
+            if pool.commit_graphic_assignment() {
+                ctx.request_repaint();
+            }
             if let Some((object_id, name)) = pool.take_rename_request() {
                 if pool.rename_object(object_id, name) {
                     ctx.request_repaint();

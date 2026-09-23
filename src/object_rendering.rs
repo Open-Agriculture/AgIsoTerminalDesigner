@@ -2,9 +2,6 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
 use std::ops::Sub;
 
 use ag_iso_stack::object_pool::object::*;
@@ -13,7 +10,6 @@ use ag_iso_stack::object_pool::object_attributes::FontSize;
 use ag_iso_stack::object_pool::object_attributes::FormatType;
 use ag_iso_stack::object_pool::object_attributes::HorizontalAlignment;
 use ag_iso_stack::object_pool::object_attributes::LineDirection;
-use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
 use ag_iso_stack::object_pool::object_attributes::Point;
 use ag_iso_stack::object_pool::object_attributes::VerticalAlignment;
 use ag_iso_stack::object_pool::vt_version::VtVersion;
@@ -22,11 +18,8 @@ use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectRef;
 use eframe::egui;
 use eframe::egui::Color32;
-use eframe::egui::ColorImage;
 use eframe::egui::FontId;
 use eframe::egui::TextWrapMode;
-use eframe::egui::TextureHandle;
-use eframe::egui::TextureId;
 use eframe::egui::UiBuilder;
 
 pub trait RenderableObject {
@@ -99,7 +92,7 @@ impl RenderableObject for Object {
     }
 }
 
-trait Colorable {
+pub(crate) trait Colorable {
     fn convert(&self) -> egui::Color32;
 }
 
@@ -1293,117 +1286,13 @@ impl RenderableObject for PictureGraphic {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        let mut hasher = DefaultHasher::new();
-        Object::PictureGraphic(self.clone())
-            .write()
-            .hash(&mut hasher);
-        // Palette/map edits must invalidate cached indexed picture textures too.
-        for index in 0..=255 {
-            crate::effective_colour::colour(pool, index)
-                .as_rgba()
-                .hash(&mut hasher);
-        }
-        let hash = hasher.finish();
-
-        let changed: bool = ui.data_mut(|data| {
-            let old_hash: Option<u64> =
-                data.get_temp(format!("picturegraphic_{}_image", self.id.value()).into());
-            if old_hash.is_none() || old_hash.unwrap() != hash {
-                data.insert_temp(
-                    format!("picturegraphic_{}_image", self.id.value()).into(),
-                    hash,
-                );
-                true
-            } else {
-                false
-            }
-        });
-
-        let texture_id: Option<TextureId>;
-        if changed {
-            let mut x = 0;
-            let mut y = 0;
-
-            let mut image = ColorImage::filled(
-                [self.actual_width.into(), self.actual_height.into()],
-                Color32::TRANSPARENT,
-            );
-
-            for raw in self.data_as_raw_encoded() {
-                let mut colors: Vec<Color32> = vec![];
-                match self.format {
-                    PictureGraphicFormat::Monochrome => {
-                        for bit in 0..8 {
-                            colors.push(
-                                crate::effective_colour::colour(pool, (raw >> (7 - bit)) & 0x01)
-                                    .convert(),
-                            );
-                        }
-                    }
-                    PictureGraphicFormat::FourBit => {
-                        for segment in 0..2 {
-                            let shift = 4 - (segment * 4);
-                            colors.push(
-                                crate::effective_colour::colour(pool, (raw >> shift) & 0x0F)
-                                    .convert(),
-                            );
-                        }
-                    }
-                    PictureGraphicFormat::EightBit => {
-                        colors.push(crate::effective_colour::colour(pool, raw).convert());
-                    }
-                }
-
-                for color in colors {
-                    let idx = y as usize * self.actual_width as usize + x as usize;
-                    if idx >= image.pixels.len() {
-                        break;
-                    }
-                    if !(self.options.transparent
-                        && color
-                            == crate::effective_colour::colour(pool, self.transparency_colour)
-                                .convert())
-                    {
-                        image.pixels[idx] = color;
-                    }
-
-                    x += 1;
-                    if x >= self.actual_width {
-                        x = 0;
-                        y += 1;
-                        // If we go onto the next row, then we discard the rest of the bits
-                        break;
-                    }
-                }
-            }
-
-            let new_texture = ui.ctx().load_texture(
-                format!("picturegraphic_{}_texture", self.id.value()).as_str(),
-                image,
-                Default::default(),
-            );
-            texture_id = Some(new_texture.id());
-            ui.data_mut(|data| {
-                log::trace!("Saving texture - {:?}", self.id.value());
-                data.insert_temp(
-                    format!("picturegraphic_{}_texture", self.id.value()).into(),
-                    new_texture,
-                );
-            });
-        } else {
-            texture_id = ui.data(|data| {
-                data.get_temp::<TextureHandle>(
-                    format!("picturegraphic_{}_texture", self.id.value()).into(),
-                )
-                .map(|t| t.id())
-            });
-        }
+        let texture = crate::graphics::preview::picture_texture(ui.ctx(), self, pool);
 
         // Use image dimensions, but clip to the available rect
         let image_size = egui::Vec2::new(self.width as f32, self.height() as f32);
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            if let Some(texture_id) = texture_id {
-                ui.image((texture_id, image_size));
+            if let Some(texture) = texture {
+                ui.image((texture.id(), image_size));
             } else {
                 ui.colored_label(Color32::RED, "Failed to load image");
             }

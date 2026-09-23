@@ -71,6 +71,7 @@ pub struct EditorProject {
 
     /// Request to open image file dialog for PictureGraphic object
     image_load_request: RefCell<Option<ObjectId>>,
+    graphic_assign_request: Cell<Option<(crate::graphics::GraphicAssetId, ObjectId)>>,
     graphic_options_request: RefCell<Option<(u16, bool, u8, bool)>>,
     graphic_format_request: RefCell<
         Option<(
@@ -128,6 +129,7 @@ impl From<ObjectPool> for EditorProject {
             next_available_id: RefCell::new(max_id.saturating_add(1)),
             default_object_names: RefCell::new(HashMap::new()),
             image_load_request: RefCell::new(None),
+            graphic_assign_request: Cell::new(None),
             graphic_options_request: RefCell::new(None),
             graphic_format_request: RefCell::new(None),
             delete_request: RefCell::new(None),
@@ -525,6 +527,32 @@ impl EditorProject {
     /// Request deletion from UI code that only has a shared project reference.
     pub fn request_delete_object(&self, object_id: ObjectId) {
         self.delete_request.replace(Some(object_id));
+    }
+
+    /// Defer inspector assignment until same-frame property edits are committed.
+    pub fn request_graphic_assignment(
+        &self,
+        asset: crate::graphics::GraphicAssetId,
+        target: ObjectId,
+    ) {
+        self.graphic_assign_request.set(Some((asset, target)));
+    }
+
+    pub fn commit_graphic_assignment(&mut self) -> bool {
+        let Some((asset, target)) = self.graphic_assign_request.take() else {
+            return false;
+        };
+        match crate::graphics::integration::GraphicService::convert_asset_into_picture_graphic(
+            self,
+            asset,
+            target.value(),
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                self.last_operation_error.replace(Some(error.to_string()));
+                false
+            }
+        }
     }
 
     /// Consume a pending hierarchy delete request.
@@ -980,6 +1008,13 @@ impl EditorProject {
         let prepared = self
             .prepare_transaction(&transaction)
             .map_err(|diagnostics| diagnostics.legacy_operation_error())?;
+        self.commit_prepared_transaction(prepared)
+    }
+
+    fn commit_prepared_transaction(
+        &mut self,
+        prepared: PreparedTransaction,
+    ) -> Result<AppliedTransaction, OperationError> {
         let PreparedTransaction {
             pool: modified_pool,
             object_info: modified_object_info,
@@ -987,8 +1022,40 @@ impl EditorProject {
             ..
         } = prepared;
 
+        // A deleted graphic becomes an available PNG. Stage all exports before
+        // changing the project, then use the existing full-project history for
+        // the pool deletion and library insertion as a single undo step.
+        let mut recovered = Vec::new();
+        for operation in &applied.inverse_operations {
+            if let Operation::RestoreObject {
+                object: Object::PictureGraphic(picture),
+                info,
+            } = operation
+            {
+                // A newly created, empty PictureGraphic has no image to recover.
+                if picture.actual_width == 0 || picture.actual_height == 0 {
+                    continue;
+                }
+                let asset = crate::graphics::integration::recover_picture_graphic(
+                    picture,
+                    &self.pool,
+                    info.as_ref(),
+                )
+                .map_err(|reason| OperationError::PropertyError {
+                    object_id: picture.id.value(),
+                    property: "data".into(),
+                    reason,
+                })?;
+                recovered.push(asset);
+            }
+        }
+        let before = (!recovered.is_empty()).then(|| self.component_checkpoint());
+
         // Replace pool and metadata with results
         self.pool = modified_pool;
+        for asset in recovered {
+            self.graphics.assets.insert(asset.id, asset);
+        }
 
         self.object_info.replace(modified_object_info);
         self.mut_object_info
@@ -997,6 +1064,12 @@ impl EditorProject {
         self.default_object_names.borrow_mut().clear();
         self.remap_selection_for_operations(&applied.forward_operations);
 
+        if let Some(before) = before {
+            self.component_history.insert(
+                applied.transaction_id.clone(),
+                (before, self.component_checkpoint()),
+            );
+        }
         // Record in history (this is a user action)
         self.operation_history.borrow_mut().push(applied.clone());
         self.component_history
@@ -1085,6 +1158,7 @@ impl EditorProject {
             {
                 drop(history);
                 self.restore_component_checkpoint(before);
+                self.remap_selection_for_operations(&applied_tx.create_inverse().operations);
                 return true;
             }
             let inverse_tx = applied_tx.create_inverse();
@@ -1134,6 +1208,7 @@ impl EditorProject {
             {
                 drop(history);
                 self.restore_component_checkpoint(after);
+                self.remap_selection_for_operations(&applied_tx.forward_operations);
                 return true;
             }
             let mut pool = self.pool.clone();
@@ -1225,25 +1300,12 @@ impl EditorProject {
                 .clone());
         }
         let prepared = self.prepare_transaction(&proposal.transaction)?;
-        let PreparedTransaction {
-            pool,
-            object_info,
-            applied,
-            ..
-        } = prepared;
-        self.pool = pool;
-        self.object_info.replace(object_info);
-        self.mut_object_info
-            .replace(self.object_info.borrow().clone());
-        self.update_next_available_id();
-        self.default_object_names.borrow_mut().clear();
-        self.remap_selection_for_operations(&applied.forward_operations);
-        self.operation_history.borrow_mut().push(applied.clone());
-        self.component_history
-            .retain(|id, _| self.operation_history.borrow().contains(id));
-        self.refresh_dirty();
-        self.bump_revision();
-        Ok(applied)
+        self.commit_prepared_transaction(prepared).map_err(|error| {
+            component_transaction_error(ComponentError::new(
+                "GRAPHIC_RECOVERY_FAILED",
+                error.to_string(),
+            ))
+        })
     }
 }
 
