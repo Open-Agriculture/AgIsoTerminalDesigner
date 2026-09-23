@@ -20,8 +20,11 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
     if ui.button("Find component…").clicked() {
         crate::object_picker::open(ui.ctx(), find_id);
     }
-    if let Some(id) =
-        crate::object_picker::window(ui.ctx(), find_id, "Find component", |ui, query| {
+    if let Some(id) = crate::object_picker::window(
+        ui.ctx(),
+        find_id,
+        "Find component",
+        |ui, query| {
             let mut selected = None;
             let mut count = 0;
             for definition in project.component_source().definitions.values() {
@@ -48,8 +51,22 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
                 ui.label("No matching components.");
             }
             selected
-        })
-    {
+        },
+        |ui, id| {
+            let Some(definition) = project.component_source().definitions.get(id) else {
+                ui.label("This component is no longer available.");
+                return false;
+            };
+            ui.label("Open this component's master editor. Its contents will not change until you edit and save it.");
+            ui.strong(&definition.name);
+            ui.label(definition.id.to_string());
+            let preview = definition_preview(ui.ctx(), project, definition);
+            crate::object_picker::review_preview(ui, |ui, rect| {
+                paint_definition_preview(ui, rect, &preview, definition.root_node)
+            });
+            true
+        },
+    ) {
         open_editor(ui, &project.component_source().definitions[&id]);
     }
     let mut error = None;
@@ -383,6 +400,7 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                                 ui,
                                                 (node.id, property, "external_reference"),
                                                 "Choose external object…",
+                                                &format!("Change {property} reference on component node {}", node.name),
                                                 project,
                                                 None,
                                                 true,
@@ -671,6 +689,20 @@ fn manual_parameter_form(
                 }
                 selected
             },
+            |ui, id| {
+                let Some(node) = definition.nodes.iter().find(|node| node.id == *id) else {
+                    ui.label("This node is no longer available.");
+                    return false;
+                };
+                ui.label("Use this node as the target for the parameter you are declaring.");
+                ui.strong(&node.name);
+                ui.label(node.id.to_string());
+                let preview = definition_preview(ui.ctx(), project, definition);
+                crate::object_picker::review_preview(ui, |ui, rect| {
+                    paint_definition_preview(ui, rect, &preview, *id)
+                });
+                true
+            },
         ) {
             draft.1 = node;
         }
@@ -845,6 +877,7 @@ pub fn inspector(
                             ui,
                             (id, parameter.id, "override_reference"),
                             "Choose referenced object…",
+                            &format!("Choose the draft value for parameter '{}'. Use Set override to apply it.", parameter.name),
                             project,
                             None,
                             true,

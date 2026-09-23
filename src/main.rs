@@ -2071,7 +2071,7 @@ impl eframe::App for DesignerApp {
             if let Some(selected) = ag_iso_terminal_designer::object_picker::object_window(
                 ctx,
                 search_id,
-                "Find object",
+                "Navigate to this object and open its inspector (no project changes)",
                 pool,
                 pool.get_selected().0,
                 false,

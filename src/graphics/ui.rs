@@ -127,14 +127,42 @@ pub fn available_button(
     ui: &mut egui::Ui,
     salt: impl std::hash::Hash,
     project: &EditorProject,
+    target: ObjectId,
 ) -> Option<GraphicAssetId> {
     let id = ui.make_persistent_id(salt);
     if ui.button("Choose Available…").clicked() {
         object_picker::open(ui.ctx(), id);
     }
-    object_picker::window(ui.ctx(), id, "Choose available graphic", |ui, query| {
-        available_picker(ui, project, query)
-    })
+    object_picker::window(
+        ui.ctx(),
+        id,
+        "Choose available graphic",
+        |ui, query| available_picker(ui, project, query),
+        |ui, asset| {
+            ui.label(format!("Replace the image in {}. The chosen graphic will be removed from Available. This is undoable.", object_picker::object_label(project, Some(target))));
+            review_asset(ui, project, *asset)
+                && project
+                    .get_pool()
+                    .object_by_id(target)
+                    .is_some_and(|object| object.object_type() == ObjectType::PictureGraphic)
+        },
+    )
+}
+
+fn review_asset(ui: &mut egui::Ui, project: &EditorProject, id: GraphicAssetId) -> bool {
+    let Some(asset) = project.graphic_library().assets.get(&id) else {
+        ui.label("This graphic is no longer available.");
+        return false;
+    };
+    ui.strong(&asset.name);
+    ui.label(format!("ID: {}", asset.id));
+    let texture = preview::asset_texture(ui.ctx(), asset);
+    object_picker::review_preview(ui, |ui, rect| {
+        if let Some(texture) = &texture {
+            object_picker::texture(ui, rect, texture);
+        }
+    });
+    true
 }
 
 fn available_picker(
@@ -310,7 +338,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
             let selected = object_picker::object_window(
                 ui.ctx(),
                 assign_key,
-                "Assign to PictureGraphic",
+                &format!("Assign '{}' to the chosen PictureGraphic, replacing its image and removing the upload from Available. This is undoable.", project.graphic_library().assets[&asset_id].name),
                 project,
                 None,
                 false,
@@ -357,6 +385,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
 
 /// Shared picker for component references, retaining create-from-asset behavior.
 pub fn select(ui: &mut egui::Ui, project: &mut EditorProject, value: &mut serde_json::Value) {
+    #[derive(Clone)]
     enum Choice {
         Picture(ObjectId),
         Asset(GraphicAssetId),
@@ -371,22 +400,46 @@ pub fn select(ui: &mut egui::Ui, project: &mut EditorProject, value: &mut serde_
     {
         object_picker::open(ui.ctx(), key);
     }
-    let choice = object_picker::window(ui.ctx(), key, "Select graphic", |ui, query| {
-        ui.strong("PICTURE GRAPHICS");
-        let picture = object_picker::objects(
-            ui,
-            project,
-            query,
-            value.as_u64().and_then(|id| ObjectId::new(id as u16).ok()),
-            false,
-            |object| object.object_type() == ObjectType::PictureGraphic,
-        )
-        .and_then(|id| id.0)
-        .map(Choice::Picture);
-        ui.separator();
-        ui.strong("AVAILABLE — creates a PictureGraphic");
-        picture.or_else(|| available_picker(ui, project, query).map(Choice::Asset))
-    });
+    let choice = object_picker::window(
+        ui.ctx(),
+        key,
+        "Select graphic",
+        |ui, query| {
+            ui.strong("PICTURE GRAPHICS");
+            let picture = object_picker::objects(
+                ui,
+                project,
+                query,
+                value.as_u64().and_then(|id| ObjectId::new(id as u16).ok()),
+                false,
+                |object| object.object_type() == ObjectType::PictureGraphic,
+            )
+            .and_then(|id| id.0)
+            .map(Choice::Picture);
+            ui.separator();
+            ui.strong("AVAILABLE — creates a PictureGraphic");
+            picture.or_else(|| available_picker(ui, project, query).map(Choice::Asset))
+        },
+        |ui, choice| {
+            ui.label(format!(
+                "Current graphic: {}",
+                object_picker::object_label(
+                    project,
+                    value.as_u64().and_then(|id| ObjectId::new(id as u16).ok())
+                )
+            ));
+            match choice {
+                Choice::Picture(id) => {
+                    ui.label("Use this PictureGraphic for the graphic value.");
+                    object_picker::review_object(ui, project, NullableObjectId(Some(*id)))
+                }
+                Choice::Asset(id) => {
+                    ui.label("Create a new PictureGraphic from this upload and use it for the graphic value. The upload will be removed from Available. Creation is undoable.");
+                    review_asset(ui, project, *id)
+                }
+            }
+        },
+    );
     match choice {
         Some(Choice::Picture(id)) => *value = serde_json::json!(id.value()),
         Some(Choice::Asset(asset)) => {

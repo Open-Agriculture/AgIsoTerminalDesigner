@@ -29,11 +29,12 @@ pub fn matches(name: &str, id: impl std::fmt::Display, query: &str) -> bool {
 }
 
 /// All callers share window behavior, search focus, scrolling, and dismissal.
-pub fn window<T>(
+pub fn window<T: Clone + Send + Sync + 'static>(
     ctx: &egui::Context,
     id: egui::Id,
     title: &str,
     contents: impl FnOnce(&mut egui::Ui, &str) -> Option<T>,
+    review: impl FnOnce(&mut egui::Ui, &T) -> bool,
 ) -> Option<T> {
     if !is_open(ctx, id) {
         return None;
@@ -45,12 +46,18 @@ pub fn window<T>(
     let focus = ctx
         .data_mut(|data| data.remove_temp::<bool>(id.with("focus")))
         .unwrap_or(false);
-    let mut open =
-        !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    let pending_key = id.with("pending_selection");
+    if focus {
+        ctx.data_mut(|data| data.remove::<T>(pending_key));
+    }
+    let pending = ctx.data_mut(|data| data.get_temp::<T>(pending_key));
+    let mut open = pending.is_some()
+        || !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     let mut selected = None;
     egui::Window::new(title)
         .id(id)
         .open(&mut open)
+        .enabled(pending.is_none())
         .collapsible(false)
         .default_size([460.0, 480.0])
         .show(ctx, |ui| {
@@ -69,13 +76,87 @@ pub fn window<T>(
                     selected = contents(ui, &query);
                 });
         });
+    let mut confirmed = None;
+    if let Some(pending) = pending {
+        let mut accept = false;
+        let mut back = false;
+        let modal = egui::Modal::new(id.with("confirm_selection")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.heading("Confirm selection");
+            ui.label(title);
+            ui.separator();
+            let valid = review(ui, &pending);
+            ui.separator();
+            ui.horizontal(|ui| {
+                accept = ui
+                    .add_enabled(valid, egui::Button::new("Confirm"))
+                    .clicked();
+                back = ui.button("Back").clicked();
+            });
+        });
+        if accept {
+            confirmed = Some(pending);
+            open = false;
+        } else if back || modal.should_close() {
+            ctx.data_mut(|data| data.remove::<T>(pending_key));
+        }
+    } else if let Some(selected) = selected {
+        ctx.data_mut(|data| data.insert_temp(pending_key, selected));
+        ctx.request_repaint();
+    }
     ctx.data_mut(|data| {
         data.insert_temp(id.with("query"), query);
-        if !open || selected.is_some() {
+        if !open {
             data.remove::<egui::Id>(ACTIVE.with("selection_window"));
+            data.remove::<T>(pending_key);
         }
     });
-    selected
+    confirmed
+}
+
+/// Large preview used by selection confirmations, with the same fitted rendering.
+pub fn review_preview(ui: &mut egui::Ui, paint: impl FnOnce(&mut egui::Ui, Rect)) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(280.0, 180.0), egui::Sense::hover());
+    checkerboard(ui.painter(), rect);
+    paint(ui, rect);
+}
+
+pub fn object_label(project: &EditorProject, id: Option<ObjectId>) -> String {
+    id.map_or_else(
+        || "None".into(),
+        |id| {
+            project.get_pool().object_by_id(id).map_or_else(
+                || format!("Missing object #{}", id.value()),
+                |object| {
+                    format!(
+                        "{} (#{} · {:?})",
+                        project.get_object_info(object).get_name(object),
+                        id.value(),
+                        object.object_type()
+                    )
+                },
+            )
+        },
+    )
+}
+
+pub fn review_object(
+    ui: &mut egui::Ui,
+    project: &EditorProject,
+    selected: NullableObjectId,
+) -> bool {
+    ui.strong(object_label(project, selected.0));
+    if let Some(id) = selected.0 {
+        let Some(object) = project.get_pool().object_by_id(id) else {
+            return false;
+        };
+        review_preview(ui, |ui, rect| {
+            object_preview(ui, rect, project.get_pool(), object)
+        });
+    } else {
+        ui.label("Clear this selection.");
+    }
+    true
 }
 
 pub fn fit_rect(bounds: Rect, size: Vec2) -> Rect {
@@ -230,21 +311,44 @@ pub fn objects(
 pub fn object_window(
     ctx: &egui::Context,
     id: egui::Id,
-    title: &str,
+    action: &str,
     project: &EditorProject,
     selected: Option<ObjectId>,
     allow_none: bool,
     eligible: impl Fn(&Object) -> bool,
 ) -> Option<NullableObjectId> {
-    window(ctx, id, title, |ui, query| {
-        objects(ui, project, query, selected, allow_none, eligible)
-    })
+    window(
+        ctx,
+        id,
+        "Select object",
+        |ui, query| objects(ui, project, query, selected, allow_none, &eligible),
+        |ui, choice| {
+            ui.label(action);
+            if let Some(current) = selected {
+                ui.label(format!("Current: {}", object_label(project, Some(current))));
+            }
+            ui.label("Chosen:");
+            let exists = review_object(ui, project, *choice);
+            let valid = exists
+                && choice.0.map_or(allow_none, |id| {
+                    project.get_pool().object_by_id(id).is_some_and(&eligible)
+                });
+            if !valid {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    "This selection is no longer available here. Go back and choose another.",
+                );
+            }
+            valid
+        },
+    )
 }
 
 pub fn button(
     ui: &mut egui::Ui,
     salt: impl std::hash::Hash,
     label: &str,
+    action: &str,
     project: &EditorProject,
     selected: Option<ObjectId>,
     allow_none: bool,
@@ -257,7 +361,7 @@ pub fn button(
     object_window(
         ui.ctx(),
         id,
-        "Select object",
+        action,
         project,
         selected,
         allow_none,
@@ -428,23 +532,178 @@ mod tests {
         assert_eq!(selected, ObjectId::new(120).ok());
     }
 
+    fn confirmation_frame(
+        ctx: &egui::Context,
+        id: egui::Id,
+        events: Vec<egui::Event>,
+        candidate: Option<u16>,
+        valid: bool,
+    ) -> (Option<u16>, egui::FullOutput) {
+        let mut choice = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                choice = window(
+                    ctx,
+                    id,
+                    "Replace child of Container #10",
+                    |_, _| candidate,
+                    |ui, selected| {
+                        ui.label(format!("Chosen: PictureGraphic #{selected}"));
+                        valid
+                    },
+                );
+            },
+        );
+        (choice, output)
+    }
+
+    fn button_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    if text.galley.text() == label {
+                        return Some(text.pos + text.galley.size() * 0.5);
+                    }
+                }
+                None
+            })
+            .unwrap_or_else(|| panic!("Missing button {label}"))
+    }
+
+    fn click_confirmation(
+        ctx: &egui::Context,
+        id: egui::Id,
+        position: egui::Pos2,
+        valid: bool,
+    ) -> Option<u16> {
+        let mut choice = None;
+        for pressed in [true, false] {
+            let result = confirmation_frame(
+                ctx,
+                id,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                None,
+                valid,
+            )
+            .0;
+            if result.is_some() {
+                choice = result;
+            }
+        }
+        choice
+    }
+
     #[test]
-    fn opening_another_picker_resets_search_and_selection_closes_it() {
+    fn choosing_waits_for_confirmation_and_confirm_returns_once() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("confirm_test");
+        open(&ctx, id);
+        assert_eq!(
+            confirmation_frame(&ctx, id, vec![], Some(120), true).0,
+            None
+        );
+        assert!(is_open(&ctx, id));
+        let (_, output) = confirmation_frame(&ctx, id, vec![], None, true);
+        let text = texts(&output.shapes);
+        assert!(text.contains("Replace child of Container #10"));
+        assert!(text.contains("Chosen: PictureGraphic #120"));
+        assert_eq!(
+            click_confirmation(&ctx, id, button_position(&output, "Confirm"), true),
+            Some(120)
+        );
+        assert!(!is_open(&ctx, id));
+        assert_eq!(confirmation_frame(&ctx, id, vec![], None, true).0, None);
+    }
+
+    #[test]
+    fn back_preserves_search_and_does_not_return_a_selection() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("back_test");
+        open(&ctx, id);
+        confirmation_frame(&ctx, id, vec![], Some(120), true);
+        ctx.data_mut(|data| data.insert_temp(id.with("query"), "warning".to_owned()));
+        let (_, output) = confirmation_frame(&ctx, id, vec![], None, true);
+        assert_eq!(
+            click_confirmation(&ctx, id, button_position(&output, "Back"), true),
+            None
+        );
+        assert!(is_open(&ctx, id));
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<String>(id.with("query")))
+                .as_deref(),
+            Some("warning")
+        );
+        assert!(ctx
+            .data(|data| data.get_temp::<u16>(id.with("pending_selection")))
+            .is_none());
+    }
+
+    #[test]
+    fn invalidated_choice_cannot_be_confirmed_and_escape_returns_to_picker() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("invalid_test");
+        open(&ctx, id);
+        confirmation_frame(&ctx, id, vec![], Some(120), true);
+        let (_, output) = confirmation_frame(&ctx, id, vec![], None, false);
+        assert_eq!(
+            click_confirmation(&ctx, id, button_position(&output, "Confirm"), false),
+            None
+        );
+        assert!(is_open(&ctx, id));
+        assert_eq!(
+            confirmation_frame(
+                &ctx,
+                id,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                None,
+                false
+            )
+            .0,
+            None
+        );
+        assert!(is_open(&ctx, id));
+        assert!(ctx
+            .data(|data| data.get_temp::<u16>(id.with("pending_selection")))
+            .is_none());
+    }
+
+    #[test]
+    fn reopening_discards_an_unconfirmed_choice() {
         let ctx = egui::Context::default();
         let first = egui::Id::new("first");
         let second = egui::Id::new("second");
         open(&ctx, first);
-        ctx.data_mut(|data| data.insert_temp(first.with("query"), "old search".to_owned()));
+        confirmation_frame(&ctx, first, vec![], Some(120), true);
         open(&ctx, second);
         assert!(!is_open(&ctx, first));
         open(&ctx, first);
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            let choice = window(ctx, first, "Choose", |_, query| {
-                assert!(query.is_empty());
-                Some(12)
-            });
-            assert_eq!(choice, Some(12));
-        });
-        assert!(!is_open(&ctx, first));
+        confirmation_frame(&ctx, first, vec![], None, true);
+        assert!(ctx
+            .data(|data| data.get_temp::<u16>(first.with("pending_selection")))
+            .is_none());
     }
 }

@@ -98,9 +98,12 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             {
                 design.request_image_load(id);
             }
-            if let Some(asset) =
-                crate::graphics::ui::available_button(ui, ("choose_available", id.value()), design)
-            {
+            if let Some(asset) = crate::graphics::ui::available_button(
+                ui,
+                ("choose_available", id.value()),
+                design,
+                id,
+            ) {
                 design.request_graphic_assignment(asset, id);
             }
         });
@@ -401,10 +404,28 @@ fn child_picker(
     allowed: &[ObjectType],
     allow_none: bool,
 ) -> Option<NullableObjectId> {
-    crate::object_picker::button(ui, salt, label, design, selected, allow_none, |candidate| {
-        allowed.contains(&candidate.object_type())
-            && candidate_is_valid(design, parent, candidate.id())
-    })
+    let action = format!(
+        "{} {}",
+        if selected.is_some() {
+            "Replace child of"
+        } else {
+            "Add child to"
+        },
+        crate::object_picker::object_label(design, Some(parent))
+    );
+    crate::object_picker::button(
+        ui,
+        salt,
+        label,
+        &action,
+        design,
+        selected,
+        allow_none,
+        |candidate| {
+            allowed.contains(&candidate.object_type())
+                && candidate_is_valid(design, parent, candidate.id())
+        },
+    )
 }
 
 fn parent_dimensions(object: &Object, design: &EditorProject) -> (u16, u16) {
@@ -810,6 +831,10 @@ fn render_add_macro_reference(
                 ui,
                 ("new_macro_object", id.value()),
                 "Select macro…",
+                &format!(
+                    "Attach macro for {event_id:?} to {}",
+                    crate::object_picker::object_label(design, Some(id))
+                ),
                 design,
                 None,
                 false,
@@ -867,6 +892,11 @@ fn render_macro_references(
                     ui,
                     ("macro_object", index),
                     &selected_text,
+                    &format!(
+                        "Replace {:?} macro on {}",
+                        reference.event_id,
+                        crate::object_picker::object_label(design, Some(id))
+                    ),
                     design,
                     macro_object.map(|object| object.id()),
                     false,
@@ -1372,6 +1402,10 @@ fn render_reference(
             ui,
             (id.value(), property),
             &label,
+            &format!(
+                "Change {property} reference on {}",
+                crate::object_picker::object_label(design, Some(id))
+            ),
             design,
             selected_id,
             allow_none,
