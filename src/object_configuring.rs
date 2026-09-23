@@ -56,13 +56,32 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             EditorKind::ObjectReference => {
                 render_reference(ui, &label, &value, property, id, editor.property, design)
             }
-            EditorKind::Json => render_json(ui, &label, &value, id, editor.property, design),
+            EditorKind::Enum => {
+                ui.horizontal(|ui| {
+                    let label_response = ui.label(&label);
+                    egui::ComboBox::from_id_salt(editor.property)
+                        .selected_text(enum_choice_label(&value))
+                        .show_ui(ui, |ui| {
+                            for choice in &property.enum_choices {
+                                if ui
+                                    .selectable_label(choice == &value, enum_choice_label(choice))
+                                    .clicked()
+                                    && choice != &value
+                                {
+                                    queue(design, id, editor.property, choice.clone());
+                                }
+                            }
+                        })
+                        .response
+                        .labelled_by(label_response.id);
+                });
+            }
             EditorKind::FlagSet => render_flag_set(ui, &label, &value, id, editor.property, design),
             EditorKind::Justification => {
                 render_justification(ui, &label, &value, id, editor.property, design)
             }
             EditorKind::Auto => render_auto(ui, &label, &value, id, editor.property, design),
-            _ => render_auto(ui, &label, &value, id, editor.property, design),
+            EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
     }
 
@@ -80,6 +99,28 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
         ui.separator();
         render_macro_references(ui, object, id, design);
     }
+}
+
+/// Keep payload enums readable without exposing their JSON representation.
+fn enum_choice_label(value: &serde_json::Value) -> String {
+    if let Some(name) = value.as_str() {
+        return human_readable_property_name(name);
+    }
+    if let Some(fields) = value.as_object() {
+        if let Some(size) = fields
+            .get("NonProportional")
+            .and_then(serde_json::Value::as_str)
+        {
+            return format!("{} px", size.trim_start_matches("Px").replace('x', " × "));
+        }
+        if let Some(height) = fields.get("Proportional") {
+            return format!("Proportional: {height} px");
+        }
+        if let Some((variant, payload)) = fields.iter().next() {
+            return format!("{}: {payload}", human_readable_property_name(variant));
+        }
+    }
+    value.to_string()
 }
 
 /// Commit a palette selection through the same undoable operation as other properties.
@@ -991,7 +1032,7 @@ fn flag_choices(field: &str) -> Vec<serde_json::Value> {
         "disabled_behaviour" => &["Pause", "ResetToFirst", "DefaultObject", "Blank"],
         "function_type" => {
             use ag_iso_stack::object_pool::object_attributes::AuxiliaryFunctionType;
-            return (0..=31)
+            return (0..=14) // IDs 0–14 are valid AuxiliaryFunctionType values
                 .map(|value| serde_json::to_value(AuxiliaryFunctionType::from(value)).unwrap())
                 .collect();
         }
@@ -1086,15 +1127,10 @@ fn auxiliary_function_type_help(
             "Use this for rotation measured in steps. Turning one way adds to the count; reversing direction subtracts from it.",
             "Value 1: current count, 0–0xFFFF, wrapping between 0xFFFF and 0.\nValue 2: fixed calibration, 1–0xFFFF encoder counts per revolution.",
         ),
-        Reserved(_) => (
-            "Reserved",
-            "IDs 15–30 have no assigned control meaning in this edition of the standard.",
+        _ => (
+            "Invalid",
+            "This auxiliary function type is not supported to be used.",
             "No control behavior or status values are defined.",
-        ),
-        RemoveAssignment => (
-            "Reserved — remove assignment",
-            "ID 31 identifies an assignment-removal request.",
-            "It does not describe an assignable control type.",
         ),
     };
     let type_id = u8::from(function_type);
@@ -1108,7 +1144,9 @@ fn auxiliary_function_type_help(
         }
     }
     if matches!(type_id, 0 | 2 | 5..=11) {
-        help.push_str("\n\nAfter a transition counter reaches 0xFFFF, its next increment produces 0.");
+        help.push_str(
+            "\n\nAfter a transition counter reaches 0xFFFF, its next increment produces 0.",
+        );
     }
     help.push_str("\n\nTechnical reference: ISO 11783-6:2018, J.4.6, Table J.5.");
     (format!("{type_id}: {label}"), help)
@@ -1144,21 +1182,27 @@ fn render_flag_field(
     let choices = flag_choices(field);
     let mut updated = None;
     let (selected_label, selected_help) = flag_choice_presentation(field, value);
-    let response = egui::ComboBox::from_label(label)
-        .selected_text(selected_label)
-        .show_ui(ui, |ui| {
-            for choice in choices {
-                let (label, help) = flag_choice_presentation(field, &choice);
-                let mut response = ui.selectable_label(value == &choice, label);
-                if let Some(help) = help {
-                    response = response.on_hover_text(help);
-                }
-                if response.clicked() && value != &choice {
-                    updated = Some(choice);
-                }
-            }
+    let response = ui
+        .horizontal(|ui| {
+            let label_response = ui.label(&label);
+            egui::ComboBox::from_id_salt(&label)
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    for choice in choices {
+                        let (label, help) = flag_choice_presentation(field, &choice);
+                        let mut response = ui.selectable_label(value == &choice, label);
+                        if let Some(help) = help {
+                            response = response.on_hover_text(help);
+                        }
+                        if response.clicked() && value != &choice {
+                            updated = Some(choice);
+                        }
+                    }
+                })
+                .response
+                .labelled_by(label_response.id)
         })
-        .response;
+        .inner;
     if let Some(help) = selected_help {
         response.on_hover_text(help);
     }
@@ -1230,29 +1274,34 @@ fn render_reference(
         return;
     };
     let selected = value.as_u64();
-    egui::ComboBox::from_label(label)
-        .selected_text(selected.map_or_else(|| "None".to_owned(), |value| value.to_string()))
-        .show_ui(ui, |ui| {
-            if selected.is_some() && ui.selectable_label(false, "None").clicked() {
-                queue(design, id, property, serde_json::Value::Null);
-            }
-            for candidate in design.get_pool().objects_by_types(allowed_types) {
-                if ui
-                    .selectable_label(
-                        selected == Some(u64::from(candidate.id().value())),
-                        format!("{}: {:?}", candidate.id().value(), candidate.object_type()),
-                    )
-                    .clicked()
-                {
-                    queue(
-                        design,
-                        id,
-                        property,
-                        serde_json::Value::from(candidate.id().value()),
-                    );
+    ui.horizontal(|ui| {
+        let label_response = ui.label(label);
+        egui::ComboBox::from_id_salt(label)
+            .selected_text(selected.map_or_else(|| "None".to_owned(), |value| value.to_string()))
+            .show_ui(ui, |ui| {
+                if selected.is_some() && ui.selectable_label(false, "None").clicked() {
+                    queue(design, id, property, serde_json::Value::Null);
                 }
-            }
-        });
+                for candidate in design.get_pool().objects_by_types(allowed_types) {
+                    if ui
+                        .selectable_label(
+                            selected == Some(u64::from(candidate.id().value())),
+                            format!("{}: {:?}", candidate.id().value(), candidate.object_type()),
+                        )
+                        .clicked()
+                    {
+                        queue(
+                            design,
+                            id,
+                            property,
+                            serde_json::Value::from(candidate.id().value()),
+                        );
+                    }
+                }
+            })
+            .response
+            .labelled_by(label_response.id);
+    });
 }
 
 fn render_justification(
@@ -1276,7 +1325,8 @@ fn render_justification(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("Top");
     ui.horizontal(|ui| {
-        egui::ComboBox::from_label(label)
+        let horizontal_label = ui.label(label);
+        egui::ComboBox::from_id_salt(label)
             .selected_text(horizontal)
             .show_ui(ui, |ui| {
                 for choice in ["Left", "Middle", "Right"] {
@@ -1286,8 +1336,11 @@ fn render_justification(
                         queue(design, id, property, serde_json::Value::Object(updated));
                     }
                 }
-            });
-        egui::ComboBox::from_label("Vertical")
+            })
+            .response
+            .labelled_by(horizontal_label.id);
+        let vertical_label = ui.label("Vertical");
+        egui::ComboBox::from_id_salt("Vertical")
             .selected_text(vertical)
             .show_ui(ui, |ui| {
                 for choice in ["Top", "Middle", "Bottom"] {
@@ -1297,7 +1350,9 @@ fn render_justification(
                         queue(design, id, property, serde_json::Value::Object(updated));
                     }
                 }
-            });
+            })
+            .response
+            .labelled_by(vertical_label.id);
     });
 }
 

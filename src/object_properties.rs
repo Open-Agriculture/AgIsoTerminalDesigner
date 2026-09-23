@@ -21,6 +21,8 @@ pub struct PropertyDescriptor {
     pub writable: bool,
     pub semantic: PropertySemantic,
     pub valid_range: Option<(Value, Value)>,
+    /// Serialized choices derived from the field type, shared by all editors.
+    pub enum_choices: Vec<Value>,
 }
 
 /// Presentation metadata for the generic property editor.
@@ -39,7 +41,7 @@ pub enum EditorKind {
     Auto,
     Colour,
     ObjectReference,
-    Json,
+    Enum,
     /// A bit-mask or JSON object of boolean options.
     FlagSet,
     Justification,
@@ -75,7 +77,7 @@ fn default_editor(semantic: &PropertySemantic) -> EditorKind {
     match semantic {
         PropertySemantic::Colour => EditorKind::Colour,
         PropertySemantic::ObjectReference { .. } => EditorKind::ObjectReference,
-        PropertySemantic::Enum => EditorKind::Json,
+        PropertySemantic::Enum => EditorKind::Enum,
         PropertySemantic::Bitflags => EditorKind::FlagSet,
         PropertySemantic::Normal => EditorKind::Auto,
     }
@@ -84,6 +86,15 @@ fn default_editor(semantic: &PropertySemantic) -> EditorKind {
 /// Widgets whose presentation cannot be determined from their semantic alone.
 fn editor_override(object_type: ObjectType, property: &str) -> Option<EditorKind> {
     match (object_type, property) {
+        // These upstream fields are raw bytes, not Rust enums. Keep their numeric
+        // editor explicit until the stack exposes typed variants.
+        (ObjectType::AuxiliaryFunctionType1 | ObjectType::AuxiliaryInputType1, "function_type")
+        | (ObjectType::AuxiliaryControlDesignatorType2, "pointer_type")
+        | (ObjectType::OutputEllipse, "ellipse_type")
+        | (ObjectType::OutputPolygon, "polygon_type")
+        | (ObjectType::FillAttributes, "fill_type")
+        | (ObjectType::GraphicData, "format")
+        | (ObjectType::ScaledGraphic, "scale_type") => Some(EditorKind::Auto),
         (_, "justification") => Some(EditorKind::Justification),
         _ => None,
     }
@@ -275,6 +286,86 @@ macro_rules! object_reference {
     };
 }
 
+// Special handling is limited to enums with payloads; unit variants are read
+// directly from Serde metadata, so adding a Rust variant updates the UI too.
+macro_rules! property_enum_choices {
+    (font_size, $owner:ty) => {{
+        use ag_iso_stack::object_pool::object_attributes::{FontSize, NonProportionalFontSize};
+        let mut choices: Vec<Value> = enum_unit_choices::<NonProportionalFontSize>()
+            .into_iter()
+            .map(|value| {
+                serde_json::to_value(FontSize::NonProportional(
+                    serde_json::from_value(value).unwrap(),
+                ))
+                .unwrap()
+            })
+            .collect();
+        choices.extend(
+            (8..=127).map(|height| serde_json::to_value(FontSize::Proportional(height)).unwrap()),
+        );
+        choices
+    }};
+    (font_type, $owner:ty) => {{
+        use ag_iso_stack::object_pool::object_attributes::FontType;
+        let mut choices = enum_unit_choices::<FontType>();
+        choices.extend(
+            (240..=255).map(|code| serde_json::to_value(FontType::Proprietary(code)).unwrap()),
+        );
+        choices
+    }};
+    ($field:ident, $owner:ty) => {
+        field_enum_choices(|object: &$owner| &object.$field)
+    };
+}
+
+fn field_enum_choices<O, T: serde::de::DeserializeOwned>(_: fn(&O) -> &T) -> Vec<Value> {
+    enum_unit_choices::<T>()
+}
+
+/// Ask the derived deserializer for its variant names without constructing an
+/// object or depending on the spelling of Serde error messages. Payload variants
+/// are excluded because they need an explicit domain-specific choice provider.
+fn enum_unit_choices<T: serde::de::DeserializeOwned>() -> Vec<Value> {
+    struct Variants<'a>(&'a mut &'static [&'static str]);
+    impl<'de> serde::Deserializer<'de> for Variants<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("metadata only"))
+        }
+
+        fn deserialize_enum<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            variants: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = variants;
+            Err(serde::de::Error::custom("metadata only"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct
+            map struct identifier ignored_any
+        }
+    }
+    let mut names = &[][..];
+    let _ = T::deserialize(Variants(&mut names));
+    names
+        .iter()
+        .filter_map(|name| {
+            let value = Value::String((*name).to_owned());
+            serde_json::from_value::<T>(value.clone())
+                .ok()
+                .map(|_| value)
+        })
+        .collect()
+}
+
 macro_rules! impl_properties {
     (
         $type:ty {
@@ -324,11 +415,21 @@ macro_rules! impl_properties {
             fn property_descriptors() -> Vec<PropertyDescriptor> {
                 vec![
                     $(
-                        PropertyDescriptor {
-                            name: stringify!($field),
-                            writable: true,
-                            semantic: property_semantic!($($semantic)?),
-                            valid_range: None,
+                        {
+                            let enum_choices = property_enum_choices!($field, Self);
+                            let semantic = property_semantic!($($semantic)?);
+                            let semantic = if semantic == PropertySemantic::Normal && !enum_choices.is_empty() {
+                                PropertySemantic::Enum
+                            } else {
+                                semantic
+                            };
+                            PropertyDescriptor {
+                                name: stringify!($field),
+                                writable: true,
+                                semantic,
+                                valid_range: None,
+                                enum_choices,
+                            }
                         },
                     )*
                 ]
@@ -1141,6 +1242,96 @@ mod tests {
 
     fn supported_object_types() -> Vec<ObjectType> {
         supported_property_objects!(supported_object_types_impl,)
+    }
+
+    #[test]
+    fn typed_enum_fields_are_discovered_without_manual_semantics_or_choices() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        enum Mode {
+            First,
+            NewlyAdded,
+        }
+        struct Example {
+            mode: Mode,
+        }
+        impl_properties! { Example { mode } }
+        let descriptor = Example::property_descriptors().remove(0);
+        assert_eq!(descriptor.semantic, PropertySemantic::Enum);
+        assert!(matches!(
+            default_editor(&descriptor.semantic),
+            EditorKind::Enum
+        ));
+        assert_eq!(
+            descriptor.enum_choices,
+            vec![json!("First"), json!("NewlyAdded")]
+        );
+    }
+
+    #[test]
+    fn every_enum_property_has_a_deliberate_editor_and_valid_choices() {
+        for object_type in supported_object_types() {
+            let object = default_object(object_type);
+            let editors = property_editor_descriptors(object_type);
+            for descriptor in get_property_descriptors(object_type) {
+                if descriptor.semantic != PropertySemantic::Enum {
+                    continue;
+                }
+                let editor = editors
+                    .iter()
+                    .find(|editor| editor.property == descriptor.name)
+                    .unwrap();
+                let current = get_object_property(&object, descriptor.name).unwrap();
+                if matches!(editor.editor, EditorKind::Auto) {
+                    // Only explicitly overridden upstream byte fields may use numbers.
+                    assert!(editor_override(object_type, descriptor.name).is_some());
+                    assert!(current.is_u64());
+                    assert!(descriptor.enum_choices.is_empty());
+                    continue;
+                }
+                assert!(matches!(editor.editor, EditorKind::Enum));
+                assert!(
+                    descriptor.enum_choices.contains(&current),
+                    "{object_type:?}.{}: missing {current}",
+                    descriptor.name
+                );
+                for choice in descriptor.enum_choices {
+                    let mut pool = ObjectPool::default();
+                    pool.add(object.clone());
+                    set_property(&mut pool, object.id(), descriptor.name, choice.clone()).unwrap();
+                    assert_eq!(
+                        get_property(&pool, object.id(), descriptor.name).unwrap(),
+                        choice
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn font_choices_cover_sizes_encodings_and_proprietary_types() {
+        let descriptors = get_property_descriptors(ObjectType::FontAttributes);
+        let sizes = &descriptors
+            .iter()
+            .find(|d| d.name == "font_size")
+            .unwrap()
+            .enum_choices;
+        assert_eq!(sizes.len(), 15 + 120);
+        assert!(sizes.contains(&json!({"NonProportional": "Px6x8"})));
+        assert!(sizes.contains(&json!({"NonProportional": "Px128x192"})));
+        assert!(sizes.contains(&json!({"Proportional": 8})));
+        assert!(sizes.contains(&json!({"Proportional": 127})));
+        let fonts = &descriptors
+            .iter()
+            .find(|d| d.name == "font_type")
+            .unwrap()
+            .enum_choices;
+        assert_eq!(fonts.len(), 6 + 16);
+        for font in ["Latin1", "Latin9", "Latin2", "Latin4", "Cyrillic", "Greek"] {
+            assert!(fonts.contains(&json!(font)));
+        }
+        assert!(fonts.contains(&json!({"Proprietary": 240})));
+        assert!(fonts.contains(&json!({"Proprietary": 255})));
+        assert!(!fonts.iter().any(|font| font.get("Reserved").is_some()));
     }
 
     #[test]
