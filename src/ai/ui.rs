@@ -205,7 +205,13 @@ fn run_loop_with_budget(
         .as_ref()
         .is_some_and(|p| p.base_revision != state.revision)
     {
-        proposal = proposal.and_then(|p| propose_transaction(state, p.transaction).ok());
+        proposal = proposal.and_then(|p| {
+            if p.component_intents.is_empty() {
+                propose_transaction(state, p.transaction).ok()
+            } else {
+                super::proposal::propose_component_intents(state, p.component_intents).ok()
+            }
+        });
     }
     let mut phase_rounds = [0usize; 4];
     let mut calls = 0;
@@ -270,7 +276,7 @@ fn run_loop_with_budget(
         task.provider_rounds_used += 1;
         conversation.task_state = Some(task.clone());
         conversation.pending_proposal = proposal.clone();
-        let instructions = format!("{SYSTEM_INSTRUCTIONS}\nProject: {summary}");
+        let instructions = format!("{SYSTEM_INSTRUCTIONS}\nProject: {summary}\nProject components: {}\nVirtual component instances: {}", super::tools::component_catalog(state), super::tools::component_instances(state));
         let mut provider_conversation = conversation.clone();
         if let Some((cursor, packet)) = &handoff {
             provider_conversation.messages = vec![
@@ -448,9 +454,18 @@ fn run_loop_with_budget(
                         cache.execute(state, &schema_call, None).0
                     };
                     if result["success"] == true {
-                        match super::visual_intent::resolve_theme(&state.pool, &call.arguments["theme"]) {
-                            Ok(theme) => { task.requested_theme=call.arguments["theme"].clone(); task.resolved_theme=theme.clone(); result["resolved_theme"]=theme; },
-                            Err(diagnostic) => {result=json!({"success":false,"diagnostics":[diagnostic]});}
+                        match super::visual_intent::resolve_theme(
+                            &state.pool,
+                            &call.arguments["theme"],
+                        ) {
+                            Ok(theme) => {
+                                task.requested_theme = call.arguments["theme"].clone();
+                                task.resolved_theme = theme.clone();
+                                result["resolved_theme"] = theme;
+                            }
+                            Err(diagnostic) => {
+                                result = json!({"success":false,"diagnostics":[diagnostic]});
+                            }
                         }
                     }
                     if result["success"] == true {
@@ -488,10 +503,25 @@ fn run_loop_with_budget(
                 cache.execute(state, &call, proposal.as_ref())
             };
             if let Some(candidate) = proposed.as_ref() {
-                let candidate_theme=super::visual_intent::resolve_theme(&candidate.prepared.pool, &task.requested_theme).unwrap_or_else(|_|task.resolved_theme.clone());
-                let mut mismatches = super::visual_intent::theme_mismatches(candidate, &candidate_theme);
-                mismatches.extend(super::visual_intent::explicit_theme_mismatches(&candidate.prepared.pool, &result["colour_resolutions"], &candidate_theme));
-                if !mismatches.is_empty() { result=json!({"success":false,"diagnostics":mismatches,"failure_class":"HarnessNormalization"}); proposed=None; } else {task.resolved_theme=candidate_theme.clone();result["resolved_theme"]=candidate_theme;}
+                let candidate_theme = super::visual_intent::resolve_theme(
+                    &candidate.prepared.pool,
+                    &task.requested_theme,
+                )
+                .unwrap_or_else(|_| task.resolved_theme.clone());
+                let mut mismatches =
+                    super::visual_intent::theme_mismatches(candidate, &candidate_theme);
+                mismatches.extend(super::visual_intent::explicit_theme_mismatches(
+                    &candidate.prepared.pool,
+                    &result["colour_resolutions"],
+                    &candidate_theme,
+                ));
+                if !mismatches.is_empty() {
+                    result = json!({"success":false,"diagnostics":mismatches,"failure_class":"HarnessNormalization"});
+                    proposed = None;
+                } else {
+                    task.resolved_theme = candidate_theme.clone();
+                    result["resolved_theme"] = candidate_theme;
+                }
             }
             let normalized = (call.name == "propose_transaction"
                 && call.arguments.get("schema_version").is_none())
@@ -742,12 +772,113 @@ fn execute_tool(
 ) -> (Value, Option<AiProposal>, bool) {
     let parse = |error: String| (json!({"success":false,"error":error}), None, false);
     match call.name.as_str() {
+        "list_components" => {
+            let query = call.arguments["query"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase();
+            let category = call.arguments["category"]
+                .as_str()
+                .unwrap_or("")
+                .to_lowercase();
+            let limit = call.arguments["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
+            let catalog = super::tools::component_catalog(state);
+            let matching: Vec<_> = catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|d| {
+                    (query.is_empty() || d.to_string().to_lowercase().contains(&query))
+                        && (category.is_empty()
+                            || d["category"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join("/")
+                                .to_lowercase()
+                                .starts_with(&category))
+                })
+                .collect();
+            (
+                json!({"success":true,"components":matching.iter().take(limit).collect::<Vec<_>>(),"total":matching.len()}),
+                None,
+                false,
+            )
+        }
+        "get_component" => {
+            match serde_json::from_value::<crate::components::ComponentId>(
+                call.arguments["component_id"].clone(),
+            )
+            .ok()
+            .and_then(|id| state.components.definitions.get(&id))
+            {
+                Some(d) => {
+                    let mut metadata = super::tools::component_catalog(state)
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|v| v["id"] == json!(d.id))
+                        .unwrap()
+                        .clone();
+                    if call.arguments["include_nodes"] == true {
+                        metadata["nodes"] = json!(d.nodes);
+                    }
+                    (json!({"success":true,"component":metadata}), None, false)
+                }
+                None => parse("Component not found".into()),
+            }
+        }
+        "propose_component_actions" => {
+            let source = proposal.map(|p| &p.components).unwrap_or(&state.components);
+            let intents = match super::tools::parse_component_actions(
+                source,
+                call.arguments["actions"].clone(),
+            ) {
+                Ok(v) => v,
+                Err(e) => return parse(e),
+            };
+            let mut combined = Vec::new();
+            if let Some(base) = proposal {
+                if !base.transaction.operations.is_empty() {
+                    return parse(
+                        "Apply the primitive proposal before staging component actions".into(),
+                    );
+                }
+                combined.extend(base.component_intents.clone());
+            }
+            combined.extend(intents);
+            match super::proposal::propose_component_intents(state, combined) {
+                Ok(p) => (
+                    json!({"success":true,"proposal_id":p.proposal_id,"component_instances":p.components.instances,"operation_count":p.summary.operation_count}),
+                    Some(p),
+                    false,
+                ),
+                Err(e) => (json!({"success":false,"diagnostics":e}), None, true),
+            }
+        }
         "resolve_colours" => {
-            let Some(queries)=call.arguments["queries"].as_array().filter(|q| !q.is_empty() && q.len()<=16) else {return parse("Provide 1..16 queries".into())};
-            let pool=proposal.map(|p|&p.prepared.pool).unwrap_or(&state.pool);
-            let results:Vec<_>=queries.iter().map(|q|match super::visual_intent::resolve(pool,q){Ok(c)=>json!({"query":q,"resolved":c}),Err(e)=>json!({"query":q,"diagnostic":e})}).collect();
-            (json!({"success":true,"results":results,"source":crate::effective_colour::source(pool)}),None,false)
-        },
+            let Some(queries) = call.arguments["queries"]
+                .as_array()
+                .filter(|q| !q.is_empty() && q.len() <= 16)
+            else {
+                return parse("Provide 1..16 queries".into());
+            };
+            let pool = proposal.map(|p| &p.prepared.pool).unwrap_or(&state.pool);
+            let results: Vec<_> = queries
+                .iter()
+                .map(|q| match super::visual_intent::resolve(pool, q) {
+                    Ok(c) => json!({"query":q,"resolved":c}),
+                    Err(e) => json!({"query":q,"diagnostic":e}),
+                })
+                .collect();
+            (
+                json!({"success":true,"results":results,"source":crate::effective_colour::source(pool)}),
+                None,
+                false,
+            )
+        }
         "inspect_design_region" => match serde_json::from_value::<
             super::design_inspection::InspectDesignRegionRequest,
         >(call.arguments.clone())
@@ -764,7 +895,7 @@ fn execute_tool(
                 .and_then(|r| get_design_context(state, r).map_err(|e| format!("{e:?}")))
             {
                 Ok(v) => (
-                    json!({"success":true,"context":super::wire::context(v)}),
+                    json!({"success":true,"context":super::tools::component_design_context(state, v)}),
                     None,
                     false,
                 ),
@@ -776,7 +907,7 @@ fn execute_tool(
             .and_then(|r| get_objects(state, r).map_err(|e| format!("{e:?}")))
         {
             Ok(v) => (
-                json!({"success":true,"objects":super::wire::objects(v)}),
+                json!({"success":true,"sources":v.iter().filter_map(|o| super::tools::source_context(&state.components, o.object.id)).collect::<Vec<_>>(),"objects":super::wire::objects(v)}),
                 None,
                 false,
             ),
@@ -823,9 +954,23 @@ fn execute_tool(
                     json!(crate::operations::CURRENT_OPERATION_SCHEMA_VERSION),
                 );
             }
-            let candidate_state=proposal.map(|p|AiDesignState { pool:p.prepared.pool.clone(), object_info:p.prepared.object_info.clone(), ..state.clone() });
-            let (arguments, colour_resolutions)=match super::visual_intent::compile(candidate_state.as_ref().unwrap_or(state),arguments) {
-                Ok(v)=>v, Err(e)=>return (json!({"success":false,"diagnostics":[e],"failure_class":"HarnessNormalization"}),None,false),
+            let candidate_state = proposal.map(|p| AiDesignState {
+                pool: p.prepared.pool.clone(),
+                object_info: p.prepared.object_info.clone(),
+                ..state.clone()
+            });
+            let (arguments, colour_resolutions) = match super::visual_intent::compile(
+                candidate_state.as_ref().unwrap_or(state),
+                arguments,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        json!({"success":false,"diagnostics":[e],"failure_class":"HarnessNormalization"}),
+                        None,
+                        false,
+                    )
+                }
             };
             let tx = match serde_json::from_value::<crate::operations::OperationTransaction>(
                 arguments,
@@ -862,38 +1007,129 @@ fn execute_tool(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    struct StylingProvider { calls: AtomicUsize, mismatch: bool }
+    struct StylingProvider {
+        calls: AtomicUsize,
+        mismatch: bool,
+    }
     impl AiProvider for StylingProvider {
-        fn run_turn(&self, request:AiTurnRequest)->super::super::AiProviderFuture<Result<super::super::AiProviderResponse,AiProviderError>> {
-            let round=self.calls.fetch_add(1,Ordering::SeqCst);
-            assert_eq!(request.settings.role,AiModelRole::Fast);
-            if round>0 { assert_eq!(request.conversation.task_state.as_ref().unwrap().resolved_theme["background"]["index"],15); }
-            if self.mismatch && round==2 {
-                let result=request.conversation.messages.iter().flat_map(|m|&m.content).filter_map(|c|if let AiContent::ToolResult(r)=c{Some(r)}else{None}).last().unwrap();
+        fn run_turn(
+            &self,
+            request: AiTurnRequest,
+        ) -> super::super::AiProviderFuture<Result<super::super::AiProviderResponse, AiProviderError>>
+        {
+            let round = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.settings.role, AiModelRole::Fast);
+            if round > 0 {
+                assert_eq!(
+                    request
+                        .conversation
+                        .task_state
+                        .as_ref()
+                        .unwrap()
+                        .resolved_theme["background"]["index"],
+                    15
+                );
+            }
+            if self.mismatch && round == 2 {
+                let result = request
+                    .conversation
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .filter_map(|c| {
+                        if let AiContent::ToolResult(r) = c {
+                            Some(r)
+                        } else {
+                            None
+                        }
+                    })
+                    .last()
+                    .unwrap();
                 assert!(result.result.to_string().contains("STYLE_INTENT_MISMATCH"));
                 assert!(request.conversation.pending_proposal.is_none());
             }
-            let content=if round==0 { vec![AiContent::ToolCall(AiToolCall{call_id:format!("style_{round}"),name:"finish_inspection".into(),arguments:json!({"required_object_types":["DataMask","PictureGraphic"],"theme":{"background":{"name":"dark_blue"},"accent":{"name":"cyan"},"primary_text":{"name":"white"}}})})] }
-            else if round==1 || self.mismatch&&round==2 {
-                let value=if self.mismatch&&round==1 {json!(6)}else{json!({"name":"dark navy"})};
-                vec![AiContent::ToolCall(AiToolCall{call_id:format!("style_{round}"),name:"propose_transaction".into(),arguments:json!({"operations":[{"type":"SetProperty","data":{"object":{"id":2},"property":"background_colour","value":value}},{"type":"CreateIcon","data":{"icon":"wifi","name":"WiFi icon","width":24,"height":24,"foreground":{"name":"cyan"},"transparent":true,"parent":{"id":2},"x":20,"y":20}}]})})]
-            } else {vec![AiContent::Text("Modern navy screen with cyan WiFi icon staged.".into())]};
-            Box::pin(async move{Ok(super::super::AiProviderResponse{content,usage:Default::default()})})
+            let content = if round == 0 {
+                vec![AiContent::ToolCall(AiToolCall {
+                    call_id: format!("style_{round}"),
+                    name: "finish_inspection".into(),
+                    arguments: json!({"required_object_types":["DataMask","PictureGraphic"],"theme":{"background":{"name":"dark_blue"},"accent":{"name":"cyan"},"primary_text":{"name":"white"}}}),
+                })]
+            } else if round == 1 || self.mismatch && round == 2 {
+                let value = if self.mismatch && round == 1 {
+                    json!(6)
+                } else {
+                    json!({"name":"dark navy"})
+                };
+                vec![AiContent::ToolCall(AiToolCall {
+                    call_id: format!("style_{round}"),
+                    name: "propose_transaction".into(),
+                    arguments: json!({"operations":[{"type":"SetProperty","data":{"object":{"id":2},"property":"background_colour","value":value}},{"type":"CreateIcon","data":{"icon":"wifi","name":"WiFi icon","width":24,"height":24,"foreground":{"name":"cyan"},"transparent":true,"parent":{"id":2},"x":20,"y":20}}]}),
+                })]
+            } else {
+                vec![AiContent::Text(
+                    "Modern navy screen with cyan WiFi icon staged.".into(),
+                )]
+            };
+            Box::pin(async move {
+                Ok(super::super::AiProviderResponse {
+                    content,
+                    usage: Default::default(),
+                })
+            })
         }
     }
     #[test]
     fn modern_screen_semantic_theme_resolves_and_repairs_without_escalation() {
-        for mismatch in [false,true] {
-            let mut state=AiDesignState{revision:1,pool:Default::default(),object_info:Default::default(),vt_version:ag_iso_stack::object_pool::vt_version::VtVersion::Version6,mask_size:480,selected:None};
-            let mut ws=crate::default_object(ObjectType::WorkingSet);ws.mut_id().set_value(1).unwrap();
-            if let ag_iso_stack::object_pool::object::Object::WorkingSet(w)=&mut ws{w.active_mask=ag_iso_stack::object_pool::ObjectId::new(2).unwrap();}state.pool.add(ws);
-            let mut mask=crate::default_object(ObjectType::DataMask);mask.mut_id().set_value(2).unwrap();state.pool.add(mask);
-            let mut conversation=Conversation::default();conversation.push(AiMessage::text(AiRole::User,"Make the screen more modern, for example by changing colours and adding icons."));
-            let provider=StylingProvider{calls:AtomicUsize::new(0),mismatch};
-            let p=run_loop(&provider,&state,&mut conversation,AiSettings::default()).unwrap().unwrap();
-            assert_eq!(crate::object_properties::get_object_property(p.prepared.pool.object_by_id(ag_iso_stack::object_pool::ObjectId::new(2).unwrap()).unwrap(),"background_colour").unwrap(),json!(15));
-            assert_eq!(state.pool.objects().len(),2);
-            assert!(conversation.task_state.as_ref().unwrap().escalation.is_none());
+        for mismatch in [false, true] {
+            let mut state = AiDesignState {
+                canonical_pool: None,
+                components: Default::default(),
+                revision: 1,
+                pool: Default::default(),
+                object_info: Default::default(),
+                vt_version: ag_iso_stack::object_pool::vt_version::VtVersion::Version6,
+                mask_size: 480,
+                selected: None,
+            };
+            let mut ws = crate::default_object(ObjectType::WorkingSet);
+            ws.mut_id().set_value(1).unwrap();
+            if let ag_iso_stack::object_pool::object::Object::WorkingSet(w) = &mut ws {
+                w.active_mask = ag_iso_stack::object_pool::ObjectId::new(2).unwrap();
+            }
+            state.pool.add(ws);
+            let mut mask = crate::default_object(ObjectType::DataMask);
+            mask.mut_id().set_value(2).unwrap();
+            state.pool.add(mask);
+            let mut conversation = Conversation::default();
+            conversation.push(AiMessage::text(
+                AiRole::User,
+                "Make the screen more modern, for example by changing colours and adding icons.",
+            ));
+            let provider = StylingProvider {
+                calls: AtomicUsize::new(0),
+                mismatch,
+            };
+            let p = run_loop(&provider, &state, &mut conversation, AiSettings::default())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::object_properties::get_object_property(
+                    p.prepared
+                        .pool
+                        .object_by_id(ag_iso_stack::object_pool::ObjectId::new(2).unwrap())
+                        .unwrap(),
+                    "background_colour"
+                )
+                .unwrap(),
+                json!(15)
+            );
+            assert_eq!(state.pool.objects().len(), 2);
+            assert!(conversation
+                .task_state
+                .as_ref()
+                .unwrap()
+                .escalation
+                .is_none());
         }
     }
     struct RepeatingProvider(AtomicUsize);
@@ -921,6 +1157,8 @@ mod tests {
     fn round_limit_preserves_conversation_and_returns_a_clear_stop_message() {
         let provider = RepeatingProvider(AtomicUsize::new(0));
         let state = AiDesignState {
+            canonical_pool: None,
+            components: Default::default(),
             revision: 0,
             pool: Default::default(),
             object_info: Default::default(),
@@ -981,6 +1219,8 @@ mod tests {
                 valid_first,
             };
             let mut state = AiDesignState {
+                canonical_pool: None,
+                components: Default::default(),
                 revision: 0,
                 pool: Default::default(),
                 object_info: Default::default(),

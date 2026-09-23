@@ -22,6 +22,17 @@ impl OperationHistory {
         }
     }
 
+    pub fn contains(&self, id: &str) -> bool {
+        self.undo_stack
+            .iter()
+            .chain(&self.redo_stack)
+            .any(|t| t.transaction_id == id)
+    }
+
+    pub fn latest(&self) -> Option<&AppliedTransaction> {
+        self.undo_stack.last()
+    }
+
     /// Record a user transaction into undo history
     /// Clears redo stack (new user action invalidates redo)
     pub fn push(&mut self, transaction: AppliedTransaction) {

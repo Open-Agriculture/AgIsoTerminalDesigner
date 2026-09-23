@@ -25,6 +25,8 @@ pub type ProjectRevision = u64;
 #[derive(Debug, Clone)]
 pub struct AiDesignState {
     pub revision: ProjectRevision,
+    pub canonical_pool: Option<ObjectPool>,
+    pub components: crate::components::ComponentSource,
     pub pool: ObjectPool,
     pub object_info: HashMap<ObjectId, ObjectInfo>,
     pub vt_version: VtVersion,
@@ -51,6 +53,6 @@ pub use tools::{get_design_context, get_objects, AiDomainTool, AiToolError, GetO
 
 mod wire;
 
-pub mod visual_intent;
 pub mod icon_recipes;
 pub mod visual_diagnostics;
+pub mod visual_intent;

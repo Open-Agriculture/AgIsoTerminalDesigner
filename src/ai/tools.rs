@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiDomainTool {
+    ListComponents,
+    GetComponent,
+    ProposeComponentActions,
     GetDesignContext,
     GetObjects,
     GetObjectSchema,
@@ -117,6 +120,9 @@ impl GetObjectSchemaRequest {
 /// Provider-facing definitions for precisely the four Phase 3 domain tools.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
+        function("list_components", "List project-local reusable components and their explicitly authored parameters. Prefer a suitable component to primitive construction.", json!({"type":"object","properties":{"query":{"type":"string"},"category":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
+        function("get_component", "Read compact component metadata and declared parameters. Include nodes only for an explicitly requested master edit affecting all instances.", json!({"type":"object","properties":{"component_id":{"type":"string"},"include_nodes":{"type":"boolean"}},"required":["component_id"],"additionalProperties":false})),
+        function("propose_component_actions", "Stage an atomic batch of component source commands. Use declared parameters only. SetComponentMasterProperty requires explicit user intent affecting all instances and scope AllInstances. No primitive schemas are needed.", json!({"type":"object","properties":{"actions":{"type":"array","minItems":1,"maxItems":256,"items":{"type":"object","properties":{"type":{"type":"string","enum":["InstantiateComponent","SetComponentOverride","ResetComponentOverride","SetComponentMasterProperty"]},"component_id":{"type":"string"},"parent":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"overrides":{"type":"object"},"instance_id":{"type":"string"},"parameter":{"type":"string"},"node_id":{"type":"string"},"property":{"type":"string"},"scope":{"type":"string","enum":["AllInstances"]},"value":{}},"required":["type"]}}},"required":["actions"]})),
         function("resolve_colours", "Resolve up to 16 semantic names, RGB requests, or explicit indices against the effective rendering palette.", json!({"type":"object","properties":{"queries":{"type":"array","minItems":1,"maxItems":16,"items":super::visual_intent::colour_schema()}},"required":["queries"],"additionalProperties":false})),
         function("get_design_context", "Forward layout overview, depth 1 by default: direct children with geometry first. Drill into root_id for relevant subtrees; page with layout_offset only when needed. Objects contain only summaries first needed on that layout page. EntirePool pages objects with offset. Coordinates are parent-relative; path identifies occurrences. Properties opt-in.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["ActiveMask","Selection","EntirePool"]},"include_selection":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"layout_offset":{"type":"integer","minimum":0},"root_id":{"type":"integer","minimum":0,"maximum":65534},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"depth":{"type":"integer","minimum":0,"maximum":8},"max_objects":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
         function("get_objects", "Batch relevant IDs (up to 20), requesting only required sections. Parents are reverse references and may be large: leave include_parents false unless reverse usage is needed; shared variables/styles may have many parents. Parents page independently with parent_offset/parent_limit (default 8, max 20). include_nearby_style returns up to 8 descendant style examples with resolved styles; page with detail_offset. Children/macros page with detail_offset/detail_limit. Long properties page with property_offset/property_limit.", json!({"type":"object","properties":{"ids":{"type":"array","maxItems":20,"items":{"type":"integer","minimum":0,"maximum":65534}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean","default":false},"parent_offset":{"type":"integer","minimum":0},"parent_limit":{"type":"integer","minimum":1,"maximum":20},"include_nearby_style":{"type":"boolean"},"include_macros":{"type":"boolean"},"detail_offset":{"type":"integer","minimum":0},"detail_limit":{"type":"integer","minimum":1,"maximum":100},"property_offset":{"type":"integer","minimum":0},"property_limit":{"type":"integer","minimum":1,"maximum":4096}},"required":["ids"],"additionalProperties":false})),
@@ -130,7 +136,7 @@ pub fn phase_tool_definitions(phase: super::task_state::AiTaskPhase) -> Vec<Valu
     let mut tools: Vec<_> = tool_definitions()
         .into_iter()
         .filter(|t| match t["name"].as_str().unwrap_or("") {
-            "propose_transaction" => phase != AiTaskPhase::Inspect,
+            "propose_transaction" | "propose_component_actions" => phase != AiTaskPhase::Inspect,
             "get_design_context" => phase == AiTaskPhase::Inspect,
             "analyze_design" => phase == AiTaskPhase::Review,
             _ => true,
@@ -151,7 +157,7 @@ pub fn canonical_object_type_schema() -> Value {
 fn function(name: &str, description: &str, mut parameters: Value) -> Value {
     // Strict function calling requires every property required. Optional inputs are
     // nullable on the wire and stripped before typed defaults are deserialized.
-    let strict = name != "propose_transaction";
+    let strict = !matches!(name, "propose_transaction" | "propose_component_actions");
     if strict {
         let required = parameters["required"]
             .as_array()
@@ -179,7 +185,18 @@ fn transaction_schema() -> Value {
     let coordinate = json!({"type":"integer","minimum":-32768,"maximum":32767});
     let string = json!({"type":"string"});
     let variants = vec![
-        operation_schema("CreateIcon", json!({"icon":{"type":"string","enum":super::icon_recipes::ICONS},"name":string,"object_id":id,"width":{"type":"integer","minimum":8,"maximum":128},"height":{"type":"integer","minimum":8,"maximum":128},"foreground":super::visual_intent::colour_schema(),"background":super::visual_intent::colour_schema(),"transparent":{"type":"boolean"},"parent":target,"x":coordinate,"y":coordinate}), &["icon","name","width","height","foreground","transparent"]),
+        operation_schema(
+            "CreateIcon",
+            json!({"icon":{"type":"string","enum":super::icon_recipes::ICONS},"name":string,"object_id":id,"width":{"type":"integer","minimum":8,"maximum":128},"height":{"type":"integer","minimum":8,"maximum":128},"foreground":super::visual_intent::colour_schema(),"background":super::visual_intent::colour_schema(),"transparent":{"type":"boolean"},"parent":target,"x":coordinate,"y":coordinate}),
+            &[
+                "icon",
+                "name",
+                "width",
+                "height",
+                "foreground",
+                "transparent",
+            ],
+        ),
         operation_schema(
             "CreateObject",
             json!({"object_id":{"anyOf":[id,{"type":"null"}]},"object_type":canonical_object_type_schema(),"name":string}),
@@ -553,9 +570,16 @@ fn nearby_style(state: &AiDesignState, root: ObjectId, offset: usize) -> Value {
             .unwrap();
         let mut example = json!({"id":placement.object.id,"type":placement.object.object_type,
             "x":placement.x,"y":placement.y,"path":placement.path});
-        for name in ["width", "height", "background_colour", "border_colour", "justification"] {
+        for name in [
+            "width",
+            "height",
+            "background_colour",
+            "border_colour",
+            "justification",
+        ] {
             if let Ok(value) = get_object_property(object, name) {
-                example[name] = super::visual_intent::enrich(&state.pool, object.object_type(), name, value);
+                example[name] =
+                    super::visual_intent::enrich(&state.pool, object.object_type(), name, value);
             }
         }
         for name in ["font_attributes", "line_attributes", "fill_attributes"] {
@@ -569,7 +593,12 @@ fn nearby_style(state: &AiDesignState, root: ObjectId, offset: usize) -> Value {
                             crate::object_properties::get_property_descriptors(style.object_type())
                         {
                             if let Ok(v) = get_object_property(style, descriptor.name) {
-                                resolved[descriptor.name] = super::visual_intent::enrich(&state.pool, style.object_type(), descriptor.name, v);
+                                resolved[descriptor.name] = super::visual_intent::enrich(
+                                    &state.pool,
+                                    style.object_type(),
+                                    descriptor.name,
+                                    v,
+                                );
                             }
                         }
                         example[name] = resolved;
@@ -645,12 +674,136 @@ mod tests {
         for variant in variants {
             let payload = example(variant);
             if payload["type"] == "CreateIcon" {
-                let ops=super::super::icon_recipes::compile(&Default::default(), &payload["data"]).unwrap();
-                for op in ops { assert!(serde_json::from_value::<crate::operations::Operation>(op).is_ok()); }
+                let ops =
+                    super::super::icon_recipes::compile(&Default::default(), &payload["data"])
+                        .unwrap();
+                for op in ops {
+                    assert!(serde_json::from_value::<crate::operations::Operation>(op).is_ok());
+                }
                 continue;
             }
             let result = serde_json::from_value::<crate::operations::Operation>(payload.clone());
             assert!(result.is_ok(), "{payload}: {result:?}");
         }
     }
+}
+
+pub fn component_catalog(state: &AiDesignState) -> Value {
+    json!(state.components.definitions.values().map(|d| json!({"id":d.id,"name":d.name,"description":d.description,"category":d.category_path,"tags":d.tags,"revision":d.revision,"bounds":crate::components::component_bounds(d),"parameters":d.parameters})).collect::<Vec<_>>())
+}
+
+/// Semantic instance records omit compiled implementation details from normal context.
+pub fn component_instances(state: &AiDesignState) -> Value {
+    json!(state.components.instances.iter().map(|i| {
+        let d = &state.components.definitions[&i.component_id];
+        json!({"instance_id":i.id,"component_id":d.id,"component":d.name,"parent":i.parent,"x":i.x,"y":i.y,"parameters":d.parameters.iter().map(|p| json!({"id":p.id,"name":p.name,"value":i.overrides.get(&p.id).unwrap_or(&p.default_value),"overridden":i.overrides.contains_key(&p.id)})).collect::<Vec<_>>()})
+    }).collect::<Vec<_>>())
+}
+
+pub fn source_context(source: &crate::components::ComponentSource, id: u16) -> Option<Value> {
+    // Reservations are authoritative source metadata, never generated names.
+    let map = crate::components::source_map(source);
+    let crate::components::MaterializedSource::ComponentNode {
+        instance_id,
+        node_id,
+    } = map.by_object_id.get(&id)?
+    else {
+        return None;
+    };
+    let instance = source.instances.iter().find(|i| i.id == *instance_id)?;
+    let definition = source.definitions.get(&instance.component_id)?;
+    let node = definition.nodes.iter().find(|n| n.id == *node_id)?;
+    Some(
+        json!({"component_id":definition.id,"component":definition.name,"instance_id":instance_id,"node_id":node_id,"node":node.name,"materialized_object_id":id}),
+    )
+}
+
+pub fn component_design_context(
+    state: &AiDesignState,
+    snapshot: crate::ai::snapshot::DesignSnapshot,
+) -> Value {
+    let mut context = super::wire::context(snapshot);
+    let map = crate::components::source_map(&state.components);
+    if let Some(objects) = context["objects"].as_array_mut() {
+        objects.retain(|object| {
+            !object["id"]
+                .as_u64()
+                .is_some_and(|id| map.by_object_id.contains_key(&(id as u16)))
+        });
+    }
+    if let Some(layout) = context["layout"].as_array_mut() {
+        layout.retain(|item| {
+            !item["id"]
+                .as_u64()
+                .is_some_and(|id| map.by_object_id.contains_key(&(id as u16)))
+        });
+    }
+    if let Some(id) = state.selected {
+        if let Some(source) = source_context(&state.components, id.value()) {
+            context["selection"] = source;
+        }
+    }
+    context["components"] = component_catalog(state);
+    context["component_instances"] = component_instances(state);
+    context
+}
+
+/// Accept human parameter names at the wire boundary, while source state uses stable IDs.
+pub fn parse_component_actions(
+    source: &crate::components::ComponentSource,
+    mut value: Value,
+) -> Result<Vec<crate::components::ComponentIntent>, String> {
+    let actions = value
+        .as_array_mut()
+        .ok_or("Expected component actions array")?;
+    for action in actions {
+        if let Some(id) = action["parent"]["id"].as_u64() {
+            action["parent"] = json!(id);
+        }
+        let component_id = action
+            .get("component_id")
+            .and_then(|id| {
+                serde_json::from_value::<crate::components::ComponentId>(id.clone()).ok()
+            })
+            .or_else(|| {
+                let instance_id = serde_json::from_value::<crate::components::ComponentInstanceId>(
+                    action["instance_id"].clone(),
+                )
+                .ok()?;
+                source
+                    .instances
+                    .iter()
+                    .find(|i| i.id == instance_id)
+                    .map(|i| i.component_id)
+            })
+            .ok_or("Unknown component or instance identity")?;
+        let definition = source
+            .definitions
+            .get(&component_id)
+            .ok_or("Unknown component")?;
+        let resolve = |name: &str| -> Result<String, String> {
+            if let Some(parameter) = definition
+                .parameters
+                .iter()
+                .find(|p| p.name == name || p.id.to_string() == name)
+            {
+                Ok(parameter.id.to_string())
+            } else {
+                Err(format!("Unknown declared parameter: {name}"))
+            }
+        };
+        if let Some(name) = action["parameter"].as_str() {
+            action["parameter"] = json!(resolve(name)?);
+        }
+        if let Some(overrides) = action.get_mut("overrides").and_then(Value::as_object_mut) {
+            let mut normalized = serde_json::Map::new();
+            for (name, value) in std::mem::take(overrides) {
+                if normalized.insert(resolve(&name)?, value).is_some() {
+                    return Err("Duplicate override parameter".into());
+                }
+            }
+            *overrides = normalized;
+        }
+    }
+    serde_json::from_value(value).map_err(|e| e.to_string())
 }

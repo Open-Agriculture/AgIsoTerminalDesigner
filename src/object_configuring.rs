@@ -997,7 +997,136 @@ fn flag_choices(field: &str) -> Vec<serde_json::Value> {
         }
         _ => &[],
     };
-    variants.iter().map(|value| serde_json::json!(value)).collect()
+    variants
+        .iter()
+        .map(|value| serde_json::json!(value))
+        .collect()
+}
+
+/// Independently worded editor guidance for the encodings in ISO 11783-6:2018,
+/// J.4.6, Table J.5. Keep protocol facts exact; do not copy the standard’s prose.
+fn auxiliary_function_type_help(
+    function_type: ag_iso_stack::object_pool::object_attributes::AuxiliaryFunctionType,
+) -> (String, String) {
+    use ag_iso_stack::object_pool::object_attributes::AuxiliaryFunctionType::*;
+
+    let (label, behavior, values) = match function_type {
+        BooleanLatching => (
+            "Boolean — latching",
+            "Choose this for an on/off control that keeps its state after the operator lets go.",
+            "Value 1: 0 = off (backward/down/left/not pressed); 1 = on (forward/up/right/pressed).\nValue 2: running total of activations after power-up.",
+        ),
+        AnalogueMaintains => (
+            "Analogue — maintains position",
+            "Choose this when releasing a variable control leaves its output unchanged.",
+            "Value 1: 0–100%.\nValue 2: unused for this type; transmit 0xFFFF.",
+        ),
+        BooleanNonLatching => (
+            "Boolean — momentary",
+            "Choose this for an on/off control that is active only while operated, such as a push button.",
+            "Value 1: 0 = off; 1 = momentary activation (forward/up/right/pressed); 2 = held.\nValue 2: running total of activations after power-up. Continuing to hold an active control adds nothing.",
+        ),
+        AnalogueReturnToCenter => (
+            "Analogue — returns to 50%",
+            "Choose this for a variable control with travel on both sides of neutral. Letting go restores a 50% output.",
+            "Value 1: 0–100%.\nValue 2: unused for this type; transmit 0xFFFF.",
+        ),
+        AnalogueReturnToZero => (
+            "Analogue — returns to 0%",
+            "Choose this for a variable control whose output falls back to zero when the operator lets go.",
+            "Value 1: 0–100%.\nValue 2: unused for this type; transmit 0xFFFF.",
+        ),
+        DualBooleanLatching => (
+            "Dual Boolean — both directions latching",
+            "Choose this when both directional states and the neutral state remain selected after release.",
+            "Value 1: 0 = centre/off; 1 = forward/up/right; 4 = backward/down/left.\nValue 2: running total of activations after power-up.",
+        ),
+        DualBooleanNonLatching => (
+            "Dual Boolean — both directions momentary",
+            "Choose this for two opposing actions that stop on release, such as holding a rocker to raise or lower a tool.",
+            "Value 1: 0 = off; 1 = momentary forward/up/right; 2 = held forward/up/right; 4 = momentary backward/down/left; 8 = held backward/down/left.\nValue 2: running total of activations after power-up. Continuing to hold an active control adds nothing.",
+        ),
+        DualBooleanLatchingUp => (
+            "Dual Boolean — latching up, momentary down",
+            "The forward/up/right action stays selected after release. The opposite action requires continued operation; releasing it selects off. Off is also a stable setting.",
+            "Value 1: 0 = off; 1 = latched forward/up/right; 4 = momentary backward/down/left; 8 = held backward/down/left.\nValue 2: running total of activations after power-up. Continuing to hold an active control adds nothing.",
+        ),
+        DualBooleanLatchingDown => (
+            "Dual Boolean — latching down, momentary up",
+            "The backward/down/left action stays selected after release. The opposite action requires continued operation; releasing it selects off. Off is also a stable setting.",
+            "Value 1: 0 = off; 1 = momentary forward/up/right; 2 = held forward/up/right; 4 = latched backward/down/left.\nValue 2: running total of activations after power-up. Continuing to hold an active control adds nothing.",
+        ),
+        CombinedAnalogueReturnWithLatch => (
+            "Combined analogue — returns to 50%, latching endpoints",
+            "Use this for variable movement around a 50% neutral output, plus a persistent directional state available at either end of travel.",
+            "Value 1: 0–100%; 0xFB00 = latched forward; 0xFB01 = latched backward.\nValue 2: running total of latch engagements after power-up. An engagement is counted only when the previous state was not latched.",
+        ),
+        CombinedAnalogueMaintainsWithLatch => (
+            "Combined analogue — maintains position, latching endpoints",
+            "Use this when a variable setting remains after release and either end of travel can also select a persistent directional state.",
+            "Value 1: 0–100%; 0xFB00 = latched forward; 0xFB01 = latched backward.\nValue 2: running total of latch engagements after power-up. An engagement is counted only when the previous state was not latched.",
+        ),
+        QuadratureBooleanNonLatching => (
+            "Quadrature Boolean — momentary",
+            "Use this for a two-axis directional control that becomes neutral on release. Each direction has its own two-bit state, allowing a change between held directions to be represented in one report.",
+            "Value 1: bits 1–0 = forward/up; bits 3–2 = backward/down; bits 5–4 = right; bits 7–6 = left. Each pair: 00 = off; 01 = first activation; 10 = held; 11 = reserved.\nValue 2: running total of activations across both axes after power-up. Continuing to hold an active direction adds nothing.",
+        ),
+        QuadratureAnalogueMaintains => (
+            "Quadrature analogue — maintains position",
+            "Use this for two independent, perpendicular variable controls whose settings remain after release. A 50% reading marks the midpoint of either axis.",
+            "Value 1: axis 1, 0% = backward/down; 100% = forward/up.\nValue 2: axis 2, 0% = left; 100% = right.",
+        ),
+        QuadratureAnalogueReturnToCenter => (
+            "Quadrature analogue — returns to 50%",
+            "Use this for a two-axis variable control that settles at a 50% reading on each axis when the operator lets go.",
+            "Value 1: axis 1, 0% = backward/down; 100% = forward/up.\nValue 2: axis 2, 0% = left; 100% = right.",
+        ),
+        BidirectionalEncoder => (
+            "Bidirectional encoder",
+            "Use this for rotation measured in steps. Turning one way adds to the count; reversing direction subtracts from it.",
+            "Value 1: current count, 0–0xFFFF, wrapping between 0xFFFF and 0.\nValue 2: fixed calibration, 1–0xFFFF encoder counts per revolution.",
+        ),
+        Reserved(_) => (
+            "Reserved",
+            "IDs 15–30 have no assigned control meaning in this edition of the standard.",
+            "No control behavior or status values are defined.",
+        ),
+        RemoveAssignment => (
+            "Reserved — remove assignment",
+            "ID 31 identifies an assignment-removal request.",
+            "It does not describe an assignable control type.",
+        ),
+    };
+    let type_id = u8::from(function_type);
+    let mut help = format!("{behavior}\n\nStatus report fields\n{values}");
+    if matches!(type_id, 1 | 3 | 4 | 9 | 10 | 12 | 13) {
+        help.push_str("\n\nAnalogue values encode 0–100% as 0–0xFAFF.");
+        if !matches!(type_id, 12 | 13) {
+            help.push_str(
+                " 0% = backward/down/left/counter-clockwise; 100% = forward/up/right/clockwise.",
+            );
+        }
+    }
+    if matches!(type_id, 0 | 2 | 5..=11) {
+        help.push_str("\n\nAfter a transition counter reaches 0xFFFF, its next increment produces 0.");
+    }
+    help.push_str("\n\nTechnical reference: ISO 11783-6:2018, J.4.6, Table J.5.");
+    (format!("{type_id}: {label}"), help)
+}
+
+/// Keep the selected value and menu entries consistent, including type-specific help.
+fn flag_choice_presentation(field: &str, value: &serde_json::Value) -> (String, Option<String>) {
+    if field == "function_type" {
+        if let Ok(function_type) = serde_json::from_value(value.clone()) {
+            let (label, help) = auxiliary_function_type_help(function_type);
+            return (label, Some(help));
+        }
+    }
+    let label = value
+        .as_str()
+        .map(human_readable_property_name)
+        .unwrap_or_else(|| value.to_string());
+    (label, None)
 }
 
 fn render_flag_field(
@@ -1013,33 +1142,35 @@ fn render_flag_field(
             .then_some(enabled.into());
     }
     let choices = flag_choices(field);
-    let choice_label = |value: &serde_json::Value| {
-        value
-            .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("Reserved {}", value["Reserved"]))
-    };
-    if choices.len() == 2 {
-        let mut enabled = value == &choices[1];
-        return ui
-            .checkbox(&mut enabled, format!("{label}: {}", choice_label(&choices[1])))
-            .on_hover_text(format!("Unchecked: {}", choice_label(&choices[0])))
-            .changed()
-            .then(|| choices[usize::from(enabled)].clone());
-    }
     let mut updated = None;
-    ui.label(label);
-    for choice in choices {
-        let mut selected = value == &choice;
-        if ui.checkbox(&mut selected, choice_label(&choice)).changed() && selected {
-            updated = Some(choice);
-        }
+    let (selected_label, selected_help) = flag_choice_presentation(field, value);
+    let response = egui::ComboBox::from_label(label)
+        .selected_text(selected_label)
+        .show_ui(ui, |ui| {
+            for choice in choices {
+                let (label, help) = flag_choice_presentation(field, &choice);
+                let mut response = ui.selectable_label(value == &choice, label);
+                if let Some(help) = help {
+                    response = response.on_hover_text(help);
+                }
+                if response.clicked() && value != &choice {
+                    updated = Some(choice);
+                }
+            }
+        })
+        .response;
+    if let Some(help) = selected_help {
+        response.on_hover_text(help);
+    }
+    if field == "function_type" {
+        ui.small("Hover over a type for control behavior and status values.")
+            .on_hover_text("For a Type 2 assignment, select the same type ID for the input and the function. This rule applies to both manual assignments and assignments made by a Working Set. ISO 15077 specifies the applicable requirements for the physical operator controls.");
     }
     updated
 }
 
-/// Render bit-mask and object-style options as individual checkboxes rather
-/// than leaking their JSON encoding into the UI.
+/// Independent bits and booleans use checkboxes; mutually exclusive enum values
+/// use dropdowns. Both preserve the property's serialized representation.
 fn render_flag_set(
     ui: &mut egui::Ui,
     label: &str,
@@ -1245,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn every_enum_flag_has_checkbox_choices_that_validate() {
+    fn every_enum_flag_has_dropdown_choices_that_validate() {
         for object_type in (0..=u8::MAX).filter_map(|value| ObjectType::try_from(value).ok()) {
             let object = object(object_type, 1);
             let id = object.id();
@@ -1463,10 +1594,7 @@ mod tests {
             &mut project,
             Operation::SetObjectList {
                 object: ObjectTarget::id(20),
-                objects: ObjectTargetList::Nullable(vec![
-                    Some(ObjectTarget::id(13)),
-                    None,
-                ]),
+                objects: ObjectTargetList::Nullable(vec![Some(ObjectTarget::id(13)), None]),
             },
         );
         assert!(project.undo_operation());

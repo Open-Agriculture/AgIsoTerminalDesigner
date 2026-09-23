@@ -5,7 +5,7 @@
 use crate::ObjectInfo;
 use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Project file format version
 const PROJECT_FILE_VERSION: u32 = 1;
@@ -17,11 +17,14 @@ pub struct ProjectFile {
     /// Version of the project file format
     version: u32,
 
+    #[serde(default)]
+    pub components: crate::components::ComponentSource,
+
     /// The object pool data as IOP bytes
     object_pool_data: Vec<u8>,
 
     /// Custom metadata for objects (names, etc.)
-    object_metadata: HashMap<u16, ObjectMetadata>,
+    object_metadata: BTreeMap<u16, ObjectMetadata>,
 
     /// Project-level settings
     settings: ProjectSettings,
@@ -61,7 +64,7 @@ impl ProjectFile {
         selected: Option<ObjectId>,
     ) -> Self {
         // Convert ObjectInfo map to ObjectMetadata map
-        let mut object_metadata = HashMap::new();
+        let mut object_metadata = BTreeMap::new();
         for (id, info) in object_info {
             let metadata = ObjectMetadata {
                 name: info.name.clone(),
@@ -72,6 +75,7 @@ impl ProjectFile {
 
         ProjectFile {
             version: PROJECT_FILE_VERSION,
+            components: Default::default(),
             object_pool_data: pool.as_iop(),
             object_metadata,
             settings: ProjectSettings {
@@ -86,6 +90,9 @@ impl ProjectFile {
     /// Returns an error if the object pool data is corrupted or invalid
     pub fn load_pool(&self) -> Result<ObjectPool, String> {
         // Validate minimum size for a valid IOP file
+        if self.object_pool_data.is_empty() {
+            return Ok(ObjectPool::default());
+        }
         if self.object_pool_data.len() < 4 {
             return Err("Object pool data is too small to be valid".to_string());
         }
@@ -103,7 +110,7 @@ impl ProjectFile {
     }
 
     /// Get object metadata
-    pub fn get_metadata(&self) -> &HashMap<u16, ObjectMetadata> {
+    pub fn get_metadata(&self) -> &BTreeMap<u16, ObjectMetadata> {
         &self.object_metadata
     }
 
@@ -133,7 +140,9 @@ impl Default for ProjectSettings {
     }
 }
 
-fn default_vt_version_number() -> u8 { u8::from(VtVersion::Version6) }
+fn default_vt_version_number() -> u8 {
+    u8::from(VtVersion::Version6)
+}
 
 impl ProjectSettings {
     /// VT6 is the explicit backwards-compatible fallback for missing/invalid legacy values.

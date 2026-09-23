@@ -132,7 +132,10 @@ pub fn schema(schema: super::schema::ObjectSchemaSnapshot) -> Value {
                     });
                     if !matches!(semantic, PropertySemanticSnapshot::Normal) {
                         v["semantic"] = json!(semantic);
-                        if matches!(semantic, PropertySemanticSnapshot::Colour) {v["value_forms"]=json!(["index","name","rgb"]); v["examples"]=json!([{"name":"dark_blue"},{"rgb":"#06162E"},6]);}
+                        if matches!(semantic, PropertySemanticSnapshot::Colour) {
+                            v["value_forms"] = json!(["index", "name", "rgb"]);
+                            v["examples"] = json!([{"name":"dark_blue"},{"rgb":"#06162E"},6]);
+                        }
                     }
                     // Structured/enum defaults convey the accepted representation; retain them.
                     if p.default_value.is_object()

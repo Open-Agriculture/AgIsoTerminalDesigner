@@ -198,7 +198,15 @@ pub(crate) fn object_snapshot_sections(
         } else {
             properties.insert(
                 descriptor.name.to_owned(),
-                sanitize_binary(descriptor.name, super::visual_intent::enrich(pool, object.object_type(), descriptor.name, value)),
+                sanitize_binary(
+                    descriptor.name,
+                    super::visual_intent::enrich(
+                        pool,
+                        object.object_type(),
+                        descriptor.name,
+                        value,
+                    ),
+                ),
             );
         }
     }

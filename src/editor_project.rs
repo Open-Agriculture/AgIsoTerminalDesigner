@@ -2,6 +2,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
+use crate::components::*;
+
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -11,13 +13,12 @@ use ag_iso_stack::object_pool::{
     object::Object, vt_version::VtVersion, NullableObjectId, ObjectId, ObjectPool, ObjectType,
 };
 
+use crate::ai::snapshot::{DesignContextRequest, DesignSnapshot, SnapshotError};
 use crate::ai::{AiDesignState, AiProposal, ProjectRevision};
-use crate::ai::snapshot::{DesignSnapshot, DesignContextRequest, SnapshotError};
 use crate::operations::{
     AppliedTransaction, ObjectTarget, Operation, OperationError, OperationExecutor,
     OperationHistory, OperationTransaction, PreparedTransaction, TransactionDiagnostics,
-    ValidationContext,
-    CURRENT_OPERATION_SCHEMA_VERSION,
+    ValidationContext, CURRENT_OPERATION_SCHEMA_VERSION,
 };
 use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
 
@@ -28,12 +29,23 @@ struct ProjectContentCheckpoint {
     pool: ObjectPool,
     object_names: Vec<(u16, String)>,
     mask_size: u16,
+    components: ComponentSource,
+}
+
+#[derive(Clone)]
+struct ComponentCheckpoint {
+    pool: ObjectPool,
+    source: ComponentSource,
+    info: HashMap<ObjectId, ObjectInfo>,
 }
 
 #[derive(Default, Clone)]
 pub struct EditorProject {
     pool: ObjectPool,
+    components: ComponentSource,
+    component_history: HashMap<String, (ComponentCheckpoint, ComponentCheckpoint)>,
     selected_object: NullableObjectId,
+    component_selection: Cell<Option<(ComponentInstanceId, ComponentNodeId)>>,
     pending_selected_object: Cell<NullableObjectId>,
     undo_selected_history: Vec<NullableObjectId>,
     redo_selected_history: Vec<NullableObjectId>,
@@ -89,7 +101,10 @@ impl From<ObjectPool> for EditorProject {
 
         let project = EditorProject {
             pool,
+            components: Default::default(),
+            component_history: Default::default(),
             selected_object: NullableObjectId::default(),
+            component_selection: Cell::new(None),
             pending_selected_object: Cell::new(NullableObjectId::default()),
             undo_selected_history: Default::default(),
             redo_selected_history: Default::default(),
@@ -117,6 +132,116 @@ impl From<ObjectPool> for EditorProject {
 }
 
 impl EditorProject {
+    pub(crate) fn from_ai_source(state: &AiDesignState) -> Self {
+        let mut project = Self::from(state.canonical_pool.as_ref().unwrap_or(&state.pool).clone());
+        project.components = state.components.clone();
+        project.vt_version = state.vt_version;
+        project.mask_size = state.mask_size;
+        project.object_info.replace(state.object_info.clone());
+        project.mut_object_info.replace(state.object_info.clone());
+        project
+    }
+    pub fn component_source(&self) -> &ComponentSource {
+        &self.components
+    }
+    pub(crate) fn component_object_info(&self) -> HashMap<ObjectId, ObjectInfo> {
+        self.object_info.borrow().clone()
+    }
+    pub fn materialize(&self) -> ComponentResult<MaterializedProject> {
+        materialize_project(self)
+    }
+    pub fn export_iop(&self) -> ComponentResult<Vec<u8>> {
+        Ok(self.materialize()?.pool.as_iop())
+    }
+    pub fn editor_selection(&self) -> Option<EditorSelection> {
+        if let Some((instance_id, node_id)) = self.component_selection.get() {
+            return Some(EditorSelection::ComponentNode {
+                instance_id,
+                node_id,
+            });
+        }
+        let id = self.get_selected().0?.value();
+        match self.materialize().ok()?.source_map.by_object_id.get(&id)? {
+            MaterializedSource::Primitive { object_id } => {
+                Some(EditorSelection::PrimitiveObject(*object_id))
+            }
+            MaterializedSource::ComponentNode {
+                instance_id,
+                node_id,
+            } => Some(EditorSelection::ComponentNode {
+                instance_id: *instance_id,
+                node_id: *node_id,
+            }),
+        }
+    }
+    fn component_checkpoint(&self) -> ComponentCheckpoint {
+        ComponentCheckpoint {
+            pool: self.pool.clone(),
+            source: self.components.clone(),
+            info: self.object_info.borrow().clone(),
+        }
+    }
+    fn restore_component_checkpoint(&mut self, state: ComponentCheckpoint) {
+        self.pool = state.pool;
+        self.components = state.source;
+        if let Some((instance, node)) = self.component_selection.get() {
+            if !self
+                .components
+                .instances
+                .iter()
+                .any(|i| i.id == instance && i.compiled_ids.contains_key(&node))
+            {
+                self.component_selection.set(None);
+                if self
+                    .selected_object
+                    .0
+                    .is_some_and(|id| self.pool.object_by_id(id).is_none())
+                {
+                    self.selected_object = NullableObjectId::NULL;
+                    self.pending_selected_object.set(NullableObjectId::NULL);
+                }
+            }
+        }
+        self.sync_component_selection();
+        self.object_info.replace(state.info.clone());
+        self.mut_object_info.replace(state.info);
+        self.update_next_available_id();
+        self.default_object_names.borrow_mut().clear();
+        self.refresh_dirty();
+        self.bump_revision();
+    }
+    pub(crate) fn edit_components(
+        &mut self,
+        description: &str,
+        edit: impl FnOnce(&mut ObjectPool, &mut ComponentSource) -> ComponentResult<()>,
+    ) -> ComponentResult<()> {
+        let before = self.component_checkpoint();
+        let mut after = before.clone();
+        edit(&mut after.pool, &mut after.source)?;
+        prepare_compiled_ids(&after.pool, &mut after.source)?;
+        materialize_source(&after.pool, &after.source, self.vt_version, &after.info)?;
+        after
+            .info
+            .retain(|id, _| after.pool.object_by_id(*id).is_some());
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        self.component_history
+            .insert(transaction_id.clone(), (before, after.clone()));
+        self.operation_history
+            .borrow_mut()
+            .push(AppliedTransaction {
+                transaction_id,
+                description: Some(description.into()),
+                forward_operations: vec![],
+                inverse_operations: vec![],
+                affected_objects: vec![],
+                execution_time_ms: 0,
+            });
+        self.component_history
+            .retain(|id, _| self.operation_history.borrow().contains(id));
+        self.restore_component_checkpoint(after);
+        Ok(())
+    }
+
     /// Start an empty, unsaved pool with a usable editing canvas.
     pub fn new_pool() -> Self {
         let mut project = Self::from(ObjectPool::default());
@@ -142,40 +267,21 @@ impl EditorProject {
 
     /// Allocate a new unique object ID efficiently
     pub fn allocate_object_id(&self) -> ObjectId {
-        let mut next_id = self.next_available_id.borrow_mut();
-
-        // Find the next available ID starting from our cached value
-        while self
-            .pool
-            .object_by_id(ObjectId::new(*next_id).unwrap_or_default())
-            .is_some()
-        {
-            *next_id = next_id.saturating_add(1);
-
-            if *next_id == u16::MAX {
-                // If we've reached the "NULL" object ID, do a full scan to find any gaps
-                let mut found = false;
-                for id in 1..=u16::MAX {
-                    if self
-                        .pool
-                        .object_by_id(ObjectId::new(id).unwrap_or_default())
-                        .is_none()
-                    {
-                        *next_id = id;
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    panic!("No available ObjectId: all IDs from 1 to u16::MAX are taken.");
-                }
-                break;
-            }
-        }
-
-        let allocated_id = ObjectId::new(*next_id).unwrap_or_default();
-        *next_id = next_id.saturating_add(1);
-        allocated_id
+        let occupied = |id| {
+            self.pool.object_by_id(ObjectId::new(id).unwrap()).is_some()
+                || self
+                    .components
+                    .instances
+                    .iter()
+                    .any(|i| i.compiled_ids.values().any(|v| *v == id))
+        };
+        let start = (*self.next_available_id.borrow()).max(1);
+        let id = (start..u16::MAX)
+            .find(|id| !occupied(*id))
+            .or_else(|| crate::operations::operation::first_available_object_id(occupied))
+            .expect("No available VT object IDs");
+        self.next_available_id.replace(id.saturating_add(1));
+        ObjectId::new(id).unwrap()
     }
 
     /// Update the next available ID cache based on the current pool
@@ -214,6 +320,7 @@ impl EditorProject {
             pool: self.pool.clone(),
             object_names,
             mask_size: self.mask_size,
+            components: self.components.clone(),
         }
     }
 
@@ -456,8 +563,7 @@ impl EditorProject {
             Ok(_) => true,
             Err(error) => {
                 log::error!("Failed to execute UI operation: {error:?}");
-                self.last_operation_error
-                    .replace(Some(error.to_string()));
+                self.last_operation_error.replace(Some(error.to_string()));
                 false
             }
         }
@@ -477,9 +583,26 @@ impl EditorProject {
                 }
             }
             self.selected_object = mut_selected;
+            self.sync_component_selection();
             return true;
         }
         false
+    }
+
+    fn sync_component_selection(&self) {
+        let map = source_map(&self.components);
+        self.component_selection
+            .set(
+                self.selected_object
+                    .0
+                    .and_then(|id| match map.by_object_id.get(&id.value()) {
+                        Some(MaterializedSource::ComponentNode {
+                            instance_id,
+                            node_id,
+                        }) => Some((*instance_id, *node_id)),
+                        _ => None,
+                    }),
+            );
     }
 
     /// Set the selected object to the previous object in the history
@@ -489,6 +612,7 @@ impl EditorProject {
             // Both need to be replaced here because otherwise it will be added to the undo history
             self.selected_object = selected.clone();
             self.pending_selected_object.set(selected);
+            self.sync_component_selection();
         }
     }
 
@@ -499,6 +623,7 @@ impl EditorProject {
             // Both need to be replaced here because otherwise the redo history will be cleared
             self.selected_object = selected.clone();
             self.pending_selected_object.set(selected);
+            self.sync_component_selection();
         }
     }
 
@@ -667,7 +792,14 @@ impl EditorProject {
             self.selected_object.0
         };
 
-        let project = ProjectFile::new(&self.pool, &object_info, self.mask_size, self.vt_version, selected);
+        let mut project = ProjectFile::new(
+            &self.pool,
+            &object_info,
+            self.mask_size,
+            self.vt_version,
+            selected,
+        );
+        project.components = self.components.clone();
         project.to_bytes()
     }
 
@@ -715,6 +847,9 @@ impl EditorProject {
             }
         }
 
+        editor_project.components = project.components.clone();
+        materialize_project(&editor_project).map_err(|e| e.to_string())?;
+        editor_project.sync_component_selection();
         editor_project.mark_saved();
 
         Ok(editor_project)
@@ -736,9 +871,15 @@ impl EditorProject {
         &mut self,
         transaction: OperationTransaction,
     ) -> Result<AppliedTransaction, OperationError> {
-        let prepared = self.prepare_transaction(&transaction)
+        let prepared = self
+            .prepare_transaction(&transaction)
             .map_err(|diagnostics| diagnostics.legacy_operation_error())?;
-        let PreparedTransaction { pool: modified_pool, object_info: modified_object_info, applied, .. } = prepared;
+        let PreparedTransaction {
+            pool: modified_pool,
+            object_info: modified_object_info,
+            applied,
+            ..
+        } = prepared;
 
         // Replace pool and metadata with results
         self.pool = modified_pool;
@@ -752,6 +893,8 @@ impl EditorProject {
 
         // Record in history (this is a user action)
         self.operation_history.borrow_mut().push(applied.clone());
+        self.component_history
+            .retain(|id, _| self.operation_history.borrow().contains(id));
 
         // Mark dirty and refresh state
         self.refresh_dirty();
@@ -765,12 +908,52 @@ impl EditorProject {
         &self,
         transaction: &OperationTransaction,
     ) -> Result<PreparedTransaction, TransactionDiagnostics> {
-        OperationExecutor::new().prepare_transaction(
+        let mut transaction = transaction.clone();
+        let mut reserved: std::collections::BTreeSet<u16> = self
+            .pool
+            .objects()
+            .iter()
+            .map(|o| o.id().value())
+            .chain(
+                self.components
+                    .instances
+                    .iter()
+                    .flat_map(|i| i.compiled_ids.values().copied()),
+            )
+            .collect();
+        for operation in &mut transaction.operations {
+            if let Operation::CreateObject { object_id, .. } = operation {
+                if object_id.is_none() {
+                    *object_id = crate::operations::operation::first_available_object_id(|id| {
+                        reserved.contains(&id)
+                    });
+                    if object_id.is_none() {
+                        return Err(component_transaction_error(ComponentError::new(
+                            "COMPONENT_COMPILED_ID_COLLISION",
+                            "VT ID space exhausted",
+                        )));
+                    }
+                }
+                reserved.insert(object_id.unwrap());
+            }
+        }
+        let prepared = OperationExecutor::new().prepare_transaction(
             &self.pool,
             &self.object_info.borrow(),
-            transaction,
-            &ValidationContext { vt_version: self.vt_version, mask_size: self.mask_size },
+            &transaction,
+            &ValidationContext {
+                vt_version: self.vt_version,
+                mask_size: self.mask_size,
+            },
+        )?;
+        materialize_source(
+            &prepared.pool,
+            &self.components,
+            self.vt_version,
+            &prepared.object_info,
         )
+        .map_err(component_transaction_error)?;
+        Ok(prepared)
     }
 
     /// Validation is deliberately preparation with its candidate discarded.
@@ -788,6 +971,15 @@ impl EditorProject {
         let mut history = self.operation_history.borrow_mut();
 
         if let Some(applied_tx) = history.undo() {
+            if let Some((before, _)) = self
+                .component_history
+                .get(&applied_tx.transaction_id)
+                .cloned()
+            {
+                drop(history);
+                self.restore_component_checkpoint(before);
+                return true;
+            }
             let inverse_tx = applied_tx.create_inverse();
 
             // Apply inverse operations directly without creating new history entry
@@ -828,6 +1020,15 @@ impl EditorProject {
         let mut history = self.operation_history.borrow_mut();
 
         if let Some(applied_tx) = history.redo() {
+            if let Some((_, after)) = self
+                .component_history
+                .get(&applied_tx.transaction_id)
+                .cloned()
+            {
+                drop(history);
+                self.restore_component_checkpoint(after);
+                return true;
+            }
             let mut pool = self.pool.clone();
             let mut object_info = self.object_info.borrow().clone();
             let mut context = crate::operations::OperationContext::default();
@@ -875,7 +1076,12 @@ impl EditorProject {
     pub fn ai_design_state(&self) -> AiDesignState {
         AiDesignState {
             revision: self.revision(),
-            pool: self.pool.clone(),
+            canonical_pool: Some(self.pool.clone()),
+            components: self.components.clone(),
+            pool: self
+                .materialize()
+                .expect("Committed source must materialize")
+                .pool,
             object_info: self.object_info.borrow().clone(),
             vt_version: self.vt_version,
             mask_size: self.mask_size,
@@ -894,23 +1100,51 @@ impl EditorProject {
         &mut self,
         proposal: AiProposal,
     ) -> Result<AppliedTransaction, TransactionDiagnostics> {
-        let prepared = if proposal.base_revision == self.revision() {
-            proposal.prepared
-        } else {
-            self.prepare_transaction(&proposal.transaction)?
-        };
-        let PreparedTransaction { pool, object_info, applied, .. } = prepared;
+        if !proposal.component_intents.is_empty() {
+            ComponentService::apply_intents(self, &proposal.component_intents)
+                .map_err(component_transaction_error)?;
+            return Ok(self
+                .operation_history
+                .borrow()
+                .latest()
+                .expect("Component action recorded")
+                .clone());
+        }
+        let prepared = self.prepare_transaction(&proposal.transaction)?;
+        let PreparedTransaction {
+            pool,
+            object_info,
+            applied,
+            ..
+        } = prepared;
         self.pool = pool;
         self.object_info.replace(object_info);
-        self.mut_object_info.replace(self.object_info.borrow().clone());
+        self.mut_object_info
+            .replace(self.object_info.borrow().clone());
         self.update_next_available_id();
         self.default_object_names.borrow_mut().clear();
         self.remap_selection_for_operations(&applied.forward_operations);
         self.operation_history.borrow_mut().push(applied.clone());
+        self.component_history
+            .retain(|id, _| self.operation_history.borrow().contains(id));
         self.refresh_dirty();
         self.bump_revision();
         Ok(applied)
     }
+}
+
+pub(crate) fn component_transaction_error(error: ComponentError) -> TransactionDiagnostics {
+    TransactionDiagnostics(vec![crate::TransactionDiagnostic {
+        severity: crate::DiagnosticSeverity::Error,
+        code: error.code.clone(),
+        message: error.to_string(),
+        operation_index: None,
+        operation_type: None,
+        object_id: error.object_id,
+        object_name: None,
+        property: error.property,
+        related_objects: vec![],
+    }])
 }
 
 #[cfg(test)]

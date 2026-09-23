@@ -11,16 +11,16 @@ use ag_iso_stack::object_pool::NullableObjectId;
 use ag_iso_stack::object_pool::ObjectId;
 use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectType;
+#[cfg(not(target_arch = "wasm32"))]
+use ag_iso_terminal_designer::ai::providers::openai::OpenAiProvider;
+#[cfg(not(target_arch = "wasm32"))]
+use ag_iso_terminal_designer::ai::ui::{AiAssistantState, AiRequestState, AiWorkerEvent};
+#[cfg(not(target_arch = "wasm32"))]
+use ag_iso_terminal_designer::ai::{AiContent, AiMessage, AiRole};
 use ag_iso_terminal_designer::render_property_editor;
 use ag_iso_terminal_designer::InteractiveMaskRenderer;
 use ag_iso_terminal_designer::RenderableObject;
 use ag_iso_terminal_designer::{EditorProject, Operation};
-#[cfg(not(target_arch = "wasm32"))]
-use ag_iso_terminal_designer::ai::{AiContent, AiMessage, AiRole};
-#[cfg(not(target_arch = "wasm32"))]
-use ag_iso_terminal_designer::ai::ui::{AiAssistantState, AiRequestState, AiWorkerEvent};
-#[cfg(not(target_arch = "wasm32"))]
-use ag_iso_terminal_designer::ai::providers::openai::OpenAiProvider;
 #[cfg(not(target_arch = "wasm32"))]
 use app_persistence::RecentProject;
 use app_persistence::{AppPersistence, RecoveryRecord};
@@ -264,42 +264,98 @@ impl DesignerApp {
     #[cfg(not(target_arch = "wasm32"))]
     fn poll_ai(&mut self, ctx: &egui::Context) {
         if matches!(self.ai_state.request_state, AiRequestState::Running { .. })
-            && self.ai_state.request_revision != self.project.as_ref().map(|p|p.revision()) {
-            self.ai_state.conversation.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            && self.ai_state.request_revision != self.project.as_ref().map(|p| p.revision())
+        {
+            self.ai_state
+                .conversation
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.ai_state.request_state = AiRequestState::Idle;
             self.ai_state.last_error = Some("Project changed during inspection. Send the request again to inspect the current revision.".into());
         }
         for event in self.ai_channel.1.try_iter() {
-            let current = match &self.ai_state.request_state { AiRequestState::Running { request_id } => request_id.clone(), _ => continue };
+            let current = match &self.ai_state.request_state {
+                AiRequestState::Running { request_id } => request_id.clone(),
+                _ => continue,
+            };
             match event {
-                AiWorkerEvent::Finished { request_id, conversation, proposal } if request_id == current => {
+                AiWorkerEvent::Finished {
+                    request_id,
+                    conversation,
+                    proposal,
+                } if request_id == current => {
                     self.ai_state.conversation = conversation;
                     self.ai_state.active_proposal = proposal;
-                    self.ai_state.request_state = if self.ai_state.active_proposal.is_some() { AiRequestState::ProposalReady } else { AiRequestState::Idle };
+                    self.ai_state.request_state = if self.ai_state.active_proposal.is_some() {
+                        AiRequestState::ProposalReady
+                    } else {
+                        AiRequestState::Idle
+                    };
                     self.ai_state.last_error = None;
                     ctx.request_repaint();
                 }
-                AiWorkerEvent::Failed { request_id, error, conversation } if request_id == current => { self.ai_state.conversation=conversation; self.ai_state.request_state=AiRequestState::Error; self.ai_state.last_error=Some(error); ctx.request_repaint(); }
+                AiWorkerEvent::Failed {
+                    request_id,
+                    error,
+                    conversation,
+                } if request_id == current => {
+                    self.ai_state.conversation = conversation;
+                    self.ai_state.request_state = AiRequestState::Error;
+                    self.ai_state.last_error = Some(error);
+                    ctx.request_repaint();
+                }
                 _ => {}
             }
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
     fn send_ai(&mut self, ctx: &egui::Context) {
-        let Some(project) = self.project.as_ref() else { self.ai_state.last_error=Some("Open or create a project before using the assistant.".into()); self.ai_state.request_state=AiRequestState::Error; return; };
-        if self.ai_input.trim().is_empty() { return; }
+        let Some(project) = self.project.as_ref() else {
+            self.ai_state.last_error =
+                Some("Open or create a project before using the assistant.".into());
+            self.ai_state.request_state = AiRequestState::Error;
+            return;
+        };
+        if self.ai_input.trim().is_empty() {
+            return;
+        }
         let request_id = uuid::Uuid::new_v4().to_string();
-        self.ai_state.conversation.push(AiMessage::text(AiRole::User, std::mem::take(&mut self.ai_input)));
+        self.ai_state.conversation.push(AiMessage::text(
+            AiRole::User,
+            std::mem::take(&mut self.ai_input),
+        ));
         self.ai_state.active_proposal = None;
         self.ai_state.last_error = None;
-        self.ai_state.request_state = AiRequestState::Running { request_id: request_id.clone() };
+        self.ai_state.request_state = AiRequestState::Running {
+            request_id: request_id.clone(),
+        };
         self.ai_state.request_revision = Some(project.revision());
         self.ai_state.conversation.cancelled = Default::default();
         let settings = self.ai_state.settings.clone();
-        let state=project.ai_design_state(); let conversation=self.ai_state.conversation.clone(); let sender=self.ai_channel.0.clone(); let repaint=ctx.clone();
+        let state = project.ai_design_state();
+        let conversation = self.ai_state.conversation.clone();
+        let sender = self.ai_channel.0.clone();
+        let repaint = ctx.clone();
         std::thread::spawn(move || match OpenAiProvider::from_environment() {
-            Ok(provider) => { ag_iso_terminal_designer::ai::ui::run_request(&provider, state, conversation, settings, request_id, sender); repaint.request_repaint(); }
-            Err(error) => { let _=sender.send(AiWorkerEvent::Failed { request_id, error:error.to_string(), conversation }); repaint.request_repaint(); }
+            Ok(provider) => {
+                ag_iso_terminal_designer::ai::ui::run_request(
+                    &provider,
+                    state,
+                    conversation,
+                    settings,
+                    request_id,
+                    sender,
+                );
+                repaint.request_repaint();
+            }
+            Err(error) => {
+                let _ = sender.send(AiWorkerEvent::Failed {
+                    request_id,
+                    error: error.to_string(),
+                    conversation,
+                });
+                repaint.request_repaint();
+            }
         });
     }
     /// Open a file dialog
@@ -417,122 +473,123 @@ impl DesignerApp {
                             if let Some(Object::PictureGraphic(o)) =
                                 pool.get_pool().object_by_id(id)
                             {
-                                        if let Ok(img) = image::load_from_memory(&content) {
-                                            // Update dimensions based on the new picture
-                                            let w = img.width();
-                                            let h = img.height();
+                                if let Ok(img) = image::load_from_memory(&content) {
+                                    // Update dimensions based on the new picture
+                                    let w = img.width();
+                                    let h = img.height();
 
-                                            if w > u16::MAX as u32 || h > u16::MAX as u32 {
-                                                log::error!(
-                                                    "Image dimensions exceed maximum size of {}x{}",
-                                                    u16::MAX,
-                                                    u16::MAX
-                                                );
-                                                self.error_message = Some(format!(
-                                                    "Image dimensions exceed the maximum of {}×{}",
-                                                    u16::MAX,
-                                                    u16::MAX
-                                                ));
-                                                continue;
-                                            }
+                                    if w > u16::MAX as u32 || h > u16::MAX as u32 {
+                                        log::error!(
+                                            "Image dimensions exceed maximum size of {}x{}",
+                                            u16::MAX,
+                                            u16::MAX
+                                        );
+                                        self.error_message = Some(format!(
+                                            "Image dimensions exceed the maximum of {}×{}",
+                                            u16::MAX,
+                                            u16::MAX
+                                        ));
+                                        continue;
+                                    }
 
-                                            let width = if o.width == 0 {
-                                                w as u16
-                                            } else {
-                                                o.width
-                                            };
-                                            let mut options = o.options.clone();
-                                            options.transparent = true;
+                                    let width = if o.width == 0 { w as u16 } else { o.width };
+                                    let mut options = o.options.clone();
+                                    options.transparent = true;
 
-                                            let rgba = if let Some(view) = img.as_rgba8() {
-                                                // Borrowed view (no allocation)
-                                                std::borrow::Cow::Borrowed(view)
-                                            } else {
-                                                // Allocates once if the image isn't already RGBA8
-                                                std::borrow::Cow::Owned(img.to_rgba8())
-                                            };
+                                    let rgba = if let Some(view) = img.as_rgba8() {
+                                        // Borrowed view (no allocation)
+                                        std::borrow::Cow::Borrowed(view)
+                                    } else {
+                                        // Allocates once if the image isn't already RGBA8
+                                        std::borrow::Cow::Owned(img.to_rgba8())
+                                    };
 
-                                            // Build raw and run-length encoded data
-                                            let pixel_count = (w as usize) * (h as usize);
+                                    // Build raw and run-length encoded data
+                                    let pixel_count = (w as usize) * (h as usize);
 
-                                            // Worst case: raw = N, rle = 2*N
-                                            let mut raw = Vec::with_capacity(pixel_count);
-                                            let mut rle = Vec::with_capacity(pixel_count * 2);
+                                    // Worst case: raw = N, rle = 2*N
+                                    let mut raw = Vec::with_capacity(pixel_count);
+                                    let mut rle = Vec::with_capacity(pixel_count * 2);
 
-                                            let mut have_run = false;
-                                            let mut run_value: u8 = 0;
-                                            let mut run_count: u8 = 0;
+                                    let mut have_run = false;
+                                    let mut run_value: u8 = 0;
+                                    let mut run_count: u8 = 0;
 
-                                            for p in rgba.pixels() {
-                                                let idx = if p[3] == 0 {
-                                                    1
-                                                } else {
-                                                    find_closest_color_index(p[0], p[1], p[2])
-                                                };
+                                    for p in rgba.pixels() {
+                                        let idx = if p[3] == 0 {
+                                            1
+                                        } else {
+                                            find_closest_color_index(p[0], p[1], p[2])
+                                        };
 
-                                                raw.push(idx);
+                                        raw.push(idx);
 
-                                                if !have_run {
-                                                    have_run = true;
-                                                    run_value = idx;
-                                                    run_count = 1;
-                                                    continue;
-                                                }
+                                        if !have_run {
+                                            have_run = true;
+                                            run_value = idx;
+                                            run_count = 1;
+                                            continue;
+                                        }
 
-                                                if idx == run_value && run_count < u8::MAX {
-                                                    run_count += 1;
-                                                } else {
-                                                    rle.push(run_count);
-                                                    rle.push(run_value);
-                                                    run_value = idx;
-                                                    run_count = 1;
-                                                }
-                                            }
+                                        if idx == run_value && run_count < u8::MAX {
+                                            run_count += 1;
+                                        } else {
+                                            rle.push(run_count);
+                                            rle.push(run_value);
+                                            run_value = idx;
+                                            run_count = 1;
+                                        }
+                                    }
 
-                                            // flush final run
-                                            if have_run {
-                                                rle.push(run_count);
-                                                rle.push(run_value);
-                                            }
+                                    // flush final run
+                                    if have_run {
+                                        rle.push(run_count);
+                                        rle.push(run_value);
+                                    }
 
-                                            // Choose the best encoding
-                                            if rle.len() < raw.len() {
-                                                options.data_code_type = DataCodeType::RunLength;
-                                                log::info!(
+                                    // Choose the best encoding
+                                    if rle.len() < raw.len() {
+                                        options.data_code_type = DataCodeType::RunLength;
+                                        log::info!(
                                             "Selected run-length encoding ({} bytes) over raw ({} bytes)",
                                             rle.len(),
                                             raw.len()
                                         );
-                                            } else {
-                                                options.data_code_type = DataCodeType::Raw;
-                                                log::info!(
+                                    } else {
+                                        options.data_code_type = DataCodeType::Raw;
+                                        log::info!(
                                             "Selected raw encoding ({} bytes) over run-length ({} bytes)",
                                             raw.len(),
                                             rle.len()
                                         );
-                                            }
+                                    }
 
-                                            let data = if rle.len() < raw.len() { rle } else { raw };
-                                            for (property, value) in [
-                                                ("actual_width", serde_json::json!(w)),
-                                                ("actual_height", serde_json::json!(h)),
-                                                ("width", serde_json::json!(width)),
-                                                ("format", serde_json::to_value(PictureGraphicFormat::EightBit).unwrap()),
-                                                ("transparency_colour", serde_json::json!(1)),
-                                                ("options", serde_json::to_value(options).unwrap()),
-                                                ("data", serde_json::json!(data)),
-                                            ] {
-                                                pool.queue_operation(Operation::SetProperty {
-                                                    object: ag_iso_terminal_designer::ObjectTarget::id(id.value()),
-                                                    property: property.to_owned(),
-                                                    value,
-                                                });
-                                            }
-                                        } else {
-                                            self.error_message = Some(
-                                                "Failed to decode the selected image".to_owned(),
-                                            );
-                                        }
+                                    let data = if rle.len() < raw.len() { rle } else { raw };
+                                    for (property, value) in [
+                                        ("actual_width", serde_json::json!(w)),
+                                        ("actual_height", serde_json::json!(h)),
+                                        ("width", serde_json::json!(width)),
+                                        (
+                                            "format",
+                                            serde_json::to_value(PictureGraphicFormat::EightBit)
+                                                .unwrap(),
+                                        ),
+                                        ("transparency_colour", serde_json::json!(1)),
+                                        ("options", serde_json::to_value(options).unwrap()),
+                                        ("data", serde_json::json!(data)),
+                                    ] {
+                                        pool.queue_operation(Operation::SetProperty {
+                                            object: ag_iso_terminal_designer::ObjectTarget::id(
+                                                id.value(),
+                                            ),
+                                            property: property.to_owned(),
+                                            value,
+                                        });
+                                    }
+                                } else {
+                                    self.error_message =
+                                        Some("Failed to decode the selected image".to_owned());
+                                }
                             }
                         }
                     }
@@ -593,7 +650,13 @@ impl DesignerApp {
             let task = rfd::AsyncFileDialog::new()
                 .set_file_name("object_pool.iop")
                 .save_file();
-            let contents = pool.get_pool().as_iop();
+            let contents = match pool.export_iop() {
+                Ok(contents) => contents,
+                Err(error) => {
+                    self.error_message = Some(error.to_string());
+                    return;
+                }
+            };
             execute(async move {
                 let file = task.await;
                 if let Some(file) = file {
@@ -719,7 +782,10 @@ impl DesignerApp {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     self.project_path = None;
-                    self.ai_state.conversation.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.ai_state
+                        .conversation
+                        .cancelled
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     self.ai_state.request_state = AiRequestState::Idle;
                     self.ai_state.active_proposal = None;
                     self.ai_state.request_revision = None;
@@ -1031,7 +1097,18 @@ fn render_object_hierarchy(
     project: &EditorProject,
 ) {
     let refs = object.referenced_objects();
-    if refs.is_empty() {
+    let instances: Vec<_> = project
+        .component_source()
+        .instances
+        .iter()
+        .filter(|i| {
+            i.parent
+                == ag_iso_terminal_designer::components::EditorParentRef::Primitive(
+                    object.id().value(),
+                )
+        })
+        .collect();
+    if refs.is_empty() && instances.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(ui.spacing().indent);
             render_selectable_object(ui, object, project);
@@ -1043,6 +1120,29 @@ fn render_object_hierarchy(
                 render_selectable_object(ui, object, project);
             })
             .body(|ui| {
+                for instance in &instances {
+                    let definition =
+                        &project.component_source().definitions[&instance.component_id];
+                    egui::CollapsingHeader::new(&definition.name)
+                        .id_salt(instance.id)
+                        .show(ui, |ui| {
+                            for node in &definition.nodes {
+                                let id = instance.compiled_ids[&node.id];
+                                if ui
+                                    .selectable_label(
+                                        project
+                                            .get_selected()
+                                            .0
+                                            .is_some_and(|selected| selected.value() == id),
+                                        &node.name,
+                                    )
+                                    .clicked()
+                                {
+                                    project.get_mut_selected().set(NullableObjectId::new(id));
+                                }
+                            }
+                        });
+                }
                 for (idx, obj_id) in refs.iter().enumerate() {
                     match project.get_pool().object_by_id(*obj_id) {
                         Some(obj) => {
@@ -1419,43 +1519,203 @@ impl eframe::App for DesignerApp {
                 .default_width(360.0)
                 .default_height(360.0)
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
-                        for message in &self.ai_state.conversation.messages {
-                            let prefix = match message.role { AiRole::User => "You", AiRole::Assistant => "Assistant", AiRole::Tool => "Tool" };
-                            for content in &message.content { match content { AiContent::Text(text) => { ui.label(format!("{prefix}: {text}")); }, AiContent::ToolCall(call) => { ui.label(format!("Assistant called {}", call.name)); }, AiContent::ToolResult(_) => {}, AiContent::Image(_) => { ui.label("Assistant reviewed a staged preview"); } } }
-                        }
-                    });
-                    if ui.add_enabled(!matches!(self.ai_state.request_state, AiRequestState::Running { .. }), egui::Button::new("Clear conversation")).clicked() {
+                    egui::ScrollArea::vertical()
+                        .max_height(190.0)
+                        .show(ui, |ui| {
+                            for message in &self.ai_state.conversation.messages {
+                                let prefix = match message.role {
+                                    AiRole::User => "You",
+                                    AiRole::Assistant => "Assistant",
+                                    AiRole::Tool => "Tool",
+                                };
+                                for content in &message.content {
+                                    match content {
+                                        AiContent::Text(text) => {
+                                            ui.label(format!("{prefix}: {text}"));
+                                        }
+                                        AiContent::ToolCall(call) => {
+                                            ui.label(format!("Assistant called {}", call.name));
+                                        }
+                                        AiContent::ToolResult(_) => {}
+                                        AiContent::Image(_) => {
+                                            ui.label("Assistant reviewed a staged preview");
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    if ui
+                        .add_enabled(
+                            !matches!(self.ai_state.request_state, AiRequestState::Running { .. }),
+                            egui::Button::new("Clear conversation"),
+                        )
+                        .clicked()
+                    {
                         self.ai_state.conversation = Default::default();
                     }
-                    ag_iso_terminal_designer::ai::debug_trace::debug_ui(ui, &self.ai_state.conversation.debug.lock().unwrap(), &mut self.ai_state.settings);
-                    if let Some(error) = &self.ai_state.last_error { ui.colored_label(egui::Color32::RED, error); }
+                    ag_iso_terminal_designer::ai::debug_trace::debug_ui(
+                        ui,
+                        &self.ai_state.conversation.debug.lock().unwrap(),
+                        &mut self.ai_state.settings,
+                    );
+                    if let Some(error) = &self.ai_state.last_error {
+                        ui.colored_label(egui::Color32::RED, error);
+                    }
                     match &self.ai_state.request_state {
-                        AiRequestState::Running { .. } => { ui.label("Working…"); if ui.button("Cancel").clicked() { cancel=true; } }
-                        _ => { ui.label("User input:"); ui.add(egui::TextEdit::multiline(&mut self.ai_input).desired_rows(3)); if ui.add_enabled(self.project.is_some(), egui::Button::new("Send")).clicked() { send=true; } }
+                        AiRequestState::Running { .. } => {
+                            ui.label("Working…");
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        }
+                        _ => {
+                            ui.label("User input:");
+                            ui.add(egui::TextEdit::multiline(&mut self.ai_input).desired_rows(3));
+                            if ui
+                                .add_enabled(self.project.is_some(), egui::Button::new("Send"))
+                                .clicked()
+                            {
+                                send = true;
+                            }
+                        }
                     }
                     if let Some(proposal) = &self.ai_state.active_proposal {
                         ui.separator();
                         ui.label("Proposed change:");
-                        ui.label(proposal.transaction.description.as_deref().unwrap_or("Untitled change"));
-                        ui.label(format!("{} operations, {} affected objects", proposal.summary.operation_count, proposal.summary.affected_objects.len()));
+                        ui.label(
+                            proposal
+                                .transaction
+                                .description
+                                .as_deref()
+                                .unwrap_or("Untitled change"),
+                        );
+                        if proposal.component_intents.is_empty() {
+                            ui.label(format!(
+                                "{} operations, {} affected objects",
+                                proposal.summary.operation_count,
+                                proposal.summary.affected_objects.len()
+                            ));
+                        } else {
+                            ui.label(format!(
+                                "{} component actions",
+                                proposal.component_intents.len()
+                            ));
+                        }
+                        for action in &proposal.component_intents {
+                            use ag_iso_terminal_designer::components::ComponentIntent;
+                            match action {
+                                ComponentIntent::InstantiateComponent {
+                                    component_id,
+                                    x,
+                                    y,
+                                    overrides,
+                                    ..
+                                } => {
+                                    let definition = &proposal.components.definitions[component_id];
+                                    ui.label(format!("Add {} at ({x}, {y})", definition.name));
+                                    for (id, value) in overrides {
+                                        if let Some(parameter) =
+                                            definition.parameters.iter().find(|p| p.id == *id)
+                                        {
+                                            ui.label(format!("{}: {value}", parameter.name));
+                                        }
+                                    }
+                                }
+                                ComponentIntent::SetComponentOverride {
+                                    parameter, value, ..
+                                } => {
+                                    ui.label(format!(
+                                        "Set declared parameter {parameter}: {value}"
+                                    ));
+                                }
+                                ComponentIntent::ResetComponentOverride { parameter, .. } => {
+                                    ui.label(format!("Reset declared parameter {parameter}"));
+                                }
+                                ComponentIntent::SetComponentMasterProperty {
+                                    component_id,
+                                    property,
+                                    value,
+                                    ..
+                                } => {
+                                    ui.label(format!(
+                                        "All {} instances: {property} = {value}",
+                                        proposal.components.definitions[component_id].name
+                                    ));
+                                }
+                            }
+                        }
                         ui.label("Validation passed");
                         if let Some(project) = self.project.as_ref() {
                             let design = project.ai_design_state();
-                            if let Ok(preview) = ag_iso_terminal_designer::ai::render_proposal_preview(&design, proposal) {
-                                ui.label(format!("Proposed mask preview: {} × {}", preview.width, preview.height));
-                                if preview.diagnostics.is_empty() { ui.label("Design checks: no deterministic issues found"); }
-                                else { ui.label(format!("Design checks: {} issue(s)", preview.diagnostics.len())); for diagnostic in preview.diagnostics.iter().take(4) { ui.label(format!("{:?}: {}", diagnostic.severity, diagnostic.message)); } }
-                                let _ = ag_iso_terminal_designer::ai::render_preview_ui(ui, &design, proposal);
+                            if let Ok(preview) =
+                                ag_iso_terminal_designer::ai::render_proposal_preview(
+                                    &design, proposal,
+                                )
+                            {
+                                ui.label(format!(
+                                    "Proposed mask preview: {} × {}",
+                                    preview.width, preview.height
+                                ));
+                                if preview.diagnostics.is_empty() {
+                                    ui.label("Design checks: no deterministic issues found");
+                                } else {
+                                    ui.label(format!(
+                                        "Design checks: {} issue(s)",
+                                        preview.diagnostics.len()
+                                    ));
+                                    for diagnostic in preview.diagnostics.iter().take(4) {
+                                        ui.label(format!(
+                                            "{:?}: {}",
+                                            diagnostic.severity, diagnostic.message
+                                        ));
+                                    }
+                                }
+                                let _ = ag_iso_terminal_designer::ai::render_preview_ui(
+                                    ui, &design, proposal,
+                                );
                             }
                         }
-                        ui.horizontal(|ui| { if ui.button("Apply").clicked() { apply=true; } if ui.button("Reject").clicked() { reject=true; } });
+                        ui.horizontal(|ui| {
+                            if ui.button("Apply").clicked() {
+                                apply = true;
+                            }
+                            if ui.button("Reject").clicked() {
+                                reject = true;
+                            }
+                        });
                     }
                 });
-            if cancel { self.ai_state.request_state=AiRequestState::Idle; self.ai_state.last_error=Some("Assistant request cancelled.".into()); }
-            if send { self.send_ai(ctx); }
-            if reject { self.ai_state.active_proposal=None; self.ai_state.request_state=AiRequestState::Idle; }
-            if apply { if let (Some(project), Some(proposal)) = (&mut self.project, self.ai_state.active_proposal.take()) { match project.apply_ai_proposal(proposal) { Ok(_) => { self.ai_state.conversation.push(AiMessage::text(AiRole::Assistant, "The proposed change was applied. You can use Undo normally.")); self.ai_state.request_state=AiRequestState::Idle; }, Err(diagnostics) => { self.ai_state.last_error=Some(format!("Could not apply proposal: {diagnostics:?}")); self.ai_state.request_state=AiRequestState::Error; } } } }
+            if cancel {
+                self.ai_state.request_state = AiRequestState::Idle;
+                self.ai_state.last_error = Some("Assistant request cancelled.".into());
+            }
+            if send {
+                self.send_ai(ctx);
+            }
+            if reject {
+                self.ai_state.active_proposal = None;
+                self.ai_state.request_state = AiRequestState::Idle;
+            }
+            if apply {
+                if let (Some(project), Some(proposal)) =
+                    (&mut self.project, self.ai_state.active_proposal.take())
+                {
+                    match project.apply_ai_proposal(proposal) {
+                        Ok(_) => {
+                            self.ai_state.conversation.push(AiMessage::text(
+                                AiRole::Assistant,
+                                "The proposed change was applied. You can use Undo normally.",
+                            ));
+                            self.ai_state.request_state = AiRequestState::Idle;
+                        }
+                        Err(diagnostics) => {
+                            self.ai_state.last_error =
+                                Some(format!("Could not apply proposal: {diagnostics:?}"));
+                            self.ai_state.request_state = AiRequestState::Error;
+                        }
+                    }
+                }
+            }
         }
 
         // Show new object name dialog
@@ -1784,20 +2044,31 @@ impl eframe::App for DesignerApp {
                 });
             });
 
+            egui::SidePanel::left("components_panel")
+                .resizable(true)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ag_iso_terminal_designer::components::ui::show(ui, pool)
+                    });
+                });
+            let materialized = pool.materialize();
             // Main panel
             egui::CentralPanel::default().show(ctx, |ui| {
-                if pool
-                    .get_pool()
-                    .objects_by_type(ObjectType::DataMask)
-                    .is_empty()
-                {
+                let effective = match &materialized {
+                    Ok(m) => &m.pool,
+                    Err(error) => {
+                        ui.colored_label(egui::Color32::RED, error.to_string());
+                        return;
+                    }
+                };
+                if effective.objects_by_type(ObjectType::DataMask).is_empty() {
                     ui.colored_label(
                         egui::Color32::RED,
                         "Missing data masks, please load a pool file or add a new mask...",
                     );
                 } else {
-                    match pool.get_pool().working_set_object() {
-                        Some(mask) => match pool.get_pool().object_by_id(mask.active_mask) {
+                    match effective.working_set_object() {
+                        Some(mask) => match effective.object_by_id(mask.active_mask) {
                             Some(obj) => {
                                 let selected_ref = pool.get_mut_selected();
 
@@ -1806,7 +2077,7 @@ impl eframe::App for DesignerApp {
                                         [pool.mask_size as f32, pool.mask_size as f32],
                                         InteractiveMaskRenderer {
                                             object: obj,
-                                            pool: pool.get_pool(),
+                                            pool: effective,
                                             selected_callback: Box::new(move |object_id| {
                                                 selected_ref.set(NullableObjectId(Some(object_id)));
                                             }),
@@ -1833,7 +2104,20 @@ impl eframe::App for DesignerApp {
 
             // Parameters panel
             egui::SidePanel::right("right_panel").show(ctx, |ui: &mut egui::Ui| {
-                if let Some(id) = pool.get_selected().into() {
+                if let Some(
+                    ag_iso_terminal_designer::components::EditorSelection::ComponentNode {
+                        instance_id,
+                        node_id,
+                    },
+                ) = pool.editor_selection()
+                {
+                    ag_iso_terminal_designer::components::ui::inspector(
+                        ui,
+                        pool,
+                        instance_id,
+                        node_id,
+                    );
+                } else if let Some(id) = pool.get_selected().into() {
                     if let Some(original) = pool.get_pool().object_by_id(id) {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             // Display editable object name as header
@@ -1846,7 +2130,9 @@ impl eframe::App for DesignerApp {
 
                                 if response.changed() {
                                     pool.queue_operation(Operation::RenameObject {
-                                        object: ag_iso_terminal_designer::ObjectTarget::id(original.id().value()),
+                                        object: ag_iso_terminal_designer::ObjectTarget::id(
+                                            original.id().value(),
+                                        ),
                                         name,
                                     });
                                 }
@@ -1854,11 +2140,17 @@ impl eframe::App for DesignerApp {
                             ui.separator();
 
                             render_property_editor(ui, original, pool);
-                            let (width, height) = pool.get_pool().content_size(original);
+                            let effective = materialized
+                                .as_ref()
+                                .map(|m| &m.pool)
+                                .unwrap_or(pool.get_pool());
+                            let rendered =
+                                effective.object_by_id(original.id()).unwrap_or(original);
+                            let (width, height) = effective.content_size(rendered);
                             ui.separator();
                             let desired_size = egui::Vec2::new(width as f32, height as f32);
                             ui.allocate_ui(desired_size, |ui| {
-                                original.render(ui, pool.get_pool(), Point::default());
+                                rendered.render(ui, effective, Point::default());
                             });
                         });
                     } else {

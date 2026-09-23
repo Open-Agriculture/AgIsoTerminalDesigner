@@ -23,23 +23,46 @@ fn preparation_is_non_mutating_and_matches_execution() {
     let (pool, info) = named_pool();
     let before = pool.as_iop();
     let mut tx = OperationTransaction::new(Some("resize".into()));
-    tx.add_operation(Operation::SetProperty { object: ObjectTarget::Name { name: "Button".into() }, property: "width".into(), value: json!(123) });
+    tx.add_operation(Operation::SetProperty {
+        object: ObjectTarget::Name {
+            name: "Button".into(),
+        },
+        property: "width".into(),
+        value: json!(123),
+    });
     let executor = OperationExecutor::new();
-    let prepared = executor.prepare_transaction(&pool, &info, &tx, &ValidationContext::default()).unwrap();
+    let prepared = executor
+        .prepare_transaction(&pool, &info, &tx, &ValidationContext::default())
+        .unwrap();
     assert_eq!(pool.as_iop(), before);
     let (executed_pool, _, applied) = executor.execute(tx, &pool, &info).unwrap();
     assert_eq!(prepared.pool.as_iop(), executed_pool.as_iop());
-    assert_eq!(prepared.applied.forward_operations.len(), applied.forward_operations.len());
+    assert_eq!(
+        prepared.applied.forward_operations.len(),
+        applied.forward_operations.len()
+    );
 }
 
 #[test]
 fn diagnostics_are_indexed_and_validation_is_preparation() {
     let (pool, info) = named_pool();
     let mut tx = OperationTransaction::new(None);
-    tx.add_operation(Operation::SetProperty { object: ObjectTarget::id(10), property: "width".into(), value: json!(123) });
-    tx.add_operation(Operation::SetProperty { object: ObjectTarget::Name { name: "Missing".into() }, property: "width".into(), value: json!(123) });
+    tx.add_operation(Operation::SetProperty {
+        object: ObjectTarget::id(10),
+        property: "width".into(),
+        value: json!(123),
+    });
+    tx.add_operation(Operation::SetProperty {
+        object: ObjectTarget::Name {
+            name: "Missing".into(),
+        },
+        property: "width".into(),
+        value: json!(123),
+    });
     let executor = OperationExecutor::new();
-    let prepared = executor.prepare_transaction(&pool, &info, &tx, &ValidationContext::default()).unwrap_err();
+    let prepared = executor
+        .prepare_transaction(&pool, &info, &tx, &ValidationContext::default())
+        .unwrap_err();
     assert_eq!(prepared.0[0].operation_index, Some(1));
     assert_eq!(prepared.0[0].code, "OBJECT_NAME_NOT_FOUND");
 }

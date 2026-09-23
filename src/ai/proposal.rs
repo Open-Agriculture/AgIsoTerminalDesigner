@@ -1,14 +1,17 @@
 use super::snapshot::ObjectSummary;
 use super::{AiDesignState, ProjectRevision};
 use crate::operations::{
-    Operation, OperationExecutor, OperationTransaction, PreparedTransaction,
-    TransactionDiagnostics, ValidationContext,
+    Operation, OperationTransaction, PreparedTransaction, TransactionDiagnostics,
 };
 use ag_iso_stack::object_pool::ObjectId;
 use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct AiProposal {
     pub proposal_id: String,
+    pub canonical_pool: ag_iso_stack::object_pool::ObjectPool,
+    pub component_intents: Vec<crate::components::ComponentIntent>,
+    pub components: crate::components::ComponentSource,
+    pub source_map: crate::components::MaterializedSourceMap,
     pub base_revision: ProjectRevision,
     pub transaction: OperationTransaction,
     pub prepared: PreparedTransaction,
@@ -30,15 +33,17 @@ pub fn propose_transaction(
     state: &AiDesignState,
     transaction: OperationTransaction,
 ) -> Result<AiProposal, TransactionDiagnostics> {
-    let prepared = OperationExecutor::new().prepare_transaction(
-        &state.pool,
-        &state.object_info,
-        &transaction,
-        &ValidationContext {
-            vt_version: state.vt_version,
-            mask_size: state.mask_size,
-        },
-    )?;
+    let mut prepared =
+        crate::EditorProject::from_ai_source(state).prepare_transaction(&transaction)?;
+    let canonical_pool = prepared.pool.clone();
+    let materialized = crate::components::materialize_source(
+        &canonical_pool,
+        &state.components,
+        state.vt_version,
+        &prepared.object_info,
+    )
+    .map_err(crate::editor_project::component_transaction_error)?;
+    prepared.pool = materialized.pool;
     let mut summary = AiProposalSummary {
         operation_count: transaction.operations.len(),
         ..Default::default()
@@ -79,6 +84,10 @@ pub fn propose_transaction(
         .collect();
     Ok(AiProposal {
         proposal_id: Uuid::new_v4().to_string(),
+        canonical_pool,
+        component_intents: vec![],
+        components: state.components.clone(),
+        source_map: materialized.source_map,
         base_revision: state.revision,
         transaction,
         prepared,
@@ -95,7 +104,12 @@ pub fn propose_refinement(
     base: &AiProposal,
     correction: OperationTransaction,
 ) -> Result<AiProposal, TransactionDiagnostics> {
+    if !base.component_intents.is_empty() {
+        return Err(crate::editor_project::component_transaction_error(crate::components::ComponentError::new("COMPONENT_EDIT_POLICY", "Use component overrides to refine component proposals; apply before adding primitive edits")));
+    }
     let candidate = AiDesignState {
+        canonical_pool: Some(base.canonical_pool.clone()),
+        components: base.components.clone(),
         revision: state.revision,
         pool: base.prepared.pool.clone(),
         object_info: base.prepared.object_info.clone(),
@@ -122,4 +136,39 @@ pub fn propose_refinement(
     refined.refinement_round = base.refinement_round.saturating_add(1);
     let _ = corrected_candidate; // documents the staged validation boundary.
     Ok(refined)
+}
+
+/// Stage source commands through exactly the same service used by the editor.
+pub fn propose_component_intents(
+    state: &AiDesignState,
+    mut intents: Vec<crate::components::ComponentIntent>,
+) -> Result<AiProposal, TransactionDiagnostics> {
+    if intents.is_empty() || intents.len() > 256 {
+        return Err(crate::editor_project::component_transaction_error(
+            crate::components::ComponentError::new(
+                "COMPONENT_INTENT_INVALID",
+                "Provide 1..256 component commands",
+            ),
+        ));
+    }
+    for intent in &mut intents {
+        if let crate::components::ComponentIntent::InstantiateComponent { instance_id, .. } = intent
+        {
+            if instance_id.is_none() {
+                *instance_id = Some(Default::default());
+            }
+        }
+    }
+    let mut project = crate::EditorProject::from_ai_source(state);
+    crate::components::ComponentService::apply_intents(&mut project, &intents)
+        .map_err(crate::editor_project::component_transaction_error)?;
+    let candidate = project.ai_design_state();
+    let mut proposal = propose_transaction(
+        &candidate,
+        OperationTransaction::new(Some("Component actions".into())),
+    )?;
+    proposal.base_revision = state.revision;
+    proposal.summary.operation_count = intents.len();
+    proposal.component_intents = intents;
+    Ok(proposal)
 }

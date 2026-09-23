@@ -392,7 +392,8 @@ impl RenderableObject for InputBoolean {
         let rect = create_relative_rect(ui, position, egui::Vec2::new(side, side));
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let background_color = crate::effective_colour::colour(pool, self.background_colour).convert();
+            let background_color =
+                crate::effective_colour::colour(pool, self.background_colour).convert();
             ui.painter().rect_filled(rect, 0.0, background_color);
 
             // If the boolean is true, we display a checkmark in the center
@@ -466,7 +467,8 @@ impl RenderableObject for InputNumber {
             };
 
             // Get the background colour from the pool.
-            let background_colour = crate::effective_colour::colour(pool, self.background_colour).convert();
+            let background_colour =
+                crate::effective_colour::colour(pool, self.background_colour).convert();
             // Fill the background if the NumberOptions do not specify transparency.
             if !self.options.transparent {
                 ui.painter().rect_filled(rect, 0.0, background_colour);
@@ -528,7 +530,8 @@ impl RenderableObject for InputNumber {
                     let galley = fonts.layout_no_wrap(
                         zero_padded.clone(),
                         font_id.clone(),
-                        crate::effective_colour::colour(pool, font_attributes.font_colour).convert(),
+                        crate::effective_colour::colour(pool, font_attributes.font_colour)
+                            .convert(),
                     );
                     if galley.size().x >= rect.width() {
                         number_string = zero_padded;
@@ -540,7 +543,8 @@ impl RenderableObject for InputNumber {
             }
 
             // Get the font colour.
-            let font_colour = crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
+            let font_colour =
+                crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
 
             // Choose the font family and height according to the font size:
             let (font_family, font_height) = match font_attributes.font_size {
@@ -676,7 +680,8 @@ impl RenderableObject for OutputString {
                 return;
             }
         };
-        let background_colour = crate::effective_colour::colour(pool, self.background_colour).convert();
+        let background_colour =
+            crate::effective_colour::colour(pool, self.background_colour).convert();
 
         let transparent = self.options.transparent;
         let auto_wrap = self.options.auto_wrap;
@@ -737,7 +742,8 @@ impl RenderableObject for OutputString {
 
         let processed_text = lines.join("\n");
 
-        let font_colour = crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
+        let font_colour =
+            crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
         let fonts = ui.fonts(|fonts| fonts.clone());
         let font_height;
         let font_family;
@@ -851,8 +857,10 @@ impl RenderableObject for OutputNumber {
             };
 
             // 2. Convert the pool color indices to `egui::Color32`
-            let background_colour = crate::effective_colour::colour(pool, self.background_colour).convert();
-            let font_colour = crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
+            let background_colour =
+                crate::effective_colour::colour(pool, self.background_colour).convert();
+            let font_colour =
+                crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
 
             // 3. Determine if we need to fill the background or remain transparent
             if !self.options.transparent {
@@ -1050,7 +1058,8 @@ impl RenderableObject for OutputLine {
                 return;
             }
 
-            let colour = crate::effective_colour::colour(pool, line_attributes.line_colour).convert();
+            let colour =
+                crate::effective_colour::colour(pool, line_attributes.line_colour).convert();
             let stroke_width = line_attributes.line_width as f32;
             let stroke = egui::Stroke::new(stroke_width, colour);
             // TODO: implement line art
@@ -1206,7 +1215,8 @@ impl RenderableObject for OutputPolygon {
                     fill_polygon_even_odd(
                         ui.painter(),
                         &points,
-                        crate::effective_colour::colour(pool, fill_attributes.fill_colour).convert(),
+                        crate::effective_colour::colour(pool, fill_attributes.fill_colour)
+                            .convert(),
                         rect,
                     );
                     // TODO: implement fill type for infill
@@ -1288,7 +1298,11 @@ impl RenderableObject for PictureGraphic {
             .write()
             .hash(&mut hasher);
         // Palette/map edits must invalidate cached indexed picture textures too.
-        for index in 0..=255 { crate::effective_colour::colour(pool, index).as_rgba().hash(&mut hasher); }
+        for index in 0..=255 {
+            crate::effective_colour::colour(pool, index)
+                .as_rgba()
+                .hash(&mut hasher);
+        }
         let hash = hasher.finish();
 
         let changed: bool = ui.data_mut(|data| {
@@ -1320,13 +1334,19 @@ impl RenderableObject for PictureGraphic {
                 match self.format {
                     PictureGraphicFormat::Monochrome => {
                         for bit in 0..8 {
-                            colors.push(crate::effective_colour::colour(pool, (raw >> (7 - bit)) & 0x01).convert());
+                            colors.push(
+                                crate::effective_colour::colour(pool, (raw >> (7 - bit)) & 0x01)
+                                    .convert(),
+                            );
                         }
                     }
                     PictureGraphicFormat::FourBit => {
                         for segment in 0..2 {
                             let shift = 4 - (segment * 4);
-                            colors.push(crate::effective_colour::colour(pool, (raw >> shift) & 0x0F).convert());
+                            colors.push(
+                                crate::effective_colour::colour(pool, (raw >> shift) & 0x0F)
+                                    .convert(),
+                            );
                         }
                     }
                     PictureGraphicFormat::EightBit => {
@@ -1340,7 +1360,9 @@ impl RenderableObject for PictureGraphic {
                         break;
                     }
                     if !(self.options.transparent
-                        && color == crate::effective_colour::colour(pool, self.transparency_colour).convert())
+                        && color
+                            == crate::effective_colour::colour(pool, self.transparency_colour)
+                                .convert())
                     {
                         image.pixels[idx] = color;
                     }
@@ -1395,7 +1417,8 @@ impl RenderableObject for AuxiliaryFunctionType2 {
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             // Draw background colour
-            let background_colour = crate::effective_colour::colour(pool, self.background_colour).convert();
+            let background_colour =
+                crate::effective_colour::colour(pool, self.background_colour).convert();
             ui.painter().rect_filled(rect, 0.0, background_colour);
 
             // Render child objects (the function designator content)
@@ -1410,7 +1433,8 @@ impl RenderableObject for AuxiliaryInputType2 {
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             // Draw background colour
-            let background_colour = crate::effective_colour::colour(pool, self.background_colour).convert();
+            let background_colour =
+                crate::effective_colour::colour(pool, self.background_colour).convert();
             ui.painter().rect_filled(rect, 0.0, background_colour);
 
             // Render child objects (the input designator content)

@@ -15,8 +15,9 @@ mod smart_naming;
 
 // New operation system and AI integration
 pub mod ai;
-pub mod isobus_colour;
+pub mod components;
 pub mod effective_colour;
+pub mod isobus_colour;
 pub mod object_properties;
 pub mod operations;
 pub mod pool_validation;
@@ -29,15 +30,15 @@ pub use object_info::ObjectInfo;
 pub use object_rendering::RenderableObject;
 
 // Operation system exports
-pub use ai::{AiDesignState, AiProposal, ProjectRevision};
 pub use ai::snapshot::{DesignSnapshot, PoolSnapshot};
+pub use ai::{AiDesignState, AiProposal, ProjectRevision};
 pub use object_properties::{
     get_properties, PropertyAccess, PropertyAccessError, PropertyDescriptor, PropertyError,
     PropertySemantic,
 };
 pub use operations::{
-    AppliedTransaction, ChildPlacement, MacroReferenceTarget, ObjectTarget, ObjectTargetList,
-    DiagnosticSeverity, Operation, OperationError, OperationExecutor, OperationHistory,
+    AppliedTransaction, ChildPlacement, DiagnosticSeverity, MacroReferenceTarget, ObjectTarget,
+    ObjectTargetList, Operation, OperationError, OperationExecutor, OperationHistory,
     OperationTransaction, PreparedTransaction, TransactionDiagnostic, TransactionDiagnostics,
     ValidationContext, CURRENT_OPERATION_SCHEMA_VERSION,
 };

@@ -4,7 +4,9 @@
 use crate::object_info::ObjectInfo;
 use ag_iso_stack::object_pool::object::Object;
 use ag_iso_stack::object_pool::object_attributes::{MacroRef, ObjectLabel, Point};
-use ag_iso_stack::object_pool::{vt_version::VtVersion, NullableObjectId, ObjectId, ObjectPool, ObjectRef, ObjectType};
+use ag_iso_stack::object_pool::{
+    vt_version::VtVersion, NullableObjectId, ObjectId, ObjectPool, ObjectRef, ObjectType,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -366,6 +368,11 @@ fn target_list_from_resolved(objects: ObjectReferenceList) -> ObjectTargetList {
     }
 }
 
+/// Authoritative lowest-free allocator, shared with editor component reservations.
+pub fn first_available_object_id(mut occupied: impl FnMut(u16) -> bool) -> Option<u16> {
+    (1..u16::MAX).find(|id| !occupied(*id))
+}
+
 impl Operation {
     /// Apply this operation to working pool and metadata
     /// Returns the inverse operation
@@ -387,14 +394,15 @@ impl Operation {
                 let target_id = if let Some(id) = object_id {
                     ObjectId::new(*id).map_err(|_| OperationError::ObjectNotFound(*id))?
                 } else {
-                    (1..u16::MAX)
-                        .filter_map(|value| ObjectId::new(value).ok())
-                        .find(|id| pool.object_by_id(*id).is_none())
-                        .ok_or(OperationError::PropertyError {
-                            object_id: 0,
-                            property: "CreateObject".to_string(),
-                            reason: "No object IDs are available".to_string(),
-                        })?
+                    first_available_object_id(|value| {
+                        pool.object_by_id(ObjectId::new(value).unwrap()).is_some()
+                    })
+                    .and_then(|value| ObjectId::new(value).ok())
+                    .ok_or(OperationError::PropertyError {
+                        object_id: 0,
+                        property: "CreateObject".to_string(),
+                        reason: "No object IDs are available".to_string(),
+                    })?
                 };
 
                 if pool.object_by_id(target_id).is_some() {
@@ -944,7 +952,10 @@ impl Operation {
                         }
                     })?;
                     crate::pool_validation::validate_parent_child_relationship_for_version(
-                        pool, parent_id, child_id, context.vt_version,
+                        pool,
+                        parent_id,
+                        child_id,
+                        context.vt_version,
                     )
                     .map_err(|diag| OperationError::InvalidReference {
                         parent_type: format!("{}: {}", object_id, diag.message),

@@ -238,7 +238,9 @@ impl AiProvider for OpenAiProvider {
                 }
                 let response = parse_response(value.clone())?;
                 if let Some(round) = request.conversation.debug.lock().unwrap().rounds.last_mut() {
-                    round.prompt_cache_diagnostics = value.get("prompt_cache_diagnostics").cloned()
+                    round.prompt_cache_diagnostics = value
+                        .get("prompt_cache_diagnostics")
+                        .cloned()
                         .or_else(|| value["usage"].get("prompt_cache_diagnostics").cloned());
                 }
                 continuation.accept(&request, &value);
