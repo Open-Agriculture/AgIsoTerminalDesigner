@@ -30,12 +30,14 @@ struct ProjectContentCheckpoint {
     object_names: Vec<(u16, String)>,
     mask_size: u16,
     components: ComponentSource,
+    graphics: crate::graphics::GraphicLibrary,
 }
 
 #[derive(Clone)]
 struct ComponentCheckpoint {
     pool: ObjectPool,
     source: ComponentSource,
+    graphics: crate::graphics::GraphicLibrary,
     info: HashMap<ObjectId, ObjectInfo>,
 }
 
@@ -43,6 +45,7 @@ struct ComponentCheckpoint {
 pub struct EditorProject {
     pool: ObjectPool,
     components: ComponentSource,
+    graphics: crate::graphics::GraphicLibrary,
     component_history: HashMap<String, (ComponentCheckpoint, ComponentCheckpoint)>,
     selected_object: NullableObjectId,
     component_selection: Cell<Option<(ComponentInstanceId, ComponentNodeId)>>,
@@ -68,6 +71,13 @@ pub struct EditorProject {
 
     /// Request to open image file dialog for PictureGraphic object
     image_load_request: RefCell<Option<ObjectId>>,
+    graphic_options_request: RefCell<Option<(u16, bool, u8, bool)>>,
+    graphic_format_request: RefCell<
+        Option<(
+            u16,
+            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat,
+        )>,
+    >,
     /// A hierarchy context-menu delete, consumed by the app after draft edits
     /// from the same frame have been committed.
     delete_request: RefCell<Option<ObjectId>>,
@@ -102,6 +112,7 @@ impl From<ObjectPool> for EditorProject {
         let project = EditorProject {
             pool,
             components: Default::default(),
+            graphics: Default::default(),
             component_history: Default::default(),
             selected_object: NullableObjectId::default(),
             component_selection: Cell::new(None),
@@ -117,6 +128,8 @@ impl From<ObjectPool> for EditorProject {
             next_available_id: RefCell::new(max_id.saturating_add(1)),
             default_object_names: RefCell::new(HashMap::new()),
             image_load_request: RefCell::new(None),
+            graphic_options_request: RefCell::new(None),
+            graphic_format_request: RefCell::new(None),
             delete_request: RefCell::new(None),
             rename_request: RefCell::new(None),
             queued_operations: RefCell::new(Vec::new()),
@@ -135,11 +148,15 @@ impl EditorProject {
     pub(crate) fn from_ai_source(state: &AiDesignState) -> Self {
         let mut project = Self::from(state.canonical_pool.as_ref().unwrap_or(&state.pool).clone());
         project.components = state.components.clone();
+        project.graphics = state.graphics.clone();
         project.vt_version = state.vt_version;
         project.mask_size = state.mask_size;
         project.object_info.replace(state.object_info.clone());
         project.mut_object_info.replace(state.object_info.clone());
         project
+    }
+    pub fn graphic_library(&self) -> &crate::graphics::GraphicLibrary {
+        &self.graphics
     }
     pub fn component_source(&self) -> &ComponentSource {
         &self.components
@@ -178,12 +195,14 @@ impl EditorProject {
         ComponentCheckpoint {
             pool: self.pool.clone(),
             source: self.components.clone(),
+            graphics: self.graphics.clone(),
             info: self.object_info.borrow().clone(),
         }
     }
     fn restore_component_checkpoint(&mut self, state: ComponentCheckpoint) {
         self.pool = state.pool;
         self.components = state.source;
+        self.graphics = state.graphics;
         if let Some((instance, node)) = self.component_selection.get() {
             if !self
                 .components
@@ -215,11 +234,28 @@ impl EditorProject {
         description: &str,
         edit: impl FnOnce(&mut ObjectPool, &mut ComponentSource) -> ComponentResult<()>,
     ) -> ComponentResult<()> {
+        self.edit_source(description, |pool, source, _| edit(pool, source))
+    }
+    pub(crate) fn edit_source(
+        &mut self,
+        description: &str,
+        edit: impl FnOnce(
+            &mut ObjectPool,
+            &mut ComponentSource,
+            &mut crate::graphics::GraphicLibrary,
+        ) -> ComponentResult<()>,
+    ) -> ComponentResult<()> {
         let before = self.component_checkpoint();
         let mut after = before.clone();
-        edit(&mut after.pool, &mut after.source)?;
+        edit(&mut after.pool, &mut after.source, &mut after.graphics)?;
         prepare_compiled_ids(&after.pool, &mut after.source)?;
-        materialize_source(&after.pool, &after.source, self.vt_version, &after.info)?;
+        materialize_source_with_graphics(
+            &after.pool,
+            &after.source,
+            self.vt_version,
+            &after.info,
+            &after.graphics,
+        )?;
         after
             .info
             .retain(|id, _| after.pool.object_by_id(*id).is_some());
@@ -321,6 +357,7 @@ impl EditorProject {
             object_names,
             mask_size: self.mask_size,
             components: self.components.clone(),
+            graphics: self.graphics.clone(),
         }
     }
 
@@ -800,6 +837,7 @@ impl EditorProject {
             selected,
         );
         project.components = self.components.clone();
+        project.graphics = self.graphics.clone();
         project.to_bytes()
     }
 
@@ -848,11 +886,35 @@ impl EditorProject {
         }
 
         editor_project.components = project.components.clone();
+        editor_project.graphics = project.graphics.clone();
         materialize_project(&editor_project).map_err(|e| e.to_string())?;
         editor_project.sync_component_selection();
         editor_project.mark_saved();
 
         Ok(editor_project)
+    }
+
+    pub fn request_graphic_options(&self, id: u16, transparent: bool, colour: u8, flashing: bool) {
+        self.graphic_options_request
+            .replace(Some((id, transparent, colour, flashing)));
+    }
+    pub fn take_graphic_options_request(&self) -> Option<(u16, bool, u8, bool)> {
+        self.graphic_options_request.take()
+    }
+    pub fn request_graphic_format(
+        &self,
+        id: u16,
+        format: ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat,
+    ) {
+        self.graphic_format_request.replace(Some((id, format)));
+    }
+    pub fn take_graphic_format_request(
+        &self,
+    ) -> Option<(
+        u16,
+        ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat,
+    )> {
+        self.graphic_format_request.take()
     }
 
     /// Request to open image file dialog for a PictureGraphic object
@@ -946,11 +1008,12 @@ impl EditorProject {
                 mask_size: self.mask_size,
             },
         )?;
-        materialize_source(
+        materialize_source_with_graphics(
             &prepared.pool,
             &self.components,
             self.vt_version,
             &prepared.object_info,
+            &self.graphics,
         )
         .map_err(component_transaction_error)?;
         Ok(prepared)
@@ -1078,6 +1141,7 @@ impl EditorProject {
             revision: self.revision(),
             canonical_pool: Some(self.pool.clone()),
             components: self.components.clone(),
+            graphics: self.graphics.clone(),
             pool: self
                 .materialize()
                 .expect("Committed source must materialize")
@@ -1100,6 +1164,12 @@ impl EditorProject {
         &mut self,
         proposal: AiProposal,
     ) -> Result<AppliedTransaction, TransactionDiagnostics> {
+        if proposal.base_revision != self.revision() {
+            return Err(component_transaction_error(ComponentError::new(
+                "STALE_PROPOSAL",
+                "Project changed since this proposal was prepared",
+            )));
+        }
         if !proposal.component_intents.is_empty() {
             ComponentService::apply_intents(self, &proposal.component_intents)
                 .map_err(component_transaction_error)?;

@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiDomainTool {
     ListComponents,
+    ListGraphicAssets,
     GetComponent,
     ProposeComponentActions,
     GetDesignContext,
@@ -120,9 +121,10 @@ impl GetObjectSchemaRequest {
 /// Provider-facing definitions for precisely the four Phase 3 domain tools.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
+        function("list_graphic_assets", "List project graphics without image bytes. Available assets can be assigned once. Assigned assets must be reused through their existing PictureGraphic object reference or child link; never assign them again.", json!({"type":"object","properties":{"query":{"type":"string"},"status":{"type":"string","enum":["available","assigned","all"]},"limit":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
         function("list_components", "List project-local reusable components and their explicitly authored parameters. Prefer a suitable component to primitive construction.", json!({"type":"object","properties":{"query":{"type":"string"},"category":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
         function("get_component", "Read compact component metadata and declared parameters. Include nodes only for an explicitly requested master edit affecting all instances.", json!({"type":"object","properties":{"component_id":{"type":"string"},"include_nodes":{"type":"boolean"}},"required":["component_id"],"additionalProperties":false})),
-        function("propose_component_actions", "Stage an atomic batch of component source commands. Use declared parameters only. SetComponentMasterProperty requires explicit user intent affecting all instances and scope AllInstances. No primitive schemas are needed.", json!({"type":"object","properties":{"actions":{"type":"array","minItems":1,"maxItems":256,"items":{"type":"object","properties":{"type":{"type":"string","enum":["InstantiateComponent","SetComponentOverride","ResetComponentOverride","SetComponentMasterProperty"]},"component_id":{"type":"string"},"parent":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"overrides":{"type":"object"},"instance_id":{"type":"string"},"parameter":{"type":"string"},"node_id":{"type":"string"},"property":{"type":"string"},"scope":{"type":"string","enum":["AllInstances"]},"value":{}},"required":["type"]}}},"required":["actions"]})),
+        function("propose_component_actions", "Stage an atomic batch of component source commands. Use declared parameters only. SetComponentMasterProperty requires explicit user intent affecting all instances and scope AllInstances. No primitive schemas are needed.", json!({"type":"object","properties":{"actions":{"type":"array","minItems":1,"maxItems":256,"items":{"type":"object","properties":{"type":{"type":"string","enum":["InstantiateComponent","SetComponentOverride","ResetComponentOverride","SetComponentMasterProperty","AssignGraphicAsset","RemoveGraphicAssignment"]},"object_id":{"type":"integer"},"asset_id":{"type":"string"},"component_id":{"type":"string"},"parent":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"overrides":{"type":"object"},"instance_id":{"type":"string"},"parameter":{"type":"string"},"node_id":{"type":"string"},"property":{"type":"string"},"scope":{"type":"string","enum":["AllInstances"]},"value":{}},"required":["type"]}}},"required":["actions"]})),
         function("resolve_colours", "Resolve up to 16 semantic names, RGB requests, or explicit indices against the effective rendering palette.", json!({"type":"object","properties":{"queries":{"type":"array","minItems":1,"maxItems":16,"items":super::visual_intent::colour_schema()}},"required":["queries"],"additionalProperties":false})),
         function("get_design_context", "Forward layout overview, depth 1 by default: direct children with geometry first. Drill into root_id for relevant subtrees; page with layout_offset only when needed. Objects contain only summaries first needed on that layout page. EntirePool pages objects with offset. Coordinates are parent-relative; path identifies occurrences. Properties opt-in.", json!({"type":"object","properties":{"scope":{"type":"string","enum":["ActiveMask","Selection","EntirePool"]},"include_selection":{"type":"boolean"},"offset":{"type":"integer","minimum":0},"layout_offset":{"type":"integer","minimum":0},"root_id":{"type":"integer","minimum":0,"maximum":65534},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"depth":{"type":"integer","minimum":0,"maximum":8},"max_objects":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false})),
         function("get_objects", "Batch relevant IDs (up to 20), requesting only required sections. Parents are reverse references and may be large: leave include_parents false unless reverse usage is needed; shared variables/styles may have many parents. Parents page independently with parent_offset/parent_limit (default 8, max 20). include_nearby_style returns up to 8 descendant style examples with resolved styles; page with detail_offset. Children/macros page with detail_offset/detail_limit. Long properties page with property_offset/property_limit.", json!({"type":"object","properties":{"ids":{"type":"array","maxItems":20,"items":{"type":"integer","minimum":0,"maximum":65534}},"include_properties":{"type":"boolean"},"include_references":{"type":"boolean"},"include_children":{"type":"boolean"},"include_parents":{"type":"boolean","default":false},"parent_offset":{"type":"integer","minimum":0},"parent_limit":{"type":"integer","minimum":1,"maximum":20},"include_nearby_style":{"type":"boolean"},"include_macros":{"type":"boolean"},"detail_offset":{"type":"integer","minimum":0},"detail_limit":{"type":"integer","minimum":1,"maximum":100},"property_offset":{"type":"integer","minimum":0},"property_limit":{"type":"integer","minimum":1,"maximum":4096}},"required":["ids"],"additionalProperties":false})),
@@ -757,6 +759,12 @@ pub fn parse_component_actions(
         .as_array_mut()
         .ok_or("Expected component actions array")?;
     for action in actions {
+        if matches!(
+            action["type"].as_str(),
+            Some("AssignGraphicAsset" | "RemoveGraphicAssignment")
+        ) {
+            continue;
+        }
         if let Some(id) = action["parent"]["id"].as_u64() {
             action["parent"] = json!(id);
         }

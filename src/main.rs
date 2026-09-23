@@ -6,7 +6,7 @@
 mod app_persistence;
 
 use ag_iso_stack::object_pool::object::*;
-use ag_iso_stack::object_pool::object_attributes::{DataCodeType, PictureGraphicFormat, Point};
+use ag_iso_stack::object_pool::object_attributes::Point;
 use ag_iso_stack::object_pool::NullableObjectId;
 use ag_iso_stack::object_pool::ObjectId;
 use ag_iso_stack::object_pool::ObjectPool;
@@ -473,122 +473,18 @@ impl DesignerApp {
                             if let Some(Object::PictureGraphic(o)) =
                                 pool.get_pool().object_by_id(id)
                             {
-                                if let Ok(img) = image::load_from_memory(&content) {
-                                    // Update dimensions based on the new picture
-                                    let w = img.width();
-                                    let h = img.height();
-
-                                    if w > u16::MAX as u32 || h > u16::MAX as u32 {
-                                        log::error!(
-                                            "Image dimensions exceed maximum size of {}x{}",
-                                            u16::MAX,
-                                            u16::MAX
-                                        );
-                                        self.error_message = Some(format!(
-                                            "Image dimensions exceed the maximum of {}×{}",
-                                            u16::MAX,
-                                            u16::MAX
-                                        ));
-                                        continue;
-                                    }
-
-                                    let width = if o.width == 0 { w as u16 } else { o.width };
-                                    let mut options = o.options.clone();
-                                    options.transparent = true;
-
-                                    let rgba = if let Some(view) = img.as_rgba8() {
-                                        // Borrowed view (no allocation)
-                                        std::borrow::Cow::Borrowed(view)
-                                    } else {
-                                        // Allocates once if the image isn't already RGBA8
-                                        std::borrow::Cow::Owned(img.to_rgba8())
-                                    };
-
-                                    // Build raw and run-length encoded data
-                                    let pixel_count = (w as usize) * (h as usize);
-
-                                    // Worst case: raw = N, rle = 2*N
-                                    let mut raw = Vec::with_capacity(pixel_count);
-                                    let mut rle = Vec::with_capacity(pixel_count * 2);
-
-                                    let mut have_run = false;
-                                    let mut run_value: u8 = 0;
-                                    let mut run_count: u8 = 0;
-
-                                    for p in rgba.pixels() {
-                                        let idx = if p[3] == 0 {
-                                            1
-                                        } else {
-                                            find_closest_color_index(p[0], p[1], p[2])
-                                        };
-
-                                        raw.push(idx);
-
-                                        if !have_run {
-                                            have_run = true;
-                                            run_value = idx;
-                                            run_count = 1;
-                                            continue;
-                                        }
-
-                                        if idx == run_value && run_count < u8::MAX {
-                                            run_count += 1;
-                                        } else {
-                                            rle.push(run_count);
-                                            rle.push(run_value);
-                                            run_value = idx;
-                                            run_count = 1;
+                                let mut picture = o.clone();
+                                match ag_iso_terminal_designer::graphics::apply_image_bytes_to_picture_graphic(&mut picture, &content) {
+                                    Ok(()) => {
+                                        let value = serde_json::to_value(&picture).unwrap();
+                                        for property in ["actual_width", "actual_height", "width", "format", "transparency_colour", "options", "data"] {
+                                            pool.queue_operation(Operation::SetProperty {
+                                                object: ag_iso_terminal_designer::ObjectTarget::id(id.value()),
+                                                property: property.into(), value: value[property].clone(),
+                                            });
                                         }
                                     }
-
-                                    // flush final run
-                                    if have_run {
-                                        rle.push(run_count);
-                                        rle.push(run_value);
-                                    }
-
-                                    // Choose the best encoding
-                                    if rle.len() < raw.len() {
-                                        options.data_code_type = DataCodeType::RunLength;
-                                        log::info!(
-                                            "Selected run-length encoding ({} bytes) over raw ({} bytes)",
-                                            rle.len(),
-                                            raw.len()
-                                        );
-                                    } else {
-                                        options.data_code_type = DataCodeType::Raw;
-                                        log::info!(
-                                            "Selected raw encoding ({} bytes) over run-length ({} bytes)",
-                                            raw.len(),
-                                            rle.len()
-                                        );
-                                    }
-
-                                    let data = if rle.len() < raw.len() { rle } else { raw };
-                                    for (property, value) in [
-                                        ("actual_width", serde_json::json!(w)),
-                                        ("actual_height", serde_json::json!(h)),
-                                        ("width", serde_json::json!(width)),
-                                        (
-                                            "format",
-                                            serde_json::to_value(PictureGraphicFormat::EightBit)
-                                                .unwrap(),
-                                        ),
-                                        ("transparency_colour", serde_json::json!(1)),
-                                        ("options", serde_json::to_value(options).unwrap()),
-                                        ("data", serde_json::json!(data)),
-                                    ] {
-                                        pool.queue_operation(Operation::SetProperty {
-                                            object: ag_iso_terminal_designer::ObjectTarget::id(
-                                                id.value(),
-                                            ),
-                                            property: property.to_owned(),
-                                            value,
-                                        });
-                                    }
-                                } else {
-                                    self.error_message =
-                                        Some("Failed to decode the selected image".to_owned());
+                                    Err(e) => self.error_message = Some(e),
                                 }
                             }
                         }
@@ -1476,6 +1372,32 @@ impl eframe::App for DesignerApp {
             return;
         }
 
+        if let Some(project) = &mut self.project {
+            if let Some((id, transparent, colour, flashing)) =
+                project.take_graphic_options_request()
+            {
+                if let Err(e) =
+                    ag_iso_terminal_designer::graphics::integration::GraphicService::set_options(
+                        project,
+                        id,
+                        transparent,
+                        colour,
+                        flashing,
+                    )
+                {
+                    self.error_message = Some(e.to_string());
+                }
+            }
+            if let Some((id, format)) = project.take_graphic_format_request() {
+                if let Err(e) =
+                    ag_iso_terminal_designer::graphics::integration::GraphicService::set_format(
+                        project, id, format,
+                    )
+                {
+                    self.error_message = Some(e.to_string());
+                }
+            }
+        }
         // Check for image load requests
         if let Some(pool) = &self.project {
             if let Some(object_id) = pool.take_image_load_request() {
@@ -1604,6 +1526,19 @@ impl eframe::App for DesignerApp {
                         for action in &proposal.component_intents {
                             use ag_iso_terminal_designer::components::ComponentIntent;
                             match action {
+                                ComponentIntent::AssignGraphicAsset {
+                                    object_id,
+                                    asset_id,
+                                } => {
+                                    ui.label(format!(
+                                        "Assign graphic {asset_id} to PictureGraphic {object_id}"
+                                    ));
+                                }
+                                ComponentIntent::RemoveGraphicAssignment { object_id } => {
+                                    ui.label(format!(
+                                        "Remove graphic assignment from PictureGraphic {object_id}"
+                                    ));
+                                }
                                 ComponentIntent::InstantiateComponent {
                                     component_id,
                                     x,
@@ -2048,6 +1983,8 @@ impl eframe::App for DesignerApp {
                 .resizable(true)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
+                        ag_iso_terminal_designer::graphics::ui::show(ui, pool);
+                        ui.separator();
                         ag_iso_terminal_designer::components::ui::show(ui, pool)
                     });
                 });
@@ -2283,20 +2220,6 @@ fn main() {
             }
         }
     });
-}
-
-/// Find the closest color index in the palette for a given RGB value
-fn find_closest_color_index(r: u8, g: u8, b: u8) -> u8 {
-    fn quantize_channel(c: u8) -> u8 {
-        // ((c + 25) / 51) in integer math, capped to 0..5
-        let v = (c as u16 + 25) / 51;
-        v.min(5) as u8
-    }
-    let rq = quantize_channel(r);
-    let gq = quantize_channel(g);
-    let bq = quantize_channel(b);
-
-    16 + 36 * rq + 6 * gq + bq
 }
 
 #[cfg(not(target_arch = "wasm32"))]

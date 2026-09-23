@@ -10,6 +10,7 @@ fn state() -> AiDesignState {
     let mut s = AiDesignState {
         canonical_pool: None,
         components: Default::default(),
+        graphics: Default::default(),
         revision: 1,
         pool: Default::default(),
         object_info: Default::default(),

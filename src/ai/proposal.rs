@@ -11,6 +11,7 @@ pub struct AiProposal {
     pub canonical_pool: ag_iso_stack::object_pool::ObjectPool,
     pub component_intents: Vec<crate::components::ComponentIntent>,
     pub components: crate::components::ComponentSource,
+    pub graphics: crate::graphics::GraphicLibrary,
     pub source_map: crate::components::MaterializedSourceMap,
     pub base_revision: ProjectRevision,
     pub transaction: OperationTransaction,
@@ -36,11 +37,12 @@ pub fn propose_transaction(
     let mut prepared =
         crate::EditorProject::from_ai_source(state).prepare_transaction(&transaction)?;
     let canonical_pool = prepared.pool.clone();
-    let materialized = crate::components::materialize_source(
+    let materialized = crate::components::materialize_source_with_graphics(
         &canonical_pool,
         &state.components,
         state.vt_version,
         &prepared.object_info,
+        &state.graphics,
     )
     .map_err(crate::editor_project::component_transaction_error)?;
     prepared.pool = materialized.pool;
@@ -87,6 +89,7 @@ pub fn propose_transaction(
         canonical_pool,
         component_intents: vec![],
         components: state.components.clone(),
+        graphics: state.graphics.clone(),
         source_map: materialized.source_map,
         base_revision: state.revision,
         transaction,
@@ -110,6 +113,7 @@ pub fn propose_refinement(
     let candidate = AiDesignState {
         canonical_pool: Some(base.canonical_pool.clone()),
         components: base.components.clone(),
+        graphics: base.graphics.clone(),
         revision: state.revision,
         pool: base.prepared.pool.clone(),
         object_info: base.prepared.object_info.clone(),

@@ -772,6 +772,19 @@ fn execute_tool(
 ) -> (Value, Option<AiProposal>, bool) {
     let parse = |error: String| (json!({"success":false,"error":error}), None, false);
     match call.name.as_str() {
+        "list_graphic_assets" => {
+            let source = proposal.map(|p| &p.components).unwrap_or(&state.components);
+            match crate::graphics::integration::catalog(
+                source,
+                proposal.map(|p| &p.graphics).unwrap_or(&state.graphics),
+                call.arguments["query"].as_str().unwrap_or(""),
+                call.arguments["status"].as_str().unwrap_or("all"),
+                call.arguments["limit"].as_u64().unwrap_or(20).min(50) as usize,
+            ) {
+                Ok(catalog) => (json!({"success":true,"graphics":catalog}), None, false),
+                Err(e) => (json!({"success":false,"diagnostic":e}), None, false),
+            }
+        }
         "list_components" => {
             let query = call.arguments["query"]
                 .as_str()
@@ -1084,6 +1097,7 @@ mod tests {
             let mut state = AiDesignState {
                 canonical_pool: None,
                 components: Default::default(),
+                graphics: Default::default(),
                 revision: 1,
                 pool: Default::default(),
                 object_info: Default::default(),
@@ -1159,6 +1173,7 @@ mod tests {
         let state = AiDesignState {
             canonical_pool: None,
             components: Default::default(),
+            graphics: Default::default(),
             revision: 0,
             pool: Default::default(),
             object_info: Default::default(),
@@ -1221,6 +1236,7 @@ mod tests {
             let mut state = AiDesignState {
                 canonical_pool: None,
                 components: Default::default(),
+                graphics: Default::default(),
                 revision: 0,
                 pool: Default::default(),
                 object_info: Default::default(),

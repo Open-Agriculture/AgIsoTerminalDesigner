@@ -166,7 +166,7 @@ fn capture_dialog(ctx: &egui::Context, project: &mut EditorProject) {
             "Parameters: {} (explicitly authored)",
             plan.definition.parameters.len()
         ));
-        manual_parameter_form(ui, &mut plan.definition);
+        manual_parameter_form(ui, &mut plan.definition, project);
         for (_, property, target) in &plan.external_references {
             ui.label(format!(
                 "External reference: {property} → ordinary object {target}"
@@ -258,6 +258,17 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                 }
                                 for (property, reference) in &mut node.references {
                                     ui.label(format!("Reference: {property}"));
+                                    let accepts_picture = crate::object_properties::get_property_descriptors(node.object_type).iter().any(|d| d.name == property && matches!(&d.semantic, crate::PropertySemantic::ObjectReference { allowed_types, .. } if allowed_types.contains(&ag_iso_stack::object_pool::ObjectType::PictureGraphic)));
+                                    if accepts_picture {
+                                        egui::ComboBox::from_id_salt((node.id, property, "reuse_graphic")).selected_text("Use existing PictureGraphic").show_ui(ui, |ui| {
+                                            for asset in project.graphic_library().assets.values() {
+                                                if let Ok(target) = crate::graphics::integration::GraphicService::reuse_target(project, asset.id) {
+                                                    if ui.selectable_label(false, &asset.name).clicked() { *reference = ComponentReference::ExternalObject(target); }
+                                                }
+                                            }
+                                        });
+                                    }
+
                                     let mut value = serde_json::to_value(&*reference).unwrap();
                                     value_editor(ui, node.id, property, &mut value);
                                     if let Ok(updated) = serde_json::from_value(value) {
@@ -374,12 +385,20 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                     }
                                 });
                                 ui.label("Default");
-                                value_editor(
-                                    ui,
-                                    parameter.target_node,
-                                    &format!("default_{}", parameter.id),
-                                    &mut parameter.default_value,
-                                );
+                                if parameter.kind == ComponentParameterKind::Graphic {
+                                    crate::graphics::ui::select(
+                                        ui,
+                                        project,
+                                        &mut parameter.default_value,
+                                    );
+                                } else {
+                                    value_editor(
+                                        ui,
+                                        parameter.target_node,
+                                        &format!("default_{}", parameter.id),
+                                        &mut parameter.default_value,
+                                    );
+                                }
                                 let mut description =
                                     parameter.description.clone().unwrap_or_default();
                                 if ui.text_edit_singleline(&mut description).changed() {
@@ -390,7 +409,7 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                         if let Some(id) = remove_parameter {
                             definition.parameters.retain(|p| p.id != id);
                         }
-                        manual_parameter_form(ui, &mut definition);
+                        manual_parameter_form(ui, &mut definition, project);
                     });
                 draft = serde_json::to_string_pretty(&definition).unwrap();
             }
@@ -459,7 +478,11 @@ fn value_editor(
         ui.data_mut(|d| d.insert_temp(key, text));
     }
 }
-fn manual_parameter_form(ui: &mut egui::Ui, definition: &mut ComponentDefinition) {
+fn manual_parameter_form(
+    ui: &mut egui::Ui,
+    definition: &mut ComponentDefinition,
+    project: &EditorProject,
+) {
     ui.collapsing("Add Parameter", |ui| {
         let key = ui.id().with("parameter_draft");
         let mut draft = ui.data_mut(|d| {
@@ -517,12 +540,29 @@ fn manual_parameter_form(ui: &mut egui::Ui, definition: &mut ComponentDefinition
                         ComponentParameterKind::ObjectReference,
                         ComponentParameterKind::Colour,
                         ComponentParameterKind::Enum,
+                        ComponentParameterKind::Graphic,
                     ] {
                         ui.selectable_value(&mut draft.3, kind, format!("{kind:?}"));
                     }
                 });
+            let graphic_key = key.with("graphic_default");
+            let mut graphic = ui.data_mut(|d| {
+                d.get_temp::<serde_json::Value>(graphic_key)
+                    .unwrap_or_default()
+            });
+            if draft.3 == ComponentParameterKind::Graphic {
+                draft.2 = "graphic".into();
+                if draft.0.is_empty() {
+                    draft.0 = "Icon".into();
+                }
+                ui.label("Target must be a PictureGraphic node");
+                crate::graphics::ui::select(ui, project, &mut graphic);
+                ui.data_mut(|d| d.insert_temp(graphic_key, graphic.clone()));
+            }
             if ui.button("Add declared parameter").clicked() {
-                let value = if draft.3 == ComponentParameterKind::ObjectReference {
+                let value = if draft.3 == ComponentParameterKind::Graphic {
+                    graphic
+                } else if draft.3 == ComponentParameterKind::ObjectReference {
                     match node.references.get(&draft.2) {
                         Some(ComponentReference::ExternalObject(target)) => {
                             serde_json::to_value(target).unwrap()
@@ -619,7 +659,13 @@ pub fn inspector(
                 }
             })
         });
-        ui.text_edit_singleline(&mut draft);
+        if parameter.kind == ComponentParameterKind::Graphic {
+            let mut value = serde_json::from_str(&draft).unwrap_or_default();
+            crate::graphics::ui::select(ui, project, &mut value);
+            draft = value.to_string();
+        } else {
+            ui.text_edit_singleline(&mut draft);
+        }
         ui.data_mut(|d| d.insert_temp(key, draft.clone()));
         ui.horizontal(|ui| {
             if ui.button("Set override").clicked() {

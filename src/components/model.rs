@@ -76,6 +76,7 @@ pub enum ComponentParameterKind {
     ObjectReference,
     Colour,
     Enum,
+    Graphic,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComponentParameter {

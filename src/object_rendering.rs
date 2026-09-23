@@ -1384,7 +1384,7 @@ impl RenderableObject for PictureGraphic {
             );
             texture_id = Some(new_texture.id());
             ui.data_mut(|data| {
-                println!("Saving texture - {:?}", self.id.value());
+                log::trace!("Saving texture - {:?}", self.id.value());
                 data.insert_temp(
                     format!("picturegraphic_{}_texture", self.id.value()).into(),
                     new_texture,

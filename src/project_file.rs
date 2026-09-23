@@ -19,6 +19,8 @@ pub struct ProjectFile {
 
     #[serde(default)]
     pub components: crate::components::ComponentSource,
+    #[serde(default)]
+    pub graphics: crate::graphics::GraphicLibrary,
 
     /// The object pool data as IOP bytes
     object_pool_data: Vec<u8>,
@@ -76,6 +78,7 @@ impl ProjectFile {
         ProjectFile {
             version: PROJECT_FILE_VERSION,
             components: Default::default(),
+            graphics: Default::default(),
             object_pool_data: pool.as_iop(),
             object_metadata,
             settings: ProjectSettings {

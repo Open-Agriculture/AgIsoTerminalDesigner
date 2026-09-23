@@ -58,11 +58,12 @@ pub fn prepare_compiled_ids(
 }
 
 pub fn materialize_project(project: &EditorProject) -> ComponentResult<MaterializedProject> {
-    materialize_source(
+    materialize_source_with_graphics(
         project.get_pool(),
         project.component_source(),
         project.vt_version,
         &project.component_object_info(),
+        project.graphic_library(),
     )
 }
 
@@ -71,6 +72,16 @@ pub fn materialize_source(
     source: &ComponentSource,
     version: VtVersion,
     info: &HashMap<ObjectId, crate::ObjectInfo>,
+) -> ComponentResult<MaterializedProject> {
+    materialize_source_with_graphics(canonical, source, version, info, &Default::default())
+}
+
+pub fn materialize_source_with_graphics(
+    canonical: &ObjectPool,
+    source: &ComponentSource,
+    version: VtVersion,
+    info: &HashMap<ObjectId, crate::ObjectInfo>,
+    graphics: &crate::graphics::GraphicLibrary,
 ) -> ComponentResult<MaterializedProject> {
     let mut result = MaterializedProject {
         pool: canonical.clone(),
@@ -285,6 +296,7 @@ pub fn materialize_source(
         )?;
         validate_pool(&pool, version, &MaterializedSourceMap::default(), source)?;
     }
+    crate::graphics::integration::apply(source, graphics, &mut result.pool)?;
     validate_pool(&result.pool, version, &result.source_map, source)?;
     Ok(result)
 }
@@ -438,6 +450,9 @@ fn compile_nodes(
                 .overrides
                 .get(&parameter.id)
                 .unwrap_or(&parameter.default_value);
+            if parameter.kind == ComponentParameterKind::Graphic {
+                continue;
+            }
             let op = if parameter.kind == ComponentParameterKind::ObjectReference {
                 Operation::SetObjectReference {
                     object: ObjectTarget::id(id),
@@ -589,6 +604,18 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
             .iter()
             .find(|n| n.id == p.target_node)
             .ok_or_else(|| invalid("Parameter node missing"))?;
+        if p.kind == ComponentParameterKind::Graphic {
+            if node.object_type != ag_iso_stack::object_pool::ObjectType::PictureGraphic
+                || p.property != "graphic"
+            {
+                return Err(ComponentError::new(
+                    "COMPONENT_PARAMETER_INVALID",
+                    "Graphic parameters must target a PictureGraphic node with property graphic",
+                ));
+            }
+            validate_value(p, &p.default_value)?;
+            continue;
+        }
         let descriptor = get_property_descriptors(node.object_type)
             .into_iter()
             .find(|d| d.name == p.property && d.writable)
@@ -609,6 +636,10 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
                     get_object_property(&crate::default_object(node.object_type), &p.property)
                         .map_err(|_| invalid("Unsupported property"))?;
                 match p.kind {
+                    ComponentParameterKind::Graphic => {
+                        serde_json::from_value::<crate::graphics::GraphicAssetId>(value.clone())
+                            .is_ok()
+                    }
                     ComponentParameterKind::Text => value.is_string(),
                     ComponentParameterKind::Number => value.is_number(),
                     ComponentParameterKind::Boolean => value.is_boolean(),
@@ -694,6 +725,9 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
 }
 fn validate_value(parameter: &ComponentParameter, value: &Value) -> ComponentResult<()> {
     let valid = match parameter.kind {
+        ComponentParameterKind::Graphic => {
+            serde_json::from_value::<crate::graphics::GraphicAssetId>(value.clone()).is_ok()
+        }
         ComponentParameterKind::Text => value.is_string(),
         ComponentParameterKind::Number => value.is_number(),
         ComponentParameterKind::Boolean => value.is_boolean(),

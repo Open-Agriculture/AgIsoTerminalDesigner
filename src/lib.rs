@@ -17,6 +17,7 @@ mod smart_naming;
 pub mod ai;
 pub mod components;
 pub mod effective_colour;
+pub mod graphics;
 pub mod isobus_colour;
 pub mod object_properties;
 pub mod operations;

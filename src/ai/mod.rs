@@ -27,6 +27,7 @@ pub struct AiDesignState {
     pub revision: ProjectRevision,
     pub canonical_pool: Option<ObjectPool>,
     pub components: crate::components::ComponentSource,
+    pub graphics: crate::graphics::GraphicLibrary,
     pub pool: ObjectPool,
     pub object_info: HashMap<ObjectId, ObjectInfo>,
     pub vt_version: VtVersion,
