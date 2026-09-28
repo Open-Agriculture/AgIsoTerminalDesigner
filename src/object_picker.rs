@@ -5,6 +5,8 @@ use ag_iso_stack::object_pool::{
 };
 use egui::{self, Rect, Vec2};
 
+pub mod impact;
+
 const ACTIVE: egui::Id = egui::Id::NULL;
 
 pub fn open(ctx: &egui::Context, id: egui::Id) {
@@ -81,11 +83,14 @@ pub fn window<T: Clone + Send + Sync + 'static>(
         let mut accept = false;
         let mut back = false;
         let modal = egui::Modal::new(id.with("confirm_selection")).show(ctx, |ui| {
-            ui.set_width(360.0);
+            ui.set_width((ctx.screen_rect().width() - 64.0).clamp(280.0, 740.0));
             ui.heading("Confirm selection");
             ui.label(title);
             ui.separator();
-            let valid = review(ui, &pending);
+            let valid = egui::ScrollArea::vertical()
+                .max_height((ctx.screen_rect().height() - 200.0).max(160.0))
+                .show(ui, |ui| review(ui, &pending))
+                .inner;
             ui.separator();
             ui.horizontal(|ui| {
                 accept = ui
@@ -316,6 +321,7 @@ pub fn object_window(
     selected: Option<ObjectId>,
     allow_none: bool,
     eligible: impl Fn(&Object) -> bool,
+    impact: impl FnOnce(&mut egui::Ui, NullableObjectId) -> bool,
 ) -> Option<NullableObjectId> {
     window(
         ctx,
@@ -339,7 +345,7 @@ pub fn object_window(
                     "This selection is no longer available here. Go back and choose another.",
                 );
             }
-            valid
+            valid && impact(ui, *choice)
         },
     )
 }
@@ -353,6 +359,7 @@ pub fn button(
     selected: Option<ObjectId>,
     allow_none: bool,
     eligible: impl Fn(&Object) -> bool,
+    impact: impl FnOnce(&mut egui::Ui, NullableObjectId) -> bool,
 ) -> Option<NullableObjectId> {
     let id = ui.make_persistent_id(salt);
     if ui.button(label).clicked() {
@@ -366,6 +373,7 @@ pub fn button(
         selected,
         allow_none,
         eligible,
+        impact,
     )
 }
 
@@ -565,6 +573,14 @@ mod tests {
         (choice, output)
     }
 
+    fn settled_confirmation(ctx: &egui::Context, id: egui::Id, valid: bool) -> egui::FullOutput {
+        let mut output = confirmation_frame(ctx, id, vec![], None, valid).1;
+        for _ in 0..3 {
+            output = confirmation_frame(ctx, id, vec![], None, valid).1;
+        }
+        output
+    }
+
     fn button_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
         output
             .shapes
@@ -621,7 +637,7 @@ mod tests {
             None
         );
         assert!(is_open(&ctx, id));
-        let (_, output) = confirmation_frame(&ctx, id, vec![], None, true);
+        let output = settled_confirmation(&ctx, id, true);
         let text = texts(&output.shapes);
         assert!(text.contains("Replace child of Container #10"));
         assert!(text.contains("Chosen: PictureGraphic #120"));
@@ -640,7 +656,7 @@ mod tests {
         open(&ctx, id);
         confirmation_frame(&ctx, id, vec![], Some(120), true);
         ctx.data_mut(|data| data.insert_temp(id.with("query"), "warning".to_owned()));
-        let (_, output) = confirmation_frame(&ctx, id, vec![], None, true);
+        let output = settled_confirmation(&ctx, id, true);
         assert_eq!(
             click_confirmation(&ctx, id, button_position(&output, "Back"), true),
             None
@@ -662,7 +678,7 @@ mod tests {
         let id = egui::Id::new("invalid_test");
         open(&ctx, id);
         confirmation_frame(&ctx, id, vec![], Some(120), true);
-        let (_, output) = confirmation_frame(&ctx, id, vec![], None, false);
+        let output = settled_confirmation(&ctx, id, false);
         assert_eq!(
             click_confirmation(&ctx, id, button_position(&output, "Confirm"), false),
             None

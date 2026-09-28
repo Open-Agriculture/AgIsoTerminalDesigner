@@ -141,10 +141,14 @@ pub fn available_button(
         |ui, asset| {
             ui.label(format!("Replace the image in {}. The chosen graphic will be removed from Available. This is undoable.", object_picker::object_label(project, Some(target))));
             review_asset(ui, project, *asset)
-                && project
-                    .get_pool()
-                    .object_by_id(target)
-                    .is_some_and(|object| object.object_type() == ObjectType::PictureGraphic)
+                && object_picker::impact::review_change(ui, project, |candidate| {
+                    GraphicService::convert_asset_into_picture_graphic(
+                        candidate,
+                        *asset,
+                        target.value(),
+                    )
+                    .map_err(|error| error.to_string())
+                })
         },
     )
 }
@@ -343,6 +347,10 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
                 None,
                 false,
                 |object| object.object_type() == ObjectType::PictureGraphic,
+                |ui, choice| object_picker::impact::review_change(ui, project, |candidate| {
+                    let target = choice.0.ok_or("Choose a PictureGraphic")?;
+                    GraphicService::convert_asset_into_picture_graphic(candidate, asset_id, target.value()).map_err(|error| error.to_string())
+                }),
             )
             .and_then(|id| id.0);
             if let Some(id) = selected {
@@ -384,7 +392,12 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
 }
 
 /// Shared picker for component references, retaining create-from-asset behavior.
-pub fn select(ui: &mut egui::Ui, project: &mut EditorProject, value: &mut serde_json::Value) {
+pub fn select(
+    ui: &mut egui::Ui,
+    project: &mut EditorProject,
+    value: &mut serde_json::Value,
+    preview_selection: impl Fn(&mut EditorProject, u16) -> Result<(), String>,
+) {
     #[derive(Clone)]
     enum Choice {
         Picture(ObjectId),
@@ -428,7 +441,7 @@ pub fn select(ui: &mut egui::Ui, project: &mut EditorProject, value: &mut serde_
                     value.as_u64().and_then(|id| ObjectId::new(id as u16).ok())
                 )
             ));
-            match choice {
+            let valid = match choice {
                 Choice::Picture(id) => {
                     ui.label("Use this PictureGraphic for the graphic value.");
                     object_picker::review_object(ui, project, NullableObjectId(Some(*id)))
@@ -437,7 +450,18 @@ pub fn select(ui: &mut egui::Ui, project: &mut EditorProject, value: &mut serde_
                     ui.label("Create a new PictureGraphic from this upload and use it for the graphic value. The upload will be removed from Available. Creation is undoable.");
                     review_asset(ui, project, *id)
                 }
-            }
+            };
+            valid
+                && object_picker::impact::review_change(ui, project, |candidate| {
+                    let id = match choice {
+                        Choice::Picture(id) => id.value(),
+                        Choice::Asset(asset) => {
+                            GraphicService::create_picture_graphic_from_asset(candidate, *asset)
+                                .map_err(|error| error.to_string())?
+                        }
+                    };
+                    preview_selection(candidate, id)
+                })
         },
     );
     match choice {

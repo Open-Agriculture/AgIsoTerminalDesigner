@@ -369,6 +369,7 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                             .map(|n| (n.id, n.name.clone()))
                             .collect();
                         let mut remove = None;
+                        let preview_definition_source = definition.clone();
                         for node in &mut definition.nodes {
                             egui::CollapsingHeader::new(format!(
                                 "{} ({:?})",
@@ -408,6 +409,13 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                                     allowed_types.is_empty()
                                                         || allowed_types
                                                             .contains(&object.object_type())
+                                                },
+                                                |ui, selected| {
+                                                    ui.label("Preview of saving this component draft:");
+                                                    let mut updated = preview_definition_source.clone();
+                                                    let target = updated.nodes.iter_mut().find(|target| target.id == node.id).unwrap();
+                                                    target.references.insert(property.clone(), selected.0.map_or(ComponentReference::Null, |id| ComponentReference::ExternalObject(crate::ObjectTarget::id(id.value()))));
+                                                    crate::object_picker::impact::review_change(ui, project, |candidate| ComponentService::edit_component_definition(candidate, updated).map_err(|error| error.to_string()))
                                                 },
                                             ) {
                                                 *reference = selected.0.map_or(
@@ -528,6 +536,7 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                         ui.separator();
                         ui.heading("Explicit parameters");
                         let mut remove_parameter = None;
+                        let parameter_preview_source = definition.clone();
                         for parameter in &mut definition.parameters {
                             ui.push_id(parameter.id, |ui| {
                                 ui.horizontal(|ui| {
@@ -543,6 +552,11 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                         ui,
                                         project,
                                         &mut parameter.default_value,
+                                        |candidate, id| {
+                                            let mut updated = parameter_preview_source.clone();
+                                            updated.parameters.iter_mut().find(|p| p.id == parameter.id).unwrap().default_value = serde_json::json!(id);
+                                            ComponentService::edit_component_definition(candidate, updated).map_err(|error| error.to_string())
+                                        },
                                     );
                                 } else {
                                     value_editor(
@@ -752,7 +766,20 @@ fn manual_parameter_form(
                     draft.0 = "Icon".into();
                 }
                 ui.label("Target must be a PictureGraphic node");
-                crate::graphics::ui::select(ui, project, &mut graphic);
+                crate::graphics::ui::select(ui, project, &mut graphic, |candidate, id| {
+                    let mut updated = definition.clone();
+                    updated.parameters.push(ComponentParameter {
+                        id: ComponentParameterId::default(),
+                        name: draft.0.clone(),
+                        description: None,
+                        target_node: draft.1,
+                        property: draft.2.clone(),
+                        kind: draft.3,
+                        default_value: serde_json::json!(id),
+                    });
+                    ComponentService::edit_component_definition(candidate, updated)
+                        .map_err(|error| error.to_string())
+                });
                 ui.data_mut(|d| d.insert_temp(graphic_key, graphic.clone()));
             }
             if ui.button("Add declared parameter").clicked() {
@@ -857,7 +884,15 @@ pub fn inspector(
         });
         if parameter.kind == ComponentParameterKind::Graphic {
             let mut value = serde_json::from_str(&draft).unwrap_or_default();
-            crate::graphics::ui::select(ui, project, &mut value);
+            crate::graphics::ui::select(ui, project, &mut value, |candidate, graphic| {
+                ComponentService::set_component_override(
+                    candidate,
+                    id,
+                    parameter.id,
+                    serde_json::json!(graphic),
+                )
+                .map_err(|error| error.to_string())
+            });
             draft = value.to_string();
         } else if parameter.kind == ComponentParameterKind::ObjectReference {
             if let Some(node) = definition
@@ -884,6 +919,13 @@ pub fn inspector(
                             |object| {
                                 allowed_types.is_empty()
                                     || allowed_types.contains(&object.object_type())
+                            },
+                            |ui, selected| {
+                                ui.label("Preview after Set override:");
+                                crate::object_picker::impact::review_change(ui, project, |candidate| {
+                                    let value = serde_json::to_value(selected.0.map(|id| crate::ObjectTarget::id(id.value()))).unwrap();
+                                    ComponentService::set_component_override(candidate, id, parameter.id, value).map_err(|error| error.to_string())
+                                })
                             },
                         ) {
                             draft = serde_json::to_string(

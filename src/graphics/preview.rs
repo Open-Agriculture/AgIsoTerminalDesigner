@@ -110,18 +110,24 @@ fn cached_texture(
     hash: u64,
     decode: impl FnOnce() -> Result<ColorImage, String>,
 ) -> Option<TextureHandle> {
-    if let Some((old_hash, texture)) =
-        ctx.data_mut(|data| data.get_temp::<(u64, Option<TextureHandle>)>(key))
-    {
-        if old_hash == hash {
-            return texture;
-        }
+    // Keep the current and staged versions together so before/after previews
+    // do not repeatedly decode the same two images or evict each other.
+    let mut entries = ctx.data_mut(|data| {
+        data.get_temp::<Vec<(u64, Option<TextureHandle>)>>(key)
+            .unwrap_or_default()
+    });
+    if let Some((_, texture)) = entries.iter().find(|(old_hash, _)| *old_hash == hash) {
+        return texture.clone();
     }
     let texture = decode()
         .ok()
         .filter(|image| !image.pixels.is_empty())
         .map(|image| ctx.load_texture(format!("graphics_{key:?}"), image, Default::default()));
-    ctx.data_mut(|data| data.insert_temp(key, (hash, texture.clone())));
+    if entries.len() == 2 {
+        entries.remove(0);
+    }
+    entries.push((hash, texture.clone()));
+    ctx.data_mut(|data| data.insert_temp(key, entries));
     texture
 }
 

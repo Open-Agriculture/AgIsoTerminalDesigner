@@ -374,6 +374,7 @@ fn render_object_selector(
     design: &EditorProject,
     parent: ObjectId,
     selected: ObjectId,
+    index: usize,
     allowed_types: &[ObjectType],
 ) -> Option<ObjectId> {
     let selected_text = design.get_pool().object_by_id(selected).map_or_else(
@@ -387,6 +388,7 @@ fn render_object_selector(
         design,
         parent,
         Some(selected),
+        Some(index),
         allowed_types,
         false,
     )
@@ -401,12 +403,13 @@ fn child_picker(
     design: &EditorProject,
     parent: ObjectId,
     selected: Option<ObjectId>,
+    index: Option<usize>,
     allowed: &[ObjectType],
     allow_none: bool,
 ) -> Option<NullableObjectId> {
     let action = format!(
         "{} {}",
-        if selected.is_some() {
+        if index.is_some() {
             "Replace child of"
         } else {
             "Add child to"
@@ -425,7 +428,75 @@ fn child_picker(
             allowed.contains(&candidate.object_type())
                 && candidate_is_valid(design, parent, candidate.id())
         },
+        |ui, choice| {
+            crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                queue_child_selection(candidate, parent, index, choice);
+            })
+        },
     )
+}
+
+fn queue_child_selection(
+    design: &EditorProject,
+    parent: ObjectId,
+    index: Option<usize>,
+    choice: NullableObjectId,
+) {
+    let Some(object) = design.get_pool().object_by_id(parent) else {
+        return;
+    };
+    if let Some(children) = crate::operations::operation::object_refs(object) {
+        let Some(child) = choice.0 else {
+            return;
+        };
+        if let Some(index) = index {
+            let mut updated = children.to_vec();
+            if let Some(entry) = updated.get_mut(index) {
+                entry.id = child;
+            } else {
+                return;
+            }
+            design.queue_operation(Operation::SetChildren {
+                parent: ObjectTarget::id(parent.value()),
+                children: updated
+                    .into_iter()
+                    .map(|child| ChildPlacement {
+                        child: ObjectTarget::id(child.id.value()),
+                        x: child.offset.x,
+                        y: child.offset.y,
+                    })
+                    .collect(),
+            });
+        } else {
+            design.queue_operation(Operation::AddChild {
+                parent: ObjectTarget::id(parent.value()),
+                child: ObjectTarget::id(child.value()),
+                x: 0,
+                y: 0,
+            });
+        }
+    } else if let Some(mut objects) = crate::operations::operation::object_list(object) {
+        match &mut objects {
+            ObjectReferenceList::Required(ids) => {
+                let Some(child) = choice.0 else {
+                    return;
+                };
+                if let Some(index) = index {
+                    ids[index] = child;
+                } else {
+                    ids.push(child);
+                }
+            }
+            ObjectReferenceList::Nullable(ids) => {
+                if let Some(index) = index {
+                    ids[index] = choice;
+                } else {
+                    ids.push(choice);
+                }
+            }
+        }
+        queue_object_list(design, parent, objects);
+    }
 }
 
 fn parent_dimensions(object: &Object, design: &EditorProject) -> (u16, u16) {
@@ -484,6 +555,7 @@ fn render_positioned_children(
                     design,
                     parent_id,
                     child_ref.id,
+                    index,
                     &allowed,
                 ) {
                     replacement = Some((index, new_id));
@@ -522,19 +594,12 @@ fn render_positioned_children(
         });
 
     if let Some((index, child_id)) = replacement {
-        let mut updated = children.to_vec();
-        updated[index].id = child_id;
-        design.queue_operation(Operation::SetChildren {
-            parent: ObjectTarget::id(parent_id.value()),
-            children: updated
-                .into_iter()
-                .map(|child| ChildPlacement {
-                    child: ObjectTarget::id(child.id.value()),
-                    x: child.offset.x,
-                    y: child.offset.y,
-                })
-                .collect(),
-        });
+        queue_child_selection(
+            design,
+            parent_id,
+            Some(index),
+            NullableObjectId(Some(child_id)),
+        );
     } else if let Some((child_id, x, y)) = position {
         design.queue_operation(Operation::SetChildPosition {
             parent_id: parent_id.value(),
@@ -567,17 +632,13 @@ fn render_positioned_children(
             design,
             parent_id,
             None,
+            None,
             &allowed,
             false,
         )
         .map(|id| id.0)
         {
-            design.queue_operation(Operation::AddChild {
-                parent: ObjectTarget::id(parent_id.value()),
-                child: ObjectTarget::id(child.value()),
-                x: 0,
-                y: 0,
-            });
+            queue_child_selection(design, parent_id, None, NullableObjectId(Some(child)));
         }
     });
 }
@@ -619,6 +680,7 @@ fn render_object_list(
                             design,
                             parent_id,
                             object_id,
+                            index,
                             &allowed,
                         ) {
                             replacement = Some((index, new_id));
@@ -629,9 +691,12 @@ fn render_object_list(
                     }
                 });
             if let Some((index, object_id)) = replacement {
-                let mut updated = objects.clone();
-                updated[index] = object_id;
-                queue_object_list(design, parent_id, ObjectReferenceList::Required(updated));
+                queue_child_selection(
+                    design,
+                    parent_id,
+                    Some(index),
+                    NullableObjectId(Some(object_id)),
+                );
             } else if let Some(action) = action {
                 let mut updated = objects.clone();
                 apply_list_action(&mut updated, action);
@@ -674,6 +739,7 @@ fn render_object_list(
                             design,
                             parent_id,
                             object_id.0,
+                            Some(index),
                             &allowed,
                             true,
                         ) {
@@ -693,9 +759,7 @@ fn render_object_list(
                     }
                 });
             if let Some((index, object_id)) = replacement {
-                let mut updated = objects.clone();
-                updated[index] = object_id;
-                queue_object_list(design, parent_id, ObjectReferenceList::Nullable(updated));
+                queue_child_selection(design, parent_id, Some(index), object_id);
             } else if let Some(action) = action {
                 let mut updated = objects.clone();
                 apply_list_action(&mut updated, action);
@@ -743,6 +807,7 @@ fn render_add_object(
             "Select existing object…",
             design,
             parent_id,
+            None,
             None,
             allowed,
             allow_none,
@@ -842,6 +907,18 @@ fn render_add_macro_reference(
                     candidate.object_type() == ObjectType::Macro
                         && candidate.id().value() <= u8::MAX.into()
                 },
+                |ui, choice| {
+                    crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                        if let Some(choice) = choice.0 {
+                            let mut updated = references.to_vec();
+                            updated.push(MacroRef {
+                                event_id,
+                                macro_id: choice.value() as u8,
+                            });
+                            queue_macro_references(candidate, id, updated);
+                        }
+                    })
+                },
             )
             .map(|id| id.0)
             {
@@ -903,6 +980,16 @@ fn render_macro_references(
                     |candidate| {
                         candidate.object_type() == ObjectType::Macro
                             && candidate.id().value() <= u8::MAX.into()
+                    },
+                    |ui, choice| {
+                        crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                            if let Some(choice) = choice.0 {
+                                let mut updated = references.to_vec();
+                                updated[index] = edited.clone();
+                                updated[index].macro_id = choice.value() as u8;
+                                queue_macro_references(candidate, id, updated);
+                            }
+                        })
                     },
                 )
                 .map(|id| id.0)
@@ -1417,6 +1504,18 @@ fn render_reference(
                         candidate.id(),
                     )
                     .is_ok()
+            },
+            |ui, reference| {
+                crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                    queue(
+                        candidate,
+                        id,
+                        property,
+                        reference
+                            .0
+                            .map_or(serde_json::Value::Null, |id| serde_json::json!(id.value())),
+                    );
+                })
             },
         ) {
             queue(

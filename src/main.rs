@@ -2076,6 +2076,10 @@ impl eframe::App for DesignerApp {
                 pool.get_selected().0,
                 false,
                 |_| true,
+                |ui, _| {
+                    ui.label("Navigation only; no objects will change.");
+                    true
+                },
             ) {
                 pool.get_mut_selected().set(selected);
             }
