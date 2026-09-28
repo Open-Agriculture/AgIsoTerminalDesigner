@@ -10,6 +10,7 @@ pub mod impact;
 const ACTIVE: egui::Id = egui::Id::NULL;
 
 pub fn open(ctx: &egui::Context, id: egui::Id) {
+    impact::clear_cache(ctx);
     ctx.data_mut(|data| {
         data.insert_temp(ACTIVE.with("selection_window"), id);
         data.insert_temp(id.with("query"), String::new());
@@ -56,28 +57,31 @@ pub fn window<T: Clone + Send + Sync + 'static>(
     let mut open = pending.is_some()
         || !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     let mut selected = None;
-    egui::Window::new(title)
-        .id(id)
-        .open(&mut open)
-        .enabled(pending.is_none())
-        .collapsible(false)
-        .default_size([460.0, 480.0])
-        .show(ctx, |ui| {
-            let search = ui.add(
-                egui::TextEdit::singleline(&mut query)
-                    .hint_text("Search by name or ID…")
-                    .desired_width(f32::INFINITY),
-            );
-            if focus {
-                search.request_focus();
-            }
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    selected = contents(ui, &query);
-                });
-        });
+    // The confirmation modal replaces the picker until Back is chosen. Do not
+    // enumerate and render the entire disabled results list behind it.
+    if pending.is_none() {
+        egui::Window::new(title)
+            .id(id)
+            .open(&mut open)
+            .collapsible(false)
+            .default_size([460.0, 480.0])
+            .show(ctx, |ui| {
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut query)
+                        .hint_text("Search by name or ID…")
+                        .desired_width(f32::INFINITY),
+                );
+                if focus {
+                    search.request_focus();
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        selected = contents(ui, &query);
+                    });
+            });
+    }
     let mut confirmed = None;
     if let Some(pending) = pending {
         let mut accept = false;
@@ -103,11 +107,16 @@ pub fn window<T: Clone + Send + Sync + 'static>(
             confirmed = Some(pending);
             open = false;
         } else if back || modal.should_close() {
+            impact::clear_cache(ctx);
             ctx.data_mut(|data| data.remove::<T>(pending_key));
         }
     } else if let Some(selected) = selected {
+        impact::clear_cache(ctx);
         ctx.data_mut(|data| data.insert_temp(pending_key, selected));
         ctx.request_repaint();
+    }
+    if !open {
+        impact::clear_cache(ctx);
     }
     ctx.data_mut(|data| {
         data.insert_temp(id.with("query"), query);
@@ -333,12 +342,9 @@ pub fn object_window(
             if let Some(current) = selected {
                 ui.label(format!("Current: {}", object_label(project, Some(current))));
             }
-            ui.label("Chosen:");
-            let exists = review_object(ui, project, *choice);
-            let valid = exists
-                && choice.0.map_or(allow_none, |id| {
-                    project.get_pool().object_by_id(id).is_some_and(&eligible)
-                });
+            let valid = choice.0.map_or(allow_none, |id| {
+                project.get_pool().object_by_id(id).is_some_and(&eligible)
+            });
             if !valid {
                 ui.colored_label(
                     egui::Color32::RED,
@@ -705,6 +711,34 @@ mod tests {
         assert!(ctx
             .data(|data| data.get_temp::<u16>(id.with("pending_selection")))
             .is_none());
+    }
+
+    #[test]
+    fn pending_confirmation_does_not_rebuild_picker_results() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("results_not_rebuilt");
+        let calls = std::cell::Cell::new(0);
+        open(&ctx, id);
+        for _ in 0..5 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                let selected = window(
+                    ctx,
+                    id,
+                    "Choose",
+                    |_, _| {
+                        calls.set(calls.get() + 1);
+                        Some(120u16)
+                    },
+                    |ui, _| {
+                        ui.label("Confirm choice");
+                        true
+                    },
+                );
+                assert_eq!(selected, None);
+            });
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(is_open(&ctx, id));
     }
 
     #[test]

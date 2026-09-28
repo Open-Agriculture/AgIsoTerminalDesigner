@@ -2076,9 +2076,9 @@ impl eframe::App for DesignerApp {
                 pool.get_selected().0,
                 false,
                 |_| true,
-                |ui, _| {
+                |ui, choice| {
                     ui.label("Navigation only; no objects will change.");
-                    true
+                    ag_iso_terminal_designer::object_picker::review_object(ui, pool, choice)
                 },
             ) {
                 pool.get_mut_selected().set(selected);
