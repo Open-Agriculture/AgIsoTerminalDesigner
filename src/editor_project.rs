@@ -1254,7 +1254,7 @@ impl EditorProject {
     }
 
     /// Create a snapshot for AI context
-    /// Owned, UI-free input for the provider-neutral AI domain tools.
+    /// Owned, UI-free input for automation domain operations.
     pub fn ai_design_state(&self) -> AiDesignState {
         AiDesignState {
             revision: self.revision(),

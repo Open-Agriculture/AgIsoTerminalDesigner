@@ -1,13 +1,11 @@
 //! Design inspection and staged proposal domain layer.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod automation_bridge;
+pub mod automation_service;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod automation_trace;
 pub mod design_analysis;
 pub mod design_inspection;
-pub mod mcp_domain;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod mcp_bridge;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod mcp_server;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod mcp_trace;
 pub mod preview;
 pub mod proposal;
 pub mod schema;
@@ -41,7 +39,7 @@ pub use preview::{
 pub use proposal::{propose_refinement, propose_transaction, AiProposal, AiProposalSummary};
 pub use schema::{get_object_schema, ObjectSchemaSnapshot, PropertySchemaSnapshot};
 pub use snapshot::*;
-pub use tools::{get_design_context, get_objects, AiDomainTool, AiToolError, GetObjectsRequest};
+pub use tools::{get_design_context, get_objects, AiToolError, GetObjectsRequest};
 
 pub(crate) mod wire;
 

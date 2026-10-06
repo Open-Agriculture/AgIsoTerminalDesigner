@@ -1,4 +1,4 @@
-//! Deterministic, provider-neutral visual quality checks.
+//! Deterministic visual quality checks.
 use super::snapshot::{active_mask, layout_instances, summary, LayoutInstance, ObjectSummary};
 use super::{AiDesignState, AiProposal};
 use ag_iso_stack::object_pool::ObjectId;

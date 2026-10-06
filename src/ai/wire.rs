@@ -1,4 +1,4 @@
-//! Compact provider-facing projections. Rich domain DTOs and validation stay unchanged.
+//! Compact automation responses. Rich domain DTOs and validation stay unchanged.
 use serde_json::{json, Value};
 
 fn summary(mut value: Value) -> Value {

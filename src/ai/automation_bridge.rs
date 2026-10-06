@@ -1,12 +1,12 @@
-//! Authenticated loopback bridge between the native editor and its stdio MCP child.
+//! Authenticated loopback bridge between the native editor and automation clients.
 //!
 //! The editor thread owns `EditorProject`. Network threads only move bounded, owned
 //! requests; domain work runs against a cloned `AiDesignState` on a worker thread.
 
 use crate::{
     ai::{
-        mcp_domain::{self, DomainResult},
-        mcp_trace::{self, ProposalMetrics, ProposalTrace, RequestTrace, TraceSink},
+        automation_service,
+        automation_trace::{self, ProposalMetrics, ProposalTrace, RequestTrace, TraceSink},
         AiProposal, ProjectRevision,
     },
     EditorProject,
@@ -36,8 +36,6 @@ const REQUEST_EXPIRED: u8 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeRecord {
     pub instance_id: String,
-    pub project_instance_id: String,
-    pub revision: Option<ProjectRevision>,
     pub address: String,
     pub token: String,
 }
@@ -45,9 +43,11 @@ pub struct RuntimeRecord {
 #[derive(Debug, Serialize, Deserialize)]
 struct WireRequest {
     token: String,
-    project_instance_id: String,
-    revision: ProjectRevision,
-    tool: String,
+    #[serde(default)]
+    project_instance_id: Option<String>,
+    #[serde(default)]
+    revision: Option<ProjectRevision>,
+    action: String,
     #[serde(default)]
     args: Value,
 }
@@ -61,7 +61,67 @@ struct WireResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
+    error: Option<WireError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireError {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<ProjectRevision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_revision: Option<ProjectRevision>,
+}
+
+/// One provider-neutral action sent through the authenticated editor bridge.
+/// Status is the sole bootstrap action and may omit project identity/revision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationRequest {
+    #[serde(default)]
+    pub project_instance_id: Option<String>,
+    #[serde(default)]
+    pub revision: Option<ProjectRevision>,
+    pub action: String,
+    #[serde(default)]
+    pub args: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutomationResponse {
+    pub success: bool,
+    pub editor_instance_id: String,
+    pub project_instance_id: String,
+    pub revision: Option<ProjectRevision>,
+    pub result: Option<Value>,
+    pub error: Option<WireError>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutomationClientError {
+    pub code: String,
+    pub message: String,
+    pub expected_revision: Option<ProjectRevision>,
+    pub current_revision: Option<ProjectRevision>,
+}
+
+impl std::fmt::Display for AutomationClientError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AutomationClientError {}
+
+impl From<WireError> for AutomationClientError {
+    fn from(error: WireError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            expected_revision: error.expected_revision,
+            current_revision: error.current_revision,
+        }
+    }
 }
 
 struct Incoming {
@@ -95,18 +155,17 @@ struct DomainCompletion {
     incoming: Incoming,
     editor_instance_id: String,
     proposal_epoch: u64,
-    result: Result<mcp_domain::DomainResult, mcp_domain::DomainError>,
+    result: Result<automation_service::DomainResult, automation_service::DomainError>,
 }
 
-/// Native editor side of the MCP connection. Construct it on the UI thread and call
+/// Native editor side of the automation connection. Construct it on the UI thread and call
 /// `poll` once per frame. Proposal methods also belong to that thread.
-pub struct EditorMcpBridge {
+pub struct EditorAutomationBridge {
     editor_instance_id: String,
     project_instance_id: String,
     observed_revision: Option<ProjectRevision>,
     pending_proposal: Option<AiProposal>,
     runtime_path: PathBuf,
-    runtime: RuntimeRecord,
     incoming: Receiver<Incoming>,
     domain_jobs: SyncSender<DomainJob>,
     completions: Receiver<DomainCompletion>,
@@ -120,7 +179,7 @@ pub struct EditorMcpBridge {
     proposal_metrics: ProposalMetrics,
 }
 
-impl EditorMcpBridge {
+impl EditorAutomationBridge {
     pub fn start(ctx: eframe::egui::Context) -> Result<Self, String> {
         Self::start_impl(ctx, None)
     }
@@ -131,11 +190,12 @@ impl EditorMcpBridge {
     ) -> Result<Self, String> {
         #[cfg(not(unix))]
         return Err(
-            "The MCP bridge currently requires Unix owner-only runtime file permissions".into(),
+            "The automation bridge currently requires Unix owner-only runtime file permissions"
+                .into(),
         );
 
         let listener = TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|e| format!("Could not start local MCP bridge: {e}"))?;
+            .map_err(|e| format!("Could not start local automation bridge: {e}"))?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let address = listener
             .local_addr()
@@ -150,8 +210,6 @@ impl EditorMcpBridge {
         };
         let runtime = RuntimeRecord {
             instance_id: editor_instance_id.clone(),
-            project_instance_id: project_instance_id.clone(),
-            revision: None,
             address,
             token: uuid::Uuid::new_v4().to_string(),
         };
@@ -177,12 +235,11 @@ impl EditorMcpBridge {
             observed_revision: None,
             pending_proposal: None,
             runtime_path,
-            runtime,
             incoming,
             domain_jobs: jobs_tx,
             completions,
             listener_stop,
-            status: "Waiting for an MCP client".into(),
+            status: "Waiting for an automation client".into(),
             last_error: None,
             context: ctx,
             work_in_flight: false,
@@ -207,10 +264,6 @@ impl EditorMcpBridge {
                 self.status = "The staged proposal was cleared because the project changed".into();
             }
             self.observed_revision = revision;
-            self.runtime.revision = revision;
-            if let Err(e) = write_runtime(&self.runtime_path, &self.runtime) {
-                self.last_error = Some(format!("Could not update MCP runtime details: {e}"));
-            }
         }
 
         if let Ok(completion) = self.completions.try_recv() {
@@ -226,7 +279,12 @@ impl EditorMcpBridge {
                     self.proposal_epoch,
                 );
             let response = if !still_current {
-                self.error_response("The project changed while this request was running")
+                self.error_response(
+                    "PROPOSAL_STALE",
+                    "Project or proposal changed while this request was running.",
+                    completion.incoming.request.revision,
+                    revision,
+                )
             } else {
                 match completion.result {
                     Ok(result) => {
@@ -251,7 +309,12 @@ impl EditorMcpBridge {
                             error: None,
                         }
                     }
-                    Err(error) => self.error_response(error.message),
+                    Err(error) => self.error_response(
+                        error.code,
+                        error.message,
+                        completion.incoming.request.revision,
+                        revision,
+                    ),
                 }
             };
             if still_current {
@@ -271,16 +334,17 @@ impl EditorMcpBridge {
                 if !incoming.claim() {
                     continue;
                 }
-                let response = if incoming.request.tool == "get_project_status"
-                    && incoming.request.project_instance_id == self.project_instance_id
-                {
+                let response = if incoming.request.action == "get_project_status" {
                     self.status_response(None)
                 } else {
-                    self.error_response("Open a project in the editor before using MCP tools")
+                    self.error_response(
+                        "PROJECT_NOT_OPEN",
+                        "Open a project in the editor before using automation.",
+                        incoming.request.revision,
+                        None,
+                    )
                 };
-                if incoming.request.project_instance_id == self.project_instance_id {
-                    self.note_call(response.success);
-                }
+                self.note_call(response.success);
                 let _ = incoming.reply.try_send(response);
             }
             return;
@@ -295,30 +359,76 @@ impl EditorMcpBridge {
                 continue;
             }
             let request = &incoming.request;
-            if request.project_instance_id != self.project_instance_id {
-                if !incoming.claim() {
-                    continue;
-                }
-                let response = self.error_response("The open project changed; retry the request");
-                let _ = incoming.reply.try_send(response);
-                continue;
-            }
-            if Some(request.revision) != revision {
-                if !incoming.claim() {
-                    continue;
-                }
-                let response =
-                    self.error_response("The project revision changed; retry the request");
-                let _ = incoming.reply.try_send(response);
-                continue;
-            }
-            if request.tool == "get_project_status" {
+            if request.action == "get_project_status" {
                 if !incoming.claim() {
                     continue;
                 }
                 let response = self.status_response(revision);
                 self.note_call(true);
                 let _ = incoming.reply.try_send(response);
+                continue;
+            }
+            if request.project_instance_id.as_deref() != Some(self.project_instance_id.as_str()) {
+                if !incoming.claim() {
+                    continue;
+                }
+                let response = self.error_response(
+                    "PROJECT_INSTANCE_MISMATCH",
+                    "The open project changed; inspect it again before retrying.",
+                    request.revision,
+                    revision,
+                );
+                let _ = incoming.reply.try_send(response);
+                continue;
+            }
+            if request.revision != revision {
+                if !incoming.claim() {
+                    continue;
+                }
+                let response = self.error_response(
+                    "PROJECT_REVISION_MISMATCH",
+                    "Project changed; inspect it again before staging changes.",
+                    request.revision,
+                    revision,
+                );
+                let _ = incoming.reply.try_send(response);
+                continue;
+            }
+            if request.action == "reject_proposal" {
+                if !incoming.claim() {
+                    continue;
+                }
+                let proposal_id = request.args["proposal_id"].as_str();
+                if proposal_id.is_none()
+                    || self
+                        .pending_proposal
+                        .as_ref()
+                        .map(|p| p.proposal_id.as_str())
+                        != proposal_id
+                {
+                    let response = self.error_response(
+                        "PROPOSAL_NOT_FOUND",
+                        "Proposal ID does not match the pending proposal.",
+                        request.revision,
+                        revision,
+                    );
+                    self.note_call(false);
+                    let _ = incoming.reply.try_send(response);
+                } else {
+                    self.reject_proposal();
+                    self.note_call(true);
+                    let response = WireResponse {
+                        success: true,
+                        editor_instance_id: self.editor_instance_id.clone(),
+                        project_instance_id: self.project_instance_id.clone(),
+                        revision,
+                        result: Some(
+                            serde_json::json!({"rejected": true, "proposal_id": proposal_id}),
+                        ),
+                        error: None,
+                    };
+                    let _ = incoming.reply.try_send(response);
+                }
                 continue;
             }
             let job = DomainJob {
@@ -331,14 +441,19 @@ impl EditorMcpBridge {
             match self.domain_jobs.try_send(job) {
                 Ok(()) => {
                     self.work_in_flight = true;
-                    self.status = "Processing an MCP request".into();
+                    self.status = "Processing an automation request".into();
                     break;
                 }
                 Err(TrySendError::Full(job)) => {
                     if !job.incoming.claim() {
                         continue;
                     }
-                    let response = self.error_response("The MCP bridge is busy; retry shortly");
+                    let response = self.error_response(
+                        "EDITOR_BUSY",
+                        "The editor is busy; retry shortly.",
+                        job.incoming.request.revision,
+                        revision,
+                    );
                     self.note_call(false);
                     let _ = job.incoming.reply.try_send(response);
                 }
@@ -346,7 +461,12 @@ impl EditorMcpBridge {
                     if !job.incoming.claim() {
                         continue;
                     }
-                    let response = self.error_response("The MCP domain worker stopped");
+                    let response = self.error_response(
+                        "EDITOR_UNAVAILABLE",
+                        "The editor automation worker stopped.",
+                        job.incoming.request.revision,
+                        revision,
+                    );
                     self.note_call(false);
                     let _ = job.incoming.reply.try_send(response);
                 }
@@ -378,11 +498,6 @@ impl EditorMcpBridge {
         self.proposal_epoch = self.proposal_epoch.wrapping_add(1);
         self.pending_proposal = None;
         self.project_instance_id = uuid::Uuid::new_v4().to_string();
-        self.runtime.project_instance_id = self.project_instance_id.clone();
-        self.runtime.revision = self.observed_revision;
-        if let Err(e) = write_runtime(&self.runtime_path, &self.runtime) {
-            self.last_error = Some(format!("Could not update MCP runtime details: {e}"));
-        }
         self.status = "Project identity changed; staged proposal cleared".into();
     }
     pub fn status(&self) -> &str {
@@ -428,7 +543,7 @@ impl EditorMcpBridge {
         ) {
             trace.record(&ProposalTrace {
                 event: "proposal",
-                timestamp_ms: mcp_trace::now_ms(),
+                timestamp_ms: automation_trace::now_ms(),
                 editor_instance_id: &self.editor_instance_id,
                 project_instance_id: &self.project_instance_id,
                 revision: self.observed_revision,
@@ -443,17 +558,28 @@ impl EditorMcpBridge {
         self.proposal_metrics = ProposalMetrics::default();
     }
 
-    fn error_response(&mut self, error: impl Into<String>) -> WireResponse {
-        let error = error.into();
-        self.last_error = Some(error.clone());
-        self.status = error.clone();
+    fn error_response(
+        &mut self,
+        code: &str,
+        message: impl Into<String>,
+        expected_revision: Option<ProjectRevision>,
+        current_revision: Option<ProjectRevision>,
+    ) -> WireResponse {
+        let message = message.into();
+        self.last_error = Some(message.clone());
+        self.status = message.clone();
         WireResponse {
             success: false,
             editor_instance_id: self.editor_instance_id.clone(),
             project_instance_id: self.project_instance_id.clone(),
             revision: self.observed_revision,
             result: None,
-            error: Some(error),
+            error: Some(WireError {
+                code: code.into(),
+                message,
+                expected_revision,
+                current_revision,
+            }),
         }
     }
 
@@ -477,7 +603,7 @@ impl EditorMcpBridge {
     }
 }
 
-impl Drop for EditorMcpBridge {
+impl Drop for EditorAutomationBridge {
     fn drop(&mut self) {
         if self.pending_proposal.is_some() {
             self.finish_proposal("closed");
@@ -496,7 +622,7 @@ fn start_listener(
     trace: Option<Arc<TraceSink>>,
 ) {
     thread::Builder::new()
-        .name("aitp-mcp-listener".into())
+        .name("aitp-automation-listener".into())
         .spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -506,7 +632,7 @@ fn start_listener(
                         let context = context.clone();
                         let trace = trace.clone();
                         let _ = thread::Builder::new()
-                            .name("aitp-mcp-request".into())
+                            .name("aitp-automation-request".into())
                             .spawn(move || {
                                 handle_connection(stream, incoming, token, context, trace)
                             });
@@ -518,7 +644,7 @@ fn start_listener(
                 }
             }
         })
-        .expect("could not spawn MCP listener");
+        .expect("could not spawn automation listener");
 }
 
 fn handle_connection(
@@ -551,7 +677,7 @@ fn handle_connection(
     };
     let trace_meta = request.as_ref().ok().map(|request| {
         (
-            request.tool.clone(),
+            request.action.clone(),
             request.args["proposal_id"].as_str().map(str::to_owned),
             request.project_instance_id.clone(),
             request.revision,
@@ -564,7 +690,12 @@ fn handle_connection(
             project_instance_id: String::new(),
             revision: None,
             result: None,
-            error: Some(format!("Invalid bridge request: {e}")),
+            error: Some(WireError {
+                code: "INVALID_BRIDGE_REQUEST".into(),
+                message: format!("Invalid bridge request: {e}"),
+                expected_revision: None,
+                current_revision: None,
+            }),
         },
         Ok(request) if !constant_time_eq(&request.token, &token) => WireResponse {
             success: false,
@@ -572,7 +703,12 @@ fn handle_connection(
             project_instance_id: String::new(),
             revision: None,
             result: None,
-            error: Some("Bridge authentication failed".into()),
+            error: Some(WireError {
+                code: "AUTHENTICATION_FAILED".into(),
+                message: "Bridge authentication failed".into(),
+                expected_revision: None,
+                current_revision: None,
+            }),
         },
         Ok(request) => {
             let (reply_tx, reply_rx) = mpsc::sync_channel(1);
@@ -591,7 +727,12 @@ fn handle_connection(
                         project_instance_id: String::new(),
                         revision: None,
                         result: None,
-                        error: Some("Timed out waiting for editor response".into()),
+                        error: Some(WireError {
+                            code: "EDITOR_TIMEOUT".into(),
+                            message: "Timed out waiting for editor response".into(),
+                            expected_revision: None,
+                            current_revision: None,
+                        }),
                     };
                     match reply_rx.recv_timeout(TOOL_TIMEOUT) {
                         Ok(response) => response,
@@ -621,7 +762,12 @@ fn handle_connection(
                     project_instance_id: String::new(),
                     revision: None,
                     result: None,
-                    error: Some("MCP request queue is full; retry shortly".into()),
+                    error: Some(WireError {
+                        code: "EDITOR_BUSY".into(),
+                        message: "Automation request queue is full; retry shortly".into(),
+                        expected_revision: None,
+                        current_revision: None,
+                    }),
                 },
                 Err(TrySendError::Disconnected(_)) => WireResponse {
                     success: false,
@@ -629,7 +775,12 @@ fn handle_connection(
                     project_instance_id: String::new(),
                     revision: None,
                     result: None,
-                    error: Some("Editor MCP bridge is shutting down".into()),
+                    error: Some(WireError {
+                        code: "EDITOR_UNAVAILABLE".into(),
+                        message: "Editor automation bridge is shutting down".into(),
+                        expected_revision: None,
+                        current_revision: None,
+                    }),
                 },
             }
         }
@@ -639,7 +790,7 @@ fn handle_connection(
     let _ = stream.write_all(b"\n");
     if let Some(trace) = trace {
         let (tool, requested_proposal_id, requested_project_id, requested_revision) =
-            trace_meta.unwrap_or_else(|| ("<invalid>".into(), None, String::new(), 0));
+            trace_meta.unwrap_or_else(|| ("<invalid>".into(), None, None, None));
         let response_proposal_id = response.result.as_ref().and_then(|value| {
             value["proposal_id"]
                 .as_str()
@@ -648,29 +799,23 @@ fn handle_connection(
         let proposal_id = response_proposal_id.or(requested_proposal_id.as_deref());
         trace.record(&RequestTrace {
             event: "request",
-            timestamp_ms: mcp_trace::now_ms(),
+            timestamp_ms: automation_trace::now_ms(),
             editor_instance_id: &response.editor_instance_id,
             project_instance_id: if response.project_instance_id.is_empty() {
-                &requested_project_id
+                requested_project_id.as_deref().unwrap_or("")
             } else {
                 &response.project_instance_id
             },
-            revision: response
-                .revision
-                .or(trace_meta_revision(requested_revision, &tool)),
-            tool: &tool,
+            revision: response.revision.or(requested_revision),
+            action: &tool,
             request_bytes,
             response_bytes: response_bytes.len() + 1,
-            duration_ms: mcp_trace::duration_ms(started.elapsed()),
+            duration_ms: automation_trace::duration_ms(started.elapsed()),
             success: response.success,
-            error_code: response.error.as_deref().map(mcp_trace::error_code),
+            error_code: response.error.as_ref().map(|error| error.code.as_str()),
             proposal_id,
         });
     }
-}
-
-fn trace_meta_revision(revision: u64, tool: &str) -> Option<u64> {
-    (tool != "<invalid>").then_some(revision)
 }
 
 fn start_domain_worker(
@@ -679,13 +824,13 @@ fn start_domain_worker(
     context: eframe::egui::Context,
 ) {
     thread::Builder::new()
-        .name("aitp-mcp-domain".into())
+        .name("aitp-automation-domain".into())
         .spawn(move || {
             while let Ok(job) = jobs.recv() {
-                let result = mcp_domain::execute(
+                let result = automation_service::execute(
                     &job.state,
                     job.pending.as_ref(),
-                    &job.incoming.request.tool,
+                    &job.incoming.request.action,
                     job.incoming.request.args.clone(),
                 );
                 let completion = DomainCompletion {
@@ -700,7 +845,7 @@ fn start_domain_worker(
                 context.request_repaint();
             }
         })
-        .expect("could not spawn MCP domain worker");
+        .expect("could not spawn automation domain worker");
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
@@ -717,7 +862,7 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 fn runtime_dir() -> Result<PathBuf, String> {
     #[cfg(not(unix))]
     return Err(
-        "The MCP bridge currently requires Unix owner-only runtime file permissions".into(),
+        "The automation bridge currently requires Unix owner-only runtime file permissions".into(),
     );
 
     let username = std::env::var("USER")
@@ -744,19 +889,23 @@ fn runtime_dir() -> Result<PathBuf, String> {
     match builder.create(&directory) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(format!("Could not create MCP runtime directory: {error}")),
+        Err(error) => {
+            return Err(format!(
+                "Could not create automation runtime directory: {error}"
+            ))
+        }
     }
     let metadata = fs::symlink_metadata(&directory)
-        .map_err(|e| format!("Could not inspect MCP runtime directory: {e}"))?;
+        .map_err(|e| format!("Could not inspect automation runtime directory: {e}"))?;
     if !metadata.file_type().is_dir() {
-        return Err("MCP runtime path is not a directory".into());
+        return Err("automation runtime path is not a directory".into());
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         // Never publish a token in a directory owned by another local account.
         if metadata.uid() != unsafe { libc::geteuid() } {
-            return Err("MCP runtime directory is owned by another user".into());
+            return Err("automation runtime directory is owned by another user".into());
         }
     }
     set_owner_only(&directory, true)?;
@@ -776,7 +925,9 @@ fn set_owner_only(path: &std::path::Path, directory: bool) -> Result<(), String>
     #[cfg(not(unix))]
     {
         let _ = (path, directory);
-        return Err("Owner-only MCP runtime permissions are unavailable on this platform".into());
+        return Err(
+            "Owner-only automation runtime permissions are unavailable on this platform".into(),
+        );
     }
     Ok(())
 }
@@ -840,10 +991,9 @@ fn choose_runtime(
             .into_iter()
             .find(|(_, r)| r.instance_id == id)
             .ok_or_else(|| format!("No running editor instance matches '{id}'")),
-        None if records.is_empty() => Err(
-            "No running editor found. Open AgIsoTerminalDesigner before starting the MCP server."
-                .into(),
-        ),
+        None if records.is_empty() => {
+            Err("No running editor found. Open AgIsoTerminalDesigner before using aitd.".into())
+        }
         None if records.len() > 1 => {
             Err("Multiple editors are running. Start with --instance <editor-instance-id>.".into())
         }
@@ -860,58 +1010,117 @@ fn completion_is_current(
     completion_epoch: u64,
     current_epoch: u64,
 ) -> bool {
-    request.project_instance_id == current_project_instance
-        && Some(request.revision) == current_revision
+    request.project_instance_id.as_deref() == Some(current_project_instance)
+        && request.revision == current_revision
         && completion_editor_instance == current_editor_instance
         && completion_epoch == current_epoch
 }
 
-/// Invoke one native editor tool using the authenticated local protocol.
-pub fn invoke_runtime_tool(
+/// Invoke one semantic automation action over the authenticated local protocol.
+pub fn invoke_runtime_request(
     instance_id: Option<&str>,
-    tool: &str,
-    args: Value,
-) -> Result<Value, String> {
-    let (_, runtime) = select_runtime(instance_id)?;
-    let revision = match runtime.revision {
-        Some(revision) => revision,
-        None if tool == "get_project_status" => 0,
-        None => return Err("No project is open in the selected editor".into()),
-    };
+    request: AutomationRequest,
+) -> Result<AutomationResponse, AutomationClientError> {
+    let (_, runtime) = select_runtime(instance_id).map_err(|message| {
+        let code = if message.contains("Multiple editors") {
+            "AMBIGUOUS_EDITOR_INSTANCE"
+        } else if message.contains("No running editor") {
+            "EDITOR_NOT_FOUND"
+        } else {
+            "EDITOR_CONNECTION_FAILED"
+        };
+        AutomationClientError {
+            code: code.into(),
+            message,
+            expected_revision: request.revision,
+            current_revision: None,
+        }
+    })?;
     let address = runtime
         .address
         .parse::<std::net::SocketAddr>()
-        .map_err(|e| format!("Invalid editor bridge address: {e}"))?;
+        .map_err(|e| AutomationClientError {
+            code: "EDITOR_CONNECTION_FAILED".into(),
+            message: format!("Invalid editor bridge address: {e}"),
+            expected_revision: request.revision,
+            current_revision: None,
+        })?;
     if !address.ip().is_loopback() {
-        return Err("Editor bridge address is not loopback".into());
+        return Err(AutomationClientError {
+            code: "EDITOR_CONNECTION_FAILED".into(),
+            message: "Editor bridge address is not loopback".into(),
+            expected_revision: request.revision,
+            current_revision: None,
+        });
     }
-    let mut stream = TcpStream::connect(address)
-        .map_err(|e| format!("Could not connect to editor bridge: {e}"))?;
+    let mut stream = TcpStream::connect(address).map_err(|e| AutomationClientError {
+        code: "EDITOR_NOT_FOUND".into(),
+        message: format!("Could not connect to editor bridge: {e}"),
+        expected_revision: request.revision,
+        current_revision: None,
+    })?;
     stream
         .set_read_timeout(Some(TOOL_TIMEOUT))
-        .map_err(|e| e.to_string())?;
-    let request = WireRequest {
+        .map_err(|e| AutomationClientError {
+            code: "EDITOR_CONNECTION_FAILED".into(),
+            message: e.to_string(),
+            expected_revision: request.revision,
+            current_revision: None,
+        })?;
+    let wire_request = WireRequest {
         token: runtime.token,
-        project_instance_id: runtime.project_instance_id,
-        revision,
-        tool: tool.into(),
-        args,
+        project_instance_id: request.project_instance_id,
+        revision: request.revision,
+        action: request.action,
+        args: request.args,
     };
-    serde_json::to_writer(&mut stream, &request).map_err(|e| e.to_string())?;
-    stream.write_all(b"\n").map_err(|e| e.to_string())?;
+    serde_json::to_writer(&mut stream, &wire_request).map_err(|e| AutomationClientError {
+        code: "INVALID_REQUEST".into(),
+        message: e.to_string(),
+        expected_revision: wire_request.revision,
+        current_revision: None,
+    })?;
+    stream.write_all(b"\n").map_err(|e| AutomationClientError {
+        code: "EDITOR_CONNECTION_FAILED".into(),
+        message: e.to_string(),
+        expected_revision: wire_request.revision,
+        current_revision: None,
+    })?;
     let mut line = String::new();
     BufReader::new(stream)
         .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| AutomationClientError {
+            code: "EDITOR_CONNECTION_FAILED".into(),
+            message: e.to_string(),
+            expected_revision: wire_request.revision,
+            current_revision: None,
+        })?;
     let response: WireResponse =
-        serde_json::from_str(&line).map_err(|e| format!("Invalid editor response: {e}"))?;
-    if response.success {
-        Ok(serde_json::to_value(response).unwrap_or(Value::Null))
-    } else {
-        Err(response
+        serde_json::from_str(&line).map_err(|e| AutomationClientError {
+            code: "INVALID_RESPONSE".into(),
+            message: format!("Invalid editor response: {e}"),
+            expected_revision: wire_request.revision,
+            current_revision: None,
+        })?;
+    if !response.success {
+        return Err(response
             .error
-            .unwrap_or_else(|| "Editor MCP request failed".into()))
+            .unwrap_or_else(|| WireError {
+                code: "EDITOR_ERROR".into(),
+                message: "Editor automation request failed".into(),
+                expected_revision: wire_request.revision,
+                current_revision: response.revision,
+            })
+            .into());
     }
+    Ok(AutomationResponse {
+        success: response.success,
+        editor_instance_id: response.editor_instance_id,
+        project_instance_id: response.project_instance_id,
+        revision: response.revision,
+        result: response.result,
+        error: response.error,
+    })
 }
 
 #[cfg(test)]
@@ -923,8 +1132,6 @@ mod tests {
             PathBuf::from(format!("/{instance_id}.json")),
             RuntimeRecord {
                 instance_id: instance_id.into(),
-                project_instance_id: "project".into(),
-                revision: Some(1),
                 address: "127.0.0.1:1".into(),
                 token: "secret".into(),
             },
@@ -947,9 +1154,9 @@ mod tests {
     fn completion_is_discarded_after_project_or_proposal_changes() {
         let request = WireRequest {
             token: "token".into(),
-            project_instance_id: "p1".into(),
-            revision: 4,
-            tool: "propose_transaction".into(),
+            project_instance_id: Some("p1".into()),
+            revision: Some(4),
+            action: "propose_transaction".into(),
             args: Value::Null,
         };
         assert!(completion_is_current(
@@ -992,7 +1199,7 @@ mod tests {
 
     #[test]
     fn loopback_rejects_a_bad_token() {
-        let bridge = EditorMcpBridge::start(eframe::egui::Context::default()).unwrap();
+        let bridge = EditorAutomationBridge::start(eframe::egui::Context::default()).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1005,12 +1212,14 @@ mod tests {
                 0o600
             );
         }
-        let mut stream = TcpStream::connect(&bridge.runtime.address).unwrap();
+        let runtime: RuntimeRecord =
+            serde_json::from_slice(&fs::read(&bridge.runtime_path).unwrap()).unwrap();
+        let mut stream = TcpStream::connect(&runtime.address).unwrap();
         let request = WireRequest {
             token: "wrong-token".into(),
-            project_instance_id: bridge.project_instance_id.clone(),
-            revision: 0,
-            tool: "get_project_status".into(),
+            project_instance_id: None,
+            revision: None,
+            action: "get_project_status".into(),
             args: Value::Null,
         };
         serde_json::to_writer(&mut stream, &request).unwrap();
@@ -1020,17 +1229,25 @@ mod tests {
         let response: WireResponse = serde_json::from_str(&line).unwrap();
         assert!(!response.success);
         assert_eq!(
-            response.error.as_deref(),
+            response.error.as_ref().map(|error| error.message.as_str()),
             Some("Bridge authentication failed")
         );
     }
 
     #[test]
     fn authenticated_status_works_without_an_open_project() {
-        let mut bridge = EditorMcpBridge::start(eframe::egui::Context::default()).unwrap();
+        let mut bridge = EditorAutomationBridge::start(eframe::egui::Context::default()).unwrap();
         let instance_id = bridge.editor_instance_id.clone();
         let caller = thread::spawn(move || {
-            invoke_runtime_tool(Some(&instance_id), "get_project_status", Value::Null)
+            invoke_runtime_request(
+                Some(&instance_id),
+                AutomationRequest {
+                    project_instance_id: None,
+                    revision: None,
+                    action: "get_project_status".into(),
+                    args: Value::Null,
+                },
+            )
         });
         for _ in 0..100 {
             bridge.poll(None);
@@ -1040,18 +1257,32 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         let response = caller.join().unwrap().unwrap();
-        assert_eq!(response["success"], true);
-        assert_eq!(response["result"]["project_open"], false);
+        assert!(response.success);
+        assert_eq!(response.result.unwrap()["project_open"], false);
     }
 
     fn call_tool(
-        bridge: &mut EditorMcpBridge,
+        bridge: &mut EditorAutomationBridge,
         project: &EditorProject,
         tool: &'static str,
         args: Value,
     ) -> Result<Value, String> {
         let instance_id = bridge.editor_instance_id.clone();
-        let caller = thread::spawn(move || invoke_runtime_tool(Some(&instance_id), tool, args));
+        let project_instance_id = bridge.project_instance_id.clone();
+        let revision = project.revision();
+        let caller = thread::spawn(move || {
+            invoke_runtime_request(
+                Some(&instance_id),
+                AutomationRequest {
+                    project_instance_id: Some(project_instance_id),
+                    revision: Some(revision),
+                    action: tool.into(),
+                    args,
+                },
+            )
+            .map(|response| serde_json::to_value(response).unwrap())
+            .map_err(|error| error.to_string())
+        });
         for _ in 0..200 {
             bridge.poll(Some(project));
             if caller.is_finished() {
@@ -1061,20 +1292,22 @@ mod tests {
         }
         assert!(
             caller.is_finished(),
-            "MCP call did not complete after egui polling"
+            "automation call did not complete after egui polling"
         );
-        caller.join().expect("MCP caller thread panicked")
+        caller.join().expect("automation caller thread panicked")
     }
 
     #[test]
     fn live_roundtrip_stages_rejects_applies_and_undoes() {
         let trace_path = std::env::temp_dir().join(format!(
-            "agiso-mcp-cycle-test-{}.jsonl",
+            "agiso-automation-cycle-test-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
-        let mut bridge =
-            EditorMcpBridge::start_impl(eframe::egui::Context::default(), Some(trace_path.clone()))
-                .unwrap();
+        let mut bridge = EditorAutomationBridge::start_impl(
+            eframe::egui::Context::default(),
+            Some(trace_path.clone()),
+        )
+        .unwrap();
         let mut project = EditorProject::new_pool();
         let unsaved_id = project
             .create_object(
@@ -1104,10 +1337,10 @@ mod tests {
 
         let proposal_args = serde_json::json!({
             "transaction": {
-                "description": "Add MCP object",
+                "description": "Add automation object",
                 "operations": [{
                     "type": "CreateObject",
-                    "data": {"object_id": null, "object_type": "OutputString", "name": "MCP output"}
+                    "data": {"object_id": null, "object_type": "OutputString", "name": "automation output"}
                 }]
             }
         });
@@ -1142,6 +1375,13 @@ mod tests {
 
         bridge.reject_proposal();
         assert!(bridge.proposal().is_none());
+        let missing = call_tool(
+            &mut bridge,
+            &project,
+            "reject_proposal",
+            serde_json::json!({}),
+        );
+        assert!(missing.is_err());
 
         let staged =
             call_tool(&mut bridge, &project, "propose_transaction", proposal_args).unwrap();
@@ -1182,7 +1422,7 @@ mod tests {
             && event["outcome"] == "applied"
             && event["proposal_id"] == applied_id));
         assert!(events.iter().any(|event| event["event"] == "request"
-            && event["tool"] == "get_objects"
+            && event["action"] == "get_objects"
             && event["request_bytes"].as_u64().unwrap() > 0));
         drop(bridge);
         std::fs::remove_file(trace_path).unwrap();
@@ -1190,21 +1430,31 @@ mod tests {
 
     #[test]
     fn concurrent_fresh_submissions_leave_only_one_proposal_staged() {
-        let mut bridge = EditorMcpBridge::start(eframe::egui::Context::default()).unwrap();
+        let mut bridge = EditorAutomationBridge::start(eframe::egui::Context::default()).unwrap();
         let project = EditorProject::new_pool();
         let args = serde_json::json!({
             "transaction": {
                 "operations": [{
                     "type": "CreateObject",
-                    "data": {"object_id": null, "object_type": "OutputString", "name": "Concurrent MCP object"}
+                    "data": {"object_id": null, "object_type": "OutputString", "name": "Concurrent automation object"}
                 }]
             }
         });
         let instance_id = bridge.editor_instance_id.clone();
         let spawn_call = |args| {
             let instance_id = instance_id.clone();
+            let project_instance_id = bridge.project_instance_id.clone();
+            let revision = project.revision();
             thread::spawn(move || {
-                invoke_runtime_tool(Some(&instance_id), "propose_transaction", args)
+                invoke_runtime_request(
+                    Some(&instance_id),
+                    AutomationRequest {
+                        project_instance_id: Some(project_instance_id),
+                        revision: Some(revision),
+                        action: "propose_transaction".into(),
+                        args,
+                    },
+                )
             })
         };
         let first = spawn_call(args.clone());
@@ -1229,12 +1479,14 @@ mod tests {
     #[test]
     fn trace_counts_refinement_as_one_proposal() {
         let path = std::env::temp_dir().join(format!(
-            "agiso-mcp-refine-test-{}.jsonl",
+            "agiso-automation-refine-test-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
-        let mut bridge =
-            EditorMcpBridge::start_impl(eframe::egui::Context::default(), Some(path.clone()))
-                .unwrap();
+        let mut bridge = EditorAutomationBridge::start_impl(
+            eframe::egui::Context::default(),
+            Some(path.clone()),
+        )
+        .unwrap();
         let project = EditorProject::new_pool();
         let first = call_tool(&mut bridge, &project, "propose_transaction", serde_json::json!({
             "operations":[{"type":"CreateObject","data":{"object_id":100,"object_type":"OutputString","name":"Text"}}]

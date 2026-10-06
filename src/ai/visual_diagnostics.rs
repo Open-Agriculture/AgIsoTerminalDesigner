@@ -1,4 +1,4 @@
-//! Resolved colour diagnostics, independent of providers and image review.
+//! Resolved colour diagnostics for design inspection.
 use super::{AiDesignState, AiProposal};
 use crate::{
     effective_colour as colours,

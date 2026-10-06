@@ -13,7 +13,7 @@ mod possible_events;
 mod project_file;
 mod smart_naming;
 
-// New operation system and AI integration
+// Operation system and automation support
 pub mod ai;
 pub mod components;
 pub mod effective_colour;

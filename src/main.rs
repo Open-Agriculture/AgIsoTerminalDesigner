@@ -12,7 +12,7 @@ use ag_iso_stack::object_pool::ObjectId;
 use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectType;
 #[cfg(not(target_arch = "wasm32"))]
-use ag_iso_terminal_designer::ai::mcp_bridge::EditorMcpBridge;
+use ag_iso_terminal_designer::ai::automation_bridge::EditorAutomationBridge;
 use ag_iso_terminal_designer::render_property_editor;
 use ag_iso_terminal_designer::InteractiveMaskRenderer;
 use ag_iso_terminal_designer::RenderableObject;
@@ -102,9 +102,9 @@ pub struct DesignerApp {
     #[cfg(target_arch = "wasm32")]
     _before_unload: Option<Closure<dyn FnMut(web_sys::BeforeUnloadEvent)>>,
     #[cfg(not(target_arch = "wasm32"))]
-    mcp_bridge: Option<EditorMcpBridge>,
+    automation_bridge: Option<EditorAutomationBridge>,
     #[cfg(not(target_arch = "wasm32"))]
-    mcp_bridge_error: Option<String>,
+    automation_bridge_error: Option<String>,
 }
 
 impl DesignerApp {
@@ -195,10 +195,11 @@ impl DesignerApp {
         };
 
         #[cfg(not(target_arch = "wasm32"))]
-        let (mcp_bridge, mcp_bridge_error) = match EditorMcpBridge::start(_cc.egui_ctx.clone()) {
-            Ok(bridge) => (Some(bridge), None),
-            Err(error) => (None, Some(error)),
-        };
+        let (automation_bridge, automation_bridge_error) =
+            match EditorAutomationBridge::start(_cc.egui_ctx.clone()) {
+                Ok(bridge) => (Some(bridge), None),
+                Err(error) => (None, Some(error)),
+            };
 
         #[cfg(target_arch = "wasm32")]
         let browser_dirty = Rc::new(Cell::new(false));
@@ -251,17 +252,17 @@ impl DesignerApp {
             #[cfg(target_arch = "wasm32")]
             _before_unload: before_unload,
             #[cfg(not(target_arch = "wasm32"))]
-            mcp_bridge,
+            automation_bridge,
             #[cfg(not(target_arch = "wasm32"))]
-            mcp_bridge_error,
+            automation_bridge_error,
         }
     }
 }
 
 impl DesignerApp {
     #[cfg(not(target_arch = "wasm32"))]
-    fn invalidate_mcp_proposal(&mut self) {
-        if let Some(bridge) = &mut self.mcp_bridge {
+    fn invalidate_automation_proposal(&mut self) {
+        if let Some(bridge) = &mut self.automation_bridge {
             bridge.invalidate_proposal();
         }
     }
@@ -336,7 +337,7 @@ impl DesignerApp {
                     FileDialogReason::LoadPool => {
                         self.open_in_progress = false;
                         #[cfg(not(target_arch = "wasm32"))]
-                        self.invalidate_mcp_proposal();
+                        self.invalidate_automation_proposal();
                         let project = EditorProject::from(ObjectPool::from_iop(content));
                         // Apply smart naming to all objects that don't have custom names (if enabled)
                         if self.apply_smart_naming_on_import {
@@ -358,7 +359,7 @@ impl DesignerApp {
                         Ok(project) => {
                             self.open_in_progress = false;
                             #[cfg(not(target_arch = "wasm32"))]
-                            self.invalidate_mcp_proposal();
+                            self.invalidate_automation_proposal();
                             self.project = Some(project);
                             self.project_display_name = file_name;
                             #[cfg(not(target_arch = "wasm32"))]
@@ -584,7 +585,7 @@ impl DesignerApp {
         match action {
             PendingAction::NewPool => {
                 #[cfg(not(target_arch = "wasm32"))]
-                self.invalidate_mcp_proposal();
+                self.invalidate_automation_proposal();
                 self.project = Some(EditorProject::new_pool());
                 self.project_display_name = "Untitled.aitp".to_owned();
                 self.new_object_dialog = None;
@@ -631,7 +632,7 @@ impl DesignerApp {
                         Ok(project) => {
                             project.mark_recovered();
                             #[cfg(not(target_arch = "wasm32"))]
-                            self.invalidate_mcp_proposal();
+                            self.invalidate_automation_proposal();
                             self.project = Some(project);
                             self.project_display_name = record.display_name;
                             #[cfg(not(target_arch = "wasm32"))]
@@ -1173,7 +1174,7 @@ impl eframe::App for DesignerApp {
         // Handle file dialogs and deferred writes first.
         self.handle_file_loaded(ctx);
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(bridge) = &mut self.mcp_bridge {
+        if let Some(bridge) = &mut self.automation_bridge {
             bridge.poll(self.project.as_ref());
         }
 
@@ -1323,17 +1324,17 @@ impl eframe::App for DesignerApp {
         {
             let mut apply = false;
             let mut reject = false;
-            egui::Window::new("MCP proposal")
+            egui::Window::new("Proposal")
                 .default_width(360.0)
                 .default_height(420.0)
                 .show(ctx, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                    if let Some(error) = &self.mcp_bridge_error {
-                        ui.colored_label(egui::Color32::RED, format!("MCP server unavailable: {error}"));
-                    } else if let Some(bridge) = &self.mcp_bridge {
+                    if let Some(error) = &self.automation_bridge_error {
+                        ui.colored_label(egui::Color32::RED, format!("Automation bridge unavailable: {error}"));
+                    } else if let Some(bridge) = &self.automation_bridge {
                         ui.label(bridge.status());
                         if let Some(path) = bridge.trace_path() {
-                            ui.small(format!("MCP trace: {}", path.display()));
+                            ui.small(format!("Automation trace: {}", path.display()));
                         }
                         if let Some(error) = bridge.last_error() {
                             ui.colored_label(egui::Color32::RED, error);
@@ -1449,20 +1450,22 @@ impl eframe::App for DesignerApp {
                         } else {
                             ui.separator();
                             ui.label("No proposal is waiting for review.");
-                            ui.label("Connect Codex or Claude Code to the local MCP server while a project is open.");
+                            ui.label("Use aitd while this editor has a project open to stage a proposal.");
                         }
                     } else {
-                        ui.colored_label(egui::Color32::RED, "MCP server did not start.");
+                        ui.colored_label(egui::Color32::RED, "Automation bridge did not start.");
                     }
                     });
                 });
             if reject {
-                if let Some(bridge) = &mut self.mcp_bridge {
+                if let Some(bridge) = &mut self.automation_bridge {
                     bridge.reject_proposal();
                 }
             }
             if apply {
-                if let (Some(project), Some(bridge)) = (&mut self.project, &mut self.mcp_bridge) {
+                if let (Some(project), Some(bridge)) =
+                    (&mut self.project, &mut self.automation_bridge)
+                {
                     if bridge
                         .proposal()
                         .is_some_and(|proposal| proposal.base_revision != project.revision())

@@ -1,4 +1,4 @@
-//! Optional, local MCP diagnostics. Trace records never contain tool arguments,
+//! Optional, local automation diagnostics. Trace records never contain tool arguments,
 //! response bodies, or the bridge bearer token.
 use serde::Serialize;
 use std::{
@@ -21,7 +21,7 @@ pub struct RequestTrace<'a> {
     pub editor_instance_id: &'a str,
     pub project_instance_id: &'a str,
     pub revision: Option<u64>,
-    pub tool: &'a str,
+    pub action: &'a str,
     pub request_bytes: usize,
     pub response_bytes: usize,
     pub duration_ms: u128,
@@ -56,9 +56,11 @@ pub struct ProposalTrace<'a> {
 
 impl TraceSink {
     pub fn optional(runtime_path: &Path) -> Result<Option<Arc<Self>>, String> {
-        let enabled = std::env::var("AG_ISO_MCP_TRACE").ok().is_some_and(|value| {
-            matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
-        });
+        let enabled = std::env::var("AG_ISO_AUTOMATION_TRACE")
+            .ok()
+            .is_some_and(|value| {
+                matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+            });
         if !enabled {
             return Ok(None);
         }
@@ -76,7 +78,7 @@ impl TraceSink {
         }
         let file = options
             .open(&path)
-            .map_err(|e| format!("Could not open MCP trace {}: {e}", path.display()))?;
+            .map_err(|e| format!("Could not open automation trace {}: {e}", path.display()))?;
         Ok(Self {
             file: Mutex::new(file),
             path,
@@ -99,10 +101,10 @@ impl TraceSink {
                             .map_err(|error| error.to_string())
                     });
                 if let Err(error) = result {
-                    log::warn!("MCP trace write failed: {error}");
+                    log::warn!("automation trace write failed: {error}");
                 }
             }
-            Err(_) => log::warn!("MCP trace writer lock was poisoned"),
+            Err(_) => log::warn!("automation trace writer lock was poisoned"),
         }
     }
 }
@@ -118,36 +120,6 @@ pub fn duration_ms(duration: Duration) -> u128 {
     duration.as_millis()
 }
 
-pub fn error_code(message: &str) -> &'static str {
-    if message.contains("authentication") {
-        "authentication_failed"
-    } else if message.contains("queue is full") || message.contains("busy") {
-        "busy"
-    } else if message.contains("Timed out") {
-        "timeout"
-    } else if message.contains("project")
-        && (message.contains("changed") || message.contains("revision"))
-    {
-        "stale_project"
-    } else if message.contains("proposal")
-        && (message.contains("ID") || message.contains("matches") || message.contains("awaiting"))
-    {
-        "stale_proposal"
-    } else if message.contains("Open a project") || message.contains("No project is open") {
-        "no_project"
-    } else if message.contains("worker stopped") || message.contains("shutting down") {
-        "worker_unavailable"
-    } else if message.contains("Invalid bridge request") {
-        "invalid_bridge_request"
-    } else if message.contains("Unsupported tool") {
-        "unsupported_tool"
-    } else if message.starts_with('[') {
-        "validation_failed"
-    } else {
-        "tool_error"
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,7 +127,7 @@ mod tests {
     #[test]
     fn writes_private_json_lines_without_payloads() {
         let path = std::env::temp_dir().join(format!(
-            "agiso-mcp-trace-test-{}.jsonl",
+            "agiso-automation-trace-test-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
         let sink = TraceSink::create(path.clone()).unwrap();
@@ -165,7 +137,7 @@ mod tests {
             editor_instance_id: "editor",
             project_instance_id: "project",
             revision: Some(4),
-            tool: "get_objects",
+            action: "get_objects",
             request_bytes: 123,
             response_bytes: 456,
             duration_ms: 2,
@@ -176,7 +148,7 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["request_bytes"], 123);
-        assert_eq!(value["tool"], "get_objects");
+        assert_eq!(value["action"], "get_objects");
         assert!(value.get("args").is_none());
         #[cfg(unix)]
         {
@@ -187,12 +159,5 @@ mod tests {
             );
         }
         std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn error_codes_group_actionable_failures() {
-        assert_eq!(error_code("Bridge authentication failed"), "authentication_failed");
-        assert_eq!(error_code("The project revision changed; retry the request"), "stale_project");
-        assert_eq!(error_code("[{\"code\":\"OBJECT_NOT_FOUND\"}]"), "validation_failed");
     }
 }

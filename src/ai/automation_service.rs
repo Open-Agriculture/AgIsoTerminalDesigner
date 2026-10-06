@@ -1,4 +1,4 @@
-//! Domain operations exposed through the desktop MCP bridge.
+//! Domain operations exposed through the authenticated automation bridge.
 use crate::ai::{self, AiDesignState, AiProposal};
 use ag_iso_stack::object_pool::ObjectType;
 use serde_json::{json, Value};
@@ -30,6 +30,21 @@ fn result(value: Value) -> Result<DomainResult, DomainError> {
     })
 }
 
+fn inspection_error(error: ai::AiToolError) -> DomainError {
+    match error {
+        ai::AiToolError::ObjectNotFound(id) => {
+            DomainError::new("OBJECT_NOT_FOUND", format!("Object {id} was not found"))
+        }
+        ai::AiToolError::RequestTooLarge => DomainError::new(
+            "INVALID_ARGUMENTS",
+            "Object request exceeds the supported limit",
+        ),
+        ai::AiToolError::InvalidScope => {
+            DomainError::new("INVALID_ARGUMENTS", "Invalid design inspection scope")
+        }
+    }
+}
+
 pub fn execute(
     state: &AiDesignState,
     pending: Option<&AiProposal>,
@@ -39,10 +54,10 @@ pub fn execute(
     let args = if args.is_null() { json!({}) } else { args };
     let selected = |id: &str| -> Result<&AiProposal, DomainError> {
         let proposal = pending
-            .ok_or_else(|| DomainError::new("stale_proposal", "No proposal is awaiting review"))?;
+            .ok_or_else(|| DomainError::new("PROPOSAL_STALE", "No proposal is awaiting review"))?;
         if args["proposal_id"].as_str() != Some(id) {
             return Err(DomainError::new(
-                "stale_proposal",
+                "PROPOSAL_STALE",
                 "Proposal ID does not match the staged proposal",
             ));
         }
@@ -51,16 +66,14 @@ pub fn execute(
     match tool {
         "get_design_context" => {
             let request = serde_json::from_value(args)
-                .map_err(|e| DomainError::new("invalid_arguments", e.to_string()))?;
-            let context = ai::get_design_context(state, request)
-                .map_err(|e| DomainError::new("inspection_failed", format!("{e:?}")))?;
+                .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
+            let context = ai::get_design_context(state, request).map_err(inspection_error)?;
             result(json!({"context": ai::tools::component_design_context(state, context)}))
         }
         "get_objects" => {
             let request = serde_json::from_value(args)
-                .map_err(|e| DomainError::new("invalid_arguments", e.to_string()))?;
-            let objects = ai::get_objects(state, request)
-                .map_err(|e| DomainError::new("inspection_failed", format!("{e:?}")))?;
+                .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
+            let objects = ai::get_objects(state, request).map_err(inspection_error)?;
             result(
                 json!({"sources": objects.iter().filter_map(|o| ai::tools::source_context(&state.components, o.object.id)).collect::<Vec<_>>(), "objects": ai::wire::objects(objects)}),
             )
@@ -72,19 +85,19 @@ pub fn execute(
                     .map(|v| {
                         v.as_str().ok_or_else(|| {
                             DomainError::new(
-                                "invalid_arguments",
+                                "INVALID_ARGUMENTS",
                                 "object_types must contain strings",
                             )
                         })
                     })
                     .collect::<Result<_, _>>()?,
                 None => vec![args["object_type"].as_str().ok_or_else(|| {
-                    DomainError::new("invalid_arguments", "Provide object_type or object_types")
+                    DomainError::new("INVALID_ARGUMENTS", "Provide object_type or object_types")
                 })?],
             };
             if names.is_empty() || names.len() > 10 {
                 return Err(DomainError::new(
-                    "invalid_arguments",
+                    "INVALID_ARGUMENTS",
                     "Provide 1..10 object types",
                 ));
             }
@@ -95,12 +108,12 @@ pub fn execute(
                     .find(|v| format!("{v:?}") == name)
                     .ok_or_else(|| {
                         DomainError::new(
-                            "invalid_arguments",
+                            "INVALID_ARGUMENTS",
                             format!("Unknown object type: {name}"),
                         )
                     })?;
                 let schema = ai::get_object_schema(state, ty)
-                    .map_err(|e| DomainError::new("inspection_failed", format!("{e:?}")))?;
+                    .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
                 schemas.push(ai::wire::schema(schema));
             }
             result(json!({"schemas": schemas}))
@@ -137,19 +150,18 @@ pub fn execute(
             let id = serde_json::from_value::<crate::components::ComponentId>(
                 args["component_id"].clone(),
             )
-            .map_err(|e| DomainError::new("invalid_arguments", e.to_string()))?;
-            let component = state
-                .components
-                .definitions
-                .get(&id)
-                .ok_or_else(|| DomainError::new("invalid_arguments", "Component not found"))?;
+            .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
+            let component =
+                state.components.definitions.get(&id).ok_or_else(|| {
+                    DomainError::new("COMPONENT_NOT_FOUND", "Component not found")
+                })?;
             let mut metadata = ai::tools::component_catalog(state)
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|item| item["id"] == json!(id))
                 .cloned()
-                .ok_or_else(|| DomainError::new("invalid_arguments", "Component not found"))?;
+                .ok_or_else(|| DomainError::new("COMPONENT_NOT_FOUND", "Component not found"))?;
             if args["include_nodes"] == true {
                 metadata["nodes"] = json!(component.nodes);
             }
@@ -165,7 +177,7 @@ pub fn execute(
             let queries = args["queries"]
                 .as_array()
                 .filter(|v| !v.is_empty() && v.len() <= 16)
-                .ok_or_else(|| DomainError::new("invalid_arguments", "Provide 1..16 queries"))?;
+                .ok_or_else(|| DomainError::new("INVALID_ARGUMENTS", "Provide 1..16 queries"))?;
             let pool = pending.map(|p| &p.prepared.pool).unwrap_or(&state.pool);
             result(
                 json!({"results":queries.iter().map(|q| match ai::visual_intent::resolve(pool,q) {
@@ -175,21 +187,21 @@ pub fn execute(
         }
         "inspect_design_region" => {
             let request = serde_json::from_value(args)
-                .map_err(|e| DomainError::new("invalid_arguments", e.to_string()))?;
+                .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
             let region = ai::design_inspection::inspect_design_region(state, request)
-                .map_err(|e| DomainError::new("inspection_failed", format!("{e:?}")))?;
+                .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
             result(json!({"region":region}))
         }
         "analyze_design" => {
             let proposal = match args["scope"].as_str() {
                 Some("proposal") => Some(pending.ok_or_else(|| {
-                    DomainError::new("stale_proposal", "No proposal is awaiting review")
+                    DomainError::new("PROPOSAL_STALE", "No proposal is awaiting review")
                 })?),
                 Some("active_mask") => None,
                 None => pending,
                 Some(_) => {
                     return Err(DomainError::new(
-                        "invalid_arguments",
+                        "INVALID_ARGUMENTS",
                         "scope must be active_mask or proposal",
                     ))
                 }
@@ -200,7 +212,7 @@ pub fn execute(
                 ai::DesignAnalysisScope::ActiveMask
             };
             let analysis = ai::analyze_design(state, proposal, scope)
-                .map_err(|e| DomainError::new("inspection_failed", format!("{e:?}")))?;
+                .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
             result(json!({"analysis":analysis}))
         }
         "propose_transaction" => {
@@ -208,7 +220,7 @@ pub fn execute(
                 Some(p) => Some(selected(&p.proposal_id)?),
                 None if args.get("proposal_id").is_some() => {
                     return Err(DomainError::new(
-                        "stale_proposal",
+                        "PROPOSAL_STALE",
                         "No proposal matches this ID",
                     ))
                 }
@@ -217,7 +229,7 @@ pub fn execute(
             let mut tx_value = args.get("transaction").cloned().unwrap_or(args);
             if !tx_value.is_object() {
                 return Err(DomainError::new(
-                    "invalid_arguments",
+                    "INVALID_ARGUMENTS",
                     "transaction must be an object with an operations array",
                 ));
             }
@@ -229,16 +241,16 @@ pub fn execute(
             });
             let (normalized, colours) =
                 ai::visual_intent::compile(candidate.as_ref().unwrap_or(state), tx_value)
-                    .map_err(|e| DomainError::new("validation_failed", format!("{e:?}")))?;
+                    .map_err(|e| DomainError::new("VALIDATION_FAILED", format!("{e:?}")))?;
             let tx = serde_json::from_value(normalized)
-                .map_err(|e| DomainError::new("invalid_arguments", e.to_string()))?;
+                .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
             let proposal = match base {
                 Some(p) => ai::propose_refinement(state, p, tx),
                 None => ai::propose_transaction(state, tx),
             }
             .map_err(|e| {
                 DomainError::new(
-                    "validation_failed",
+                    "VALIDATION_FAILED",
                     serde_json::to_string(&e).unwrap_or_else(|_| format!("{e:?}")),
                 )
             })?;
@@ -255,7 +267,7 @@ pub fn execute(
                 Some(p) => Some(selected(&p.proposal_id)?),
                 None if args.get("proposal_id").is_some() => {
                     return Err(DomainError::new(
-                        "stale_proposal",
+                        "PROPOSAL_STALE",
                         "No proposal matches this ID",
                     ))
                 }
@@ -263,7 +275,7 @@ pub fn execute(
             };
             if base.is_some_and(|p| !p.transaction.operations.is_empty()) {
                 return Err(DomainError::new(
-                    "validation_failed",
+                    "VALIDATION_FAILED",
                     "Apply the primitive proposal before staging component actions",
                 ));
             }
@@ -273,12 +285,12 @@ pub fn execute(
                 .unwrap_or_default();
             intents.extend(
                 ai::tools::parse_component_actions(source, args["actions"].clone())
-                    .map_err(|e| DomainError::new("invalid_arguments", e))?,
+                    .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e))?,
             );
             let proposal =
                 ai::proposal::propose_component_intents(state, intents).map_err(|e| {
                     DomainError::new(
-                        "validation_failed",
+                        "VALIDATION_FAILED",
                         serde_json::to_string(&e).unwrap_or_else(|_| format!("{e:?}")),
                     )
                 })?;
@@ -292,13 +304,13 @@ pub fn execute(
             let proposal = selected(
                 pending
                     .ok_or_else(|| {
-                        DomainError::new("stale_proposal", "No proposal is awaiting review")
+                        DomainError::new("PROPOSAL_STALE", "No proposal is awaiting review")
                     })?
                     .proposal_id
                     .as_str(),
             )?;
             let preview = ai::render_proposal_preview(state, proposal)
-                .map_err(|e| DomainError::new("inspection_failed", format!("{e:?}")))?;
+                .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
             result(
                 json!({"proposal_id":preview.proposal_id,"width":preview.width,"height":preview.height,"mask_id":preview.mask_id,"diagnostics":preview.diagnostics,"colour_summary":preview.colour_summary,"png_base64":base64::Engine::encode(&base64::engine::general_purpose::STANDARD,&preview.image.bytes)}),
             )
@@ -307,7 +319,7 @@ pub fn execute(
             json!({"proposal":pending.map(|p|json!({"proposal_id":p.proposal_id,"base_revision":p.base_revision,"summary":{"operation_count":p.summary.operation_count,"affected_objects":p.summary.affected_objects},"refinement_round":p.refinement_round}))}),
         ),
         _ => Err(DomainError::new(
-            "unsupported_tool",
+            "UNSUPPORTED_OPERATION",
             format!("Unsupported tool: {tool}"),
         )),
     }

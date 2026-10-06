@@ -1,4 +1,4 @@
-//! Deterministic, semantic snapshots used by provider-neutral AI tools.
+//! Deterministic, semantic snapshots used by automation requests.
 use crate::object_properties::{get_object_property, get_property_descriptors, PropertySemantic};
 use crate::operations::{macro_refs, object_list, object_refs, ObjectReferenceList};
 use crate::{ObjectInfo, ProjectRevision};
