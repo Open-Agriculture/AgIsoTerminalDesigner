@@ -141,6 +141,38 @@ The lists below only apply to version 3 of the VT specification. There are 3 sta
 cargo run --release
 ```
 
+### Using Codex or Claude Code with the desktop editor
+
+Build the native editor and its local MCP server, then keep the editor running with a project open:
+
+```bash
+cargo build --release
+cargo run --release
+```
+
+In another terminal, register the MCP binary with either client (replace the path with the absolute path to this checkout):
+
+```bash
+codex mcp add agiso -- /absolute/path/to/AgIsoTerminalDesigner/target/release/ag-iso-terminal-designer-mcp
+claude mcp add --transport stdio --scope user agiso -- /absolute/path/to/AgIsoTerminalDesigner/target/release/ag-iso-terminal-designer-mcp
+```
+
+The server reads the live project, including unsaved edits. It stages validated proposals in the editor's **MCP Proposal** panel; the project changes only when you press **Apply** there. Press **Reject** to discard a proposal. Saving the `.aitp` file remains a separate editor action. The browser app is a manual editor and does not host the MCP bridge.
+
+MCP tools cover project status, design context and objects, object schemas, components, graphics, colour resolution, design analysis, staged transactions and component actions, proposal preview, and proposal status. To refine a staged proposal, pass its `proposal_id` to the next staging call. Only one proposal can await review in an editor instance.
+
+If more than one editor is running, select one with `--instance <editor-instance-id>` after the MCP binary path, or set `AG_ISO_EDITOR_INSTANCE_ID`. The editor instance IDs and connection details are in owner-only runtime files under the system temporary directory in `ag-iso-terminal-designer-<user>/`. A server call reports a clear error when the editor is closed, no project is open, or multiple instances exist without a selection.
+
+The local MCP bridge currently starts on Unix systems, where it enforces owner-only access to the runtime connection token.
+
+To collect local tool-quality diagnostics, start the **editor** with tracing enabled:
+
+```bash
+AG_ISO_MCP_TRACE=1 cargo run --release
+```
+
+The MCP proposal panel shows the trace file path. The owner-only JSONL file stays in the runtime directory after the editor closes. Each request entry records the tool, request and response byte counts, duration, success/error code, proposal ID, and project revision. A proposal entry records total tool calls, failed calls, refinement rounds, and its outcome (`applied`, `rejected`, `invalidated`, `closed`, or `apply_failed`). Arguments, response bodies, and authentication tokens are excluded. Tracing is off by default.
+
 ### Running the Web Application
 
 ```bash

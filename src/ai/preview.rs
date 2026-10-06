@@ -1,7 +1,7 @@
 //! Staged preview rendering. The UI path delegates to the application's normal renderer.
 use super::design_analysis::{analyze_design, DesignAnalysisScope, DesignDiagnostic};
 use super::snapshot::{active_mask, layout_instances};
-use super::{AiDesignState, AiImage, AiProposal};
+use super::{AiDesignState, AiProposal};
 use ag_iso_stack::object_pool::{ObjectId, ObjectPool};
 use eframe::egui;
 use image::{ImageFormat, Rgba, RgbaImage};
@@ -9,6 +9,11 @@ use std::io::Cursor;
 
 pub const MAX_AI_PREVIEW_WIDTH: u32 = 800;
 pub const MAX_AI_PREVIEW_HEIGHT: u32 = 600;
+#[derive(Debug, Clone)]
+pub struct AiImage {
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
 #[derive(Debug, Clone)]
 pub struct RenderedPreview {
     pub proposal_id: String,

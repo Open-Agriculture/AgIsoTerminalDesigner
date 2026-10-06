@@ -12,11 +12,7 @@ use ag_iso_stack::object_pool::ObjectId;
 use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectType;
 #[cfg(not(target_arch = "wasm32"))]
-use ag_iso_terminal_designer::ai::providers::openai::OpenAiProvider;
-#[cfg(not(target_arch = "wasm32"))]
-use ag_iso_terminal_designer::ai::ui::{AiAssistantState, AiRequestState, AiWorkerEvent};
-#[cfg(not(target_arch = "wasm32"))]
-use ag_iso_terminal_designer::ai::{AiContent, AiMessage, AiRole};
+use ag_iso_terminal_designer::ai::mcp_bridge::EditorMcpBridge;
 use ag_iso_terminal_designer::render_property_editor;
 use ag_iso_terminal_designer::InteractiveMaskRenderer;
 use ag_iso_terminal_designer::RenderableObject;
@@ -106,11 +102,9 @@ pub struct DesignerApp {
     #[cfg(target_arch = "wasm32")]
     _before_unload: Option<Closure<dyn FnMut(web_sys::BeforeUnloadEvent)>>,
     #[cfg(not(target_arch = "wasm32"))]
-    ai_state: AiAssistantState,
+    mcp_bridge: Option<EditorMcpBridge>,
     #[cfg(not(target_arch = "wasm32"))]
-    ai_input: String,
-    #[cfg(not(target_arch = "wasm32"))]
-    ai_channel: (Sender<AiWorkerEvent>, Receiver<AiWorkerEvent>),
+    mcp_bridge_error: Option<String>,
 }
 
 impl DesignerApp {
@@ -200,6 +194,12 @@ impl DesignerApp {
             }
         };
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let (mcp_bridge, mcp_bridge_error) = match EditorMcpBridge::start(_cc.egui_ctx.clone()) {
+            Ok(bridge) => (Some(bridge), None),
+            Err(error) => (None, Some(error)),
+        };
+
         #[cfg(target_arch = "wasm32")]
         let browser_dirty = Rc::new(Cell::new(false));
         #[cfg(target_arch = "wasm32")]
@@ -251,112 +251,19 @@ impl DesignerApp {
             #[cfg(target_arch = "wasm32")]
             _before_unload: before_unload,
             #[cfg(not(target_arch = "wasm32"))]
-            ai_state: AiAssistantState::default(),
+            mcp_bridge,
             #[cfg(not(target_arch = "wasm32"))]
-            ai_input: String::new(),
-            #[cfg(not(target_arch = "wasm32"))]
-            ai_channel: std::sync::mpsc::channel(),
+            mcp_bridge_error,
         }
     }
 }
 
 impl DesignerApp {
     #[cfg(not(target_arch = "wasm32"))]
-    fn poll_ai(&mut self, ctx: &egui::Context) {
-        if matches!(self.ai_state.request_state, AiRequestState::Running { .. })
-            && self.ai_state.request_revision != self.project.as_ref().map(|p| p.revision())
-        {
-            self.ai_state
-                .conversation
-                .cancelled
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            self.ai_state.request_state = AiRequestState::Idle;
-            self.ai_state.last_error = Some("Project changed during inspection. Send the request again to inspect the current revision.".into());
+    fn invalidate_mcp_proposal(&mut self) {
+        if let Some(bridge) = &mut self.mcp_bridge {
+            bridge.invalidate_proposal();
         }
-        for event in self.ai_channel.1.try_iter() {
-            let current = match &self.ai_state.request_state {
-                AiRequestState::Running { request_id } => request_id.clone(),
-                _ => continue,
-            };
-            match event {
-                AiWorkerEvent::Finished {
-                    request_id,
-                    conversation,
-                    proposal,
-                } if request_id == current => {
-                    self.ai_state.conversation = conversation;
-                    self.ai_state.active_proposal = proposal;
-                    self.ai_state.request_state = if self.ai_state.active_proposal.is_some() {
-                        AiRequestState::ProposalReady
-                    } else {
-                        AiRequestState::Idle
-                    };
-                    self.ai_state.last_error = None;
-                    ctx.request_repaint();
-                }
-                AiWorkerEvent::Failed {
-                    request_id,
-                    error,
-                    conversation,
-                } if request_id == current => {
-                    self.ai_state.conversation = conversation;
-                    self.ai_state.request_state = AiRequestState::Error;
-                    self.ai_state.last_error = Some(error);
-                    ctx.request_repaint();
-                }
-                _ => {}
-            }
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    fn send_ai(&mut self, ctx: &egui::Context) {
-        let Some(project) = self.project.as_ref() else {
-            self.ai_state.last_error =
-                Some("Open or create a project before using the assistant.".into());
-            self.ai_state.request_state = AiRequestState::Error;
-            return;
-        };
-        if self.ai_input.trim().is_empty() {
-            return;
-        }
-        let request_id = uuid::Uuid::new_v4().to_string();
-        self.ai_state.conversation.push(AiMessage::text(
-            AiRole::User,
-            std::mem::take(&mut self.ai_input),
-        ));
-        self.ai_state.active_proposal = None;
-        self.ai_state.last_error = None;
-        self.ai_state.request_state = AiRequestState::Running {
-            request_id: request_id.clone(),
-        };
-        self.ai_state.request_revision = Some(project.revision());
-        self.ai_state.conversation.cancelled = Default::default();
-        let settings = self.ai_state.settings.clone();
-        let state = project.ai_design_state();
-        let conversation = self.ai_state.conversation.clone();
-        let sender = self.ai_channel.0.clone();
-        let repaint = ctx.clone();
-        std::thread::spawn(move || match OpenAiProvider::from_environment() {
-            Ok(provider) => {
-                ag_iso_terminal_designer::ai::ui::run_request(
-                    &provider,
-                    state,
-                    conversation,
-                    settings,
-                    request_id,
-                    sender,
-                );
-                repaint.request_repaint();
-            }
-            Err(error) => {
-                let _ = sender.send(AiWorkerEvent::Failed {
-                    request_id,
-                    error: error.to_string(),
-                    conversation,
-                });
-                repaint.request_repaint();
-            }
-        });
     }
     /// Open a file dialog
     fn open_file_dialog(&mut self, reason: FileDialogReason, ctx: &egui::Context) {
@@ -428,6 +335,8 @@ impl DesignerApp {
                 } => match reason {
                     FileDialogReason::LoadPool => {
                         self.open_in_progress = false;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        self.invalidate_mcp_proposal();
                         let project = EditorProject::from(ObjectPool::from_iop(content));
                         // Apply smart naming to all objects that don't have custom names (if enabled)
                         if self.apply_smart_naming_on_import {
@@ -448,6 +357,8 @@ impl DesignerApp {
                     FileDialogReason::LoadProject => match EditorProject::load_project(content) {
                         Ok(project) => {
                             self.open_in_progress = false;
+                            #[cfg(not(target_arch = "wasm32"))]
+                            self.invalidate_mcp_proposal();
                             self.project = Some(project);
                             self.project_display_name = file_name;
                             #[cfg(not(target_arch = "wasm32"))]
@@ -672,19 +583,14 @@ impl DesignerApp {
     fn perform_action(&mut self, action: PendingAction, ctx: &egui::Context) {
         match action {
             PendingAction::NewPool => {
+                #[cfg(not(target_arch = "wasm32"))]
+                self.invalidate_mcp_proposal();
                 self.project = Some(EditorProject::new_pool());
                 self.project_display_name = "Untitled.aitp".to_owned();
                 self.new_object_dialog = None;
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     self.project_path = None;
-                    self.ai_state
-                        .conversation
-                        .cancelled
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    self.ai_state.request_state = AiRequestState::Idle;
-                    self.ai_state.active_proposal = None;
-                    self.ai_state.request_revision = None;
                 }
                 if self.discard_on_replace {
                     self.clear_recovery();
@@ -724,6 +630,8 @@ impl DesignerApp {
                     match EditorProject::load_project(record.project_json.into_bytes()) {
                         Ok(project) => {
                             project.mark_recovered();
+                            #[cfg(not(target_arch = "wasm32"))]
+                            self.invalidate_mcp_proposal();
                             self.project = Some(project);
                             self.project_display_name = record.display_name;
                             #[cfg(not(target_arch = "wasm32"))]
@@ -1265,7 +1173,9 @@ impl eframe::App for DesignerApp {
         // Handle file dialogs and deferred writes first.
         self.handle_file_loaded(ctx);
         #[cfg(not(target_arch = "wasm32"))]
-        self.poll_ai(ctx);
+        if let Some(bridge) = &mut self.mcp_bridge {
+            bridge.poll(self.project.as_ref());
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
         if ctx.input(|input| input.viewport().close_requested()) {
@@ -1411,77 +1321,26 @@ impl eframe::App for DesignerApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let mut send = false;
-            let mut cancel = false;
             let mut apply = false;
             let mut reject = false;
-            egui::Window::new("Assistant")
+            egui::Window::new("MCP proposal")
                 .default_width(360.0)
-                .default_height(360.0)
+                .default_height(420.0)
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(190.0)
-                        .show(ui, |ui| {
-                            for message in &self.ai_state.conversation.messages {
-                                let prefix = match message.role {
-                                    AiRole::User => "You",
-                                    AiRole::Assistant => "Assistant",
-                                    AiRole::Tool => "Tool",
-                                };
-                                for content in &message.content {
-                                    match content {
-                                        AiContent::Text(text) => {
-                                            ui.label(format!("{prefix}: {text}"));
-                                        }
-                                        AiContent::ToolCall(call) => {
-                                            ui.label(format!("Assistant called {}", call.name));
-                                        }
-                                        AiContent::ToolResult(_) => {}
-                                        AiContent::Image(_) => {
-                                            ui.label("Assistant reviewed a staged preview");
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    if ui
-                        .add_enabled(
-                            !matches!(self.ai_state.request_state, AiRequestState::Running { .. }),
-                            egui::Button::new("Clear conversation"),
-                        )
-                        .clicked()
-                    {
-                        self.ai_state.conversation = Default::default();
-                    }
-                    ag_iso_terminal_designer::ai::debug_trace::debug_ui(
-                        ui,
-                        &self.ai_state.conversation.debug.lock().unwrap(),
-                        &mut self.ai_state.settings,
-                    );
-                    if let Some(error) = &self.ai_state.last_error {
-                        ui.colored_label(egui::Color32::RED, error);
-                    }
-                    match &self.ai_state.request_state {
-                        AiRequestState::Running { .. } => {
-                            ui.label("Working…");
-                            if ui.button("Cancel").clicked() {
-                                cancel = true;
-                            }
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(error) = &self.mcp_bridge_error {
+                        ui.colored_label(egui::Color32::RED, format!("MCP server unavailable: {error}"));
+                    } else if let Some(bridge) = &self.mcp_bridge {
+                        ui.label(bridge.status());
+                        if let Some(path) = bridge.trace_path() {
+                            ui.small(format!("MCP trace: {}", path.display()));
                         }
-                        _ => {
-                            ui.label("User input:");
-                            ui.add(egui::TextEdit::multiline(&mut self.ai_input).desired_rows(3));
-                            if ui
-                                .add_enabled(self.project.is_some(), egui::Button::new("Send"))
-                                .clicked()
-                            {
-                                send = true;
-                            }
+                        if let Some(error) = bridge.last_error() {
+                            ui.colored_label(egui::Color32::RED, error);
                         }
-                    }
-                    if let Some(proposal) = &self.ai_state.active_proposal {
+                        if let Some(proposal) = bridge.proposal() {
                         ui.separator();
-                        ui.label("Proposed change:");
+                        ui.heading("Proposed change");
                         ui.label(
                             proposal
                                 .transaction
@@ -1573,45 +1432,54 @@ impl eframe::App for DesignerApp {
                                 let _ = ag_iso_terminal_designer::ai::render_preview_ui(
                                     ui, &design, proposal,
                                 );
+                            } else {
+                                ui.colored_label(egui::Color32::RED, "Could not render proposal preview.");
                             }
+                        } else {
+                            ui.colored_label(egui::Color32::RED, "The project was closed; this proposal cannot be applied.");
                         }
                         ui.horizontal(|ui| {
-                            if ui.button("Apply").clicked() {
+                            if ui.add_enabled(self.project.is_some(), egui::Button::new("Apply")).clicked() {
                                 apply = true;
                             }
                             if ui.button("Reject").clicked() {
                                 reject = true;
                             }
                         });
+                        } else {
+                            ui.separator();
+                            ui.label("No proposal is waiting for review.");
+                            ui.label("Connect Codex or Claude Code to the local MCP server while a project is open.");
+                        }
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "MCP server did not start.");
                     }
+                    });
                 });
-            if cancel {
-                self.ai_state.request_state = AiRequestState::Idle;
-                self.ai_state.last_error = Some("Assistant request cancelled.".into());
-            }
-            if send {
-                self.send_ai(ctx);
-            }
             if reject {
-                self.ai_state.active_proposal = None;
-                self.ai_state.request_state = AiRequestState::Idle;
+                if let Some(bridge) = &mut self.mcp_bridge {
+                    bridge.reject_proposal();
+                }
             }
             if apply {
-                if let (Some(project), Some(proposal)) =
-                    (&mut self.project, self.ai_state.active_proposal.take())
-                {
-                    match project.apply_ai_proposal(proposal) {
-                        Ok(_) => {
-                            self.ai_state.conversation.push(AiMessage::text(
-                                AiRole::Assistant,
-                                "The proposed change was applied. You can use Undo normally.",
-                            ));
-                            self.ai_state.request_state = AiRequestState::Idle;
-                        }
-                        Err(diagnostics) => {
-                            self.ai_state.last_error =
-                                Some(format!("Could not apply proposal: {diagnostics:?}"));
-                            self.ai_state.request_state = AiRequestState::Error;
+                if let (Some(project), Some(bridge)) = (&mut self.project, &mut self.mcp_bridge) {
+                    if bridge
+                        .proposal()
+                        .is_some_and(|proposal| proposal.base_revision != project.revision())
+                    {
+                        bridge.invalidate_proposal();
+                        self.error_message = Some(
+                            "The project changed after this proposal was staged. Request a new proposal.".into(),
+                        );
+                    } else if let Some(proposal) = bridge.take_proposal() {
+                        let proposal_id = proposal.proposal_id.clone();
+                        match project.apply_ai_proposal(proposal) {
+                            Ok(_) => bridge.record_applied(&proposal_id),
+                            Err(diagnostics) => {
+                                bridge.record_apply_failed(&proposal_id);
+                                self.error_message =
+                                    Some(format!("Could not apply proposal: {diagnostics:?}"));
+                            }
                         }
                     }
                 }

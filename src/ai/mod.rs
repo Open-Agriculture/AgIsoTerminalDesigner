@@ -1,22 +1,18 @@
-//! Provider-neutral AI domain layer. It only reads snapshots and proposes transactions.
-pub mod backend;
-pub mod debug_trace;
-pub mod design_inspection;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod evaluation;
-pub mod task_state;
-pub use debug_trace::{AiTokenUsage, AiUsageStats};
-pub mod conversation;
+//! Design inspection and staged proposal domain layer.
 pub mod design_analysis;
+pub mod design_inspection;
+pub mod mcp_domain;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mcp_bridge;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mcp_server;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mcp_trace;
 pub mod preview;
 pub mod proposal;
-pub mod protocol;
-pub mod providers;
 pub mod schema;
 pub mod snapshot;
 pub mod tools;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod ui;
 
 use crate::ObjectInfo;
 use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectId, ObjectPool};
@@ -34,16 +30,11 @@ pub struct AiDesignState {
     pub mask_size: u16,
     pub selected: Option<ObjectId>,
 }
-pub use backend::{
-    AiProvider, AiProviderError, AiProviderFuture, AiProviderResponse, AiSettings, AiTurnRequest,
-};
-pub use conversation::{
-    AiContent, AiImage, AiMessage, AiRole, AiToolCall, AiToolResult, Conversation,
-};
 pub use design_analysis::{
     analyze_design, DesignAnalysis, DesignAnalysisError, DesignAnalysisScope, DesignDiagnostic,
     DesignDiagnosticSeverity, DiagnosticRegion,
 };
+pub use preview::AiImage;
 pub use preview::{
     render_preview_ui, render_proposal_preview, AiPreview, PreviewError, RenderedPreview,
 };
@@ -52,7 +43,7 @@ pub use schema::{get_object_schema, ObjectSchemaSnapshot, PropertySchemaSnapshot
 pub use snapshot::*;
 pub use tools::{get_design_context, get_objects, AiDomainTool, AiToolError, GetObjectsRequest};
 
-mod wire;
+pub(crate) mod wire;
 
 pub mod icon_recipes;
 pub mod visual_diagnostics;

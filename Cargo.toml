@@ -2,7 +2,12 @@
 name = "ag-iso-terminal-designer"
 version = "0.1.0"
 edition = "2021"
+default-run = "ag-iso-terminal-designer"
 authors = ["Daan Steenbergen <d.steenbergen@student.tue.nl>"]
+
+[[bin]]
+name = "ag-iso-terminal-designer-mcp"
+path = "src/ai/mcp_server_bin.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -18,14 +23,16 @@ uuid = { version = "1.17.0", features = ["v4", "v7", "js", "serde"] }
 getrandom = { version = "0.2", features = ["js"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+base64 = "0.22"
 
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tracing-subscriber = "0.3"
 futures = "0.3.28"
 env_logger = "0.11.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "io-std"] }
+rmcp = { version = "3", features = ["server", "macros", "transport-io"] }
+libc = "0.2"
 
 # web:
 [target.'cfg(target_arch = "wasm32")'.dependencies]
