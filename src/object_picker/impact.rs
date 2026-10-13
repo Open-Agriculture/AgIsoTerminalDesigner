@@ -37,6 +37,7 @@ struct Comparison {
 struct CachedReview {
     owner: egui::Id,
     revision: crate::ai::ProjectRevision,
+    object_id_format: crate::ObjectIdFormat,
     result: Result<Comparison, String>,
 }
 
@@ -74,8 +75,8 @@ fn prepare_comparison(
                 .unwrap();
             let label = format!(
                 "{} (#{} · {:?})",
-                candidate.get_object_info(object).get_name(object),
-                value,
+                candidate.object_display_name(object),
+                candidate.format_object_id(value),
                 object.object_type()
             );
             (id, label)
@@ -100,14 +101,17 @@ pub fn review_change(
     let cached = ui
         .ctx()
         .data_mut(|data| data.get_temp::<Arc<CachedReview>>(cache_key()));
-    let cached = if let Some(cached) =
-        cached.filter(|cached| cached.owner == owner && cached.revision == revision)
-    {
+    let cached = if let Some(cached) = cached.filter(|cached| {
+        cached.owner == owner
+            && cached.revision == revision
+            && cached.object_id_format == project.object_id_format()
+    }) {
         cached
     } else {
         let cached = Arc::new(CachedReview {
             owner,
             revision,
+            object_id_format: project.object_id_format(),
             result: prepare_comparison(project, edit),
         });
         ui.ctx()
@@ -116,7 +120,7 @@ pub fn review_change(
     };
     match &cached.result {
         Ok(comparison) => {
-            review_comparison(ui, comparison);
+            review_comparison(ui, comparison, project.object_id_format());
             true
         }
         Err(error) => {
@@ -142,7 +146,7 @@ pub fn review_queued(
     })
 }
 
-fn review_comparison(ui: &mut egui::Ui, comparison: &Comparison) {
+fn review_comparison(ui: &mut egui::Ui, comparison: &Comparison, format: crate::ObjectIdFormat) {
     ui.separator();
     if comparison.changed.is_empty() {
         ui.label("This selection does not change the rendered objects.");
@@ -150,7 +154,14 @@ fn review_comparison(ui: &mut egui::Ui, comparison: &Comparison) {
     }
     ui.strong("Changed objects — before / after");
     for (id, label) in &comparison.changed {
-        draw_comparison(ui, &comparison.before, &comparison.after, *id, label);
+        draw_comparison(
+            ui,
+            &comparison.before,
+            &comparison.after,
+            *id,
+            label,
+            format,
+        );
     }
 }
 
@@ -170,6 +181,7 @@ fn draw_comparison(
     after: &ObjectPool,
     id: ObjectId,
     label: &str,
+    format: crate::ObjectIdFormat,
 ) {
     let old = before.object_by_id(id);
     let new = after.object_by_id(id);
@@ -211,7 +223,7 @@ fn draw_comparison(
                     let refs = object
                         .referenced_objects()
                         .iter()
-                        .map(|id| format!("#{}", id.value()))
+                        .map(|id| format!("#{}", format.format(id.value())))
                         .collect::<Vec<_>>()
                         .join(", ");
                     if !refs.is_empty() {

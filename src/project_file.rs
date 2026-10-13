@@ -46,6 +46,10 @@ pub struct ObjectMetadata {
 
     #[serde(default)]
     pub tags: Vec<String>,
+
+    /// Ordered editor-only ObjectPointer targets; empty preserves unrestricted selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_references: Vec<ObjectId>,
 }
 
 /// Project-level settings
@@ -53,6 +57,11 @@ pub struct ObjectMetadata {
 pub struct ProjectSettings {
     /// Virtual mask size for preview
     pub mask_size: u16,
+
+    /// Softkey designator width and height in design pixels. Missing legacy
+    /// values are inferred from Key contents when opening the project.
+    #[serde(default)]
+    pub soft_key_size: Option<(u16, u16)>,
 
     /// Stored since project format v1; missing values in legacy files use VT6.
     #[serde(default = "default_vt_version_number")]
@@ -69,11 +78,15 @@ impl ProjectFile {
         pool: &ObjectPool,
         object_info: &HashMap<ObjectId, ObjectInfo>,
         mask_size: u16,
+        soft_key_size: (u16, u16),
         vt_version: VtVersion,
         selected: Option<ObjectId>,
     ) -> Result<Self, serde_json::Error> {
         let object_pool_data = pool.try_as_iop().map_err(|message| {
-            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            ))
         })?;
         // Convert ObjectInfo map to ObjectMetadata map
         let mut object_metadata = BTreeMap::new();
@@ -83,6 +96,7 @@ impl ProjectFile {
                 notes: None, // Future feature
                 description: info.description.clone(),
                 tags: info.tags.clone(),
+                allowed_references: info.allowed_references.clone(),
             };
             object_metadata.insert(id.value(), metadata);
         }
@@ -95,6 +109,7 @@ impl ProjectFile {
             object_metadata,
             settings: ProjectSettings {
                 mask_size,
+                soft_key_size: Some(soft_key_size),
                 vt_version: vt_version.into(),
                 last_selected: selected.map(|id| id.value()),
             },
@@ -149,6 +164,7 @@ impl Default for ProjectSettings {
     fn default() -> Self {
         ProjectSettings {
             mask_size: 500,
+            soft_key_size: Some((60, 60)),
             vt_version: default_vt_version_number(),
             last_selected: None,
         }

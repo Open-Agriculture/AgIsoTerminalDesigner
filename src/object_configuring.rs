@@ -9,6 +9,7 @@ use crate::object_properties::{
 };
 use crate::operations::{
     ChildPlacement, MacroReferenceTarget, ObjectReferenceList, ObjectTarget, ObjectTargetList,
+    OperationTransaction,
 };
 use crate::{EditorProject, Operation};
 use ag_iso_stack::object_pool::object::Object;
@@ -159,7 +160,19 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
         ui.push_id(editor.property, |ui| match editor.editor {
             EditorKind::Colour => render_colour(ui, &label, &value, id, editor.property, design),
             EditorKind::ObjectReference => {
-                render_reference(ui, &label, &value, property, id, editor.property, design)
+                if object_type == ObjectType::ObjectPointer && editor.property == "value" {
+                    render_pointer_reference(
+                        ui,
+                        &label,
+                        &value,
+                        property,
+                        id,
+                        editor.property,
+                        design,
+                    );
+                } else {
+                    render_reference(ui, &label, &value, property, id, editor.property, design)
+                }
             }
             EditorKind::Enum => {
                 ui.horizontal(|ui| {
@@ -397,20 +410,25 @@ fn row_actions(ui: &mut egui::Ui, index: usize, len: usize, action: &mut Option<
 }
 
 fn object_label(design: &EditorProject, object: &Object) -> String {
-    format!(
-        "{}: {:?} - {}",
-        object.id().value(),
-        object.object_type(),
-        design.get_object_info(object).get_name(object)
-    )
+    let name = design.object_display_name(object);
+    if design.get_object_info(object).name.is_some() {
+        format!(
+            "{}: {:?} - {name}",
+            design.format_object_id(object.id().value()),
+            object.object_type(),
+        )
+    } else {
+        name
+    }
 }
 
 fn object_selector_label(design: &EditorProject, object: &Object) -> String {
-    let info = design.get_object_info(object);
-    info.name.map_or_else(
-        || object.id().value().to_string(),
-        |name| format!("{} - {name}", object.id().value()),
-    )
+    let name = design.object_display_name(object);
+    if design.get_object_info(object).name.is_some() {
+        format!("{} - {name}", design.format_object_id(object.id().value()))
+    } else {
+        name
+    }
 }
 
 fn select_object(design: &EditorProject, id: ObjectId) {
@@ -744,7 +762,7 @@ fn render_object_list(
                 .striped(true)
                 .show(ui, |ui| {
                     for (index, object_id) in objects.iter().copied().enumerate() {
-                        ui.label(object_id.value().to_string());
+                        ui.label(design.format_object_id(object_id.value()));
                         if let Some(new_id) = render_object_selector(
                             ui,
                             ("required_object", index),
@@ -788,17 +806,21 @@ fn render_object_list(
                 .striped(true)
                 .show(ui, |ui| {
                     for (index, object_id) in objects.iter().copied().enumerate() {
-                        ui.label(
-                            object_id
-                                .0
-                                .map_or_else(|| "None".to_owned(), |id| id.value().to_string()),
-                        );
+                        ui.label(object_id.0.map_or_else(
+                            || "None".to_owned(),
+                            |id| design.format_object_id(id.value()),
+                        ));
                         let mut selected = object_id;
                         let label = object_id.0.map_or_else(
                             || "None".to_owned(),
                             |id| {
                                 design.get_pool().object_by_id(id).map_or_else(
-                                    || format!("#{}: Missing object", id.value()),
+                                    || {
+                                        format!(
+                                            "#{}: Missing object",
+                                            design.format_object_id(id.value())
+                                        )
+                                    },
                                     |object| object_label(design, object),
                                 )
                             },
@@ -850,10 +872,7 @@ fn render_reference_links(ui: &mut egui::Ui, design: &EditorProject, object_id: 
         if ui.link(format!("{:?}", object.object_type())).clicked() {
             select_object(design, object_id);
         }
-        if ui
-            .link(design.get_object_info(object).get_name(object))
-            .clicked()
-        {
+        if ui.link(design.object_display_name(object)).clicked() {
             select_object(design, object_id);
         }
     } else {
@@ -1033,7 +1052,12 @@ fn render_macro_references(
 
                 let macro_object = macro_object(design, reference.macro_id);
                 let selected_text = macro_object.map_or_else(
-                    || format!("{} - Missing macro", reference.macro_id),
+                    || {
+                        format!(
+                            "{} - Missing macro",
+                            design.format_object_id(reference.macro_id.into())
+                        )
+                    },
                     |object| object_label(design, object),
                 );
                 if let Some(Some(candidate)) = crate::object_picker::button(
@@ -1105,7 +1129,13 @@ fn render_identity(
         .unwrap_or_else(|| id.value());
     ui.horizontal(|ui| {
         ui.label("Object ID");
-        let response = ui.add(egui::DragValue::new(&mut value).range(0..=65534));
+        let format = design.object_id_format();
+        let response = ui.add(
+            egui::DragValue::new(&mut value)
+                .range(0..=65534)
+                .custom_formatter(|value, _| design.format_object_id(value as u16))
+                .custom_parser(move |text| format.parse(text).ok().map(f64::from)),
+        );
         if response.changed() {
             ui.data_mut(|data| data.insert_temp(key, PendingValue::Number(value.into())));
         }
@@ -1558,7 +1588,7 @@ fn render_reference(
             || "None".into(),
             |id| {
                 referenced_object.map_or_else(
-                    || format!("Missing object #{}", id.value()),
+                    || format!("Missing object #{}", design.format_object_id(id.value())),
                     |object| object_selector_label(design, object),
                 )
             },
@@ -1618,6 +1648,169 @@ fn render_reference(
             }
         }
     });
+}
+
+fn queue_allowed_references(design: &EditorProject, pointer: ObjectId, references: &[ObjectId]) {
+    design.queue_operation(Operation::SetObjectPointerAllowedReferences {
+        object: ObjectTarget::id(pointer.value()),
+        references: references
+            .iter()
+            .map(|id| ObjectTarget::id(id.value()))
+            .collect(),
+    });
+}
+
+fn render_pointer_reference(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    descriptor: &crate::object_properties::PropertyDescriptor,
+    id: ObjectId,
+    property: &str,
+    design: &EditorProject,
+) {
+    let PropertySemantic::ObjectReference { allowed_types } = &descriptor.semantic else {
+        return;
+    };
+    let selected_id = value.as_u64().and_then(|id| ObjectId::new(id as u16).ok());
+    let references = design
+        .get_pool()
+        .object_by_id(id)
+        .map(|object| design.get_object_info(object).allowed_references)
+        .unwrap_or_default();
+
+    if references.is_empty() {
+        render_reference(ui, label, value, descriptor, id, property, design);
+    } else {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let selected_label = selected_id.map_or_else(
+                || "None".to_owned(),
+                |target| crate::object_picker::object_label(design, Some(target)),
+            );
+            egui::ComboBox::from_id_salt((id.value(), property, "allowed_reference"))
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(selected_id.is_none(), "None").clicked()
+                        && selected_id.is_some()
+                    {
+                        queue(design, id, property, serde_json::Value::Null);
+                    }
+                    for target in &references {
+                        let Some(candidate) = design.get_pool().object_by_id(*target) else {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new(format!(
+                                    "Missing object #{}",
+                                    design.format_object_id(target.value())
+                                )),
+                            )
+                            .on_disabled_hover_text("This allowed object no longer exists.");
+                            continue;
+                        };
+                        let choice = crate::object_picker::object_label(design, Some(*target));
+                        let reason = if !allowed_types.is_empty()
+                            && !allowed_types.contains(&candidate.object_type())
+                        {
+                            Some("This object type is not valid for this reference.".to_owned())
+                        } else {
+                            validate_pointer_target(design, id, property, *target).err()
+                        };
+                        let response = ui.add_enabled(
+                            reason.is_none(),
+                            egui::Button::selectable(selected_id == Some(*target), choice),
+                        );
+                        if let Some(reason) = reason {
+                            response.on_disabled_hover_text(reason);
+                        } else if response.clicked() && selected_id != Some(*target) {
+                            queue(design, id, property, serde_json::json!(target.value()));
+                        }
+                    }
+                });
+            if let Some(object) =
+                selected_id.and_then(|target| design.get_pool().object_by_id(target))
+            {
+                if ui
+                    .link("View")
+                    .on_hover_text("View referenced object")
+                    .clicked()
+                {
+                    select_object(design, object.id());
+                }
+            }
+        });
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("Allowed references:");
+        if let Some(reference) = crate::object_picker::button(
+            ui,
+            (id.value(), property, "add_allowed_reference"),
+            "Add",
+            &format!(
+                "Add an allowed reference for {}",
+                crate::object_picker::object_label(design, Some(id))
+            ),
+            design,
+            None,
+            false,
+            |candidate| {
+                candidate.id() != id
+                    && !references.contains(&candidate.id())
+                    && (allowed_types.is_empty()
+                        || allowed_types.contains(&candidate.object_type()))
+                    && crate::pool_validation::would_create_circular_reference(
+                        design.get_pool(),
+                        id,
+                        candidate.id(),
+                    )
+                    .is_ok()
+            },
+            |_, _| true,
+        ) {
+            if let Some(reference) = reference.0 {
+                let mut updated = references.clone();
+                updated.push(reference);
+                queue_allowed_references(design, id, &updated);
+            }
+        }
+    });
+    for target in &references {
+        ui.horizontal(|ui| {
+            ui.label(crate::object_picker::object_label(design, Some(*target)));
+            if ui.small_button("Remove").clicked() {
+                let updated: Vec<_> = references
+                    .iter()
+                    .copied()
+                    .filter(|reference| reference != target)
+                    .collect();
+                queue_allowed_references(design, id, &updated);
+            }
+        });
+    }
+}
+
+fn validate_pointer_target(
+    design: &EditorProject,
+    pointer: ObjectId,
+    property: &str,
+    target: ObjectId,
+) -> Result<(), String> {
+    let mut transaction = OperationTransaction::new(None);
+    transaction.add_operation(Operation::SetObjectReference {
+        object: ObjectTarget::id(pointer.value()),
+        property: property.to_owned(),
+        reference: Some(ObjectTarget::id(target.value())),
+    });
+    design
+        .validate_transaction(&transaction)
+        .map_err(|diagnostics| {
+            diagnostics
+                .0
+                .first()
+                .map(|diagnostic| diagnostic.message.clone())
+                .unwrap_or_else(|| "This reference is invalid.".to_owned())
+        })
 }
 
 fn render_justification(

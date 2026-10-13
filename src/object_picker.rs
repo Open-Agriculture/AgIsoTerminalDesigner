@@ -31,6 +31,17 @@ pub fn matches(name: &str, id: impl std::fmt::Display, query: &str) -> bool {
             .contains(query.trim_start_matches('#'))
 }
 
+pub fn matches_object(project: &EditorProject, object: &Object, query: &str) -> bool {
+    let id = object.id().value();
+    let name = project.object_display_name(object);
+    project
+        .object_id_format()
+        .parse(query.trim().trim_start_matches('#'))
+        .ok()
+        == Some(id)
+        || matches(&name, project.format_object_id(id), query)
+}
+
 /// All callers share window behavior, search focus, scrolling, and dismissal.
 pub fn window<T: Clone + Send + Sync + 'static>(
     ctx: &egui::Context,
@@ -140,14 +151,19 @@ pub fn object_label(project: &EditorProject, id: Option<ObjectId>) -> String {
         || "None".into(),
         |id| {
             project.get_pool().object_by_id(id).map_or_else(
-                || format!("Missing object #{}", id.value()),
+                || format!("Missing object #{}", project.format_object_id(id.value())),
                 |object| {
-                    format!(
-                        "{} (#{} · {:?})",
-                        project.get_object_info(object).get_name(object),
-                        id.value(),
-                        object.object_type()
-                    )
+                    let name = project.object_display_name(object);
+                    if project.get_object_info(object).name.is_some() {
+                        format!(
+                            "{} (#{} · {:?})",
+                            name,
+                            project.format_object_id(id.value()),
+                            object.object_type()
+                        )
+                    } else {
+                        name
+                    }
                 },
             )
         },
@@ -299,8 +315,8 @@ pub fn objects(
     }
     let mut count = 0;
     for object in project.get_pool().objects() {
-        let name = project.get_object_info(object).get_name(object);
-        if !eligible(object) || !matches(&name, object.id().value(), query) {
+        let name = project.object_display_name(object);
+        if !eligible(object) || !matches_object(project, object, query) {
             continue;
         }
         count += 1;
@@ -308,7 +324,11 @@ pub fn objects(
             if row(
                 ui,
                 &name,
-                &format!("#{} · {:?}", object.id().value(), object.object_type()),
+                &format!(
+                    "#{} · {:?}",
+                    project.format_object_id(object.id().value()),
+                    object.object_type()
+                ),
                 selected == Some(object.id()),
                 |ui, rect| object_preview(ui, rect, project.get_pool(), object),
             ) {
@@ -433,14 +453,19 @@ mod tests {
 
     #[test]
     fn name_and_id_search_respects_caller_eligibility() {
-        let project = fixture();
+        let mut project = fixture();
         let ctx = egui::Context::default();
-        for (query, pictures_only, expected, excluded) in [
-            (" wArNiNg ", false, "Warning", "Wide Button"),
-            ("#12", false, "Wide Button", "Macro"),
-            ("12", true, "Warning", "Wide Button"),
-            ("missing", true, "No matching objects", "Warning"),
+        use crate::ObjectIdFormat::{Decimal, Hexadecimal};
+        for (format, query, pictures_only, expected, excluded) in [
+            (Decimal, " wArNiNg ", false, "Warning", "Wide Button"),
+            (Decimal, "#12", false, "Wide Button", "Macro"),
+            (Decimal, "12", true, "Warning", "Wide Button"),
+            (Decimal, "missing", true, "No matching objects", "Warning"),
+            (Decimal, "0xC", false, "Wide Button", "Warning"),
+            (Hexadecimal, "#0xC", false, "Wide Button", "Warning"),
+            (Hexadecimal, "12C", false, "Macro", "Wide Button"),
         ] {
+            project.set_object_id_format(format);
             let output = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     objects(ui, &project, query, None, false, |object| {

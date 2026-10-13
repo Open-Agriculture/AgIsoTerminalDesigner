@@ -377,6 +377,15 @@ fn duplicate_target(
                 if let Some(original) = copied_info.get(&old_object_id) {
                     metadata.description = original.description.clone();
                     metadata.tags = original.tags.clone();
+                    metadata.allowed_references = original
+                        .allowed_references
+                        .iter()
+                        .map(|id| {
+                            mapping
+                                .get(&id.value())
+                                .map_or(*id, |mapped| ObjectId::new(*mapped).unwrap())
+                        })
+                        .collect();
                     if let Some(name) = &original.name {
                         metadata.name = Some(unique_copy_name(name, info));
                     }
@@ -674,6 +683,51 @@ mod tests {
         assert_eq!(child_placements(project.get_pool(), 1).unwrap()[0].x, 0);
         assert!(
             matches!(project.get_pool().object_by_id(object_id(2).unwrap()), Some(Object::Button(button)) if button.width == 0)
+        );
+    }
+
+    #[test]
+    fn duplicate_preserves_pointer_allowed_targets_and_remaps_copied_targets() {
+        let mut pool = ObjectPool::new();
+        pool.add(object_with_id(ObjectType::DataMask, 1));
+        pool.add(object_with_id(ObjectType::Container, 2));
+        pool.add(object_with_id(ObjectType::ObjectPointer, 3));
+        pool.add(object_with_id(ObjectType::Button, 4));
+        pool.add(object_with_id(ObjectType::Button, 5));
+        add_positioned_child(&mut pool, 1, 2, 0, 0);
+        add_positioned_child(&mut pool, 2, 3, 0, 0);
+        add_positioned_child(&mut pool, 2, 4, 0, 0);
+        let mut project = project(pool);
+        project.queue_operation(Operation::SetObjectPointerAllowedReferences {
+            object: ObjectTarget::id(3),
+            references: vec![ObjectTarget::id(4), ObjectTarget::id(5)],
+        });
+        assert!(project.commit_queued("Allow pointer targets"));
+        apply(
+            &mut project,
+            "Duplicate container",
+            &[CanvasEdit::Duplicate {
+                target: PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index: 0,
+                },
+                x: 0,
+                y: 0,
+            }],
+        )
+        .unwrap();
+        let root = target_id(&child_placements(project.get_pool(), 1).unwrap()[1].child).unwrap();
+        let children = child_placements(project.get_pool(), root).unwrap();
+        let pointer = target_id(&children[0].child).unwrap();
+        let copied_target = target_id(&children[1].child).unwrap();
+        let metadata = project.component_object_info();
+        assert_eq!(
+            metadata[&object_id(pointer).unwrap()].allowed_references,
+            vec![object_id(copied_target).unwrap(), object_id(5).unwrap()]
+        );
+        assert_eq!(
+            metadata[&object_id(3).unwrap()].allowed_references,
+            vec![object_id(4).unwrap(), object_id(5).unwrap()]
         );
     }
 

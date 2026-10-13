@@ -55,9 +55,9 @@ pub fn propose_transaction(
             Operation::CreateObject { .. } => summary.created += 1,
             Operation::DeleteObject { .. } => summary.deleted += 1,
             Operation::RenameObject { .. } => summary.renamed += 1,
-            Operation::SetProperty { .. } | Operation::SetObjectReference { .. } => {
-                summary.property_changes += 1
-            }
+            Operation::SetProperty { .. }
+            | Operation::SetObjectReference { .. }
+            | Operation::SetObjectPointerAllowedReferences { .. } => summary.property_changes += 1,
             Operation::AddChild { .. }
             | Operation::RemoveChild { .. }
             | Operation::SetChildPosition { .. }
@@ -119,6 +119,7 @@ pub fn propose_refinement(
         object_info: base.prepared.object_info.clone(),
         vt_version: state.vt_version,
         mask_size: state.mask_size,
+        soft_key_size: state.soft_key_size,
         selected: state.selected,
     };
     // First validate against P1. This is the important validation boundary for

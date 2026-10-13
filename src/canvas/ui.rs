@@ -533,7 +533,11 @@ impl CanvasState {
                             && i.hit_rect.expand(hit_tolerance).contains(pos)
                     }) {
                         if ui
-                            .button(format!("#{} · depth {}", item.object_id, item.path.len()))
+                            .button(format!(
+                                "{} · depth {}",
+                                project.format_object_id(item.object_id),
+                                item.path.len()
+                            ))
                             .clicked()
                         {
                             self.selected = vec![item.path.clone()];
@@ -727,7 +731,7 @@ impl CanvasState {
                     .items
                     .iter()
                     .filter(|i| path.path.starts_with(&i.path))
-                    .map(|i| format!("#{}", i.object_id))
+                    .map(|i| project.format_object_id(i.object_id))
                     .collect::<Vec<_>>()
                     .join(" / ");
                 ui.label(if items.len() > 1 {

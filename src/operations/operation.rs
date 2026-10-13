@@ -50,6 +50,23 @@ pub enum Operation {
         reference: Option<ObjectTarget>,
     },
 
+    /// Replace the editor-only allowed target list for an ObjectPointer.
+    /// Entries must be unique existing objects; new entries must not create a cycle.
+    /// A populated list clears an excluded active target to None in the same undo step.
+    /// An empty list leaves target selection unrestricted and preserves its value.
+    SetObjectPointerAllowedReferences {
+        object: ObjectTarget,
+        references: Vec<ObjectTarget>,
+    },
+
+    /// Internal inverse restoring both pointer metadata and its active value.
+    #[serde(skip)]
+    RestoreObjectPointerAllowedReferences {
+        object_id: u16,
+        references: Vec<ObjectId>,
+        value: Value,
+    },
+
     /// Internal-only inverse that can also restore the editor's unresolved
     /// ObjectId(0) default for required references.
     #[serde(skip)]
@@ -466,7 +483,10 @@ impl Operation {
 
                 // RejectIfReferenced policy: prevent deletion if other objects reference this
                 let referencing = crate::pool_validation::get_referencing_objects(pool, id);
-                if !referencing.is_empty() {
+                let allowed_by = object_info
+                    .values()
+                    .any(|info| info.allowed_references.contains(&id));
+                if !referencing.is_empty() || allowed_by {
                     return Err(OperationError::DeleteReferencedObject(*object_id));
                 }
 
@@ -567,6 +587,33 @@ impl Operation {
                 let value = match reference {
                     Some(target) => {
                         let reference_id = resolve_target(target, pool, object_info)?;
+                        let info = object_info.get(&id);
+                        let is_pointer = pool.object_by_id(id).is_some_and(|object| {
+                            object.object_type() == ObjectType::ObjectPointer
+                        });
+                        if is_pointer {
+                            would_create_circular_reference(pool, id, reference_id).map_err(
+                                |_| OperationError::CircularReference {
+                                    parent: object_id,
+                                    child: reference_id.value(),
+                                },
+                            )?;
+                        }
+                        if is_pointer
+                            && info.is_some_and(|info| {
+                                !info.allowed_references.is_empty()
+                                    && !info.allowed_references.contains(&reference_id)
+                            })
+                        {
+                            return Err(OperationError::PropertyError {
+                                object_id,
+                                property: property.clone(),
+                                reason: format!(
+                                    "Object {} is not in this pointer's allowed references",
+                                    reference_id.value()
+                                ),
+                            });
+                        }
                         context.affected_objects.insert(reference_id);
                         serde_json::to_value(reference_id).unwrap()
                     }
@@ -590,6 +637,155 @@ impl Operation {
                 Ok(Operation::RestoreObjectReference {
                     object_id,
                     property: property.clone(),
+                    value: old_value,
+                })
+            }
+
+            Operation::SetObjectPointerAllowedReferences { object, references } => {
+                let id = resolve_target(object, pool, object_info)?;
+                let object_id = id.value();
+                if pool
+                    .object_by_id(id)
+                    .is_none_or(|object| object.object_type() != ObjectType::ObjectPointer)
+                {
+                    return Err(OperationError::PropertyError {
+                        object_id,
+                        property: "allowed_references".to_owned(),
+                        reason: "Allowed references can only be assigned to an ObjectPointer"
+                            .into(),
+                    });
+                }
+                let previous = object_info
+                    .get(&id)
+                    .map(|info| info.allowed_references.clone())
+                    .unwrap_or_default();
+                let mut resolved = Vec::with_capacity(references.len());
+                for target in references {
+                    let reference_id = resolve_target(target, pool, object_info)?;
+                    if reference_id == id {
+                        return Err(OperationError::PropertyError {
+                            object_id,
+                            property: "allowed_references".to_owned(),
+                            reason: "An ObjectPointer cannot allow itself as a reference".into(),
+                        });
+                    }
+                    if resolved.contains(&reference_id) {
+                        return Err(OperationError::PropertyError {
+                            object_id,
+                            property: "allowed_references".to_owned(),
+                            reason: format!(
+                                "Object {} is listed more than once",
+                                reference_id.value()
+                            ),
+                        });
+                    }
+                    // Existing options can become temporarily invalid as the pool
+                    // changes. Keep list maintenance possible; selection still
+                    // validates the current reference graph.
+                    if !previous.contains(&reference_id) {
+                        would_create_circular_reference(pool, id, reference_id).map_err(|_| {
+                            OperationError::CircularReference {
+                                parent: object_id,
+                                child: reference_id.value(),
+                            }
+                        })?;
+                    }
+                    resolved.push(reference_id);
+                }
+                let active_value = crate::object_properties::get_property(pool, id, "value")
+                    .map_err(|error| OperationError::PropertyError {
+                        object_id,
+                        property: "value".to_owned(),
+                        reason: error.to_string(),
+                    })?;
+                let active_target = serde_json::from_value::<ObjectId>(active_value.clone()).ok();
+                let next_value = if !resolved.is_empty()
+                    && active_target.is_some_and(|target| !resolved.contains(&target))
+                {
+                    Value::Null
+                } else {
+                    active_value.clone()
+                };
+                if next_value != active_value {
+                    crate::object_properties::set_property(pool, id, "value", next_value).map_err(
+                        |error| OperationError::PropertyError {
+                            object_id,
+                            property: "value".to_owned(),
+                            reason: error.to_string(),
+                        },
+                    )?;
+                }
+                object_info
+                    .entry(id)
+                    .or_insert_with(|| {
+                        ObjectInfo::new(pool.object_by_id(id).expect("resolved pointer exists"))
+                    })
+                    .allowed_references = resolved.clone();
+                context.affected_objects.insert(id);
+                context.affected_objects.extend(previous.iter().copied());
+                context.affected_objects.extend(resolved.iter().copied());
+                context.affected_objects.extend(active_target);
+                Ok(Operation::RestoreObjectPointerAllowedReferences {
+                    object_id,
+                    references: previous,
+                    value: active_value,
+                })
+            }
+
+            Operation::RestoreObjectPointerAllowedReferences {
+                object_id,
+                references,
+                value,
+            } => {
+                let id = ObjectId::new(*object_id)
+                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+                let object = pool
+                    .object_by_id(id)
+                    .ok_or(OperationError::ObjectNotFound(*object_id))?;
+                if object.object_type() != ObjectType::ObjectPointer {
+                    return Err(OperationError::PropertyError {
+                        object_id: *object_id,
+                        property: "allowed_references".to_owned(),
+                        reason: "Allowed references can only be assigned to an ObjectPointer"
+                            .into(),
+                    });
+                }
+                let old_references = object_info
+                    .get(&id)
+                    .map(|info| info.allowed_references.clone())
+                    .unwrap_or_default();
+                let old_value =
+                    crate::object_properties::get_property(pool, id, "value").map_err(|error| {
+                        OperationError::PropertyError {
+                            object_id: *object_id,
+                            property: "value".to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+                crate::object_properties::set_property(pool, id, "value", value.clone()).map_err(
+                    |error| OperationError::PropertyError {
+                        object_id: *object_id,
+                        property: "value".to_owned(),
+                        reason: error.to_string(),
+                    },
+                )?;
+                object_info
+                    .entry(id)
+                    .or_insert_with(|| {
+                        ObjectInfo::new(pool.object_by_id(id).expect("resolved pointer exists"))
+                    })
+                    .allowed_references = references.clone();
+                context.affected_objects.insert(id);
+                context
+                    .affected_objects
+                    .extend(old_references.iter().copied());
+                context.affected_objects.extend(references.iter().copied());
+                context
+                    .affected_objects
+                    .extend(serde_json::from_value::<ObjectId>(old_value.clone()).ok());
+                Ok(Operation::RestoreObjectPointerAllowedReferences {
+                    object_id: *object_id,
+                    references: old_references,
                     value: old_value,
                 })
             }
@@ -661,6 +857,16 @@ impl Operation {
 
                 if let Some(info) = object_info.remove(&old_id) {
                     object_info.insert(new_id, info);
+                }
+                for (owner_id, info) in object_info.iter_mut() {
+                    if info.allowed_references.contains(&old_id) {
+                        for reference in &mut info.allowed_references {
+                            if *reference == old_id {
+                                *reference = new_id;
+                            }
+                        }
+                        context.affected_objects.insert(*owner_id);
+                    }
                 }
                 context.affected_objects.insert(old_id);
                 context.affected_objects.insert(new_id);

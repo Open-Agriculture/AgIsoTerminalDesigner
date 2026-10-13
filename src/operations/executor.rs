@@ -519,6 +519,10 @@ fn operation_type(operation: &Operation) -> String {
         Operation::DeleteObject { .. } => "DeleteObject",
         Operation::SetProperty { .. } => "SetProperty",
         Operation::SetObjectReference { .. } => "SetObjectReference",
+        Operation::SetObjectPointerAllowedReferences { .. } => "SetObjectPointerAllowedReferences",
+        Operation::RestoreObjectPointerAllowedReferences { .. } => {
+            "RestoreObjectPointerAllowedReferences"
+        }
         Operation::RestoreObjectReference { .. } => "RestoreObjectReference",
         Operation::ChangeObjectId { .. } => "ChangeObjectId",
         Operation::ReorderObjects { .. } => "ReorderObjects",
@@ -537,6 +541,7 @@ fn primary_target(operation: &Operation) -> Option<&ObjectTarget> {
     match operation {
         Operation::SetProperty { object, .. }
         | Operation::SetObjectReference { object, .. }
+        | Operation::SetObjectPointerAllowedReferences { object, .. }
         | Operation::SetObjectList { object, .. }
         | Operation::SetMacroReferences { object, .. }
         | Operation::RenameObject { object, .. } => Some(object),

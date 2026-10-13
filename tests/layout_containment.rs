@@ -191,10 +191,14 @@ fn mask_size_reduction_rejects_new_overflow_without_changing_project_state() {
         .undo_description()
         .map(str::to_owned);
     assert_eq!(
-        project.set_mask_size(490).unwrap_err().code,
+        project
+            .set_design_dimensions(490, (80, 96))
+            .unwrap_err()
+            .code,
         "OBJECT_OUTSIDE_PARENT"
     );
     assert_eq!(project.mask_size, 500);
+    assert_eq!(project.soft_key_size(), (60, 60));
     assert_eq!(project.revision(), revision);
     assert_eq!(
         project.operation_history.borrow().undo_description(),

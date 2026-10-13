@@ -42,6 +42,7 @@ This project is under **active development**. While some features may not yet be
 - Use hyperlinks to navigate to referenced objects
 - Edit the active mask on an interactive canvas: drag, resize, duplicate, align, and distribute placements with undo/redo
 - Limit selecting macro's and object references to allowed types only.
+- Assign allowed references to object pointers and switch their active target with a dropdown in the properties panel. Empty lists keep unrestricted selection; lists are saved in `.aitp` projects, while IOP export contains only the active target.
 
 ### Interactive layout editor
 

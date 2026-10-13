@@ -4,6 +4,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 mod app_persistence;
+mod designer_settings;
 
 use ag_iso_stack::object_pool::object::*;
 use ag_iso_stack::object_pool::object_attributes::Point;
@@ -20,6 +21,7 @@ use ag_iso_terminal_designer::{EditorProject, Operation};
 #[cfg(not(target_arch = "wasm32"))]
 use app_persistence::RecentProject;
 use app_persistence::{AppPersistence, RecoveryRecord};
+use designer_settings::{AppPreferences, DimensionsDraft};
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -86,6 +88,11 @@ pub struct DesignerApp {
     #[cfg(not(target_arch = "wasm32"))]
     project_path: Option<PathBuf>,
     project_display_name: String,
+    preferences: AppPreferences,
+    project_settings_open: bool,
+    dimensions_draft: Option<DimensionsDraft>,
+    #[cfg(not(target_arch = "wasm32"))]
+    last_proposal_id: Option<String>,
     pending_action: Option<PendingAction>,
     confirm_discard_recovery: Option<PendingAction>,
     save_then_continue: Option<PendingAction>,
@@ -109,6 +116,11 @@ pub struct DesignerApp {
 }
 
 impl DesignerApp {
+    fn close_project_settings(&mut self) {
+        self.project_settings_open = false;
+        self.dimensions_draft = None;
+    }
+
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         // TODO: Create font files and load them here
         //// Install ISO 8859-1 (ISO Latin 1) font
@@ -177,6 +189,10 @@ impl DesignerApp {
         //     .unwrap()
         //     .insert(0, "iso_greek".to_owned());
 
+        let preferences = _cc
+            .storage
+            .and_then(|storage| eframe::get_value(storage, designer_settings::STORAGE_KEY))
+            .unwrap_or_default();
         let persistence = AppPersistence::new();
         let (recovery, mut error_message, recovery_load_error) = match persistence.load_recovery() {
             Ok(recovery) => (recovery, None, false),
@@ -237,6 +253,11 @@ impl DesignerApp {
             #[cfg(not(target_arch = "wasm32"))]
             project_path: None,
             project_display_name: "Untitled project".to_owned(),
+            preferences,
+            project_settings_open: false,
+            dimensions_draft: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            last_proposal_id: None,
             pending_action: None,
             confirm_discard_recovery: None,
             save_then_continue: None,
@@ -346,6 +367,7 @@ impl DesignerApp {
                             project.apply_smart_naming_to_all_objects();
                         }
                         project.mark_saved();
+                        self.close_project_settings();
                         self.canvas = CanvasState::default();
                         self.project = Some(project);
                         self.project_display_name = file_name;
@@ -363,6 +385,7 @@ impl DesignerApp {
                             self.open_in_progress = false;
                             #[cfg(not(target_arch = "wasm32"))]
                             self.invalidate_automation_proposal();
+                            self.close_project_settings();
                             self.canvas = CanvasState::default();
                             self.project = Some(project);
                             self.project_display_name = file_name;
@@ -590,6 +613,7 @@ impl DesignerApp {
             PendingAction::NewPool => {
                 #[cfg(not(target_arch = "wasm32"))]
                 self.invalidate_automation_proposal();
+                self.close_project_settings();
                 self.canvas = CanvasState::default();
                 self.project = Some(EditorProject::new_pool());
                 self.project_display_name = "Untitled.aitp".to_owned();
@@ -638,6 +662,7 @@ impl DesignerApp {
                             project.mark_recovered();
                             #[cfg(not(target_arch = "wasm32"))]
                             self.invalidate_automation_proposal();
+                            self.close_project_settings();
                             self.canvas = CanvasState::default();
                             self.project = Some(project);
                             self.project_display_name = record.display_name;
@@ -874,8 +899,8 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
         let is_selected = project.get_selected() == object.id().into();
         let label_text = format!(
             "{}: {}",
-            u16::from(object.id()),
-            object_info.get_name(object)
+            project.format_object_id(object.id().value()),
+            project.object_display_name(object)
         );
         let response = ui.selectable_label(is_selected, label_text);
 
@@ -1084,7 +1109,10 @@ fn render_selected_ancestry_hierarchy(
     let Some(object) = project.get_pool().object_by_id(object_id) else {
         ui.colored_label(
             egui::Color32::RED,
-            format!("Missing object: {}", object_id.value()),
+            format!(
+                "Missing object: {}",
+                project.format_object_id(object_id.value())
+            ),
         );
         return;
     };
@@ -1112,7 +1140,10 @@ fn render_selected_ancestry_hierarchy(
                 if path_guard.contains(parent) {
                     ui.colored_label(
                         egui::Color32::RED,
-                        format!("Cycle detected in ancestry at {}", parent.value()),
+                        format!(
+                            "Cycle detected in ancestry at {}",
+                            project.format_object_id(parent.value())
+                        ),
                     );
                     continue;
                 }
@@ -1145,7 +1176,10 @@ fn render_selected_ancestry_panel(ui: &mut egui::Ui, project: &EditorProject) {
     if project.get_pool().object_by_id(selected_id).is_none() {
         ui.colored_label(
             egui::Color32::RED,
-            format!("Selected object not found: {}", selected_id.value()),
+            format!(
+                "Selected object not found: {}",
+                project.format_object_id(selected_id.value())
+            ),
         );
         return;
     }
@@ -1173,12 +1207,16 @@ fn render_selected_ancestry_panel(ui: &mut egui::Ui, project: &EditorProject) {
 
 impl eframe::App for DesignerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.preferences.apply(ctx);
         ctx.style_mut(|style| {
             style.interaction.selectable_labels = false;
         });
 
         // Handle file dialogs and deferred writes first.
         self.handle_file_loaded(ctx);
+        if let Some(project) = &mut self.project {
+            project.set_object_id_format(self.preferences.object_id_format);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(bridge) = &mut self.automation_bridge {
             bridge.poll(self.project.as_ref());
@@ -1328,9 +1366,19 @@ impl eframe::App for DesignerApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let proposal_id = self
+                .automation_bridge
+                .as_ref()
+                .and_then(|bridge| bridge.proposal())
+                .map(|proposal| proposal.proposal_id.clone());
+            if proposal_id.is_some() && proposal_id != self.last_proposal_id {
+                self.preferences.show_proposal = true;
+            }
+            self.last_proposal_id = proposal_id;
             let mut apply = false;
             let mut reject = false;
             egui::Window::new("Proposal")
+                .open(&mut self.preferences.show_proposal)
                 .default_width(360.0)
                 .default_height(420.0)
                 .show(ctx, |ui| {
@@ -1555,18 +1603,114 @@ impl eframe::App for DesignerApp {
         }
 
         egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                egui::widgets::global_theme_preference_buttons(ui);
-                ui.separator();
-
-                if let Some(project) = &self.project {
-                    let dirty_marker = if project.is_dirty() { " *" } else { "" };
-                    ui.label(format!("{}{}", self.project_display_name, dirty_marker))
-                        .on_hover_text("An asterisk means the project has unsaved changes");
+            ui.horizontal(|ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("New Object Pool").clicked() {
+                        self.request_action(PendingAction::NewPool, ctx);
+                        ui.close();
+                    }
+                    if ui.button("Open Project…").clicked() {
+                        self.request_action(PendingAction::OpenProject, ctx);
+                        ui.close();
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if !self.recent_projects.is_empty() {
+                        ui.menu_button("Recent Projects", |ui| {
+                            for recent in self.recent_projects.clone() {
+                                if ui
+                                    .button(&recent.display_name)
+                                    .on_hover_text(recent.path.display().to_string())
+                                    .clicked()
+                                {
+                                    self.request_action(
+                                        PendingAction::OpenRecent(recent.path),
+                                        ctx,
+                                    );
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
                     ui.separator();
-                }
+                    ui.add_enabled_ui(self.project.is_some(), |ui| {
+                        if ui.button("Save").clicked() {
+                            self.save_project(false, ctx);
+                            ui.close();
+                        }
+                        if ui.button("Save As…").clicked() {
+                            self.save_project(true, ctx);
+                            ui.close();
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Import IOP…").clicked() {
+                        self.request_action(PendingAction::ImportPool, ctx);
+                        ui.close();
+                    }
+                    ui.checkbox(
+                        &mut self.apply_smart_naming_on_import,
+                        "Apply smart naming on import",
+                    );
+                    ui.add_enabled_ui(self.project.is_some(), |ui| {
+                        if ui.button("Export IOP…").clicked() {
+                            self.save_pool();
+                            ui.close();
+                        }
+                        if ui.button("Export Header…").clicked() {
+                            self.save_header();
+                            ui.close();
+                        }
+                    });
+                });
+                ui.menu_button("Project", |ui| {
+                    ui.add_enabled_ui(self.project.is_some(), |ui| {
+                        ui.menu_button("Add Object", |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(400.0)
+                                .show(ui, |ui| {
+                                    for object_type in ObjectType::values() {
+                                        if ui.button(format!("{:?}", object_type)).clicked() {
+                                            let default_name = self
+                                                .project
+                                                .as_ref()
+                                                .unwrap()
+                                                .generate_smart_name_for_new_object(object_type);
+                                            self.new_object_dialog =
+                                                Some((object_type, default_name));
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                        });
+                        if ui.button("Project Settings…").clicked() {
+                            self.project_settings_open = true;
+                            self.dimensions_draft =
+                                self.project.as_ref().map(DimensionsDraft::from_project);
+                            ui.close();
+                        }
+                    });
+                });
+                self.preferences.show_view_menu(ui, ctx);
+                ui.separator();
+                let dirty_marker = if self.project.as_ref().is_some_and(EditorProject::is_dirty) {
+                    " *"
+                } else {
+                    ""
+                };
+                let project_name = if self.project.is_some() {
+                    format!("{}{}", self.project_display_name, dirty_marker)
+                } else {
+                    "No project open".to_owned()
+                };
+                let reserved_undo_width = if self.project.is_some() { 72.0 } else { 0.0 };
+                let project_name_width = (ui.available_width() - reserved_undo_width).max(0.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(project_name_width);
+                    ui.add(egui::Label::new(project_name).truncate())
+                })
+                .inner
+                .on_hover_text("An asterisk means the project has unsaved changes");
 
-                // Undo/redo buttons
                 if let Some(pool) = &mut self.project {
                     let undo_shortcut =
                         egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::Z);
@@ -1609,115 +1753,31 @@ impl eframe::App for DesignerApp {
                     }
                     ui.separator();
                 }
-
-                ui.menu_button("File", |ui| {
-                    ui.label("Project Files");
-                    if ui.button("New Object Pool").clicked() {
-                        self.request_action(PendingAction::NewPool, ctx);
-                        ui.close();
-                    }
-                    if ui.button("Open Project (.aitp)").clicked() {
-                        self.request_action(PendingAction::OpenProject, ctx);
-                        ui.close();
-                    }
-                    if self.project.is_some() && ui.button("Save Project (.aitp)").clicked() {
-                        self.save_project(false, ctx);
-                        ui.close();
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        if !self.recent_projects.is_empty() {
-                            ui.menu_button("Recent Projects", |ui| {
-                                let projects = self.recent_projects.clone();
-                                for recent in projects {
-                                    if ui
-                                        .button(&recent.display_name)
-                                        .on_hover_text(recent.path.display().to_string())
-                                        .clicked()
-                                    {
-                                        self.request_action(
-                                            PendingAction::OpenRecent(recent.path),
-                                            ctx,
-                                        );
-                                        ui.close();
-                                    }
-                                }
-                            });
-                        }
-                    }
-
-                    ui.separator();
-                    ui.label("ISOBUS Files");
-
-                    if ui.button("Import IOP (.iop)").clicked() {
-                        self.request_action(PendingAction::ImportPool, ctx);
-                        ui.close();
-                    }
-
-                    ui.checkbox(
-                        &mut self.apply_smart_naming_on_import,
-                        "Apply smart naming on import",
-                    )
-                    .on_hover_text(
-                        "Automatically apply smart naming to objects when importing IOP files",
-                    );
-                    if self.project.is_some() && ui.button("Export IOP (.iop)").clicked() {
-                        self.save_pool();
-                        ui.close();
-                    }
-                    if self.project.is_some() && ui.button("Export Header (.h)").clicked() {
-                        self.save_header();
-                        ui.close();
-                    }
-                });
-
-                if self.project.is_some() {
-                    // Add a new object
-                    ui.menu_button("Add object", |ui| {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for object_type in ObjectType::values() {
-                                if ui.button(format!("{:?}", object_type)).clicked() {
-                                    // Generate smart default name
-                                    let pool = self.project.as_ref().unwrap();
-                                    let default_name =
-                                        pool.generate_smart_name_for_new_object(object_type);
-                                    self.new_object_dialog = Some((object_type, default_name));
-                                    ui.close();
-                                }
-                            }
-                        });
-                    });
-                }
-
-                if let Some(pool) = &mut self.project {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut mask_size = pool.mask_size;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut mask_size, 100..=2000)
-                                    .text("Virtual Mask size"),
-                            )
-                            .changed()
-                        {
-                            if let Err(error) = pool.set_mask_size(mask_size) {
-                                self.error_message = Some(error.to_string());
-                            }
-                        }
-                    });
-                }
             });
         });
 
+        designer_settings::show_project_settings(
+            ctx,
+            &mut self.project_settings_open,
+            self.project.as_mut(),
+            &mut self.preferences,
+            &mut self.dimensions_draft,
+            &mut self.error_message,
+        );
+
         if let Some(pool) = &mut self.project {
-            egui::TopBottomPanel::bottom("selected_ancestry_panel")
-                .default_height(180.0)
-                .resizable(true)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        render_selected_ancestry_panel(ui, pool);
-                        ui.allocate_space(ui.available_size());
+            pool.set_object_id_format(self.preferences.object_id_format);
+            if self.preferences.show_ancestry {
+                egui::TopBottomPanel::bottom("selected_ancestry_panel")
+                    .default_height(180.0)
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            render_selected_ancestry_panel(ui, pool);
+                            ui.allocate_space(ui.available_size());
+                        });
                     });
-                });
+            }
 
             // Set forward and backward navigation shortcuts to mouse buttons
             if ctx.input(|i| i.pointer.button_released(egui::PointerButton::Extra1)) {
@@ -1727,170 +1787,188 @@ impl eframe::App for DesignerApp {
             }
 
             // Object selector panel
-            egui::SidePanel::left("left_panel").show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                    if let Some(working_set) = pool.get_pool().working_set_object() {
-                        render_object_hierarchy(
-                            ui,
-                            egui::Id::new(OBJECT_HIERARCHY_ID),
-                            &Object::WorkingSet(working_set.clone()),
-                            pool,
-                        );
-                    } else {
-                        ui.label("This pool has no Working Set.");
-                        if ui.button("Create Working Set").clicked() {
-                            let object_type = ObjectType::WorkingSet;
-                            self.new_object_dialog = Some((
-                                object_type,
-                                pool.generate_smart_name_for_new_object(object_type),
-                            ));
-                        }
-                    }
-                    let auxiliary_objects = pool.get_pool().objects_by_types(&[
-                        ObjectType::AuxiliaryFunctionType1,
-                        ObjectType::AuxiliaryInputType1,
-                        ObjectType::AuxiliaryFunctionType2,
-                        ObjectType::AuxiliaryInputType2,
-                    ]);
-                    if !auxiliary_objects.is_empty() {
-                        ui.separator();
-                        for object in auxiliary_objects {
-                            render_selectable_object(ui, object, pool);
-                        }
-                    }
-                    ui.separator();
-
-                    // Filter objects in the pool by name
-                    let filter_id = ui.id().with("filter_text");
-                    let mut filter_text = ui
-                        .data(|data| data.get_temp::<String>(filter_id))
-                        .unwrap_or_default();
-
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(ui.spacing().scroll.bar_width);
-                            ui.menu_button("\u{2195}", |ui| {
-                                if ui.button("Sort by name").clicked() {
-                                    pool.sort_objects_by_name();
-                                    ui.close();
-                                }
-                                if ui.button("Sort by id").clicked() {
-                                    pool.sort_objects_by_id();
-                                    ui.close();
-                                }
-                            })
-                            .response
-                            .on_hover_text("Sort objects");
-
-                            if ui
-                                .button("Find…")
-                                .on_hover_text("Find an object with previews (Ctrl+F)")
-                                .clicked()
-                            {
-                                ag_iso_terminal_designer::object_picker::open(
-                                    ctx,
-                                    egui::Id::new("find_project_object"),
-                                );
-                            }
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut filter_text)
-                                    .hint_text("Filter by name or ID…")
-                                    .desired_width(ui.available_width()),
+            if self.preferences.show_objects {
+                egui::SidePanel::left("left_panel").show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                        if let Some(working_set) = pool.get_pool().working_set_object() {
+                            render_object_hierarchy(
+                                ui,
+                                egui::Id::new(OBJECT_HIERARCHY_ID),
+                                &Object::WorkingSet(working_set.clone()),
+                                pool,
                             );
-                            if response.changed() {
-                                ui.data_mut(|data| {
-                                    data.insert_temp(filter_id, filter_text.clone())
-                                });
+                        } else {
+                            ui.label("This pool has no Working Set.");
+                            if ui.button("Create Working Set").clicked() {
+                                let object_type = ObjectType::WorkingSet;
+                                self.new_object_dialog = Some((
+                                    object_type,
+                                    pool.generate_smart_name_for_new_object(object_type),
+                                ));
+                            }
+                        }
+                        let auxiliary_objects = pool.get_pool().objects_by_types(&[
+                            ObjectType::AuxiliaryFunctionType1,
+                            ObjectType::AuxiliaryInputType1,
+                            ObjectType::AuxiliaryFunctionType2,
+                            ObjectType::AuxiliaryInputType2,
+                        ]);
+                        if !auxiliary_objects.is_empty() {
+                            ui.separator();
+                            for object in auxiliary_objects {
+                                render_selectable_object(ui, object, pool);
+                            }
+                        }
+                        ui.separator();
+
+                        // Filter objects in the pool by name
+                        let filter_id = ui.id().with("filter_text");
+                        let mut filter_text = ui
+                            .data(|data| data.get_temp::<String>(filter_id))
+                            .unwrap_or_default();
+
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(ui.spacing().scroll.bar_width);
+                                    ui.menu_button("\u{2195}", |ui| {
+                                        if ui.button("Sort by name").clicked() {
+                                            pool.sort_objects_by_name();
+                                            ui.close();
+                                        }
+                                        if ui.button("Sort by id").clicked() {
+                                            pool.sort_objects_by_id();
+                                            ui.close();
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("Sort objects");
+
+                                    if ui
+                                        .button("Find…")
+                                        .on_hover_text("Find an object with previews (Ctrl+F)")
+                                        .clicked()
+                                    {
+                                        ag_iso_terminal_designer::object_picker::open(
+                                            ctx,
+                                            egui::Id::new("find_project_object"),
+                                        );
+                                    }
+                                    let response = ui.add(
+                                        egui::TextEdit::singleline(&mut filter_text)
+                                            .hint_text("Filter by name or ID…")
+                                            .desired_width(ui.available_width()),
+                                    );
+                                    if response.changed() {
+                                        ui.data_mut(|data| {
+                                            data.insert_temp(filter_id, filter_text.clone())
+                                        });
+                                    }
+                                },
+                            );
+                        });
+
+                        let filter_text = filter_text.to_lowercase();
+                        for object in pool.get_pool().objects() {
+                            if ag_iso_terminal_designer::object_picker::matches_object(
+                                pool,
+                                object,
+                                &filter_text,
+                            ) {
+                                render_selectable_object(ui, object, pool);
+                            }
+                        }
+
+                        ui.allocate_space(ui.available_size());
+                    });
+                });
+            }
+
+            if self.preferences.show_graphics || self.preferences.show_components {
+                egui::SidePanel::left("components_panel")
+                    .resizable(true)
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            if self.preferences.show_graphics {
+                                ag_iso_terminal_designer::graphics::ui::show(ui, pool);
+                            }
+                            if self.preferences.show_graphics && self.preferences.show_components {
+                                ui.separator();
+                            }
+                            if self.preferences.show_components {
+                                ag_iso_terminal_designer::components::ui::show(ui, pool)
                             }
                         });
                     });
-
-                    let filter_text = filter_text.to_lowercase();
-                    for object in pool.get_pool().objects() {
-                        if ag_iso_terminal_designer::object_picker::matches(
-                            &pool.get_object_info(object).get_name(object),
-                            object.id().value(),
-                            &filter_text,
-                        ) {
-                            render_selectable_object(ui, object, pool);
-                        }
-                    }
-
-                    ui.allocate_space(ui.available_size());
-                });
-            });
-
-            egui::SidePanel::left("components_panel")
-                .resizable(true)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ag_iso_terminal_designer::graphics::ui::show(ui, pool);
-                        ui.separator();
-                        ag_iso_terminal_designer::components::ui::show(ui, pool)
-                    });
-                });
+            }
             let materialized = pool.materialize();
             // Parameters panel
-            egui::SidePanel::right("right_panel").show(ctx, |ui: &mut egui::Ui| {
-                if let Some(
-                    ag_iso_terminal_designer::components::EditorSelection::ComponentNode {
-                        instance_id,
-                        node_id,
-                    },
-                ) = pool.editor_selection()
-                {
-                    ag_iso_terminal_designer::components::ui::inspector(
-                        ui,
-                        pool,
-                        instance_id,
-                        node_id,
-                    );
-                } else if let Some(id) = pool.get_selected().into() {
-                    if let Some(original) = pool.get_pool().object_by_id(id) {
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            // Display editable object name as header
-                            ui.horizontal(|ui| {
-                                ui.label("Name:");
-
-                                let object_info = pool.get_object_info(original);
-                                let mut name = object_info.get_name(original);
-                                let response = ui.text_edit_singleline(&mut name);
-
-                                if response.changed() {
-                                    pool.queue_operation(Operation::RenameObject {
-                                        object: ag_iso_terminal_designer::ObjectTarget::id(
-                                            original.id().value(),
-                                        ),
-                                        name,
-                                    });
-                                }
-                            });
-                            ui.separator();
-
-                            render_property_editor(ui, original, pool);
-                            let effective = materialized
-                                .as_ref()
-                                .map(|m| &m.pool)
-                                .unwrap_or(pool.get_pool());
-                            let rendered =
-                                effective.object_by_id(original.id()).unwrap_or(original);
-                            let (width, height) = effective.content_size(rendered);
-                            ui.separator();
-                            let desired_size = egui::Vec2::new(width as f32, height as f32);
-                            ui.allocate_ui(desired_size, |ui| {
-                                rendered.render(ui, effective, Point::default());
-                            });
-                        });
-                    } else {
-                        ui.colored_label(
-                            egui::Color32::RED,
-                            format!("Selected object not found: {}", u16::from(id)),
+            if self.preferences.show_properties {
+                egui::SidePanel::right("right_panel").show(ctx, |ui: &mut egui::Ui| {
+                    if let Some(
+                        ag_iso_terminal_designer::components::EditorSelection::ComponentNode {
+                            instance_id,
+                            node_id,
+                        },
+                    ) = pool.editor_selection()
+                    {
+                        ag_iso_terminal_designer::components::ui::inspector(
+                            ui,
+                            pool,
+                            instance_id,
+                            node_id,
                         );
+                    } else if let Some(id) = pool.get_selected().into() {
+                        if let Some(original) = pool.get_pool().object_by_id(id) {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                // Display editable object name as header
+                                ui.horizontal(|ui| {
+                                    ui.label("Name:");
+
+                                    let object_info = pool.get_object_info(original);
+                                    let mut name = object_info.get_name(original);
+                                    let response = ui.text_edit_singleline(&mut name);
+
+                                    if response.changed() {
+                                        pool.queue_operation(Operation::RenameObject {
+                                            object: ag_iso_terminal_designer::ObjectTarget::id(
+                                                original.id().value(),
+                                            ),
+                                            name,
+                                        });
+                                    }
+                                });
+                                ui.separator();
+
+                                render_property_editor(ui, original, pool);
+                                let effective = materialized
+                                    .as_ref()
+                                    .map(|m| &m.pool)
+                                    .unwrap_or(pool.get_pool());
+                                let rendered =
+                                    effective.object_by_id(original.id()).unwrap_or(original);
+                                let (width, height) = effective.content_size(rendered);
+                                ui.separator();
+                                let desired_size = egui::Vec2::new(width as f32, height as f32);
+                                ui.allocate_ui(desired_size, |ui| {
+                                    rendered.render(ui, effective, Point::default());
+                                });
+                            });
+                        } else {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                format!(
+                                    "Selected object not found: {}",
+                                    pool.format_object_id(u16::from(id))
+                                ),
+                            );
+                        }
                     }
-                }
-                ui.allocate_space(ui.available_size());
-            });
+                    ui.allocate_space(ui.available_size());
+                });
+            }
 
             // Allocate the central panel after all side panels to keep canvas input within the preview.
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -1993,7 +2071,8 @@ impl eframe::App for DesignerApp {
             .set(self.project.as_ref().is_some_and(EditorProject::is_dirty));
     }
 
-    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, designer_settings::STORAGE_KEY, &self.preferences);
         self.persist_recovery();
     }
 

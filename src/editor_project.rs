@@ -20,7 +20,7 @@ use crate::operations::{
     OperationHistory, OperationTransaction, PreparedTransaction, TransactionDiagnostics,
     ValidationContext, CURRENT_OPERATION_SCHEMA_VERSION,
 };
-use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
+use crate::{project_file::ProjectFile, smart_naming, ObjectIdFormat, ObjectInfo};
 
 const MAX_UNDO_REDO_SELECTED: usize = 20;
 
@@ -28,7 +28,10 @@ const MAX_UNDO_REDO_SELECTED: usize = 20;
 struct ProjectContentCheckpoint {
     pool: ObjectPool,
     object_names: Vec<(u16, String)>,
+    allowed_references: Vec<(u16, Vec<ObjectId>)>,
     mask_size: u16,
+    soft_key_size: (u16, u16),
+    vt_version: VtVersion,
     components: ComponentSource,
     graphics: crate::graphics::GraphicLibrary,
 }
@@ -39,6 +42,12 @@ struct ComponentCheckpoint {
     source: ComponentSource,
     graphics: crate::graphics::GraphicLibrary,
     info: HashMap<ObjectId, ObjectInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DesignDimensions {
+    mask_size: u16,
+    soft_key_size: (u16, u16),
 }
 
 impl ComponentCheckpoint {
@@ -62,6 +71,7 @@ pub struct EditorProject {
     components: ComponentSource,
     graphics: crate::graphics::GraphicLibrary,
     component_history: HashMap<String, (ComponentCheckpoint, ComponentCheckpoint)>,
+    dimension_history: HashMap<String, (DesignDimensions, DesignDimensions)>,
     selected_object: NullableObjectId,
     component_selection: Cell<Option<(ComponentInstanceId, ComponentNodeId)>>,
     pending_selected_object: Cell<NullableObjectId>,
@@ -71,6 +81,8 @@ pub struct EditorProject {
     /// Authoritative project VT version. Old projects default to Version 6.
     pub vt_version: VtVersion,
     soft_key_size: (u16, u16),
+    /// Application preference, excluded from project content and history.
+    object_id_format: ObjectIdFormat,
     object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
     /// Metadata draft edited by the UI and committed through operations.
     mut_object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
@@ -115,7 +127,14 @@ pub struct EditorProject {
 
 impl From<ObjectPool> for EditorProject {
     fn from(pool: ObjectPool) -> Self {
-        let (mask_size, soft_key_size) = pool.get_minimum_mask_sizes();
+        let (mask_size, _) = pool.get_minimum_mask_sizes();
+        let soft_key_size =
+            pool.objects_by_type(ObjectType::Key)
+                .iter()
+                .fold((60, 60), |(width, height), key| {
+                    let size = pool.content_size(key);
+                    (width.max(size.0), height.max(size.1))
+                });
 
         // Find the highest ID in use to initialize next_available_id
         let max_id = pool
@@ -130,14 +149,16 @@ impl From<ObjectPool> for EditorProject {
             components: Default::default(),
             graphics: Default::default(),
             component_history: Default::default(),
+            dimension_history: Default::default(),
             selected_object: NullableObjectId::default(),
             component_selection: Cell::new(None),
             pending_selected_object: Cell::new(NullableObjectId::default()),
             undo_selected_history: Default::default(),
             redo_selected_history: Default::default(),
-            mask_size,
+            mask_size: mask_size.max(1),
             vt_version: VtVersion::Version6,
             soft_key_size,
+            object_id_format: ObjectIdFormat::default(),
             object_info: RefCell::new(HashMap::new()),
             mut_object_info: RefCell::new(HashMap::new()),
             renaming_object: RefCell::new(None),
@@ -168,6 +189,7 @@ impl EditorProject {
         project.graphics = state.graphics.clone();
         project.vt_version = state.vt_version;
         project.mask_size = state.mask_size;
+        project.soft_key_size = state.soft_key_size;
         project.object_info.replace(state.object_info.clone());
         project.mut_object_info.replace(state.object_info.clone());
         project
@@ -182,6 +204,7 @@ impl EditorProject {
             mask_size: self.mask_size,
             soft_key_size: self.soft_key_size,
             vt_version: self.vt_version,
+            object_id_format: self.object_id_format,
             object_info: RefCell::new(self.object_info.borrow().clone()),
             mut_object_info: RefCell::new(self.object_info.borrow().clone()),
             ..Self::default()
@@ -189,6 +212,33 @@ impl EditorProject {
     }
     pub fn graphic_library(&self) -> &crate::graphics::GraphicLibrary {
         &self.graphics
+    }
+
+    /// Current application-level object-ID presentation preference.
+    pub fn object_id_format(&self) -> ObjectIdFormat {
+        self.object_id_format
+    }
+
+    /// Change ID presentation without changing content, revision or history.
+    pub fn set_object_id_format(&mut self, format: ObjectIdFormat) {
+        self.object_id_format = format;
+    }
+
+    /// Format an object identifier for the editor UI, including null sentinels.
+    pub fn format_object_id(&self, id: u16) -> String {
+        self.object_id_format.format(id)
+    }
+
+    /// UI name with the preferred ID radix for unnamed objects. Explicit names
+    /// (including generated names) are returned verbatim.
+    pub fn object_display_name(&self, object: &Object) -> String {
+        self.get_object_info(object).name.unwrap_or_else(|| {
+            format!(
+                "{}: {:?}",
+                self.format_object_id(object.id().value()),
+                object.object_type()
+            )
+        })
     }
     pub fn component_source(&self) -> &ComponentSource {
         &self.components
@@ -202,10 +252,9 @@ impl EditorProject {
     /// Export the materialized pool, rejecting strings whose encoded byte
     /// length exceeds the ISO field limit.
     pub fn export_iop(&self) -> ComponentResult<Vec<u8>> {
-        self.materialize()?
-            .pool
-            .try_as_iop()
-            .map_err(|message| crate::components::ComponentError::new("STRING_EXPORT_INVALID", message))
+        self.materialize()?.pool.try_as_iop().map_err(|message| {
+            crate::components::ComponentError::new("STRING_EXPORT_INVALID", message)
+        })
     }
     pub fn editor_selection(&self) -> Option<EditorSelection> {
         if let Some((instance_id, node_id)) = self.component_selection.get() {
@@ -329,8 +378,7 @@ impl EditorProject {
                 affected_objects: vec![],
                 execution_time_ms: 0,
             });
-        self.component_history
-            .retain(|id, _| self.operation_history.borrow().contains(id));
+        self.prune_checkpoint_history();
         self.restore_component_checkpoint(after);
         Ok(())
     }
@@ -408,11 +456,20 @@ impl EditorProject {
             .filter_map(|(id, info)| info.name.clone().map(|name| (id.value(), name)))
             .collect();
         object_names.sort_by_key(|(id, _)| *id);
+        let mut allowed_references: Vec<_> = object_info
+            .iter()
+            .filter(|(_, info)| !info.allowed_references.is_empty())
+            .map(|(id, info)| (id.value(), info.allowed_references.clone()))
+            .collect();
+        allowed_references.sort_by_key(|(id, _)| *id);
 
         ProjectContentCheckpoint {
             pool: self.pool.clone(),
             object_names,
+            allowed_references,
             mask_size: self.mask_size,
+            soft_key_size: self.soft_key_size,
+            vt_version: self.vt_version,
             components: self.components.clone(),
             graphics: self.graphics.clone(),
         }
@@ -444,11 +501,63 @@ impl EditorProject {
         self.dirty.set(true);
     }
 
-    /// Change the mask viewport size without introducing or increasing child overflow.
+    /// Change the mask viewport size as one undo action, retaining softkey dimensions.
     ///
     /// Returns an error without changing content or revision if the new size
     /// would violate containment. Existing overflow may be retained or reduced.
     pub fn set_mask_size(&mut self, mask_size: u16) -> ComponentResult<()> {
+        self.set_design_dimensions(mask_size, self.soft_key_size)
+    }
+
+    /// Saved softkey designator width and height in design pixels. These are
+    /// design metadata until a softkey canvas preview is implemented.
+    pub fn soft_key_size(&self) -> (u16, u16) {
+        self.soft_key_size
+    }
+
+    fn dimensions(&self) -> DesignDimensions {
+        DesignDimensions {
+            mask_size: self.mask_size,
+            soft_key_size: self.soft_key_size,
+        }
+    }
+
+    fn restore_dimensions(&mut self, dimensions: DesignDimensions) {
+        self.mask_size = dimensions.mask_size;
+        self.soft_key_size = dimensions.soft_key_size;
+        self.bump_revision();
+        self.refresh_dirty();
+    }
+
+    fn prune_checkpoint_history(&mut self) {
+        let history = self.operation_history.borrow();
+        self.component_history.retain(|id, _| history.contains(id));
+        self.dimension_history.retain(|id, _| history.contains(id));
+    }
+
+    /// Atomically apply positive mask and softkey dimensions as one undo action.
+    /// Mask reductions cannot introduce or increase placement overflow; no
+    /// objects are scaled. Failure or a no-op leaves content and revision intact.
+    /// Standard terminal minima are advisory, not limits on design pixels.
+    pub fn set_design_dimensions(
+        &mut self,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+    ) -> ComponentResult<()> {
+        if mask_size == 0 || soft_key_size.0 == 0 || soft_key_size.1 == 0 {
+            return Err(ComponentError::new(
+                "INVALID_DESIGN_DIMENSIONS",
+                "Design dimensions must be greater than zero",
+            ));
+        }
+        let before = self.dimensions();
+        let after = DesignDimensions {
+            mask_size,
+            soft_key_size,
+        };
+        if before == after {
+            return Ok(());
+        }
         if self.mask_size != mask_size {
             let materialized = self.materialize()?;
             crate::layout_containment::validate_change(
@@ -458,10 +567,22 @@ impl EditorProject {
                 mask_size,
             )
             .map_err(containment_component_error)?;
-            self.mask_size = mask_size;
-            self.bump_revision();
-            self.refresh_dirty();
         }
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        self.dimension_history
+            .insert(transaction_id.clone(), (before, after));
+        self.operation_history
+            .borrow_mut()
+            .push(AppliedTransaction {
+                transaction_id,
+                description: Some("Change design dimensions".into()),
+                forward_operations: vec![],
+                inverse_operations: vec![],
+                affected_objects: vec![],
+                execution_time_ms: 0,
+            });
+        self.prune_checkpoint_history();
+        self.restore_dimensions(after);
         Ok(())
     }
 
@@ -929,6 +1050,7 @@ impl EditorProject {
             &self.pool,
             &object_info,
             self.mask_size,
+            self.soft_key_size,
             self.vt_version,
             selected,
         )?;
@@ -982,6 +1104,9 @@ impl EditorProject {
 
         let mut editor_project = EditorProject::from(pool);
         editor_project.mask_size = settings.mask_size;
+        if let Some(soft_key_size) = settings.soft_key_size {
+            editor_project.soft_key_size = soft_key_size;
+        }
         editor_project.vt_version = settings.vt_version();
 
         // Restore object metadata
@@ -997,6 +1122,7 @@ impl EditorProject {
                 }
                 info.description = meta.description.clone();
                 info.tags = meta.tags.clone();
+                info.allowed_references = meta.allowed_references.clone();
             }
         }
         drop(object_info);
@@ -1134,8 +1260,7 @@ impl EditorProject {
         }
         // Record in history (this is a user action)
         self.operation_history.borrow_mut().push(applied.clone());
-        self.component_history
-            .retain(|id, _| self.operation_history.borrow().contains(id));
+        self.prune_checkpoint_history();
 
         // Mark dirty and refresh state
         self.refresh_dirty();
@@ -1234,6 +1359,15 @@ impl EditorProject {
 
         if let Some(applied_tx) = history.undo() {
             if let Some((before, _)) = self
+                .dimension_history
+                .get(&applied_tx.transaction_id)
+                .copied()
+            {
+                drop(history);
+                self.restore_dimensions(before);
+                return true;
+            }
+            if let Some((before, _)) = self
                 .component_history
                 .get(&applied_tx.transaction_id)
                 .cloned()
@@ -1283,6 +1417,15 @@ impl EditorProject {
         let mut history = self.operation_history.borrow_mut();
 
         if let Some(applied_tx) = history.redo() {
+            if let Some((_, after)) = self
+                .dimension_history
+                .get(&applied_tx.transaction_id)
+                .copied()
+            {
+                drop(history);
+                self.restore_dimensions(after);
+                return true;
+            }
             if let Some((_, after)) = self
                 .component_history
                 .get(&applied_tx.transaction_id)
@@ -1350,6 +1493,7 @@ impl EditorProject {
             object_info: self.object_info.borrow().clone(),
             vt_version: self.vt_version,
             mask_size: self.mask_size,
+            soft_key_size: self.soft_key_size,
             selected: self.selected_object.0,
         }
     }
@@ -1663,6 +1807,96 @@ mod tests {
         assert!(project.is_dirty());
         project.set_object_name(&object, "First name".to_owned());
         assert!(!project.is_dirty());
+    }
+
+    #[test]
+    fn dimensions_round_trip_and_undo_in_order_with_object_edits() {
+        let mut project = EditorProject::new_pool();
+        project.mark_saved();
+        let original = project.save_project().unwrap();
+        let revision = project.revision();
+        project.set_object_id_format(ObjectIdFormat::Hexadecimal);
+        assert_eq!(project.save_project().unwrap(), original);
+        assert_eq!(project.revision(), revision);
+        assert!(!project.is_dirty());
+
+        project.set_design_dimensions(640, (80, 96)).unwrap();
+        assert!(project.is_dirty());
+        let revision = project.revision();
+        project.set_design_dimensions(640, (80, 96)).unwrap();
+        assert!(project.set_design_dimensions(320, (0, 60)).is_err());
+        assert_eq!(project.revision(), revision);
+        assert_eq!(
+            project.dimensions(),
+            DesignDimensions {
+                mask_size: 640,
+                soft_key_size: (80, 96)
+            }
+        );
+        let saved = project.save_project().unwrap();
+        let restored = EditorProject::load_project(saved).unwrap();
+        assert_eq!(restored.mask_size, 640);
+        assert_eq!(restored.soft_key_size(), (80, 96));
+        assert_eq!(project.canvas_preview_copy().soft_key_size(), (80, 96));
+        assert_eq!(
+            EditorProject::from_ai_source(&project.ai_design_state()).soft_key_size(),
+            (80, 96)
+        );
+
+        let id = project
+            .create_object(ObjectType::Button, "Button".into())
+            .unwrap();
+        project.set_design_dimensions(800, (100, 120)).unwrap();
+        assert!(project.undo_operation());
+        assert_eq!(project.mask_size, 640);
+        assert_eq!(project.soft_key_size(), (80, 96));
+        assert!(project.get_pool().object_by_id(id).is_some());
+        assert!(project.undo_operation());
+        assert!(project.get_pool().object_by_id(id).is_none());
+        assert!(project.undo_operation());
+        assert_eq!(project.mask_size, 500);
+        assert_eq!(project.soft_key_size(), (60, 60));
+        assert!(!project.is_dirty());
+        assert!(!project.undo_available());
+        assert!(project.redo_operation());
+        assert!(project.redo_operation());
+        assert!(project.redo_operation());
+        assert_eq!(project.mask_size, 800);
+        assert_eq!(project.soft_key_size(), (100, 120));
+        assert!(project.get_pool().object_by_id(id).is_some());
+    }
+
+    #[test]
+    fn legacy_softkey_dimensions_take_independent_key_content_extents() {
+        let mut pool = ObjectPool::default();
+        for (key_id, child_id, width, height) in [(10, 11, 90, 40), (12, 13, 30, 110)] {
+            let mut key = object_with_id(ObjectType::Key, key_id);
+            let mut child = object_with_id(ObjectType::Button, child_id);
+            if let Object::Key(key) = &mut key {
+                key.object_refs.push(ag_iso_stack::object_pool::ObjectRef {
+                    id: ObjectId::new(child_id).unwrap(),
+                    offset: ag_iso_stack::object_pool::object_attributes::Point::default(),
+                });
+            }
+            if let Object::Button(child) = &mut child {
+                child.width = width;
+                child.height = height;
+            }
+            pool.add(key);
+            pool.add(child);
+        }
+        let project = EditorProject::from(pool);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&project.save_project().unwrap()).unwrap();
+        legacy["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("soft_key_size");
+        legacy["settings"]["mask_size"] = serde_json::json!(240);
+        let restored = EditorProject::load_project(serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(restored.mask_size, 240);
+        assert_eq!(restored.soft_key_size(), (90, 110));
+        assert!(!restored.is_dirty());
     }
 
     #[test]

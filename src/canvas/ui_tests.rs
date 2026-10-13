@@ -579,7 +579,8 @@ fn resize_keeps_zero_dimensions_when_no_larger_size_fits() {
         }],
     });
     project.execute_transaction(transaction).unwrap();
-    project.set_mask_size(0).unwrap();
+    // Legacy projects may retain a zero viewport; new settings require positive dimensions.
+    project.mask_size = 0;
     let materialized = project.materialize().unwrap();
     let scene = geometry::build(&project, &materialized, 1);
     let item = scene.items.iter().find(|i| i.target.is_some()).unwrap();

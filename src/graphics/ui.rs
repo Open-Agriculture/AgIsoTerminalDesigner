@@ -248,24 +248,19 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
 
     ui.strong("PICTURE GRAPHICS");
     let pictures = picture_graphics(project);
-    let pictures = pictures.into_iter().filter(|object| {
-        format!(
-            "{} #{}",
-            project.get_object_info(object).get_name(object),
-            object.id().value()
-        )
-        .to_lowercase()
-        .contains(&search)
-    });
+    let pictures = pictures
+        .into_iter()
+        .filter(|object| object_picker::matches_object(project, object, &search));
     thumbnail_grid(ui, "picture_grid", pictures, |ui, object| {
         let Object::PictureGraphic(picture) = object else {
             return;
         };
-        let name = format!(
-            "{} #{}",
-            project.get_object_info(object).get_name(object),
-            object.id().value()
-        );
+        let name = project.object_display_name(object);
+        let name = if project.get_object_info(object).name.is_some() {
+            format!("{name} {}", project.format_object_id(object.id().value()))
+        } else {
+            name
+        };
         ui.push_id(("picture", object.id().value()), |ui| {
             match graphics_card(
                 ui,
@@ -407,7 +402,7 @@ pub fn select(
     if ui
         .button(value.as_u64().map_or_else(
             || "Select PictureGraphic…".to_owned(),
-            |id| format!("PictureGraphic #{id}"),
+            |id| format!("PictureGraphic {}", project.format_object_id(id as u16)),
         ))
         .clicked()
     {

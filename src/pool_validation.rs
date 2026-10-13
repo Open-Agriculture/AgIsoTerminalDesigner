@@ -227,7 +227,9 @@ pub fn validate_pool_state_for_version(
             if value.wire_bytes().len() > maximum {
                 diagnostics.push(ValidationDiagnostic {
                     severity: ValidationSeverity::Error,
-                    message: format!("String value exceeds its {maximum}-byte encoded length limit"),
+                    message: format!(
+                        "String value exceeds its {maximum}-byte encoded length limit"
+                    ),
                     affected_objects: Some(vec![obj.id().value()]),
                     code: "STRING_TOO_LONG".to_owned(),
                 });

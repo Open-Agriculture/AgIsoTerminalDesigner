@@ -26,6 +26,8 @@ pub struct AiDesignState {
     pub object_info: HashMap<ObjectId, ObjectInfo>,
     pub vt_version: VtVersion,
     pub mask_size: u16,
+    /// Saved design metadata, retained when making proposal/project copies.
+    pub soft_key_size: (u16, u16),
     pub selected: Option<ObjectId>,
 }
 pub use design_analysis::{

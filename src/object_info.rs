@@ -3,6 +3,7 @@
 //! Authors: Daan Steenbergen
 
 use ag_iso_stack::object_pool::object::Object;
+use ag_iso_stack::object_pool::ObjectId;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -20,6 +21,9 @@ pub struct ObjectInfo {
 
     /// Searchable semantic tags used by graphics discovery.
     pub tags: Vec<String>,
+
+    /// Ordered editor-only targets for an ObjectPointer. Empty means unrestricted.
+    pub allowed_references: Vec<ObjectId>,
 }
 
 impl ObjectInfo {
@@ -29,6 +33,7 @@ impl ObjectInfo {
             name: None,
             description: None,
             tags: vec![],
+            allowed_references: vec![],
         }
     }
 
@@ -55,7 +60,10 @@ impl ObjectInfo {
     }
 
     pub(crate) fn content_eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.description == other.description && self.tags == other.tags
+        self.name == other.name
+            && self.description == other.description
+            && self.tags == other.tags
+            && self.allowed_references == other.allowed_references
     }
 }
 

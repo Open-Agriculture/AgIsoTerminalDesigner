@@ -8,6 +8,7 @@ mod interactive_rendering_simple;
 mod layout_containment;
 mod object_configuring;
 mod object_defaults;
+mod object_id_format;
 mod object_info;
 mod object_rendering;
 mod output_string_rendering;
@@ -31,6 +32,7 @@ pub use editor_project::EditorProject;
 pub use interactive_rendering_simple::InteractiveMaskRenderer;
 pub use object_configuring::render_property_editor;
 pub use object_defaults::default_object;
+pub use object_id_format::ObjectIdFormat;
 pub use object_info::ObjectInfo;
 pub use object_rendering::RenderableObject;
 
