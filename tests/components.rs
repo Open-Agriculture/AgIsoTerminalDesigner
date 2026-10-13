@@ -1,4 +1,6 @@
-use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool, ObjectRef, ObjectType};
+use ag_iso_stack::object_pool::{
+    object::Object, object_attributes::FontType, ObjectId, ObjectPool, ObjectRef, ObjectType,
+};
 use ag_iso_terminal_designer::{components::*, *};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -143,7 +145,7 @@ fn master_update_preserves_overrides_and_ids_without_generated_source_mutation()
                     assert_eq!(button.background_colour, 14);
                 }
                 Object::OutputString(label) => {
-                    assert_eq!(label.value, caption);
+                    assert_eq!(label.value.decode(FontType::Latin1).unwrap(), caption);
                     assert_eq!(
                         serde_json::to_value(label.justification).unwrap(),
                         json!({"horizontal":"Middle","vertical":"Middle"})
@@ -241,7 +243,7 @@ fn reset_default_add_remove_nodes_and_duplicate() {
     assert!(pool
         .objects()
         .iter()
-        .any(|o| matches!(o, Object::OutputString(s) if s.value == "Button")));
+        .any(|o| matches!(o, Object::OutputString(s) if s.value.decode(FontType::Latin1).unwrap() == "Button")));
     let mut master = p.component_source().definitions[&component].clone();
     master.nodes.retain(|n| n.id != icon);
     ComponentService::edit_component_definition(&mut p, master).unwrap();
@@ -303,7 +305,7 @@ fn ai_component_instantiation_and_override_are_single_source_actions() {
         .pool
         .objects()
         .iter()
-        .any(|o| matches!(o, Object::OutputString(s) if s.value == "Join")));
+        .any(|o| matches!(o, Object::OutputString(s) if s.value.decode(FontType::Latin1).unwrap() == "Join")));
 }
 
 #[test]

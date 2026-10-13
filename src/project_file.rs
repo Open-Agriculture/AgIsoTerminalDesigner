@@ -63,14 +63,18 @@ pub struct ProjectSettings {
 }
 
 impl ProjectFile {
-    /// Create a new project file from an ObjectPool and metadata
+    /// Create a new project file from an ObjectPool and metadata.
+    /// Returns an error if an encoded string exceeds its wire length field.
     pub fn new(
         pool: &ObjectPool,
         object_info: &HashMap<ObjectId, ObjectInfo>,
         mask_size: u16,
         vt_version: VtVersion,
         selected: Option<ObjectId>,
-    ) -> Self {
+    ) -> Result<Self, serde_json::Error> {
+        let object_pool_data = pool.try_as_iop().map_err(|message| {
+            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+        })?;
         // Convert ObjectInfo map to ObjectMetadata map
         let mut object_metadata = BTreeMap::new();
         for (id, info) in object_info {
@@ -83,18 +87,18 @@ impl ProjectFile {
             object_metadata.insert(id.value(), metadata);
         }
 
-        ProjectFile {
+        Ok(ProjectFile {
             version: PROJECT_FILE_VERSION,
             components: Default::default(),
             graphics: Default::default(),
-            object_pool_data: pool.as_iop(),
+            object_pool_data,
             object_metadata,
             settings: ProjectSettings {
                 mask_size,
                 vt_version: vt_version.into(),
                 last_selected: selected.map(|id| id.value()),
             },
-        }
+        })
     }
 
     /// Load object pool from project file

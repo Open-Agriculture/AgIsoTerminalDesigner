@@ -10,6 +10,7 @@ mod object_configuring;
 mod object_defaults;
 mod object_info;
 mod object_rendering;
+mod output_string_rendering;
 mod possible_events;
 mod project_file;
 mod smart_naming;

@@ -199,8 +199,13 @@ impl EditorProject {
     pub fn materialize(&self) -> ComponentResult<MaterializedProject> {
         materialize_project(self)
     }
+    /// Export the materialized pool, rejecting strings whose encoded byte
+    /// length exceeds the ISO field limit.
     pub fn export_iop(&self) -> ComponentResult<Vec<u8>> {
-        Ok(self.materialize()?.pool.as_iop())
+        self.materialize()?
+            .pool
+            .try_as_iop()
+            .map_err(|message| crate::components::ComponentError::new("STRING_EXPORT_INVALID", message))
     }
     pub fn editor_selection(&self) -> Option<EditorSelection> {
         if let Some((instance_id, node_id)) = self.component_selection.get() {
@@ -926,7 +931,7 @@ impl EditorProject {
             self.mask_size,
             self.vt_version,
             selected,
-        );
+        )?;
         project.components = self.components.clone();
         project.graphics = self.graphics.clone();
         project.to_bytes()

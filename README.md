@@ -68,6 +68,12 @@ Moving a repeated reference updates its exact child-list occurrence. Resizing ch
 
 Primitive copies receive fresh object IDs and metadata identities. Internal references within the copied positioned subtree are remapped; external styles and resources remain shared. Component copies retain their master and overrides. Completed gestures and numeric edits each create one undo action.
 
+### Output String preview
+
+Output Strings use the VT version 4 and later presentation rules from ISO 11783-6:2018 §4.6.19: per-line justification, wrapping at spaces and hyphens, control characters, and clipping to the object's dimensions. Font Attributes control character dimensions, styles, inversion, and flashing. The preview flashes on a one-second cycle; the font-size selector chooses fixed or proportional rendering.
+
+Imported strings retain their original bytes and decode using their ISO-8859 font character set or UTF-16LE BOM. Editing text converts it to Unicode, exported as a UTF-16LE WideString (VT version 4 and later). Unsupported proprietary encodings display a diagnostic. Export rejects strings exceeding their encoded byte-length limit. A shared String Variable is decoded separately for each rendered field; its text editor uses the first referencing field's character set.
+
 ### What's Next
 
 The list below outlines some of the features and improvements that are planned to be implemented in the future. The order is a good indication of the priority.

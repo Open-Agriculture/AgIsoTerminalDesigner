@@ -216,6 +216,23 @@ pub fn validate_pool_state_for_version(
 
     // Check all object references for validity
     for obj in pool.objects() {
+        use ag_iso_stack::object_pool::object::Object;
+        let string = match obj {
+            Object::InputString(s) => Some((&s.value, u8::MAX as usize)),
+            Object::OutputString(s) => Some((&s.value, u16::MAX as usize)),
+            Object::StringVariable(s) => Some((&s.value, u16::MAX as usize)),
+            _ => None,
+        };
+        if let Some((value, maximum)) = string {
+            if value.wire_bytes().len() > maximum {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: format!("String value exceeds its {maximum}-byte encoded length limit"),
+                    affected_objects: Some(vec![obj.id().value()]),
+                    code: "STRING_TOO_LONG".to_owned(),
+                });
+            }
+        }
         for referenced_id in obj.referenced_objects() {
             // Default editor objects use ObjectId(0) as an unresolved required
             // reference until the user assigns one. It is not a pool object.

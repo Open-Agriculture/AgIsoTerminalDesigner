@@ -1,6 +1,11 @@
 //! Project-local component browser and source editor.
 use super::*;
 use crate::EditorProject;
+use ag_iso_stack::object_pool::{
+    object::{Object, VtString},
+    object_attributes::FontType,
+    ObjectId, ObjectType,
+};
 use eframe::egui;
 
 /// UI drafts live in egui temporary state; saving invokes the same atomic service as AI.
@@ -370,6 +375,10 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                             .collect();
                         let mut remove = None;
                         let preview_definition_source = definition.clone();
+                        let editor_font_context = super::materialize::preview_definition(
+                            project,
+                            &preview_definition_source,
+                        );
                         for node in &mut definition.nodes {
                             egui::CollapsingHeader::new(format!(
                                 "{} ({:?})",
@@ -381,7 +390,28 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                 for (property, value) in &mut node.properties {
                                     ui.horizontal(|ui| {
                                         ui.label(property);
-                                        value_editor(ui, node.id, property, value);
+                                        let font_type = if property == "value"
+                                            && matches!(
+                                                node.object_type,
+                                                ObjectType::OutputString
+                                                    | ObjectType::InputString
+                                                    | ObjectType::StringVariable
+                                            )
+                                        {
+                                            Some(font_type_for_node(
+                                                &editor_font_context,
+                                                node.id,
+                                            ))
+                                        } else {
+                                            None
+                                        };
+                                        value_editor_with_font(
+                                            ui,
+                                            node.id,
+                                            property,
+                                            value,
+                                            font_type,
+                                        );
                                     });
                                 }
                                 for (property, reference) in &mut node.references {
@@ -559,11 +589,21 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                         },
                                     );
                                 } else {
-                                    value_editor(
+                                    let font_type = (parameter.kind
+                                        == ComponentParameterKind::Text
+                                        && parameter.property == "value")
+                                        .then(|| {
+                                            font_type_for_node(
+                                                &editor_font_context,
+                                                parameter.target_node,
+                                            )
+                                        });
+                                    value_editor_with_font(
                                         ui,
                                         parameter.target_node,
                                         &format!("default_{}", parameter.id),
                                         &mut parameter.default_value,
+                                        font_type,
                                     );
                                 }
                                 let mut description =
@@ -622,12 +662,33 @@ fn value_editor(
     property: &str,
     value: &mut serde_json::Value,
 ) {
-    if let Some(text) = value.as_str() {
-        let mut text = text.to_owned();
-        if ui.text_edit_singleline(&mut text).changed() {
-            *value = serde_json::Value::String(text);
+    value_editor_with_font(ui, node, property, value, None);
+}
+
+fn value_editor_with_font(
+    ui: &mut egui::Ui,
+    node: ComponentNodeId,
+    property: &str,
+    value: &mut serde_json::Value,
+    font_type: Option<Result<FontType, String>>,
+) {
+    if let Ok(vt_string) = serde_json::from_value::<VtString>(value.clone()) {
+        match decode_editor_text(&vt_string, font_type.as_ref()) {
+            Ok(mut text) => {
+                if ui.text_edit_singleline(&mut text).changed() {
+                    *value = serde_json::Value::String(text);
+                }
+            }
+            Err(error) => {
+                ui.colored_label(
+                    egui::Color32::DARK_RED,
+                    format!("Cannot edit encoded string: {error}"),
+                );
+            }
         }
-    } else if let Some(mut boolean) = value.as_bool() {
+        return;
+    }
+    if let Some(mut boolean) = value.as_bool() {
         if ui.checkbox(&mut boolean, "").changed() {
             *value = boolean.into();
         }
@@ -643,6 +704,100 @@ fn value_editor(
             }
         }
         ui.data_mut(|d| d.insert_temp(key, text));
+    }
+}
+
+fn decode_editor_text(
+    value: &VtString,
+    font_type: Option<&Result<FontType, String>>,
+) -> Result<String, String> {
+    match value {
+        VtString::Text(text) => Ok(text.clone()),
+        VtString::Encoded { encoded_bytes } if encoded_bytes.starts_with(&[0xFF, 0xFE]) => {
+            value.decode(FontType::Latin1).map_err(str::to_owned)
+        }
+        VtString::Encoded { .. } => value
+            .decode(
+                font_type
+                    .ok_or_else(|| "Font Attributes are unavailable".to_owned())?
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .copied()?,
+            )
+            .map_err(str::to_owned),
+    }
+}
+
+fn font_type_for_node(
+    context: &ComponentResult<(
+        ag_iso_stack::object_pool::ObjectPool,
+        std::collections::BTreeMap<ComponentNodeId, u16>,
+    )>,
+    node_id: ComponentNodeId,
+) -> Result<FontType, String> {
+    let (pool, ids) = context.as_ref().map_err(|error| error.to_string())?;
+    let id = ids
+        .get(&node_id)
+        .copied()
+        .and_then(|id| ObjectId::new(id).ok())
+        .ok_or_else(|| "string node is missing from the compiled component".to_owned())?;
+    let object = pool
+        .object_by_id(id)
+        .ok_or_else(|| "compiled string node is missing".to_owned())?;
+    font_type_for_object(pool, object)
+}
+
+fn font_type_for_instance_node(
+    context: &ComponentResult<super::MaterializedProject>,
+    instance_id: ComponentInstanceId,
+    node_id: ComponentNodeId,
+) -> Result<FontType, String> {
+    let materialized = context.as_ref().map_err(|error| error.to_string())?;
+    let id = materialized
+        .source_map
+        .by_component_node
+        .get(&(instance_id, node_id))
+        .copied()
+        .and_then(|id| ObjectId::new(id).ok())
+        .ok_or_else(|| "string node is missing from the materialized instance".to_owned())?;
+    let object = materialized
+        .pool
+        .object_by_id(id)
+        .ok_or_else(|| "materialized string node is missing".to_owned())?;
+    font_type_for_object(&materialized.pool, object)
+}
+
+fn font_type_for_object(
+    pool: &ag_iso_stack::object_pool::ObjectPool,
+    object: &Object,
+) -> Result<FontType, String> {
+    let font_id = match object {
+        Object::OutputString(field) => field.font_attributes,
+        Object::InputString(field) => field.font_attributes,
+        Object::StringVariable(variable) => {
+            let variable_id = variable.id;
+            pool.objects()
+                .iter()
+                .find_map(|object| match object {
+                    Object::OutputString(field)
+                        if field.variable_reference.0 == Some(variable_id) =>
+                    {
+                        Some(field.font_attributes)
+                    }
+                    Object::InputString(field)
+                        if field.variable_reference.0 == Some(variable_id) =>
+                    {
+                        Some(field.font_attributes)
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| "String Variable has no referencing string field".to_owned())?
+        }
+        _ => return Err("component node is not a string object".to_owned()),
+    };
+    match pool.object_by_id(font_id) {
+        Some(Object::FontAttributes(font)) => Ok(font.font_type),
+        _ => Err("Font Attributes reference is missing or invalid".to_owned()),
     }
 }
 fn manual_parameter_form(
@@ -843,6 +998,7 @@ pub fn inspector(
         return;
     };
     let definition = project.component_source().definitions[&instance.component_id].clone();
+    let materialized = super::materialize::materialize_project(project);
     ui.heading(&definition.name);
     ui.label(format!("Instance: {id}"));
     ui.label(format!(
@@ -872,15 +1028,20 @@ pub fn inspector(
             .overrides
             .get(&parameter.id)
             .unwrap_or(&parameter.default_value);
+        let font_type = (parameter.kind == ComponentParameterKind::Text
+            && parameter.property == "value")
+            .then(|| font_type_for_instance_node(&materialized, id, parameter.target_node));
+        let initial_text = if parameter.kind == ComponentParameterKind::Text {
+            serde_json::from_value::<VtString>(value.clone())
+                .map_err(|error| error.to_string())
+                .and_then(|value| decode_editor_text(&value, font_type.as_ref()))
+        } else {
+            Ok(serde_json::to_string(value).unwrap())
+        };
         let key = ui.id().with((id, parameter.id, project.revision()));
         let mut draft = ui.data_mut(|d| {
-            d.get_temp::<String>(key).unwrap_or_else(|| {
-                if parameter.kind == ComponentParameterKind::Text {
-                    value.as_str().unwrap_or_default().to_owned()
-                } else {
-                    serde_json::to_string(value).unwrap()
-                }
-            })
+            d.get_temp::<String>(key)
+                .unwrap_or_else(|| initial_text.clone().unwrap_or_default())
         });
         if parameter.kind == ComponentParameterKind::Graphic {
             let mut value = serde_json::from_str(&draft).unwrap_or_default();
@@ -937,12 +1098,30 @@ pub fn inspector(
                 }
             }
             ui.label(&draft);
+        } else if parameter.kind == ComponentParameterKind::Text {
+            match &initial_text {
+                Ok(_) => {
+                    ui.text_edit_singleline(&mut draft);
+                }
+                Err(error) => {
+                    ui.colored_label(
+                        egui::Color32::DARK_RED,
+                        format!("Cannot edit encoded string: {error}"),
+                    );
+                }
+            }
         } else {
             ui.text_edit_singleline(&mut draft);
         }
         ui.data_mut(|d| d.insert_temp(key, draft.clone()));
         ui.horizontal(|ui| {
-            if ui.button("Set override").clicked() {
+            if ui
+                .add_enabled(
+                    parameter.kind != ComponentParameterKind::Text || initial_text.is_ok(),
+                    egui::Button::new("Set override"),
+                )
+                .clicked()
+            {
                 result = (if parameter.kind == ComponentParameterKind::Text {
                     Ok(serde_json::Value::String(draft.clone()))
                 } else {

@@ -301,7 +301,8 @@ macro_rules! property_enum_choices {
             })
             .collect();
         choices.extend(
-            (8..=127).map(|height| serde_json::to_value(FontSize::Proportional(height)).unwrap()),
+            // The preview supports every fixed font through 128×192, hence N=192.
+            (8..=192).map(|height| serde_json::to_value(FontSize::Proportional(height)).unwrap()),
         );
         choices
     }};
@@ -1320,11 +1321,11 @@ mod tests {
             .find(|d| d.name == "font_size")
             .unwrap()
             .enum_choices;
-        assert_eq!(sizes.len(), 15 + 120);
+        assert_eq!(sizes.len(), 15 + 185);
         assert!(sizes.contains(&json!({"NonProportional": "Px6x8"})));
         assert!(sizes.contains(&json!({"NonProportional": "Px128x192"})));
         assert!(sizes.contains(&json!({"Proportional": 8})));
-        assert!(sizes.contains(&json!({"Proportional": 127})));
+        assert!(sizes.contains(&json!({"Proportional": 192})));
         let fonts = &descriptors
             .iter()
             .find(|d| d.name == "font_type")

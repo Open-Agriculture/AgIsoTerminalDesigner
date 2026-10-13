@@ -141,6 +141,21 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             continue;
         };
         let label = human_readable_property_name(editor.property);
+        if editor.property == "value" {
+            if let Some(decoded) = decoded_string_value(object, design.get_pool()) {
+                match decoded {
+                    Ok(text) => {
+                        ui.push_id(editor.property, |ui| {
+                            render_text(ui, &label, &text, id, editor.property, design)
+                        });
+                    }
+                    Err(message) => {
+                        ui.colored_label(egui::Color32::RED, message);
+                    }
+                }
+                continue;
+            }
+        }
         ui.push_id(editor.property, |ui| match editor.editor {
             EditorKind::Colour => render_colour(ui, &label, &value, id, editor.property, design),
             EditorKind::ObjectReference => {
@@ -189,6 +204,44 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
         ui.separator();
         render_macro_references(ui, object, id, design);
     }
+}
+
+/// Encoded values retain their bytes until the operator actually edits text.
+/// A shared variable has no font of its own; use the first referencing string
+/// field in pool order to choose its editor character set.
+fn decoded_string_value(
+    object: &Object,
+    pool: &ag_iso_stack::object_pool::ObjectPool,
+) -> Option<Result<String, String>> {
+    use ag_iso_stack::object_pool::object_attributes::FontType;
+    let (value, font_id) = match object {
+        Object::OutputString(o) => (&o.value, Some(o.font_attributes)),
+        Object::InputString(o) => (&o.value, Some(o.font_attributes)),
+        Object::StringVariable(o) => {
+            let font = pool.objects().iter().find_map(|candidate| match candidate {
+                Object::OutputString(s) if s.variable_reference.0 == Some(o.id) => {
+                    Some(s.font_attributes)
+                }
+                Object::InputString(s) if s.variable_reference.0 == Some(o.id) => {
+                    Some(s.font_attributes)
+                }
+                _ => None,
+            });
+            (&o.value, font)
+        }
+        _ => return None,
+    };
+    let font_type = font_id
+        .and_then(|id| match pool.object_by_id(id) {
+            Some(Object::FontAttributes(font)) => Some(font.font_type),
+            _ => None,
+        })
+        .unwrap_or(FontType::Latin1);
+    Some(
+        value
+            .decode(font_type)
+            .map_err(|_| "Unsupported string encoding".to_owned()),
+    )
 }
 
 /// Keep payload enums readable without exposing their JSON representation.
@@ -1466,6 +1519,10 @@ fn render_flag_set(
     } else if let Some(fields) = value.as_object() {
         ui.label(label);
         for (field, value) in fields {
+            // The font-size selector already chooses fixed/proportional mode.
+            if property == "font_style" && field == "proportional" {
+                continue;
+            }
             let edited = ui
                 .push_id(field, |ui| render_flag_field(ui, field, value))
                 .inner;
@@ -1496,10 +1553,16 @@ fn render_reference(
     ui.horizontal(|ui| {
         ui.label(label);
         let selected_id = selected.and_then(|id| ObjectId::new(id as u16).ok());
-        let label = selected_id
-            .and_then(|id| design.get_pool().object_by_id(id))
-            .map(|object| object_selector_label(design, object))
-            .unwrap_or_else(|| "None".into());
+        let referenced_object = selected_id.and_then(|id| design.get_pool().object_by_id(id));
+        let label = selected_id.map_or_else(
+            || "None".into(),
+            |id| {
+                referenced_object.map_or_else(
+                    || format!("Missing object #{}", id.value()),
+                    |object| object_selector_label(design, object),
+                )
+            },
+        );
         let allow_none = design.get_pool().object_by_id(id).is_some_and(|object| {
             crate::object_properties::property_accepts_null(object, property)
         });
@@ -1544,6 +1607,15 @@ fn render_reference(
                     .0
                     .map_or(serde_json::Value::Null, |id| serde_json::json!(id.value())),
             );
+        }
+        if let Some(object) = referenced_object {
+            if ui
+                .link("View")
+                .on_hover_text("View referenced object")
+                .clicked()
+            {
+                select_object(design, object.id());
+            }
         }
     });
 }
@@ -1678,6 +1750,139 @@ mod tests {
                 macro_object: ObjectTarget::id(reference.macro_id.into()),
             })
             .collect()
+    }
+
+    #[test]
+    fn reference_view_navigates_without_editing_and_preserves_history() {
+        for (source_type, property, target_type) in [
+            (
+                ObjectType::ObjectPointer,
+                "value",
+                ObjectType::ObjectPointer,
+            ),
+            (
+                ObjectType::OutputNumber,
+                "variable_reference",
+                ObjectType::NumberVariable,
+            ),
+            (
+                ObjectType::OutputString,
+                "font_attributes",
+                ObjectType::FontAttributes,
+            ),
+        ] {
+            let mut pool = ObjectPool::default();
+            pool.add(object(source_type, 1));
+            pool.add(object(target_type, 2));
+            let mut project = EditorProject::from(pool);
+            let source = ObjectId::new(1).unwrap();
+            let target = ObjectId::new(2).unwrap();
+            select_object(&project, source);
+            project.update_selected();
+            // Object labels lazily initialize default metadata during rendering.
+            for object in project.get_pool().objects() {
+                project.get_object_info(object);
+            }
+            let before = project.save_project().unwrap();
+            let descriptor = get_property_descriptors(source_type)
+                .into_iter()
+                .find(|descriptor| descriptor.name == property)
+                .unwrap();
+            let ctx = egui::Context::default();
+            let mut position = None;
+            // Resolve the link position from rendered text, then click it.
+            for pressed in [None, Some(true), Some(false)] {
+                let events = pressed.map_or_else(Vec::new, |pressed| {
+                    let pos = position.unwrap();
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                });
+                let output = ctx.run(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            render_reference(
+                                ui,
+                                property,
+                                &serde_json::json!(2),
+                                &descriptor,
+                                source,
+                                property,
+                                &project,
+                            );
+                        });
+                    },
+                );
+                if pressed.is_none() {
+                    position = output.shapes.iter().find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == "View" => {
+                            Some(text.pos + text.galley.size() * 0.5)
+                        }
+                        _ => None,
+                    });
+                    assert!(position.is_some());
+                }
+            }
+            assert!(project.update_selected());
+            assert_eq!(project.get_selected().0, Some(target));
+            assert!(!project.commit_queued("Navigation"));
+            project.set_previous_selected();
+            assert_eq!(project.get_selected().0, Some(source));
+            // Saving includes the last selection; compare at the original selection.
+            assert_eq!(project.save_project().unwrap(), before);
+            project.set_next_selected();
+            assert_eq!(project.get_selected().0, Some(target));
+        }
+    }
+
+    #[test]
+    fn null_and_missing_references_have_no_view_link() {
+        let mut pool = ObjectPool::default();
+        pool.add(object(ObjectType::ObjectPointer, 1));
+        let project = EditorProject::from(pool);
+        let descriptor = get_property_descriptors(ObjectType::ObjectPointer)
+            .into_iter()
+            .find(|descriptor| descriptor.name == "value")
+            .unwrap();
+        for (value, expected) in [
+            (serde_json::Value::Null, "None"),
+            (serde_json::json!(42), "Missing object #42"),
+        ] {
+            let ctx = egui::Context::default();
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_reference(
+                        ui,
+                        "Value",
+                        &value,
+                        &descriptor,
+                        ObjectId::new(1).unwrap(),
+                        "value",
+                        &project,
+                    );
+                });
+            });
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.text()),
+                    _ => None,
+                })
+                .collect();
+            assert!(text.contains(&expected), "{text:?}");
+            assert!(!text.contains(&"View"));
+        }
     }
 
     #[test]

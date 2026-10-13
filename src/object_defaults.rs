@@ -205,7 +205,7 @@ fn default_input_string() -> InputString {
             horizontal: HorizontalAlignment::Left,
             vertical: VerticalAlignment::Top,
         },
-        value: "".to_string(),
+        value: "".into(),
         enabled: true,
         macro_refs: vec![],
     }
@@ -277,7 +277,7 @@ fn default_output_string() -> OutputString {
             horizontal: HorizontalAlignment::Left,
             vertical: VerticalAlignment::Top,
         },
-        value: "".to_string(),
+        value: "".into(),
         macro_refs: vec![],
     }
 }
@@ -469,7 +469,7 @@ fn default_number_variable() -> NumberVariable {
 fn default_string_variable() -> StringVariable {
     StringVariable {
         id: ObjectId::new(0).unwrap(),
-        value: "".to_string(),
+        value: "".into(),
     }
 }
 
