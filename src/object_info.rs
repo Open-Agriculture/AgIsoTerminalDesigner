@@ -53,6 +53,10 @@ impl ObjectInfo {
     pub fn get_unique_id(&self) -> Uuid {
         self.unique_id
     }
+
+    pub(crate) fn content_eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.description == other.description && self.tags == other.tags
+    }
 }
 
 impl PartialEq for ObjectInfo {

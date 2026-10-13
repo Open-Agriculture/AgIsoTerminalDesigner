@@ -387,7 +387,7 @@ mod tests {
         }
         assert_eq!(calls.get(), 1);
 
-        project.set_mask_size(project.mask_size + 1);
+        project.set_mask_size(project.mask_size + 1).unwrap();
         for _ in 0..3 {
             draw_cached_review(&ctx, &project, &calls, false);
         }

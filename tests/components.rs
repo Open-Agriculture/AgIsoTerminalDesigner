@@ -22,8 +22,9 @@ fn fixture() -> EditorProject {
         });
     }
     if let Some(Object::Button(button)) = pool.object_mut_by_id(ObjectId::new(100).unwrap()) {
-        button.width = 140;
-        button.height = 40;
+        // Keep the captured label inside the Button's four-pixel content inset.
+        button.width = 148;
+        button.height = 60;
         button.background_colour = 12;
         button.object_refs.push(ObjectRef {
             id: ObjectId::new(101).unwrap(),
@@ -36,7 +37,9 @@ fn fixture() -> EditorProject {
         label.value = "Action".into();
         label.font_attributes = ObjectId::new(102).unwrap().into();
     }
-    EditorProject::from(pool)
+    let mut project = EditorProject::from(pool);
+    project.mask_size = 500;
+    project
 }
 fn captured() -> (EditorProject, ComponentId, ComponentInstanceId) {
     let mut p = fixture();
@@ -313,6 +316,7 @@ fn shared_visual_dependencies_are_copied_and_internal_sharing_is_preserved() {
     }
     pool.add(outside);
     let mut p = EditorProject::from(pool);
+    p.mask_size = 500;
     let plan = plan_component_capture(&p, 100, "Shared style capture".into()).unwrap();
     let component = plan.definition.id;
     let font = plan
@@ -607,8 +611,8 @@ fn three_button_payload_benchmark() {
             });
         }
         for (id, property, value) in [
-            (button, "width", json!(140)),
-            (button, "height", json!(40)),
+            (button, "width", json!(148)),
+            (button, "height", json!(48)),
             (button, "background_colour", json!(12)),
             (label, "width", json!(140)),
             (label, "height", json!(20)),

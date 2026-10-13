@@ -13,8 +13,8 @@ use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectType;
 #[cfg(not(target_arch = "wasm32"))]
 use ag_iso_terminal_designer::ai::automation_bridge::EditorAutomationBridge;
+use ag_iso_terminal_designer::canvas::CanvasState;
 use ag_iso_terminal_designer::render_property_editor;
-use ag_iso_terminal_designer::InteractiveMaskRenderer;
 use ag_iso_terminal_designer::RenderableObject;
 use ag_iso_terminal_designer::{EditorProject, Operation};
 #[cfg(not(target_arch = "wasm32"))]
@@ -78,6 +78,7 @@ enum FileEvent {
 
 pub struct DesignerApp {
     project: Option<EditorProject>,
+    canvas: CanvasState,
     file_channel: (Sender<FileEvent>, Receiver<FileEvent>),
     show_development_popup: bool,
     new_object_dialog: Option<(ObjectType, String)>,
@@ -228,6 +229,7 @@ impl DesignerApp {
 
         Self {
             project: None,
+            canvas: CanvasState::default(),
             file_channel: std::sync::mpsc::channel(),
             show_development_popup: true,
             new_object_dialog: None,
@@ -344,6 +346,7 @@ impl DesignerApp {
                             project.apply_smart_naming_to_all_objects();
                         }
                         project.mark_saved();
+                        self.canvas = CanvasState::default();
                         self.project = Some(project);
                         self.project_display_name = file_name;
                         #[cfg(not(target_arch = "wasm32"))]
@@ -360,6 +363,7 @@ impl DesignerApp {
                             self.open_in_progress = false;
                             #[cfg(not(target_arch = "wasm32"))]
                             self.invalidate_automation_proposal();
+                            self.canvas = CanvasState::default();
                             self.project = Some(project);
                             self.project_display_name = file_name;
                             #[cfg(not(target_arch = "wasm32"))]
@@ -586,6 +590,7 @@ impl DesignerApp {
             PendingAction::NewPool => {
                 #[cfg(not(target_arch = "wasm32"))]
                 self.invalidate_automation_proposal();
+                self.canvas = CanvasState::default();
                 self.project = Some(EditorProject::new_pool());
                 self.project_display_name = "Untitled.aitp".to_owned();
                 self.new_object_dialog = None;
@@ -633,6 +638,7 @@ impl DesignerApp {
                             project.mark_recovered();
                             #[cfg(not(target_arch = "wasm32"))]
                             self.invalidate_automation_proposal();
+                            self.canvas = CanvasState::default();
                             self.project = Some(project);
                             self.project_display_name = record.display_name;
                             #[cfg(not(target_arch = "wasm32"))]
@@ -1693,7 +1699,9 @@ impl eframe::App for DesignerApp {
                             )
                             .changed()
                         {
-                            pool.set_mask_size(mask_size);
+                            if let Err(error) = pool.set_mask_size(mask_size) {
+                                self.error_message = Some(error.to_string());
+                            }
                         }
                     });
                 }
@@ -1823,56 +1831,6 @@ impl eframe::App for DesignerApp {
                     });
                 });
             let materialized = pool.materialize();
-            // Main panel
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let effective = match &materialized {
-                    Ok(m) => &m.pool,
-                    Err(error) => {
-                        ui.colored_label(egui::Color32::RED, error.to_string());
-                        return;
-                    }
-                };
-                if effective.objects_by_type(ObjectType::DataMask).is_empty() {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        "Missing data masks, please load a pool file or add a new mask...",
-                    );
-                } else {
-                    match effective.working_set_object() {
-                        Some(mask) => match effective.object_by_id(mask.active_mask) {
-                            Some(obj) => {
-                                let selected_ref = pool.get_mut_selected();
-
-                                egui::ScrollArea::both().show(ui, |ui| {
-                                    ui.add_sized(
-                                        [pool.mask_size as f32, pool.mask_size as f32],
-                                        InteractiveMaskRenderer {
-                                            object: obj,
-                                            pool: effective,
-                                            selected_callback: Box::new(move |object_id| {
-                                                selected_ref.set(NullableObjectId(Some(object_id)));
-                                            }),
-                                        },
-                                    );
-                                });
-                            }
-                            None => {
-                                ui.colored_label(
-                                    egui::Color32::RED,
-                                    format!("Missing data mask: {:?}", mask),
-                                );
-                            }
-                        },
-                        None => {
-                            ui.colored_label(
-                                egui::Color32::RED,
-                                "No working sets, please add a new working set...",
-                            );
-                        }
-                    }
-                }
-            });
-
             // Parameters panel
             egui::SidePanel::right("right_panel").show(ctx, |ui: &mut egui::Ui| {
                 if let Some(
@@ -1932,6 +1890,45 @@ impl eframe::App for DesignerApp {
                     }
                 }
                 ui.allocate_space(ui.available_size());
+            });
+
+            // Allocate the central panel after all side panels to keep canvas input within the preview.
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let effective = match &materialized {
+                    Ok(m) => &m.pool,
+                    Err(error) => {
+                        ui.colored_label(egui::Color32::RED, error.to_string());
+                        return;
+                    }
+                };
+                if effective.objects_by_type(ObjectType::DataMask).is_empty() {
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "Missing data masks, please load a pool file or add a new mask...",
+                    );
+                } else {
+                    match effective.working_set_object() {
+                        Some(mask) => match effective.object_by_id(mask.active_mask) {
+                            Some(obj) => {
+                                if let Ok(materialized) = &materialized {
+                                    self.canvas.show(ui, pool, materialized, obj.id().value());
+                                }
+                            }
+                            None => {
+                                ui.colored_label(
+                                    egui::Color32::RED,
+                                    format!("Missing data mask: {:?}", mask),
+                                );
+                            }
+                        },
+                        None => {
+                            ui.colored_label(
+                                egui::Color32::RED,
+                                "No working sets, please add a new working set...",
+                            );
+                        }
+                    }
+                }
             });
 
             let search_id = egui::Id::new("find_project_object");

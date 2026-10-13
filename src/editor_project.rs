@@ -41,6 +41,21 @@ struct ComponentCheckpoint {
     info: HashMap<ObjectId, ObjectInfo>,
 }
 
+impl ComponentCheckpoint {
+    fn content_eq(&self, other: &Self) -> bool {
+        self.pool == other.pool
+            && self.source == other.source
+            && self.graphics == other.graphics
+            && self.info.len() == other.info.len()
+            && self.info.iter().all(|(id, info)| {
+                other
+                    .info
+                    .get(id)
+                    .is_some_and(|other| info.content_eq(other))
+            })
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct EditorProject {
     pool: ObjectPool,
@@ -157,6 +172,21 @@ impl EditorProject {
         project.mut_object_info.replace(state.object_info.clone());
         project
     }
+    /// Copy authoritative canvas content without history, pending UI edits, or
+    /// save checkpoints. Mutating this copy cannot change the source project.
+    pub(crate) fn canvas_preview_copy(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            components: self.components.clone(),
+            graphics: self.graphics.clone(),
+            mask_size: self.mask_size,
+            soft_key_size: self.soft_key_size,
+            vt_version: self.vt_version,
+            object_info: RefCell::new(self.object_info.borrow().clone()),
+            mut_object_info: RefCell::new(self.object_info.borrow().clone()),
+            ..Self::default()
+        }
+    }
     pub fn graphic_library(&self) -> &crate::graphics::GraphicLibrary {
         &self.graphics
     }
@@ -257,16 +287,30 @@ impl EditorProject {
             &mut after.info,
         )?;
         prepare_compiled_ids(&after.pool, &mut after.source)?;
-        materialize_source_with_graphics(
+        let candidate = materialize_source_with_graphics(
             &after.pool,
             &after.source,
             self.vt_version,
             &after.info,
             &after.graphics,
         )?;
+        let baseline = self
+            .materialize()
+            .map(|m| m.pool)
+            .unwrap_or_else(|_| before.pool.clone());
+        crate::layout_containment::validate_change(
+            &baseline,
+            &candidate.pool,
+            self.mask_size,
+            self.mask_size,
+        )
+        .map_err(containment_component_error)?;
         after
             .info
             .retain(|id, _| after.pool.object_by_id(*id).is_some());
+        if before.content_eq(&after) {
+            return Ok(());
+        }
         let transaction_id = uuid::Uuid::new_v4().to_string();
         self.component_history
             .insert(transaction_id.clone(), (before, after.clone()));
@@ -395,12 +439,25 @@ impl EditorProject {
         self.dirty.set(true);
     }
 
-    pub fn set_mask_size(&mut self, mask_size: u16) {
+    /// Change the mask viewport size without introducing or increasing child overflow.
+    ///
+    /// Returns an error without changing content or revision if the new size
+    /// would violate containment. Existing overflow may be retained or reduced.
+    pub fn set_mask_size(&mut self, mask_size: u16) -> ComponentResult<()> {
         if self.mask_size != mask_size {
+            let materialized = self.materialize()?;
+            crate::layout_containment::validate_change(
+                &materialized.pool,
+                &materialized.pool,
+                self.mask_size,
+                mask_size,
+            )
+            .map_err(containment_component_error)?;
             self.mask_size = mask_size;
             self.bump_revision();
             self.refresh_dirty();
         }
+        Ok(())
     }
 
     pub fn set_object_name(&self, object: &Object, name: String) {
@@ -1125,7 +1182,7 @@ impl EditorProject {
                 mask_size: self.mask_size,
             },
         )?;
-        materialize_source_with_graphics(
+        let candidate = materialize_source_with_graphics(
             &prepared.pool,
             &self.components,
             self.vt_version,
@@ -1133,6 +1190,26 @@ impl EditorProject {
             &self.graphics,
         )
         .map_err(component_transaction_error)?;
+        let baseline = self
+            .materialize()
+            .map(|m| m.pool)
+            .unwrap_or_else(|_| self.pool.clone());
+        let id_changes: Vec<_> = transaction
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::ChangeObjectId { old_id, new_id } => Some((*old_id, *new_id)),
+                _ => None,
+            })
+            .collect();
+        crate::layout_containment::validate_change_with_id_changes(
+            &baseline,
+            &candidate.pool,
+            self.mask_size,
+            self.mask_size,
+            &id_changes,
+        )
+        .map_err(crate::operations::executor::containment_transaction_error)?;
         Ok(prepared)
     }
 
@@ -1307,6 +1384,14 @@ impl EditorProject {
             ))
         })
     }
+}
+
+fn containment_component_error(
+    error: crate::layout_containment::ContainmentError,
+) -> ComponentError {
+    let mut diagnostic = ComponentError::new(error.code(), error.message);
+    diagnostic.object_id = Some(error.child_id);
+    diagnostic
 }
 
 pub(crate) fn component_transaction_error(error: ComponentError) -> TransactionDiagnostics {
@@ -1559,9 +1644,11 @@ mod tests {
         project.get_object_info(&object);
 
         let original_mask_size = project.mask_size;
-        project.set_mask_size(original_mask_size.saturating_add(1));
+        project
+            .set_mask_size(original_mask_size.saturating_add(1))
+            .unwrap();
         assert!(project.is_dirty());
-        project.set_mask_size(original_mask_size);
+        project.set_mask_size(original_mask_size).unwrap();
         assert!(!project.is_dirty());
 
         project.set_object_name(&object, "First name".to_owned());
@@ -1662,7 +1749,11 @@ mod tests {
     fn queued_structural_edits_use_reversible_structural_operations() {
         use ag_iso_stack::object_pool::object_attributes::Event;
 
-        let parent = object_with_id(ObjectType::Button, 10);
+        let mut parent = object_with_id(ObjectType::Button, 10);
+        if let Object::Button(button) = &mut parent {
+            button.width = 100;
+            button.height = 100;
+        }
         let child = object_with_id(ObjectType::PictureGraphic, 11);
         let macro_object = object_with_id(ObjectType::Macro, 12);
         let mut pool = ObjectPool::default();
@@ -1873,6 +1964,7 @@ mod tests {
         pool.add(parent.clone());
         pool.add(child.clone());
         let mut project = EditorProject::from(pool);
+        project.set_mask_size(500).unwrap();
         let before = project.get_pool().as_iop();
 
         let mut add = OperationTransaction::new(Some("Add child".to_owned()));

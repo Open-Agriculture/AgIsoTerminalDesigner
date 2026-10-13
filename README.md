@@ -40,8 +40,33 @@ This project is under **active development**. While some features may not yet be
 - Load and save object pools from/to files
 - Navigate through the object pool tree
 - Use hyperlinks to navigate to referenced objects
-- Render active mask and current selection in a preview window
+- Edit the active mask on an interactive canvas: drag, resize, duplicate, align, and distribute placements with undo/redo
 - Limit selecting macro's and object references to allowed types only.
+
+### Interactive layout editor
+
+Select placements in the active-mask canvas or select objects from the hierarchy. Dragging updates the selected placement within its current parent. Parent bounds, dimensions, local coordinates, alignment guides, and spacing measurements appear during editing. Dragging and resizing stop at parent boundaries. Sidebar and CLI edits that introduce or increase overflow are rejected, including parent and mask-size reductions. Shared dimensions must fit every placement. Existing out-of-bounds layouts can still be loaded and repaired without increasing their overflow.
+
+| Control | Action |
+| --- | --- |
+| Shift-click / drag empty canvas | Toggle selection / marquee selection |
+| Double-click or Enter / Shift+Enter | Enter children / select parent |
+| Ctrl-click / Ctrl-marquee | Select nested objects |
+| Shift-drag / Ctrl-drag | Constrain movement / bypass snapping |
+| Alt-drag / Ctrl+D | Duplicate independently editable primitive objects and positioned descendants |
+| Alt-hover | Measure spacing to another object or the parent |
+| Arrow / Shift+Arrow | Move by 1 / 10 pool pixels |
+| Resize handle + Shift / Alt | Preserve aspect ratio / resize from center |
+| Delete / Escape | Remove selected placements / cancel a gesture or clear selection |
+| Space-drag or middle mouse | Pan |
+| Ctrl-wheel | Zoom around the pointer |
+| Shift+1 / Shift+2 | Fit mask / fit selection |
+
+The canvas toolbar provides X/Y and supported W/H fields, alignment/distribution, snapping switches, and a shortcut reference. Alignment and distribution operate on selections sharing a parent; hold Shift while aligning to align the selection as a group to that parent.
+
+Moving a repeated reference updates its exact child-list occurrence. Resizing changes the shared object's dimensions at every reference; the toolbar identifies shared dimensions. Removing a placement retains its primitive object definition in the pool. Component instances move and duplicate as units; their internal geometry stays controlled by their component definitions.
+
+Primitive copies receive fresh object IDs and metadata identities. Internal references within the copied positioned subtree are remapped; external styles and resources remain shared. Component copies retain their master and overrides. Completed gestures and numeric edits each create one undo action.
 
 ### What's Next
 

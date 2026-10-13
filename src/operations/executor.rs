@@ -5,9 +5,11 @@ use super::transaction::{
     AppliedTransaction, OperationTransaction, CURRENT_OPERATION_SCHEMA_VERSION,
 };
 use crate::object_info::ObjectInfo;
-use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectId, ObjectPool};
+use ag_iso_stack::object_pool::{
+    object_attributes::ObjectRef, vt_version::VtVersion, ObjectId, ObjectPool,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 pub const MAX_OPERATIONS_PER_TRANSACTION: usize = 256;
@@ -99,6 +101,22 @@ impl TransactionDiagnostics {
     }
 }
 
+pub(crate) fn containment_transaction_error(
+    error: crate::layout_containment::ContainmentError,
+) -> TransactionDiagnostics {
+    TransactionDiagnostics(vec![TransactionDiagnostic {
+        severity: DiagnosticSeverity::Error,
+        code: error.code().into(),
+        message: error.message,
+        operation_index: None,
+        operation_type: None,
+        object_id: Some(error.child_id),
+        object_name: None,
+        property: None,
+        related_objects: vec![error.parent_id, error.child_id],
+    }])
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ValidationContext {
     pub vt_version: VtVersion,
@@ -125,11 +143,150 @@ pub struct PreparedTransaction {
 
 pub struct OperationExecutor;
 
+/// Tracks reference provenance through a batch so a new placement cannot reuse
+/// a legacy placement's overflow allowance, even when the old one is repaired.
+struct PlacementProvenance(HashMap<u16, Vec<(ObjectRef, bool)>>);
+
+impl PlacementProvenance {
+    fn new(pool: &ObjectPool) -> Self {
+        Self(
+            pool.objects()
+                .iter()
+                .filter_map(|object| {
+                    super::object_refs(object).map(|refs| {
+                        (
+                            object.id().value(),
+                            refs.iter().map(|r| (r.clone(), false)).collect(),
+                        )
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn update(&mut self, operation: &Operation, inverse: &Operation, pool: &ObjectPool) {
+        match (operation, inverse) {
+            (Operation::AddChild { .. }, Operation::RemoveChild { parent_id, .. }) => {
+                if let Some(reference) = ObjectId::new(*parent_id)
+                    .ok()
+                    .and_then(|id| pool.object_by_id(id))
+                    .and_then(super::object_refs)
+                    .and_then(|refs| refs.last())
+                {
+                    self.0
+                        .entry(*parent_id)
+                        .or_default()
+                        .push((reference.clone(), true));
+                }
+            }
+            (
+                Operation::RemoveChild {
+                    parent_id,
+                    child_id,
+                },
+                _,
+            ) => {
+                if let Some(refs) = self.0.get_mut(parent_id) {
+                    if let Some(index) = refs
+                        .iter()
+                        .position(|(reference, _)| reference.id.value() == *child_id)
+                    {
+                        refs.remove(index);
+                    }
+                }
+            }
+            (Operation::ChangeObjectId { old_id, new_id }, _) => {
+                if let Some(refs) = self.0.remove(old_id) {
+                    self.0.insert(*new_id, refs);
+                }
+                for refs in self.0.values_mut() {
+                    for (reference, _) in refs {
+                        if reference.id.value() == *old_id {
+                            reference.id =
+                                ObjectId::new(*new_id).expect("applied object ID is valid");
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut updated = HashMap::new();
+        for object in pool.objects() {
+            let Some(refs) = super::object_refs(object) else {
+                continue;
+            };
+            let old = self.0.remove(&object.id().value()).unwrap_or_default();
+            let mut matched = vec![false; old.len()];
+            let mut origins = vec![None; refs.len()];
+            // Preserve unchanged references across reorder. When a replacement
+            // list adds repeated children, its first existing occurrences retain
+            // their identity and the additional occurrences are new.
+            let mut old_counts = HashMap::<ObjectId, usize>::new();
+            let mut new_counts = HashMap::<ObjectId, usize>::new();
+            for (reference, _) in &old {
+                *old_counts.entry(reference.id).or_default() += 1;
+            }
+            for reference in refs {
+                *new_counts.entry(reference.id).or_default() += 1;
+            }
+            for (index, reference) in refs.iter().enumerate() {
+                if old_counts.get(&reference.id) != new_counts.get(&reference.id) {
+                    continue;
+                }
+                if let Some(previous) = old
+                    .iter()
+                    .enumerate()
+                    .position(|(i, (r, _))| !matched[i] && r == reference)
+                {
+                    matched[previous] = true;
+                    origins[index] = Some(old[previous].1);
+                }
+            }
+            let origins = refs
+                .iter()
+                .enumerate()
+                .map(|(index, reference)| {
+                    let is_new = origins[index].unwrap_or_else(|| {
+                        if let Some(previous) = old
+                            .iter()
+                            .enumerate()
+                            .position(|(i, (r, _))| !matched[i] && r.id == reference.id)
+                        {
+                            matched[previous] = true;
+                            old[previous].1
+                        } else {
+                            true
+                        }
+                    });
+                    (reference.clone(), is_new)
+                })
+                .collect();
+            updated.insert(object.id().value(), origins);
+        }
+        self.0 = updated;
+    }
+
+    fn new_references(&self) -> HashSet<(u16, usize)> {
+        self.0
+            .iter()
+            .flat_map(|(parent, refs)| {
+                refs.iter()
+                    .enumerate()
+                    .filter_map(move |(index, (_, is_new))| is_new.then_some((*parent, index)))
+            })
+            .collect()
+    }
+}
+
 impl OperationExecutor {
     pub fn new() -> Self {
         Self
     }
 
+    /// Prepare the final candidate atomically, including parent containment.
+    /// Existing placement overflow may remain or decrease; new placements must
+    /// fit fully. No intermediate operation state is committed or validated as
+    /// the resulting layout.
     pub fn prepare_transaction(
         &self,
         pool: &ObjectPool,
@@ -177,6 +334,7 @@ impl OperationExecutor {
         let started = std::time::Instant::now();
         let mut candidate_pool = pool.clone();
         let mut candidate_info = object_info.clone();
+        let mut placements = PlacementProvenance::new(pool);
         let mut op_context = OperationContext {
             vt_version: context.vt_version,
             ..Default::default()
@@ -196,6 +354,7 @@ impl OperationExecutor {
             }
             match operation.apply(&mut candidate_pool, &mut candidate_info, &mut op_context) {
                 Ok(inverse) => {
+                    placements.update(operation, &inverse, &candidate_pool);
                     let forward = match (operation, &inverse) {
                         (Operation::CreateObject { .. }, Operation::DeleteObject { object_id }) => {
                             let id = ObjectId::new(*object_id).map_err(|_| {
@@ -234,6 +393,28 @@ impl OperationExecutor {
                 }
             }
         }
+        crate::layout_containment::validate_new_placements(
+            &candidate_pool,
+            context.mask_size,
+            &placements.new_references(),
+        )
+        .map_err(containment_transaction_error)?;
+        let id_changes: Vec<_> = transaction
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                Operation::ChangeObjectId { old_id, new_id } => Some((*old_id, *new_id)),
+                _ => None,
+            })
+            .collect();
+        crate::layout_containment::validate_change_with_id_changes(
+            pool,
+            &candidate_pool,
+            context.mask_size,
+            context.mask_size,
+            &id_changes,
+        )
+        .map_err(containment_transaction_error)?;
         let diagnostics: Vec<_> = crate::pool_validation::validate_pool_state_for_version(
             &candidate_pool,
             context.vt_version,

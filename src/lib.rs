@@ -5,6 +5,7 @@
 mod allowed_object_relationships;
 mod editor_project;
 mod interactive_rendering_simple;
+mod layout_containment;
 mod object_configuring;
 mod object_defaults;
 mod object_info;
@@ -15,6 +16,7 @@ mod smart_naming;
 
 // Operation system and automation support
 pub mod ai;
+pub mod canvas;
 pub mod components;
 pub mod effective_colour;
 pub mod graphics;

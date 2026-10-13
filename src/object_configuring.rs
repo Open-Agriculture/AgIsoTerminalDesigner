@@ -23,6 +23,13 @@ enum PendingValue {
     Text(String),
 }
 
+#[derive(Clone)]
+struct PendingPosition {
+    x: i16,
+    y: i16,
+    revision: u64,
+}
+
 /// A drag value changes on every pointer-move frame. Keep displaying those
 /// intermediate values, but only turn the edit into an operation when the
 /// pointer is released (or a keyboard edit loses focus).
@@ -499,29 +506,6 @@ fn queue_child_selection(
     }
 }
 
-fn parent_dimensions(object: &Object, design: &EditorProject) -> (u16, u16) {
-    object
-        .as_sized_object()
-        .map(|sized| (sized.width(), sized.height()))
-        .unwrap_or((design.mask_size, design.mask_size))
-}
-
-fn child_position_limits(
-    parent: &Object,
-    child: Option<&Object>,
-    design: &EditorProject,
-) -> (i16, i16) {
-    let (width, height) = parent_dimensions(parent, design);
-    let (child_width, child_height) = child
-        .and_then(Object::as_sized_object)
-        .map(|sized| (sized.width(), sized.height()))
-        .unwrap_or_default();
-    (
-        width.saturating_sub(child_width).min(i16::MAX as u16) as i16,
-        height.saturating_sub(child_height).min(i16::MAX as u16) as i16,
-    )
-}
-
 fn render_positioned_children(
     ui: &mut egui::Ui,
     parent: &Object,
@@ -568,25 +552,35 @@ fn render_positioned_children(
                 } else {
                     ui.colored_label(egui::Color32::RED, "Missing object");
                 }
-                let (max_x, max_y) = child_position_limits(parent, child, design);
-                let mut x = child_ref.offset.x.clamp(0, max_x);
-                let mut y = child_ref.offset.y.clamp(0, max_y);
-                let x_changed = ui
-                    .add(
-                        egui::Slider::new(&mut x, 0..=max_x)
-                            .show_value(true)
-                            .drag_value_speed(1.0),
-                    )
-                    .changed();
-                let y_changed = ui
-                    .add(
-                        egui::Slider::new(&mut y, 0..=max_y)
-                            .show_value(true)
-                            .drag_value_speed(1.0),
-                    )
-                    .changed();
-                if x_changed || y_changed {
-                    position = Some((child_ref.id, x, y));
+                let position_key =
+                    ui.make_persistent_id(("positioned_child_position", parent_id.value(), index));
+                let revision = design.revision();
+                let mut edited = ui
+                    .data(|data| data.get_temp::<PendingPosition>(position_key))
+                    .filter(|pending| pending.revision == revision)
+                    .unwrap_or(PendingPosition {
+                        x: child_ref.offset.x,
+                        y: child_ref.offset.y,
+                        revision,
+                    });
+                let x_response = ui.add(
+                    egui::DragValue::new(&mut edited.x)
+                        .range(i16::MIN..=i16::MAX)
+                        .speed(1.0),
+                );
+                let y_response = ui.add(
+                    egui::DragValue::new(&mut edited.y)
+                        .range(i16::MIN..=i16::MAX)
+                        .speed(1.0),
+                );
+                if x_response.changed() || y_response.changed() {
+                    ui.data_mut(|data| data.insert_temp(position_key, edited.clone()));
+                }
+                if drag_value_finished(&x_response) || drag_value_finished(&y_response) {
+                    if edited.x != child_ref.offset.x || edited.y != child_ref.offset.y {
+                        position = Some((index, edited.x, edited.y));
+                    }
+                    ui.data_mut(|data| data.remove::<PendingPosition>(position_key));
                 }
                 row_actions(ui, index, children.len(), &mut action);
                 ui.end_row();
@@ -600,12 +594,11 @@ fn render_positioned_children(
             Some(index),
             NullableObjectId(Some(child_id)),
         );
-    } else if let Some((child_id, x, y)) = position {
-        design.queue_operation(Operation::SetChildPosition {
-            parent_id: parent_id.value(),
-            child_id: child_id.value(),
-            x,
-            y,
+    } else if let Some((index, x, y)) = position {
+        let updated = positioned_children_with_position(children, index, x, y);
+        design.queue_operation(Operation::SetChildren {
+            parent: ObjectTarget::id(parent_id.value()),
+            children: updated,
         });
     } else if let Some(action) = action {
         let mut updated = children.to_vec();
@@ -641,6 +634,31 @@ fn render_positioned_children(
             queue_child_selection(design, parent_id, None, NullableObjectId(Some(child)));
         }
     });
+}
+
+fn positioned_children_with_position(
+    children: &[ObjectRef],
+    index: usize,
+    x: i16,
+    y: i16,
+) -> Vec<ChildPlacement> {
+    children
+        .iter()
+        .enumerate()
+        .map(|(child_index, child)| ChildPlacement {
+            child: ObjectTarget::id(child.id.value()),
+            x: if child_index == index {
+                x
+            } else {
+                child.offset.x
+            },
+            y: if child_index == index {
+                y
+            } else {
+                child.offset.y
+            },
+        })
+        .collect()
 }
 
 fn apply_list_action<T>(list: &mut Vec<T>, action: ListAction) {
@@ -1628,6 +1646,12 @@ mod tests {
     fn object(object_type: ObjectType, id: u16) -> Object {
         let mut object = default_object(object_type);
         object.mut_id().set_value(id).unwrap();
+        // Structural-edit tests use Buttons as parents. Give them a usable
+        // content area so placement behavior is independent of zero defaults.
+        if let Object::Button(button) = &mut object {
+            button.width = 100;
+            button.height = 100;
+        }
         object
     }
 
@@ -1826,6 +1850,96 @@ mod tests {
             }],
         });
         assert!(cycle_project.execute_transaction(transaction).is_err());
+    }
+
+    #[test]
+    fn positioned_child_edit_updates_the_exact_repeated_occurrence() {
+        let parent = object(ObjectType::Button, 10);
+        let child = object(ObjectType::PictureGraphic, 11);
+        let mut pool = ObjectPool::default();
+        pool.add(parent);
+        pool.add(child);
+        let mut project = EditorProject::from(pool);
+        let child_id = ObjectId::new(11).unwrap();
+        let initial = vec![
+            ObjectRef {
+                id: child_id,
+                offset: ag_iso_stack::object_pool::object_attributes::Point { x: 12, y: 7 },
+            },
+            ObjectRef {
+                id: child_id,
+                offset: ag_iso_stack::object_pool::object_attributes::Point { x: 30, y: 42 },
+            },
+        ];
+        apply(
+            &mut project,
+            Operation::SetChildren {
+                parent: ObjectTarget::id(10),
+                children: placements(&initial),
+            },
+        );
+
+        let edited = positioned_children_with_position(&initial, 1, 80, 80);
+        apply(
+            &mut project,
+            Operation::SetChildren {
+                parent: ObjectTarget::id(10),
+                children: edited,
+            },
+        );
+        let refs = crate::operations::operation::object_refs(
+            project
+                .get_pool()
+                .object_by_id(ObjectId::new(10).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refs[0].offset.x, 12);
+        assert_eq!(refs[0].offset.y, 7);
+        assert_eq!(refs[1].offset.x, 80);
+        assert_eq!(refs[1].offset.y, 80);
+    }
+
+    #[test]
+    fn existing_signed_offsets_can_be_repaired_without_worsening_overflow() {
+        let parent = object(ObjectType::Button, 10);
+        let child = object(ObjectType::PictureGraphic, 11);
+        let mut pool = ObjectPool::default();
+        pool.add(parent);
+        pool.add(child);
+        let child_id = ObjectId::new(11).unwrap();
+        let legacy = vec![
+            ObjectRef {
+                id: child_id,
+                offset: ag_iso_stack::object_pool::object_attributes::Point { x: -12, y: -7 },
+            },
+            ObjectRef {
+                id: child_id,
+                offset: ag_iso_stack::object_pool::object_attributes::Point { x: 30, y: 42 },
+            },
+        ];
+        if let Some(Object::Button(button)) = pool.object_mut_by_id(ObjectId::new(10).unwrap()) {
+            button.object_refs = legacy.clone();
+        }
+        let mut project = EditorProject::from(pool);
+
+        let repaired = positioned_children_with_position(&legacy, 0, 0, 0);
+        apply(
+            &mut project,
+            Operation::SetChildren {
+                parent: ObjectTarget::id(10),
+                children: repaired,
+            },
+        );
+        let refs = crate::operations::operation::object_refs(
+            project
+                .get_pool()
+                .object_by_id(ObjectId::new(10).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!((refs[0].offset.x, refs[0].offset.y), (0, 0));
+        assert_eq!((refs[1].offset.x, refs[1].offset.y), (30, 42));
     }
 
     #[test]

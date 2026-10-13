@@ -2,7 +2,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use std::ops::Sub;
+use std::{cell::RefCell, collections::HashSet, ops::Sub};
 
 use ag_iso_stack::object_pool::object::*;
 use ag_iso_stack::object_pool::object_attributes::ButtonState;
@@ -22,6 +22,35 @@ use eframe::egui::FontId;
 use eframe::egui::TextWrapMode;
 use eframe::egui::UiBuilder;
 
+/// Border inset used by the preview's fixed Version 3 button rendering.
+pub(crate) const BUTTON_BORDER_INSET: f32 = 4.0;
+
+thread_local! {
+    /// Prevent malformed cyclic object references from recursing forever.
+    static RENDER_ANCESTRY: RefCell<HashSet<u16>> = RefCell::new(HashSet::new());
+}
+
+struct RenderAncestryGuard(u16);
+
+impl RenderAncestryGuard {
+    fn enter(object_id: u16) -> Option<Self> {
+        RENDER_ANCESTRY.with(|active| {
+            active
+                .borrow_mut()
+                .insert(object_id)
+                .then_some(Self(object_id))
+        })
+    }
+}
+
+impl Drop for RenderAncestryGuard {
+    fn drop(&mut self) {
+        RENDER_ANCESTRY.with(|active| {
+            active.borrow_mut().remove(&self.0);
+        });
+    }
+}
+
 pub trait RenderableObject {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>);
 }
@@ -35,6 +64,10 @@ pub fn render_mask(ui: &mut egui::Ui, pool: &ObjectPool, mask: &Object) {
 
 impl RenderableObject for Object {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let Some(_ancestry_guard) = RenderAncestryGuard::enter(self.id().value()) else {
+            return;
+        };
+
         // Make sure text is truncated if it doesn't fit for all object renderings (useful for error labels)
         ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
 
@@ -253,6 +286,7 @@ impl RenderableObject for Container {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.shrink_clip_rect(rect);
             render_object_refs(ui, pool, &self.object_refs);
         });
     }
@@ -296,13 +330,12 @@ impl RenderableObject for Button {
         //
         // The border is a VT proprietary 8-pixel area, but we must reduce face size accordingly.
         // Let's assume a uniform distribution of that 8-pixel shrinkage (4 pixels on each side).
-        const BORDER_WIDTH: f32 = 4.0;
         let face_rect = if no_border {
             rect
         } else {
             // Face is area minus 8 pixels in width and height.
             // We'll just evenly shrink by 4 pixels on each side.
-            rect.shrink(BORDER_WIDTH)
+            rect.shrink(BUTTON_BORDER_INSET)
         };
 
         let response = ui.interact(
@@ -347,7 +380,7 @@ impl RenderableObject for Button {
             ui.painter().rect_stroke(
                 rect,
                 0.0,
-                egui::Stroke::new(BORDER_WIDTH, border_color),
+                egui::Stroke::new(BUTTON_BORDER_INSET, border_color),
                 egui::StrokeKind::Inside,
             );
         }
@@ -356,6 +389,7 @@ impl RenderableObject for Button {
 
         // Child objects are clipped to the face area
         ui.scope_builder(UiBuilder::new().max_rect(face_rect), |ui| {
+            ui.shrink_clip_rect(face_rect);
             render_object_refs(ui, pool, &self.object_refs);
         });
 
