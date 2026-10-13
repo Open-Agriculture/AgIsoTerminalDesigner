@@ -38,7 +38,9 @@ This project is under **active development**. While some features may not yet be
 
 - [Web version](https://open-agriculture.github.io/AgIsoTerminalDesigner/) for easy access
 - Load and save object pools from/to files
-- Navigate through the object pool tree
+- Navigate through the object pool tree with full-width selection highlighting
+- Rearrange the workspace with dockable tabs, splits, and floating panes; layouts persist locally
+- Follow the system appearance or choose coordinated light and dark themes
 - Use hyperlinks to navigate to referenced objects
 - Edit the active mask on an interactive canvas: drag, resize, duplicate, align, and distribute placements with undo/redo
 - Limit selecting macro's and object references to allowed types only.

@@ -7,9 +7,6 @@ use crate::{components::MaterializedProject, EditorProject, RenderableObject};
 use ag_iso_stack::object_pool::{object_attributes::Point, NullableObjectId, ObjectId};
 use egui::{Color32, Key, Modifiers, Pos2, Rect, Stroke, Vec2};
 
-pub(super) const BLUE: Color32 = Color32::from_rgb(80, 165, 255);
-pub(super) const GUIDE: Color32 = Color32::from_rgb(245, 100, 135);
-
 /// Transient viewport, occurrence selection, and gesture drafts for one project.
 /// Reset this state when replacing the project; no canvas state is serialized.
 pub struct CanvasState {
@@ -78,6 +75,13 @@ struct Gesture {
 }
 
 impl CanvasState {
+    /// Cancel unfinished canvas edits when its pane is hidden or moved.
+    /// Completed edits, selection, zoom, and pan remain intact.
+    pub fn cancel_interaction(&mut self) {
+        self.gesture = None;
+        self.field_draft = None;
+    }
+
     /// Show the active mask editor. All coordinates committed to the project are
     /// parent-relative integer pool pixels; preview transformations stay local.
     pub fn show(
@@ -136,11 +140,19 @@ impl CanvasState {
             ui.id().with("layout_canvas"),
             egui::Sense::click_and_drag(),
         );
-        if self.gesture.is_some() && self.viewport.is_finite() {
-            self.pan += self.viewport.min - viewport.min;
+        if self.viewport.is_finite()
+            && (self.viewport.min - viewport.min).length_sq() > 0.25
+            && (self.gesture.is_some() || self.field_draft.is_some())
+        {
+            self.cancel_interaction();
         }
         self.viewport = viewport;
         let canvas_id = response.id;
+        let visuals = ui.visuals();
+        let selection_color = visuals.selection.stroke.color;
+        let guide_color = visuals.warn_fg_color;
+        let mask_fill = visuals.extreme_bg_color;
+        let workspace_fill = visuals.faint_bg_color;
         let mask_rect = scene
             .items
             .first()
@@ -263,11 +275,24 @@ impl CanvasState {
                 });
             }
         }
-        if let Some(p) = pointer.interact_pos().or_else(|| {
-            self.gesture
-                .as_ref()
-                .map(|g| origin + g.current.to_vec2() * zoom)
-        }) {
+        let owns_pointer = response.hovered()
+            || response.dragged_by(egui::PointerButton::Primary)
+            || response.dragged_by(egui::PointerButton::Middle)
+            || response.drag_stopped_by(egui::PointerButton::Primary)
+            || response.drag_stopped_by(egui::PointerButton::Middle);
+        if let Some(p) = owns_pointer
+            .then(|| pointer.interact_pos())
+            .flatten()
+            .or_else(|| {
+                (owns_pointer && self.gesture.is_some())
+                    .then(|| {
+                        self.gesture
+                            .as_ref()
+                            .map(|g| origin + g.current.to_vec2() * zoom)
+                    })
+                    .flatten()
+            })
+        {
             if let Some(mut gesture) = self.gesture.take() {
                 gesture.current = to_pool(p);
                 let raw = gesture.current - gesture.start;
@@ -357,8 +382,11 @@ impl CanvasState {
                         }
                     }
                 }
-                let stopped = pointer.button_released(egui::PointerButton::Primary)
-                    || pointer.button_released(egui::PointerButton::Middle);
+                let stopped = response.drag_stopped_by(egui::PointerButton::Primary)
+                    || response.drag_stopped_by(egui::PointerButton::Middle)
+                    || response.hovered()
+                        && (pointer.button_released(egui::PointerButton::Primary)
+                            || pointer.button_released(egui::PointerButton::Middle));
                 if stopped {
                     if gesture.changed && gesture.draft.is_some() && !gesture.edits.is_empty() {
                         let description = match gesture.kind {
@@ -398,6 +426,17 @@ impl CanvasState {
             .map(|d| &d.0)
             .unwrap_or(materialized);
         let transform = egui::emath::TSTransform::new(viewport.min.to_vec2() + self.pan, self.zoom);
+        let workspace_painter = ui.painter().with_clip_rect(viewport);
+        workspace_painter.rect_filled(viewport, 0.0, workspace_fill);
+        let mask_screen_rect =
+            egui::emath::TSTransform::new(viewport.min.to_vec2() + self.pan, self.zoom) * mask_rect;
+        workspace_painter.rect_filled(mask_screen_rect.intersect(viewport), 1.0, mask_fill);
+        workspace_painter.rect_stroke(
+            mask_screen_rect,
+            1.0,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
         let mut child = ui.new_child(
             egui::UiBuilder::new()
                 .id_salt(canvas_id.with("objects"))
@@ -439,7 +478,7 @@ impl CanvasState {
             painter.rect_stroke(
                 screen(item.rect),
                 0.0,
-                Stroke::new(1.5, BLUE),
+                Stroke::new(1.5, selection_color),
                 egui::StrokeKind::Outside,
             );
         }
@@ -448,7 +487,7 @@ impl CanvasState {
                 painter.rect_stroke(
                     screen(item.rect),
                     0.0,
-                    Stroke::new(1.0, BLUE),
+                    Stroke::new(1.0, selection_color),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -458,24 +497,33 @@ impl CanvasState {
                     &display_items[0],
                     screen,
                     dimensions(project, &display_items[0]),
+                    selection_color,
                 );
                 let rect = display_items[0].rect;
                 label(
                     &painter,
                     screen(rect).left_bottom() + egui::vec2(0.0, 17.0),
                     format!("{} × {}", rect.width().round(), rect.height().round()),
-                    BLUE,
+                    selection_color,
                 );
             }
         }
         if let Some(g) = &self.gesture {
             if matches!(g.kind, GestureKind::Marquee) && g.changed {
                 let r = screen(Rect::from_two_pos(g.start, g.current));
-                painter.rect_filled(r, 0.0, BLUE.gamma_multiply(0.12));
-                painter.rect_stroke(r, 0.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
+                painter.rect_filled(r, 0.0, selection_color.gamma_multiply(0.12));
+                painter.rect_stroke(
+                    r,
+                    0.0,
+                    Stroke::new(1.0, selection_color),
+                    egui::StrokeKind::Inside,
+                );
             }
             for (a, b) in &g.guides {
-                painter.line_segment([transform * *a, transform * *b], Stroke::new(1.0, GUIDE));
+                painter.line_segment(
+                    [transform * *a, transform * *b],
+                    Stroke::new(1.0, guide_color),
+                );
             }
             for item in &display_items {
                 let parent_path = &item.path[..item.path.len().saturating_sub(1)];
@@ -488,7 +536,7 @@ impl CanvasState {
                 painter.rect_stroke(
                     screen(parent_bounds),
                     0.0,
-                    Stroke::new(1.0, GUIDE),
+                    Stroke::new(1.0, guide_color),
                     egui::StrokeKind::Outside,
                 );
                 label(
@@ -499,13 +547,15 @@ impl CanvasState {
                         parent_bounds.width().round(),
                         parent_bounds.height().round()
                     ),
-                    GUIDE,
+                    guide_color,
                 );
                 parent_measure(
                     &painter,
                     screen(item.rect),
                     screen(item.parent_rect),
                     self.zoom,
+                    guide_color,
+                    selection_color,
                 );
             }
         } else if modifiers.alt {
@@ -519,6 +569,7 @@ impl CanvasState {
                             .unwrap_or(selected.parent_rect),
                     ),
                     self.zoom,
+                    guide_color,
                 );
             }
         }
@@ -686,7 +737,7 @@ impl CanvasState {
         commands: &mut Vec<CanvasEdit>,
     ) {
         ui.horizontal_wrapped(|ui| {
-            ui.strong("Layout editor");
+            ui.strong("VIEW");
             if ui.small_button("−").clicked() {
                 self.zoom = (self.zoom / 1.25).max(0.1);
             }
@@ -706,6 +757,8 @@ impl CanvasState {
             {
                 self.fit = Some(true);
             }
+            ui.separator();
+            ui.strong("SNAP");
             ui.checkbox(&mut self.snap_objects, "Snap objects");
             ui.checkbox(&mut self.snap_spacing, "Snap spacing");
             ui.menu_button("Shortcuts", |ui| {
@@ -722,10 +775,11 @@ impl CanvasState {
         });
         if items.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                ui.label("Select a placement to edit its position and dimensions.");
+                ui.weak("Select a placement to edit its position and dimensions.");
             });
         } else {
             ui.horizontal_wrapped(|ui| {
+                ui.strong("SELECTION");
                 let path = items.last().unwrap();
                 let breadcrumb = scene
                     .items

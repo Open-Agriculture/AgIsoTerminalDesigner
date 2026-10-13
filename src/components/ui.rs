@@ -10,9 +10,12 @@ use eframe::egui;
 
 /// UI drafts live in egui temporary state; saving invokes the same atomic service as AI.
 pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
+    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+    ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+    ui.spacing_mut().interact_size.y = 26.0;
     ui.heading("Components");
     if let Some(error) = ui.data_mut(|d| d.get_temp::<String>(egui::Id::new("component_error"))) {
-        ui.colored_label(egui::Color32::RED, error);
+        ui.colored_label(ui.visuals().error_fg_color, error);
         if ui.button("Dismiss error").clicked() {
             ui.data_mut(|d| d.remove::<String>(egui::Id::new("component_error")));
         }
@@ -1168,5 +1171,5 @@ pub fn inspector(
 fn report_error(ui: &mut egui::Ui, message: impl Into<String>) {
     let message = message.into();
     ui.data_mut(|d| d.insert_temp(egui::Id::new("component_error"), message.clone()));
-    ui.colored_label(egui::Color32::RED, message);
+    ui.colored_label(ui.visuals().error_fg_color, message);
 }

@@ -2,7 +2,6 @@
 use super::{
     edits::{position, CanvasEdit, PlacementTarget},
     geometry::{Scene, SceneItem},
-    ui::{BLUE, GUIDE},
 };
 use crate::EditorProject;
 use ag_iso_stack::object_pool::ObjectId;
@@ -399,11 +398,17 @@ pub(super) fn paint_handles(
     item: &SceneItem,
     screen: impl Fn(Rect) -> Rect,
     dim: (Option<u16>, Option<u16>),
+    selection_color: Color32,
 ) {
     for h in handles(dim) {
         let r = Rect::from_center_size(handle_pos(screen(item.rect), h), Vec2::splat(6.0));
         painter.rect_filled(r, 0.0, Color32::WHITE);
-        painter.rect_stroke(r, 0.0, Stroke::new(1.0, BLUE), egui::StrokeKind::Inside);
+        painter.rect_stroke(
+            r,
+            0.0,
+            Stroke::new(1.0, selection_color),
+            egui::StrokeKind::Inside,
+        );
     }
 }
 pub(super) fn resize_edits(
@@ -807,7 +812,13 @@ pub(super) fn label(p: &egui::Painter, pos: Pos2, text: String, color: Color32) 
         color,
     );
 }
-pub(super) fn measure(p: &egui::Painter, object: Rect, reference: Rect, zoom: f32) {
+pub(super) fn measure(
+    p: &egui::Painter,
+    object: Rect,
+    reference: Rect,
+    zoom: f32,
+    guide_color: Color32,
+) {
     let containing = reference.contains_rect(object);
     let segments = if containing {
         vec![
@@ -861,19 +872,26 @@ pub(super) fn measure(p: &egui::Painter, object: Rect, reference: Rect, zoom: f3
         ]
     };
     for (a, b, distance) in segments {
-        p.line_segment([a, b], Stroke::new(1.0, GUIDE));
+        p.line_segment([a, b], Stroke::new(1.0, guide_color));
         let tick = if a.y == b.y {
             egui::vec2(0.0, 3.0)
         } else {
             egui::vec2(3.0, 0.0)
         };
-        p.line_segment([a - tick, a + tick], Stroke::new(1.0, GUIDE));
-        p.line_segment([b - tick, b + tick], Stroke::new(1.0, GUIDE));
-        label(p, a + (b - a) * 0.5, format!("{distance:.0}"), GUIDE);
+        p.line_segment([a - tick, a + tick], Stroke::new(1.0, guide_color));
+        p.line_segment([b - tick, b + tick], Stroke::new(1.0, guide_color));
+        label(p, a + (b - a) * 0.5, format!("{distance:.0}"), guide_color);
     }
 }
 
-pub(super) fn parent_measure(p: &egui::Painter, object: Rect, parent: Rect, zoom: f32) {
+pub(super) fn parent_measure(
+    p: &egui::Painter,
+    object: Rect,
+    parent: Rect,
+    zoom: f32,
+    guide_color: Color32,
+    selection_color: Color32,
+) {
     for (a, b, value) in [
         (
             egui::pos2(parent.left(), object.center().y),
@@ -896,8 +914,13 @@ pub(super) fn parent_measure(p: &egui::Painter, object: Rect, parent: Rect, zoom
             parent.bottom() - object.bottom(),
         ),
     ] {
-        p.line_segment([a, b], Stroke::new(1.0, GUIDE));
-        label(p, a + (b - a) * 0.5, format!("{:.0}", value / zoom), GUIDE);
+        p.line_segment([a, b], Stroke::new(1.0, guide_color));
+        label(
+            p,
+            a + (b - a) * 0.5,
+            format!("{:.0}", value / zoom),
+            guide_color,
+        );
     }
     label(
         p,
@@ -909,6 +932,6 @@ pub(super) fn parent_measure(p: &egui::Painter, object: Rect, parent: Rect, zoom
             object.width() / zoom,
             object.height() / zoom
         ),
-        BLUE,
+        selection_color,
     );
 }

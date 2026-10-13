@@ -41,63 +41,6 @@ impl AppPreferences {
     pub fn apply(&self, ctx: &egui::Context) {
         ctx.set_theme(self.theme);
     }
-
-    pub fn show_view_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.menu_button("View", |ui| {
-            ui.menu_button("Theme", |ui| {
-                for (theme, label) in [
-                    (egui::ThemePreference::System, "System"),
-                    (egui::ThemePreference::Light, "Light"),
-                    (egui::ThemePreference::Dark, "Dark"),
-                ] {
-                    if ui.selectable_value(&mut self.theme, theme, label).clicked() {
-                        ctx.set_theme(self.theme);
-                    }
-                }
-            });
-            ui.menu_button("Panels", |ui| {
-                ui.checkbox(&mut self.show_objects, "Objects");
-                ui.checkbox(&mut self.show_graphics, "Graphics");
-                ui.checkbox(&mut self.show_components, "Components");
-                ui.checkbox(&mut self.show_properties, "Properties");
-                ui.checkbox(&mut self.show_ancestry, "Selection Ancestry");
-                #[cfg(not(target_arch = "wasm32"))]
-                ui.checkbox(&mut self.show_proposal, "Proposal");
-                ui.separator();
-                if ui.button("Reset Panel Layout").clicked() {
-                    self.show_objects = true;
-                    self.show_graphics = true;
-                    self.show_components = true;
-                    self.show_properties = true;
-                    self.show_ancestry = true;
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        self.show_proposal = true;
-                    }
-                    ctx.memory_mut(|memory| memory.reset_areas());
-                    ctx.data_mut(|data| {
-                        for id in [
-                            "left_panel",
-                            "components_panel",
-                            "right_panel",
-                            "selected_ancestry_panel",
-                        ] {
-                            data.remove::<egui::containers::panel::PanelState>(egui::Id::new(id));
-                        }
-                    });
-                    ui.close();
-                }
-            });
-            ui.menu_button("Object IDs", |ui| {
-                for (format, label) in [
-                    (ObjectIdFormat::Decimal, "Decimal"),
-                    (ObjectIdFormat::Hexadecimal, "Hexadecimal (0x00AF)"),
-                ] {
-                    ui.selectable_value(&mut self.object_id_format, format, label);
-                }
-            });
-        });
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -125,17 +68,16 @@ pub fn show_project_settings(
     preferences: &mut AppPreferences,
     draft: &mut Option<DimensionsDraft>,
     error_message: &mut Option<String>,
-) {
+) -> Option<crate::workspace::Pane> {
     if !*open {
-        return;
+        return None;
     }
     if draft.is_none() {
         *draft = project.as_deref().map(DimensionsDraft::from_project);
     }
     let mut apply = false;
     let mut cancel = false;
-    let mut open_graphics = false;
-    let mut open_components = false;
+    let mut requested_pane = None;
     egui::Window::new("Project Settings")
         .open(open)
         .default_width(520.0)
@@ -149,7 +91,7 @@ pub fn show_project_settings(
                 return;
             };
             egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.heading("Dimensions");
+                ag_iso_terminal_designer::ui_style::section_heading(ui, "Dimensions");
                 ui.horizontal(|ui| {
                     ui.label("Data/alarm mask");
                     ui.add(egui::DragValue::new(&mut values.mask).range(0..=u16::MAX));
@@ -164,7 +106,7 @@ pub fn show_project_settings(
                 });
                 ui.small("Softkey dimensions are saved design values; softkey preview is not available yet.");
                 if values.mask == 0 || values.soft_key_width == 0 || values.soft_key_height == 0 {
-                    ui.colored_label(egui::Color32::RED, "Dimensions must be positive.");
+                    ui.colored_label(ag_iso_terminal_designer::ui_style::palette(ui).error, "Dimensions must be positive.");
                 }
                 let (mask_minimum, key_minimum) = if project.vt_version == VtVersion::Version6 {
                     (480, (60, 60))
@@ -179,7 +121,7 @@ pub fn show_project_settings(
                 }
 
                 ui.separator();
-                ui.heading("Compatibility");
+                ag_iso_terminal_designer::ui_style::section_heading(ui, "Compatibility");
                 ui.label(format!("Target VT version: VT{} (read-only)", u8::from(project.vt_version)));
                 disabled_section(
                     ui,
@@ -213,7 +155,7 @@ pub fn show_project_settings(
                         ("Translation resources", DisabledControl::Configure),
                     ],
                 );
-                ui.heading("Authoring");
+                ag_iso_terminal_designer::ui_style::section_heading(ui, "Authoring");
                 ui.horizontal(|ui| {
                     ui.label("Object ID format");
                     egui::ComboBox::from_id_salt("settings_object_id_format")
@@ -249,15 +191,15 @@ pub fn show_project_settings(
                         ("Generated-code options", DisabledControl::Choice(&["Not configured"])),
                     ],
                 );
-                ui.heading("Shared resources");
+                ag_iso_terminal_designer::ui_style::section_heading(ui, "Shared resources");
                 ui.small("Project-specific resource defaults are not available yet.");
                 ui.label("Edit shared resources in the existing editors:");
                 ui.horizontal(|ui| {
                     if ui.button("Open Graphics editor").clicked() {
-                        open_graphics = true;
+                        requested_pane = Some(crate::workspace::Pane::Graphics);
                     }
                     if ui.button("Open Components editor").clicked() {
-                        open_components = true;
+                        requested_pane = Some(crate::workspace::Pane::Components);
                     }
                 });
                 ui.add_enabled_ui(false, |ui| {
@@ -294,20 +236,16 @@ pub fn show_project_settings(
                 *open = false;
             }
         }
-    } else if cancel || open_graphics || open_components || !*open {
+    } else if cancel || requested_pane.is_some() || !*open {
         if cancel {
             *open = false;
         }
-        if open_graphics {
-            preferences.show_graphics = true;
-            *open = false;
-        }
-        if open_components {
-            preferences.show_components = true;
+        if requested_pane.is_some() {
             *open = false;
         }
         *draft = None;
     }
+    requested_pane
 }
 
 #[derive(Clone, Copy)]
@@ -323,7 +261,7 @@ fn disabled_section(
     explanation: &str,
     controls: &[(&str, DisabledControl)],
 ) {
-    ui.heading(title);
+    ag_iso_terminal_designer::ui_style::section_heading(ui, title);
     ui.add_enabled_ui(false, |ui| {
         for (index, (label, control)) in controls.iter().enumerate() {
             ui.horizontal(|ui| {

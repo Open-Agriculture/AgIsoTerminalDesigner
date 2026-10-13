@@ -27,12 +27,25 @@ The mask size also applies to Alarm Masks; softkeys occupy a separate area.
 
 ## Application preferences
 
-View offers System, Light and Dark themes and individual visibility controls for
-Objects, Graphics, Components, Properties and Selection Ancestry. The desktop
-version also offers Proposal. Graphics and Components share a sidebar; hiding
-both removes it. New proposals reopen their review window. Reset Panel Layout
-restores visible panels and their initial layout, preserving theme and ID format.
-Themes change editor chrome, not object-pool colours.
+View offers System, Light and Dark themes. The default follows the operating
+system. Themes style editor controls and canvas guides without changing
+object-pool colours.
+
+Objects, Graphics and Components initially share a tab group on the left, with
+Canvas in the centre, Properties on the right and a compact Selection Ancestry
+pane beneath Canvas. The desktop version also offers Proposal. Drag a pane's
+tab to reorder tabs, split the workspace or float the pane inside the application.
+Resize splits and floating panes to suit your workspace. Ancestry's details button
+expands the existing relationship tree.
+
+View → Panels hides, reopens and activates individual panes, including Canvas.
+New proposals reveal their review pane. Reset Panel Layout restores the default
+arrangement while preserving theme and ID format. Layout, active tabs and floating
+window positions persist locally across project changes and application restarts;
+they are not stored in `.aitp` projects. Invalid saved layouts fall back to defaults.
+
+Selected object rows have a continuous highlight spanning the tree width,
+including indentation, so the selection remains visible in deeply nested trees.
 
 View → Object IDs and Project Settings → Authoring edit the same application
 preference. Decimal is the default; hexadecimal displays IDs as `0x00AF`.
@@ -41,7 +54,7 @@ format. Unprefixed numeric ID input uses the selected radix; `0x` or `0X` always
 means hexadecimal. Existing ID uniqueness, range and null-reference rules still
 apply. Explicit object names, generated names, serialized IDs and exports are unchanged.
 
-Theme, panel visibility and ID format persist locally across restarts and project
+Theme, workspace layout and ID format persist locally across restarts and project
 changes. They do not dirty a project or enter its undo history. Canvas zoom, pan
 and snapping retain their existing controls.
 

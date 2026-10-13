@@ -27,8 +27,8 @@
 
     <link rel="manifest" href="assets/manifest.json">
     <link rel="apple-touch-icon" href="assets/icon_ios_touch_192.png">
-    <meta name="theme-color" media="(prefers-color-scheme: light)" content="white">
-    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#404040">
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#eff1f4">
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#181b20">
 
     <style>
         html {
@@ -36,17 +36,26 @@
             touch-action: manipulation;
         }
 
-        body {
-            /* Light mode background color for what is not covered by the egui canvas,
-            or where the egui canvas is translucent. */
-            background: #909090;
+        :root {
+            color-scheme: light dark;
+            --loading-bg: #eff1f4;
+            --loading-card: rgba(250, 251, 252, .94);
+            --loading-border: #dadedc;
+            --loading-text: #232830;
+            --loading-muted: #69717b;
+            --loading-accent: #3470d2;
         }
 
+        body { background: var(--loading-bg); }
+
         @media (prefers-color-scheme: dark) {
-            body {
-                /* Dark mode background color for what is not covered by the egui canvas,
-                or where the egui canvas is translucent. */
-                background: #404040;
+            :root {
+                --loading-bg: #181b20;
+                --loading-card: rgba(31, 35, 41, .96);
+                --loading-border: #393f48;
+                --loading-text: #e2e6ec;
+                --loading-muted: #97a0ac;
+                --loading-accent: #69a3ff;
             }
         }
 
@@ -80,29 +89,43 @@
             top: 50%;
             left: 50%;
             transform: translate(-50%, -50%);
-            color: #f0f0f0;
-            font-size: 24px;
-            font-family: Ubuntu-Light, Helvetica, sans-serif;
+            box-sizing: border-box;
+            width: min(320px, calc(100vw - 32px));
+            padding: 28px 24px;
+            border: 1px solid var(--loading-border);
+            border-radius: 12px;
+            background: var(--loading-card);
+            box-shadow: 0 18px 50px rgba(19, 27, 39, .12);
+            color: var(--loading-text);
+            font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
             text-align: center;
+        }
+
+        .centered p {
+            margin: 0 0 20px;
+            color: var(--loading-muted);
+            font-size: 13px !important;
+            letter-spacing: .01em;
         }
 
         /* ---------------------------------------------- */
         /* Loading animation from https://loading.io/css/ */
         .lds-dual-ring {
             display: inline-block;
-            width: 24px;
-            height: 24px;
+            width: 28px;
+            height: 28px;
+            vertical-align: middle;
         }
 
         .lds-dual-ring:after {
             content: " ";
             display: block;
-            width: 24px;
-            height: 24px;
+            width: 28px;
+            height: 28px;
             margin: 0px;
             border-radius: 50%;
-            border: 3px solid #fff;
-            border-color: #fff transparent #fff transparent;
+            border: 3px solid var(--loading-border);
+            border-color: var(--loading-accent) transparent var(--loading-accent) transparent;
             animation: lds-dual-ring 1.2s linear infinite;
         }
 

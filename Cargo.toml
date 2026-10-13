@@ -13,6 +13,7 @@ path = "src/bin/aitd.rs"
 
 [dependencies]
 egui = "0.32"
+egui_dock = { version = "0.17", features = ["serde"] }
 eframe = { version = "0.32", features = ["persistence"] }
 ag-iso-stack = { path = "../AgIsoStack-rs" }
 # ag-iso-stack = { git = "https://github.com/Open-Agriculture/AgIsoStack-rs", branch = "daan/terminal-designer-changes" }

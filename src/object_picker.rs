@@ -197,6 +197,9 @@ pub fn fit_rect(bounds: Rect, size: Vec2) -> Rect {
 
 pub fn checkerboard(painter: &egui::Painter, rect: Rect) {
     const TILE: f32 = 8.0;
+    let visuals = painter.ctx().style().visuals.clone();
+    let base = visuals.extreme_bg_color;
+    let alternate = visuals.faint_bg_color;
     for row in 0..(rect.height() / TILE).ceil() as usize {
         for column in 0..(rect.width() / TILE).ceil() as usize {
             let tile = Rect::from_min_size(
@@ -207,7 +210,7 @@ pub fn checkerboard(painter: &egui::Painter, rect: Rect) {
             painter.rect_filled(
                 tile,
                 0.0,
-                egui::Color32::from_gray(if (row + column) % 2 == 0 { 190 } else { 235 }),
+                if (row + column) % 2 == 0 { base } else { alternate },
             );
         }
     }
@@ -285,9 +288,11 @@ pub fn row(
     paint: impl Fn(&mut egui::Ui, Rect),
 ) -> bool {
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
         let image = preview(ui, paint);
         let text = ui
             .vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
                 let response = ui.selectable_label(selected, name);
                 ui.weak(detail);
                 response
@@ -367,7 +372,7 @@ pub fn object_window(
             });
             if !valid {
                 ui.colored_label(
-                    egui::Color32::RED,
+                    ui.visuals().error_fg_color,
                     "This selection is no longer available here. Go back and choose another.",
                 );
             }

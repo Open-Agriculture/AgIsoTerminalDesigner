@@ -1,7 +1,7 @@
-use super::{integration::GraphicService, preview, GraphicAssetId};
+use super::{GraphicAssetId, integration::GraphicService, preview};
 use crate::object_picker::checkerboard;
-use crate::{object_picker, EditorProject};
-use ag_iso_stack::object_pool::{object::Object, NullableObjectId, ObjectId, ObjectType};
+use crate::{EditorProject, object_picker};
+use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectType, object::Object};
 use eframe::egui;
 
 /// The panel and all PictureGraphic pickers share this unfiltered enumeration.
@@ -60,65 +60,82 @@ fn graphics_card(
     available: bool,
 ) -> Option<Action> {
     let mut action = None;
-    ui.vertical(|ui| {
-        ui.set_width(CARD_WIDTH);
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(CARD_WIDTH, 86.0), egui::Sense::click());
-        checkerboard(ui.painter(), rect);
-        if let Some(texture) = &texture {
-            object_picker::texture(ui, rect, texture);
-            object_picker::hover_preview(response.clone(), |ui, rect| {
-                object_picker::texture(ui, rect, texture);
-            });
-        } else {
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "No image",
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_gray(60),
-            );
-        }
-        if response.clicked() && !available {
-            action = Some(Action::Navigate);
-        }
-        response.clone().on_hover_text(name).context_menu(|ui| {
-            if ui.button("Download").clicked() {
-                action = Some(Action::Download);
-                ui.close();
-            }
-            if available && ui.button("Delete").clicked() {
-                action = Some(Action::Delete);
-                ui.close();
-            }
-        });
-        // Rect containment keeps buttons visible when they take pointer hover.
-        if ui.rect_contains_pointer(rect) {
-            let buttons: &[(Action, &str, &str)] = if available {
-                &[
-                    (Action::Create, "+", "Create PictureGraphic"),
-                    (Action::Assign, "🔗", "Assign to PictureGraphic"),
-                ]
-            } else {
-                &[(Action::Navigate, "↗", "Go to PictureGraphic")]
-            };
-            for (index, (value, icon, tooltip)) in buttons.iter().enumerate() {
-                let button_rect = egui::Rect::from_min_size(
-                    rect.right_bottom() - egui::vec2(28.0 * (index + 1) as f32, 26.0),
-                    egui::vec2(26.0, 24.0),
+    let visuals = ui.visuals().clone();
+    egui::Frame::new()
+        .fill(visuals.faint_bg_color)
+        .stroke(egui::Stroke::new(
+            1.0,
+            visuals.widgets.noninteractive.bg_stroke.color,
+        ))
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(4))
+        .show(ui, |ui| {
+            ui.set_width(CARD_WIDTH - 8.0);
+            ui.vertical(|ui| {
+                let (rect, response) = ui
+                    .allocate_exact_size(egui::vec2(CARD_WIDTH - 8.0, 76.0), egui::Sense::click());
+                checkerboard(ui.painter(), rect);
+                ui.painter().rect_stroke(
+                    rect,
+                    0.0,
+                    egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+                    egui::StrokeKind::Inside,
                 );
-                if ui
-                    .put(button_rect, egui::Button::new(*icon))
-                    .on_hover_text(*tooltip)
-                    .clicked()
-                {
-                    action = Some(*value);
+                if let Some(texture) = &texture {
+                    object_picker::texture(ui, rect, texture);
+                    object_picker::hover_preview(response.clone(), |ui, rect| {
+                        object_picker::texture(ui, rect, texture);
+                    });
+                } else {
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "No image",
+                        egui::FontId::proportional(12.0),
+                        visuals.weak_text_color(),
+                    );
                 }
-            }
-        }
-        ui.add(egui::Label::new(name).truncate())
-            .on_hover_text(name);
-    });
+                if response.clicked() && !available {
+                    action = Some(Action::Navigate);
+                }
+                response.clone().on_hover_text(name).context_menu(|ui| {
+                    if ui.button("Download").clicked() {
+                        action = Some(Action::Download);
+                        ui.close();
+                    }
+                    if available && ui.button("Delete").clicked() {
+                        action = Some(Action::Delete);
+                        ui.close();
+                    }
+                });
+                // Rect containment keeps buttons visible when they take pointer hover.
+                if ui.rect_contains_pointer(rect) {
+                    let buttons: &[(Action, &str, &str)] = if available {
+                        &[
+                            (Action::Create, "+", "Create PictureGraphic"),
+                            (Action::Assign, "🔗", "Assign to PictureGraphic"),
+                        ]
+                    } else {
+                        &[(Action::Navigate, "↗", "Go to PictureGraphic")]
+                    };
+                    for (index, (value, icon, tooltip)) in buttons.iter().enumerate() {
+                        let button_rect = egui::Rect::from_min_size(
+                            rect.right_bottom() - egui::vec2(28.0 * (index + 1) as f32, 26.0),
+                            egui::vec2(26.0, 24.0),
+                        );
+                        if ui
+                            .put(button_rect, egui::Button::new(*icon))
+                            .on_hover_text(*tooltip)
+                            .clicked()
+                        {
+                            action = Some(*value);
+                        }
+                    }
+                }
+                ui.add(egui::Label::new(name).truncate())
+                    .on_hover_text(name);
+            });
+        });
     action
 }
 
@@ -223,6 +240,9 @@ fn download(filename: &str, bytes: &[u8]) -> Result<(), String> {
 }
 
 pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
+    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+    ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+    ui.spacing_mut().interact_size.y = 26.0;
     ui.heading("Graphics");
     let mut error = None;
     #[cfg(not(target_arch = "wasm32"))]
@@ -379,7 +399,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
         ui.data_mut(|data| data.insert_temp(key, error));
     }
     if let Some(error) = ui.data_mut(|data| data.get_temp::<String>(key)) {
-        ui.colored_label(egui::Color32::RED, error);
+        ui.colored_label(ui.visuals().error_fg_color, error);
         if ui.button("Dismiss graphic error").clicked() {
             ui.data_mut(|data| data.remove::<String>(key));
         }

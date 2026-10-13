@@ -41,6 +41,9 @@ fn drag_value_finished(response: &egui::Response) -> bool {
 /// Render every writable property declared for `object`.
 pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &EditorProject) {
     ui.style_mut().spacing.combo_width = 0.0;
+    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+    ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+    ui.spacing_mut().interact_size.y = 26.0;
     let id = object.id();
     let object_type = object.object_type();
     let properties = get_property_descriptors(object_type);
@@ -151,7 +154,7 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                         });
                     }
                     Err(message) => {
-                        ui.colored_label(egui::Color32::RED, message);
+                        ui.colored_label(ui.visuals().error_fg_color, message);
                     }
                 }
                 continue;
@@ -621,7 +624,7 @@ fn render_positioned_children(
                         select_object(design, child.id());
                     }
                 } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object");
+                    ui.colored_label(ui.visuals().error_fg_color, "Missing object");
                 }
                 let position_key =
                     ui.make_persistent_id(("positioned_child_position", parent_id.value(), index));
@@ -876,7 +879,7 @@ fn render_reference_links(ui: &mut egui::Ui, design: &EditorProject, object_id: 
             select_object(design, object_id);
         }
     } else {
-        ui.colored_label(egui::Color32::RED, "Missing object");
+        ui.colored_label(ui.visuals().error_fg_color, "Missing object");
         ui.label("");
     }
 }
@@ -1145,7 +1148,7 @@ fn render_identity(
                 .ok()
                 .is_some_and(|new_id| design.get_pool().object_by_id(new_id).is_some());
         if conflict {
-            ui.colored_label(egui::Color32::RED, "ID already in use");
+            ui.colored_label(ui.visuals().error_fg_color, "ID already in use");
         }
 
         if drag_value_finished(&response) {
@@ -1890,7 +1893,7 @@ fn render_json(
             queue(design, id, property, parsed);
             ui.data_mut(|data| data.remove::<PendingValue>(key));
         } else {
-            ui.colored_label(egui::Color32::RED, "Invalid JSON");
+            ui.colored_label(ui.visuals().error_fg_color, "Invalid JSON");
         }
     }
 }

@@ -27,6 +27,7 @@ pub mod object_picker;
 pub mod object_properties;
 pub mod operations;
 pub mod pool_validation;
+pub mod ui_style;
 
 pub use editor_project::EditorProject;
 pub use interactive_rendering_simple::InteractiveMaskRenderer;
