@@ -1245,6 +1245,139 @@ impl EditorProject {
             .then_some(object_id)
     }
 
+    /// Duplicate a shared Font, Line, or Fill Attribute as one undoable action.
+    ///
+    /// Copies writable properties and outgoing references into a uniquely named
+    /// object with a fresh automatic ID from its configured range. Consumers keep
+    /// referencing `source_id`; editor metadata other than the name is not copied.
+    /// Returns the new ID, or an error for a missing/unsupported source, exhausted
+    /// range, or invalid copied content. Failure leaves the project unchanged.
+    pub fn duplicate_shared_attribute(
+        &mut self,
+        source_id: ObjectId,
+    ) -> Result<ObjectId, OperationError> {
+        let source = self
+            .pool
+            .object_by_id(source_id)
+            .ok_or(OperationError::ObjectNotFound(source_id.value()))?
+            .clone();
+        let object_type = source.object_type();
+        if !matches!(
+            object_type,
+            ObjectType::FontAttributes | ObjectType::LineAttributes | ObjectType::FillAttributes
+        ) {
+            return Err(OperationError::PropertyError {
+                object_id: source_id.value(),
+                property: "duplicate".to_owned(),
+                reason: "Only Font, Line, and Fill Attributes can be duplicated here".to_owned(),
+            });
+        }
+
+        let new_id = self.allocate_object_id(object_type).map_err(|error| {
+            OperationError::PropertyError {
+                object_id: source_id.value(),
+                property: "CreateObject".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        let source_name = self
+            .object_info
+            .borrow()
+            .get(&source_id)
+            .map(|info| info.get_name(&source))
+            .unwrap_or_else(|| {
+                format!(
+                    "{} {}",
+                    smart_naming::get_object_type_name(object_type),
+                    source_id.value()
+                )
+            });
+        let names = self.get_all_object_names();
+        let base_name = format!("Copy of {source_name}");
+        let mut name = base_name.clone();
+        let mut suffix = 2u32;
+        while names.contains_key(&name) {
+            name = format!("{base_name} ({suffix})");
+            suffix += 1;
+        }
+
+        let mut operations = vec![
+            Operation::CreateObject {
+                object_id: Some(new_id.value()),
+                object_type,
+                name: name.clone(),
+            },
+            // An explicit ID is used to reserve the already selected range ID;
+            // reset the metadata so it behaves like an automatic assignment.
+            Operation::SetObjectIdAssignment {
+                object_id: new_id.value(),
+                new_id: new_id.value(),
+                overridden: false,
+            },
+        ];
+
+        for descriptor in crate::object_properties::get_property_descriptors(object_type)
+            .into_iter()
+            .filter(|descriptor| descriptor.writable)
+        {
+            let value = crate::object_properties::get_object_property(&source, descriptor.name)
+                .map_err(|error| OperationError::PropertyError {
+                    object_id: source_id.value(),
+                    property: descriptor.name.to_owned(),
+                    reason: error.to_string(),
+                })?;
+            let target = ObjectTarget::Name { name: name.clone() };
+            if matches!(
+                descriptor.semantic,
+                crate::object_properties::PropertySemantic::ObjectReference { .. }
+            ) {
+                let reference = if value.is_null() {
+                    None
+                } else {
+                    let reference_id: ObjectId = serde_json::from_value(value).map_err(|error| {
+                        OperationError::PropertyError {
+                            object_id: source_id.value(),
+                            property: descriptor.name.to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    Some(ObjectTarget::id(reference_id.value()))
+                };
+                operations.push(Operation::SetObjectReference {
+                    object: target,
+                    property: descriptor.name.to_owned(),
+                    reference,
+                });
+            } else {
+                operations.push(Operation::SetProperty {
+                    object: target,
+                    property: descriptor.name.to_owned(),
+                    value,
+                });
+            }
+        }
+
+        if let Some(references) = crate::operations::macro_refs(&source) {
+            operations.push(Operation::SetMacroReferences {
+                object: ObjectTarget::Name { name: name.clone() },
+                macro_refs: references
+                    .iter()
+                    .map(|reference| crate::operations::MacroReferenceTarget {
+                        event_id: reference.event_id,
+                        macro_object: ObjectTarget::id(u16::from(reference.macro_id)),
+                    })
+                    .collect(),
+            });
+        }
+
+        self.execute_transaction(OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description: Some(format!("Duplicate {source_name}")),
+            operations,
+        })?;
+        Ok(new_id)
+    }
+
     /// Delete an object through a reversible operation.
     pub fn delete_object(&mut self, object_id: ObjectId) -> bool {
         let deleted = self.execute_ui_transaction(OperationTransaction {
@@ -2440,6 +2573,267 @@ mod tests {
 
         project.undo();
         assert!(!project.is_dirty());
+    }
+
+    #[test]
+    fn duplicate_shared_attribute_copies_properties_and_macro_references_as_one_history_item() {
+        let attribute_type = ObjectType::FontAttributes;
+        let source_id = ObjectId::new(20_001).unwrap();
+        let macro_id = ObjectId::new(20).unwrap();
+        let mut attribute = object_with_id(attribute_type, source_id.value());
+        let macro_object = object_with_id(ObjectType::Macro, macro_id.value());
+        let mut pool = ObjectPool::default();
+        pool.add(attribute.clone());
+        pool.add(macro_object);
+        let mut project = EditorProject::from(pool);
+        let mut setup = OperationTransaction::new(Some("Add attribute macro".into()));
+        setup.add_operation(Operation::SetMacroReferences {
+            object: ObjectTarget::id(source_id.value()),
+            macro_refs: vec![crate::operations::MacroReferenceTarget {
+                event_id: ag_iso_stack::object_pool::object_attributes::Event::OnChangeAttribute,
+                macro_object: ObjectTarget::id(macro_id.value()),
+            }],
+        });
+        project.execute_transaction(setup).unwrap();
+        attribute = project
+            .get_pool()
+            .object_by_id(source_id)
+            .unwrap()
+            .clone();
+
+        let descriptors = crate::object_properties::get_property_descriptors(attribute_type);
+        let duplicate_id = project.duplicate_shared_attribute(source_id).unwrap();
+        assert_eq!(
+            duplicate_id,
+            ObjectId::new(project.object_id_ranges().range_for(attribute_type).start).unwrap()
+        );
+        let duplicate = project.get_pool().object_by_id(duplicate_id).unwrap();
+        for descriptor in descriptors.iter().filter(|descriptor| descriptor.writable) {
+            assert_eq!(
+                crate::object_properties::get_object_property(&attribute, descriptor.name).unwrap(),
+                crate::object_properties::get_object_property(duplicate, descriptor.name).unwrap(),
+                "writable property {} should be copied",
+                descriptor.name
+            );
+        }
+        assert_eq!(
+            crate::operations::macro_refs(&attribute),
+            crate::operations::macro_refs(duplicate)
+        );
+        assert!(!project.object_id_is_overridden(duplicate_id));
+        assert!(project.undo_operation());
+        assert!(project.get_pool().object_by_id(duplicate_id).is_none());
+        assert!(project.redo_operation());
+        assert!(project.get_pool().object_by_id(duplicate_id).is_some());
+    }
+
+    #[test]
+    fn duplicate_shared_attribute_fails_when_automatic_range_is_exhausted() {
+        let attribute_type = ObjectType::LineAttributes;
+        let range_start = crate::ObjectIdRanges::defaults()
+            .range_for(attribute_type)
+            .start;
+        let configured_range = crate::ObjectIdRange {
+            start: range_start,
+            end: range_start,
+        };
+        let source_id = ObjectId::new(configured_range.start).unwrap();
+        let mut pool = ObjectPool::default();
+        pool.add(object_with_id(attribute_type, source_id.value()));
+        let mut project = EditorProject::from(pool);
+        let mut ranges = project.object_id_ranges().clone();
+        ranges.set_range(attribute_type, configured_range);
+        project.set_object_id_ranges(ranges).unwrap();
+        let before_size = project.get_pool().size();
+
+        assert!(project.duplicate_shared_attribute(source_id).is_err());
+        assert_eq!(project.get_pool().size(), before_size);
+    }
+
+    #[test]
+    fn duplicate_fill_attribute_copies_picture_reference_without_reassigning_consumers() {
+        let fill_id = ObjectId::new(30_001).unwrap();
+        let picture_id = ObjectId::new(30_002).unwrap();
+        let consumer_id = ObjectId::new(30_003).unwrap();
+        let mut pool = ObjectPool::default();
+        pool.add(object_with_id(ObjectType::FillAttributes, fill_id.value()));
+        pool.add(object_with_id(ObjectType::PictureGraphic, picture_id.value()));
+        pool.add(object_with_id(ObjectType::GraphicsContext, consumer_id.value()));
+        let mut project = EditorProject::from(pool);
+        let mut references = OperationTransaction::new(Some("Connect fill attribute".into()));
+        references.add_operation(Operation::SetObjectReference {
+            object: ObjectTarget::id(fill_id.value()),
+            property: "fill_pattern".into(),
+            reference: Some(ObjectTarget::id(picture_id.value())),
+        });
+        references.add_operation(Operation::SetObjectReference {
+            object: ObjectTarget::id(consumer_id.value()),
+            property: "fill_attributes_object".into(),
+            reference: Some(ObjectTarget::id(fill_id.value())),
+        });
+        project.execute_transaction(references).unwrap();
+
+        let duplicate_id = project.duplicate_shared_attribute(fill_id).unwrap();
+        let duplicate = project.get_pool().object_by_id(duplicate_id).unwrap();
+        assert_eq!(
+            crate::object_properties::get_object_property(duplicate, "fill_pattern").unwrap(),
+            serde_json::json!(picture_id)
+        );
+        assert_eq!(
+            crate::object_properties::get_object_property(
+                project.get_pool().object_by_id(consumer_id).unwrap(),
+                "fill_attributes_object"
+            )
+            .unwrap(),
+            serde_json::json!(fill_id)
+        );
+
+        let restored = EditorProject::load_project(project.save_project().unwrap()).unwrap();
+        assert_eq!(
+            crate::object_properties::get_object_property(
+                restored.get_pool().object_by_id(duplicate_id).unwrap(),
+                "fill_pattern"
+            )
+            .unwrap(),
+            serde_json::json!(picture_id)
+        );
+        assert_eq!(
+            crate::object_properties::get_object_property(
+                restored.get_pool().object_by_id(consumer_id).unwrap(),
+                "fill_attributes_object"
+            )
+            .unwrap(),
+            serde_json::json!(fill_id)
+        );
+    }
+
+    #[test]
+    fn duplicate_shared_attribute_rejects_non_attribute_without_mutation() {
+        let object_id = ObjectId::new(40_001).unwrap();
+        let mut pool = ObjectPool::default();
+        pool.add(object_with_id(ObjectType::Button, object_id.value()));
+        let mut project = EditorProject::from(pool);
+        let before = project.get_pool().as_iop();
+
+        assert!(project.duplicate_shared_attribute(object_id).is_err());
+        assert_eq!(project.get_pool().as_iop(), before);
+        assert!(!project.undo_available());
+    }
+
+    #[test]
+    fn duplicate_default_shared_attributes_twice_has_unique_names_and_automatic_ids() {
+        let types = [
+            ObjectType::FontAttributes,
+            ObjectType::LineAttributes,
+            ObjectType::FillAttributes,
+        ];
+        let mut pool = ObjectPool::default();
+        for (index, object_type) in types.into_iter().enumerate() {
+            pool.add(object_with_id(object_type, 50_001 + index as u16));
+        }
+        let mut project = EditorProject::from(pool);
+
+        for (index, object_type) in types.into_iter().enumerate() {
+            let source_id = ObjectId::new(50_001 + index as u16).unwrap();
+            let first = project.duplicate_shared_attribute(source_id).unwrap();
+            let second = project.duplicate_shared_attribute(source_id).unwrap();
+            assert_ne!(first, second);
+            assert!(!project.object_id_is_overridden(first));
+            assert!(!project.object_id_is_overridden(second));
+            let first_name = project
+                .get_object_info(project.get_pool().object_by_id(first).unwrap())
+                .name
+                .unwrap();
+            let second_name = project
+                .get_object_info(project.get_pool().object_by_id(second).unwrap())
+                .name
+                .unwrap();
+            assert_ne!(first_name, second_name, "{object_type:?} names must be unique");
+        }
+    }
+
+    #[test]
+    fn exported_shared_font_keeps_two_field_references_and_edit_is_undoable() {
+        let font_id = ObjectId::new(40_101).unwrap();
+        let string_id = ObjectId::new(40_102).unwrap();
+        let number_id = ObjectId::new(40_103).unwrap();
+        let mut pool = ObjectPool::default();
+        pool.add(object_with_id(ObjectType::FontAttributes, font_id.value()));
+        pool.add(object_with_id(ObjectType::OutputString, string_id.value()));
+        pool.add(object_with_id(ObjectType::OutputNumber, number_id.value()));
+        let mut project = EditorProject::from(pool);
+        let mut references = OperationTransaction::new(Some("Share font".into()));
+        for consumer_id in [string_id, number_id] {
+            references.add_operation(Operation::SetObjectReference {
+                object: ObjectTarget::id(consumer_id.value()),
+                property: "font_attributes".into(),
+                reference: Some(ObjectTarget::id(font_id.value())),
+            });
+        }
+        project.execute_transaction(references).unwrap();
+
+        let export = project.export_iop().unwrap();
+        let imported = EditorProject::import_iop(export, VtVersion::Version6).unwrap();
+        for consumer_id in [string_id, number_id] {
+            assert_eq!(
+                crate::object_properties::get_object_property(
+                    imported.get_pool().object_by_id(consumer_id).unwrap(),
+                    "font_attributes"
+                )
+                .unwrap(),
+                serde_json::json!(font_id)
+            );
+        }
+
+        let before = crate::object_properties::get_object_property(
+            project.get_pool().object_by_id(font_id).unwrap(),
+            "font_colour",
+        )
+        .unwrap();
+        let changed = serde_json::json!(if before == serde_json::json!(0) { 1 } else { 0 });
+        let mut edit = OperationTransaction::new(Some("Edit shared font".into()));
+        edit.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(font_id.value()),
+            property: "font_colour".into(),
+            value: changed.clone(),
+        });
+        project.execute_transaction(edit).unwrap();
+        for consumer_id in [string_id, number_id] {
+            assert_eq!(
+                crate::object_properties::get_object_property(
+                    project.get_pool().object_by_id(consumer_id).unwrap(),
+                    "font_attributes"
+                )
+                .unwrap(),
+                serde_json::json!(font_id)
+            );
+        }
+        assert_eq!(
+            crate::object_properties::get_object_property(
+                project.get_pool().object_by_id(font_id).unwrap(),
+                "font_colour"
+            )
+            .unwrap(),
+            changed
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            crate::object_properties::get_object_property(
+                project.get_pool().object_by_id(font_id).unwrap(),
+                "font_colour"
+            )
+            .unwrap(),
+            before
+        );
+        assert!(project.redo_operation());
+        assert_eq!(
+            crate::object_properties::get_object_property(
+                project.get_pool().object_by_id(font_id).unwrap(),
+                "font_colour"
+            )
+            .unwrap(),
+            changed
+        );
     }
 
     #[test]

@@ -125,6 +125,27 @@ locally across restarts and project changes. They do not dirty a project or
 enter its undo history. Canvas zoom, pan and snapping retain their existing
 controls.
 
+## Shared attributes
+
+Project Settings → Shared resources → **Manage Shared Attributes…** opens a
+searchable manager for ordinary Font, Line, and Fill Attributes objects, including
+unused objects. Create, rename, duplicate, delete, and edit them using the existing
+attribute controls. Assign shared attributes through the reference selectors in
+individual object editors. Editing an attribute updates every object using it.
+
+Changes apply immediately and enter the normal project undo history. Opening the
+manager closes Project Settings and discards its unapplied configuration draft.
+Duplicating creates an independent attribute with a unique name and a fresh
+automatic ID from the configured range; existing consumers retain their references.
+The manager lists consumers, including component instances and editor-only allowed
+targets. Click a consumer to open its Properties. Referenced attributes cannot be
+deleted. If component usage cannot be checked, deletion is disabled with an
+explanation. Generated component attributes remain managed through Components.
+
+Shared attributes are normal object-pool resources and retain their existing
+project persistence and IOP export behavior. Colour styles, creation presets, and
+reusable graphic defaults remain future settings.
+
 ## Planned configuration
 
 The remaining settings below have disabled controls with **Not configured**

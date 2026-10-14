@@ -72,6 +72,11 @@ impl DimensionsDraft {
     }
 }
 
+pub enum SettingsAction {
+    OpenPane(crate::workspace::Pane),
+    SharedAttributes,
+}
+
 pub fn show_project_settings(
     ctx: &egui::Context,
     open: &mut bool,
@@ -79,7 +84,7 @@ pub fn show_project_settings(
     preferences: &mut AppPreferences,
     draft: &mut Option<DimensionsDraft>,
     error_message: &mut Option<String>,
-) -> Option<crate::workspace::Pane> {
+) -> Option<SettingsAction> {
     if !*open {
         return None;
     }
@@ -269,16 +274,20 @@ pub fn show_project_settings(
                     ],
                 );
                 ag_iso_terminal_designer::ui_style::section_heading(ui, "Shared resources");
-                ui.small("Project-specific resource defaults are not available yet.");
+                ui.small("Manage reusable attributes, graphics, and components for this project.");
                 ui.label("Edit shared resources in the existing editors:");
                 ui.horizontal(|ui| {
                     if ui.button("Open Graphics editor").clicked() {
-                        requested_pane = Some(crate::workspace::Pane::Graphics);
+                        requested_pane = Some(SettingsAction::OpenPane(crate::workspace::Pane::Graphics));
                     }
                     if ui.button("Open Components editor").clicked() {
-                        requested_pane = Some(crate::workspace::Pane::Components);
+                        requested_pane = Some(SettingsAction::OpenPane(crate::workspace::Pane::Components));
                     }
                 });
+                if ui.button("Manage Shared Attributes…").clicked() {
+                    requested_pane = Some(SettingsAction::SharedAttributes);
+                }
+                ui.small("Reuse Font, Line, and Fill Attributes across objects. Attribute edits apply immediately and are undoable. Opening the manager discards unapplied settings.");
                 ui.add_enabled_ui(false, |ui| {
                     for label in ["Project colour styles", "Font presets", "Reusable graphic defaults"] {
                         ui.horizontal(|ui| {

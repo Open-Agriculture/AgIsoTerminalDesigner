@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 mod app_persistence;
 mod designer_settings;
+mod shared_attributes;
 mod workspace;
 use workspace::{Pane, Workspace};
 
@@ -103,6 +104,7 @@ pub struct DesignerApp {
     #[cfg(not(target_arch = "wasm32"))]
     proposal_reject: bool,
     project_settings_open: bool,
+    shared_attributes: shared_attributes::SharedAttributes,
     reassign_ids_open: bool,
     reassign_include_overrides: bool,
     dimensions_draft: Option<DimensionsDraft>,
@@ -284,6 +286,7 @@ impl DesignerApp {
 
     fn close_project_settings(&mut self) {
         self.project_settings_open = false;
+        self.shared_attributes = shared_attributes::SharedAttributes::default();
         self.reassign_ids_open = false;
         self.dimensions_draft = None;
     }
@@ -436,6 +439,7 @@ impl DesignerApp {
             #[cfg(not(target_arch = "wasm32"))]
             proposal_reject: false,
             project_settings_open: false,
+            shared_attributes: shared_attributes::SharedAttributes::default(),
             reassign_ids_open: false,
             reassign_include_overrides: false,
             dimensions_draft: None,
@@ -2240,8 +2244,19 @@ impl eframe::App for DesignerApp {
             &mut self.dimensions_draft,
             &mut self.error_message,
         );
-        if let Some(pane) = requested_pane {
-            self.workspace.open(pane);
+        match requested_pane {
+            Some(designer_settings::SettingsAction::OpenPane(pane)) => self.workspace.open(pane),
+            Some(designer_settings::SettingsAction::SharedAttributes) => {
+                if let Some(project) = self.project.as_ref() {
+                    self.shared_attributes.open(ctx, project);
+                }
+            }
+            None => {}
+        }
+        if let Some(project) = self.project.as_mut() {
+            if self.shared_attributes.show(ctx, project, &mut self.error_message) {
+                self.workspace.open(Pane::Properties);
+            }
         }
 
         if self.project.is_some() {
