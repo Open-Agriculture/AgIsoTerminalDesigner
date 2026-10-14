@@ -45,6 +45,7 @@ struct Harness {
     time: f64,
     output: egui::FullOutput,
     inspector: Option<(Rect, Rect)>,
+    masks: Option<super::super::MaskViewState>,
 }
 impl Harness {
     fn new(nested: bool) -> Self {
@@ -55,6 +56,7 @@ impl Harness {
             time: 0.0,
             output: egui::FullOutput::default(),
             inspector: None,
+            masks: None,
         };
         h.frame(vec![], Modifiers::NONE);
         h
@@ -79,7 +81,12 @@ impl Harness {
                     inspector.0 = panel.response.rect;
                 }
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    self.state.show(ui, &mut self.project, &materialized, 1)
+                    if let Some(masks) = &mut self.masks {
+                        self.state
+                            .show_masks(ui, &mut self.project, &materialized, masks);
+                    } else {
+                        self.state.show(ui, &mut self.project, &materialized, 1);
+                    }
                 });
             },
         );
@@ -715,5 +722,120 @@ fn softkey_contents_edit_in_local_coordinates_and_page_changes_clear_selection()
     h.pointer(next, Some(true), Modifiers::NONE);
     h.pointer(next, Some(false), Modifiers::NONE);
     assert_eq!(h.state.softkey_page, 1);
+    assert!(h.state.selected.is_empty());
+}
+
+#[test]
+fn multiple_mask_pairs_keep_edits_local_and_softkey_pages_independent() {
+    let mut h = Harness::new(false);
+    let mut pool = h.project.get_pool().clone();
+    if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(1).unwrap()) {
+        mask.soft_key_mask = NullableObjectId::new(10);
+    }
+    let mut alarm = default_object(ObjectType::AlarmMask);
+    alarm.mut_id().set_value(20).unwrap();
+    if let Object::AlarmMask(mask) = &mut alarm {
+        mask.soft_key_mask = NullableObjectId::new(10);
+    }
+    let mut softmask = default_object(ObjectType::SoftKeyMask);
+    softmask.mut_id().set_value(10).unwrap();
+    if let Object::SoftKeyMask(mask) = &mut softmask {
+        mask.objects = vec![ObjectId::new(11).unwrap(); 13];
+    }
+    let mut key = default_object(ObjectType::Key);
+    key.mut_id().set_value(11).unwrap();
+    if let Object::Key(key) = &mut key {
+        key.background_colour = 2;
+        key.object_refs.push(ObjectRef {
+            id: ObjectId::new(2).unwrap(),
+            offset: Point { x: 5, y: 5 },
+        });
+    }
+    pool.add(alarm);
+    pool.add(softmask);
+    pool.add(key);
+    h.project = EditorProject::from(pool);
+    h.project.mask_size = 500;
+    h.state = CanvasState::default();
+    let mut masks = super::super::MaskViewState::default();
+    masks.reconcile(&h.project);
+    masks.set_visible(20, true);
+    h.masks = Some(masks);
+    h.frame(vec![], Modifiers::NONE);
+    let keys = super::super::softkeys::build(&h.project, h.project.get_pool(), 1, 0);
+    let pair = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 500.0)).union(keys.rect);
+    let second = egui::vec2(pair.width() + 32.0, 24.0);
+    let slot = keys.slots[0].rect;
+    let child = h.screen(slot.min + second + egui::vec2(15.0, 15.0));
+    h.pointer(child, Some(true), Modifiers::CTRL);
+    h.pointer(
+        child + egui::vec2(5.0 * h.state.zoom, 0.0),
+        None,
+        Modifiers::CTRL,
+    );
+    h.pointer(
+        child + egui::vec2(5.0 * h.state.zoom, 0.0),
+        Some(false),
+        Modifiers::CTRL,
+    );
+    assert_eq!(h.masks.as_ref().unwrap().focused, Some(20));
+    assert_eq!(
+        position(
+            &h.project,
+            &PlacementTarget::Primitive {
+                parent_id: 11,
+                child_index: 0,
+            }
+        ),
+        Some((10, 5))
+    );
+    assert_eq!(h.project.get_selected(), NullableObjectId::new(2));
+
+    // A later dock pane can change focus before a numeric draft is completed.
+    h.frame(vec![], Modifiers::NONE);
+    let draft = h.state.field_draft.as_mut().unwrap();
+    draft.position = Some((30, 5));
+    draft.changed = true;
+    draft.finish_pending = true;
+    h.masks.as_mut().unwrap().focus(1);
+    h.frame(vec![], Modifiers::NONE);
+    assert_eq!(
+        position(
+            &h.project,
+            &PlacementTarget::Primitive {
+                parent_id: 11,
+                child_index: 0,
+            }
+        ),
+        Some((10, 5))
+    );
+    h.masks.as_mut().unwrap().focus(20);
+    h.frame(vec![], Modifiers::NONE);
+
+    // Both owners render the shared key, but changing one owner's page is local.
+    let key_fill = crate::effective_colour::colour(h.project.get_pool(), 2).convert();
+    for offset in [egui::vec2(0.0, 24.0), second] {
+        let rect = Rect::from_min_size(h.screen(slot.min + offset), slot.size() * h.state.zoom);
+        assert!(h.output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Rect(painted) if painted.rect == rect && painted.fill == key_fill)));
+    }
+    let next = h.screen(keys.slots.last().unwrap().rect.center() + second);
+    h.pointer(next, Some(true), Modifiers::NONE);
+    h.pointer(next, Some(false), Modifiers::NONE);
+    assert_eq!(h.state.pages[&20].1, 1);
+    assert_eq!(h.state.pages[&1].1, 0);
+    assert!(h.state.selected.is_empty());
+
+    let first_background = h.screen(egui::pos2(25.0, 49.0));
+    h.pointer(first_background, Some(true), Modifiers::NONE);
+    h.pointer(first_background, Some(false), Modifiers::NONE);
+    assert_eq!(h.masks.as_ref().unwrap().focused, Some(1));
+    assert_eq!(h.state.softkey_page, 0);
+    assert_eq!(h.state.pages[&20].1, 1);
+    h.masks.as_mut().unwrap().unfocus();
+    h.frame(vec![], Modifiers::NONE);
+    let revision = h.project.revision();
+    h.key(Key::Delete, Modifiers::NONE);
+    assert_eq!(h.project.revision(), revision);
     assert!(h.state.selected.is_empty());
 }

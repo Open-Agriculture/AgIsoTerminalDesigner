@@ -38,17 +38,17 @@ This project is under **active development**. While some features may not yet be
 
 - [Web version](https://open-agriculture.github.io/AgIsoTerminalDesigner/) for easy access
 - Load and save object pools from/to files
-- Navigate through the object pool tree with full-width selection highlighting
+- Browse the focused mask's placement and linked soft-key hierarchy, or search all objects by name/ID
 - Rearrange the workspace with dockable tabs, splits, and floating panes; layouts persist locally
 - Follow the system appearance or choose coordinated light and dark themes
 - Use hyperlinks to navigate to referenced objects
-- Edit the active mask on an interactive canvas: drag, resize, duplicate, align, and distribute placements with undo/redo
+- Preview multiple data/alarm masks with their linked soft keys on one canvas; edit the focused mask with undo/redo
 - Limit selecting macro's and object references to allowed types only.
 - Assign allowed references to object pointers and switch their active target with a dropdown in the properties panel. Empty lists keep unrestricted selection; lists are saved in `.aitp` projects, while IOP export contains only the active target.
 
 ### Interactive layout editor
 
-Select placements in the active-mask canvas or select objects from the hierarchy. Dragging updates the selected placement within its current parent. Parent bounds, dimensions, local coordinates, alignment guides, and spacing measurements appear during editing. Dragging and resizing stop at parent boundaries. Sidebar and CLI edits that introduce or increase overflow are rejected, including parent and mask-size reductions. Shared dimensions must fit every placement. Existing out-of-bounds layouts can still be loaded and repaired without increasing their overflow.
+Check masks in the Objects pane to preview them side by side. Click a mask row or its preview to focus it; clicking the focused row again clears its hierarchy. The mask-list filter and pool-wide object filter work independently. Zoom/pan is shared, while soft-key pages are independent per mask. Select placements in the canvas or objects from the hierarchy. Dragging updates the selected placement within its current parent. Parent bounds, dimensions, local coordinates, alignment guides, and spacing measurements appear during editing. Dragging and resizing stop at parent boundaries. Sidebar and CLI edits that introduce or increase overflow are rejected, including parent and mask-size reductions. Shared dimensions must fit every placement. Existing out-of-bounds layouts can still be loaded and repaired without increasing their overflow.
 
 | Control | Action |
 | --- | --- |

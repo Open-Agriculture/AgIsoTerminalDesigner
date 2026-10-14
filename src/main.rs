@@ -16,7 +16,7 @@ use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectType;
 #[cfg(not(target_arch = "wasm32"))]
 use ag_iso_terminal_designer::ai::automation_bridge::EditorAutomationBridge;
-use ag_iso_terminal_designer::canvas::CanvasState;
+use ag_iso_terminal_designer::canvas::{mask_view::MaskViewState, CanvasState};
 use ag_iso_terminal_designer::render_property_editor;
 use ag_iso_terminal_designer::{EditorProject, Operation};
 #[cfg(not(target_arch = "wasm32"))]
@@ -82,6 +82,7 @@ enum FileEvent {
 pub struct DesignerApp {
     project: Option<EditorProject>,
     canvas: CanvasState,
+    mask_view: MaskViewState,
     file_channel: (Sender<FileEvent>, Receiver<FileEvent>),
     show_development_popup: bool,
     new_object_dialog: Option<(ObjectType, String)>,
@@ -175,6 +176,7 @@ impl DesignerApp {
                     let diagnostics = project.compatibility_diagnostics();
                     self.close_project_settings();
                     self.canvas = CanvasState::default();
+                    self.mask_view = MaskViewState::default();
                     self.project = Some(project);
                     self.project_display_name = name;
                     #[cfg(not(target_arch = "wasm32"))]
@@ -344,6 +346,7 @@ impl DesignerApp {
         Self {
             project: None,
             canvas: CanvasState::default(),
+            mask_view: MaskViewState::default(),
             file_channel: std::sync::mpsc::channel(),
             show_development_popup: true,
             new_object_dialog: None,
@@ -487,6 +490,7 @@ impl DesignerApp {
                             self.invalidate_automation_proposal();
                             self.close_project_settings();
                             self.canvas = CanvasState::default();
+                            self.mask_view = MaskViewState::default();
                             self.project = Some(project);
                             self.project_display_name = file_name;
                             #[cfg(not(target_arch = "wasm32"))]
@@ -715,6 +719,7 @@ impl DesignerApp {
                 self.invalidate_automation_proposal();
                 self.close_project_settings();
                 self.canvas = CanvasState::default();
+                self.mask_view = MaskViewState::default();
                 self.project = Some(EditorProject::new_pool());
                 self.project_display_name = "Untitled.aitp".to_owned();
                 self.new_object_dialog = None;
@@ -764,6 +769,7 @@ impl DesignerApp {
                             self.invalidate_automation_proposal();
                             self.close_project_settings();
                             self.canvas = CanvasState::default();
+                            self.mask_view = MaskViewState::default();
                             self.project = Some(project);
                             self.project_display_name = record.display_name;
                             #[cfg(not(target_arch = "wasm32"))]
@@ -998,7 +1004,7 @@ fn recovery_age_label(saved_at: u64) -> String {
     }
 }
 
-fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &EditorProject) {
+fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &EditorProject) -> bool {
     let this_ui_id = ui.id();
     let object_info = project.get_object_info(object);
 
@@ -1021,6 +1027,7 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
             // We need to focus the text edit when we start renaming
             response.request_focus();
         }
+        false
     } else {
         let is_selected = project.get_selected() == object.id().into();
         let label_text = format!(
@@ -1049,11 +1056,17 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
                 ui.close();
             }
         });
+        response.clicked()
     }
 }
 
 /// Show flat object-list results without filtering the navigation hierarchy.
-fn render_filtered_object_list(ui: &mut egui::Ui, project: &EditorProject, query: &str) {
+fn render_filtered_object_list(
+    ui: &mut egui::Ui,
+    project: &EditorProject,
+    query: &str,
+    mask_view: &mut MaskViewState,
+) {
     let matches: Vec<_> = project
         .get_pool()
         .objects()
@@ -1076,124 +1089,491 @@ fn render_filtered_object_list(ui: &mut egui::Ui, project: &EditorProject, query
         });
     }
     for object in matches {
-        render_selectable_object(ui, object, project);
+        if render_selectable_object(ui, object, project) {
+            mask_view.navigate(project, object.id().value());
+        }
     }
 }
 
-fn render_object_hierarchy(
+fn render_mask_object_hierarchy(
     ui: &mut egui::Ui,
     parent_id: egui::Id,
+    root: u16,
     object: &Object,
     project: &EditorProject,
+    mask_view: &mut MaskViewState,
+    canvas: &mut CanvasState,
+    path: &mut Vec<usize>,
+    visiting: &mut HashSet<u16>,
+    softkey_slot: Option<usize>,
+    open_selection: bool,
 ) {
-    let row_background = ui.painter().add(egui::Shape::Noop);
-    ui.data_mut(|data| data.insert_temp(egui::Id::new("tree_row_background"), row_background));
-    let refs = object.referenced_objects();
-    let instances: Vec<_> = project
+    let id_value = object.id().value();
+    if !visiting.insert(id_value) {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("Cycle detected at {}", project.format_object_id(id_value)),
+        );
+        return;
+    }
+    let component_instances: Vec<_> = project
         .component_source()
         .instances
         .iter()
-        .filter(|i| {
-            i.parent
-                == ag_iso_terminal_designer::components::EditorParentRef::Primitive(
-                    object.id().value(),
-                )
+        .filter(|instance| {
+            instance.parent
+                == ag_iso_terminal_designer::components::EditorParentRef::Primitive(id_value)
         })
         .collect();
-    if refs.is_empty() && instances.is_empty() {
-        ui.horizontal(|ui| {
-            ui.add_space(ui.spacing().indent);
-            render_selectable_object(ui, object, project);
+    let placed = ag_iso_terminal_designer::operations::object_refs(object).unwrap_or_default();
+    let pointer_target = match object {
+        Object::ObjectPointer(pointer) => pointer.value.0.map(|id| id.value()),
+        _ => None,
+    };
+    let has_children =
+        !placed.is_empty() || !component_instances.is_empty() || pointer_target.is_some();
+    let occurrence_id = parent_id.with((root, path.clone()));
+    let selected_id = project.get_selected().0.map(|id| id.value());
+    let expand = open_selection
+        && selected_id.is_some_and(|selected| {
+            mask_branch_contains(project, object, selected, &mut HashSet::new())
         });
-    } else {
-        let id = parent_id.with(project.get_object_info(object).get_unique_id());
+
+    if has_children {
+        let selected_in_header = std::cell::Cell::new(None);
+        if expand {
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                occurrence_id,
+                true,
+            );
+            state.set_open(true);
+            state.store(ui.ctx());
+        }
         ag_iso_terminal_designer::ui_style::collapsing_section(
             ui,
-            id,
-            false,
+            occurrence_id,
+            expand,
             |ui| {
-                render_selectable_object(ui, object, project);
+                if render_selectable_object(ui, object, project) {
+                    selected_in_header.set(Some((id_value, softkey_slot)));
+                }
             },
             |ui| {
-                for instance in &instances {
+                for (index, reference) in placed.iter().enumerate() {
+                    path.push(index);
+                    if let Some(child) = project.get_pool().object_by_id(reference.id) {
+                        render_mask_object_hierarchy(
+                            ui,
+                            occurrence_id.with(index),
+                            root,
+                            child,
+                            project,
+                            mask_view,
+                            canvas,
+                            path,
+                            visiting,
+                            softkey_slot,
+                            open_selection,
+                        );
+                    } else {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!("Missing placed object: {}", reference.id.value()),
+                        );
+                    }
+                    path.pop();
+                }
+                if let Some(target_id) = pointer_target {
+                    let pointer_branch = occurrence_id.with("pointer-target");
+                    let target = ag_iso_stack::object_pool::ObjectId::new(target_id)
+                        .ok()
+                        .and_then(|id| project.get_pool().object_by_id(id));
+                    match target {
+                        Some(target) => {
+                            let opens_target = open_selection
+                                && selected_id.is_some_and(|selected| {
+                                    mask_branch_contains(
+                                        project,
+                                        target,
+                                        selected,
+                                        &mut HashSet::new(),
+                                    )
+                                });
+                            let target_header_id = ui.make_persistent_id(pointer_branch);
+                            if opens_target {
+                                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                                    ui.ctx(),
+                                    target_header_id,
+                                    true,
+                                );
+                                state.set_open(true);
+                                state.store(ui.ctx());
+                            }
+                            egui::CollapsingHeader::new("Active pointer target")
+                                .id_salt(pointer_branch)
+                                .show(ui, |ui| {
+                                    path.push(usize::MAX);
+                                    render_mask_object_hierarchy(
+                                        ui,
+                                        pointer_branch,
+                                        root,
+                                        target,
+                                        project,
+                                        mask_view,
+                                        canvas,
+                                        path,
+                                        visiting,
+                                        softkey_slot,
+                                        open_selection,
+                                    );
+                                    path.pop();
+                                });
+                        }
+                        None => {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                format!("Missing active pointer target: {target_id}"),
+                            );
+                        }
+                    };
+                }
+                for instance in component_instances {
                     let definition =
                         &project.component_source().definitions[&instance.component_id];
+                    let component_salt = (root, instance.id, path.clone());
+                    let opens_component = open_selection
+                        && selected_id.is_some_and(|selected| {
+                            instance.compiled_ids.values().any(|id| *id == selected)
+                        });
+                    let component_header_id = ui.make_persistent_id(component_salt.clone());
+                    if opens_component {
+                        let mut state =
+                            egui::collapsing_header::CollapsingState::load_with_default_open(
+                                ui.ctx(),
+                                component_header_id,
+                                true,
+                            );
+                        state.set_open(true);
+                        state.store(ui.ctx());
+                    }
                     egui::CollapsingHeader::new(&definition.name)
-                        .icon(ag_iso_terminal_designer::ui_style::collapsing_icon)
-                        .id_salt(instance.id)
+                        .id_salt(component_salt)
                         .show(ui, |ui| {
                             for node in &definition.nodes {
-                                let id = instance.compiled_ids[&node.id];
-                                ui.data_mut(|data| {
-                                    data.remove::<egui::layers::ShapeIdx>(egui::Id::new(
-                                        "tree_row_background",
-                                    ))
-                                });
+                                let node_id = instance.compiled_ids[&node.id];
                                 if tree_row(
                                     ui,
                                     project
                                         .get_selected()
                                         .0
-                                        .is_some_and(|selected| selected.value() == id),
+                                        .is_some_and(|selected| selected.value() == node_id),
                                     &node.name,
                                 )
                                 .clicked()
                                 {
-                                    project.get_mut_selected().set(NullableObjectId::new(id));
+                                    project
+                                        .get_mut_selected()
+                                        .set(NullableObjectId::new(node_id));
+                                    if let Some(slot) = softkey_slot {
+                                        canvas.select_softkey_slot(project, root, slot);
+                                    }
                                 }
                             }
                         });
                 }
-                for (idx, obj_id) in refs.iter().enumerate() {
-                    match project.get_pool().object_by_id(*obj_id) {
-                        Some(obj) => {
-                            render_object_hierarchy(ui, id.with(idx), obj, project);
-                        }
-                        None => {
-                            ui.colored_label(
-                                ui.visuals().error_fg_color,
-                                format!("Missing object: {:?}", id),
-                            );
-                        }
-                    }
-                }
             },
         );
+        if let Some((selected, slot)) = selected_in_header.get() {
+            mask_view.navigate(project, selected);
+            if let Some(slot) = slot {
+                canvas.select_softkey_slot(project, root, slot);
+            }
+        }
+    } else if render_selectable_object(ui, object, project) {
+        mask_view.navigate(project, id_value);
+        if let Some(slot) = softkey_slot {
+            canvas.select_softkey_slot(project, root, slot);
+        }
+    }
+    visiting.remove(&id_value);
+}
+
+fn mask_branch_contains(
+    project: &EditorProject,
+    object: &Object,
+    selected: u16,
+    visiting: &mut HashSet<u16>,
+) -> bool {
+    let id = object.id().value();
+    if id == selected {
+        return true;
+    }
+    if !visiting.insert(id) {
+        return false;
+    }
+    let component_contains = project
+        .component_source()
+        .instances
+        .iter()
+        .filter(|instance| {
+            instance.parent == ag_iso_terminal_designer::components::EditorParentRef::Primitive(id)
+        })
+        .any(|instance| {
+            instance
+                .compiled_ids
+                .values()
+                .any(|node_id| *node_id == selected)
+        });
+    let placements_contain = ag_iso_terminal_designer::operations::object_refs(object)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|reference| project.get_pool().object_by_id(reference.id))
+        .any(|child| mask_branch_contains(project, child, selected, visiting));
+    let pointer_contains = match object {
+        Object::ObjectPointer(pointer) => pointer
+            .value
+            .0
+            .and_then(|target| project.get_pool().object_by_id(target))
+            .is_some_and(|target| mask_branch_contains(project, target, selected, visiting)),
+        _ => false,
+    };
+    visiting.remove(&id);
+    component_contains || placements_contain || pointer_contains
+}
+
+fn render_focused_mask_hierarchy(
+    ui: &mut egui::Ui,
+    project: &EditorProject,
+    mask_view: &mut MaskViewState,
+    canvas: &mut CanvasState,
+) {
+    let Some(root) = mask_view.focused else {
+        ui.weak("Select a mask to view its hierarchy.");
+        return;
+    };
+    let Some(mask) = ag_iso_stack::object_pool::ObjectId::new(root)
+        .ok()
+        .and_then(|id| project.get_pool().object_by_id(id))
+    else {
+        ui.weak("The focused mask no longer exists.");
+        return;
+    };
+    ag_iso_terminal_designer::ui_style::section_heading(
+        ui,
+        &format!("Hierarchy: {}", project.object_display_name(mask)),
+    );
+    let selection_marker = egui::Id::new("focused_mask_tree_selection");
+    let selected = project.get_selected().0.map(|id| id.value());
+    let previous_selection = ui.data(|data| data.get_temp::<(u16, Option<u16>)>(selection_marker));
+    let open_selection = previous_selection != Some((root, selected));
+    ui.data_mut(|data| data.insert_temp(selection_marker, (root, selected)));
+    let mut visit = |ui: &mut egui::Ui, object: &Object, index: usize, slot| {
+        render_mask_object_hierarchy(
+            ui,
+            egui::Id::new((OBJECT_HIERARCHY_ID, root, index)),
+            root,
+            object,
+            project,
+            mask_view,
+            canvas,
+            &mut vec![index],
+            &mut HashSet::new(),
+            slot,
+            open_selection,
+        );
+    };
+    visit(ui, mask, 0, None);
+
+    let softkey_id = match mask {
+        Object::DataMask(mask) => mask.soft_key_mask.0.map(|id| id.value()),
+        Object::AlarmMask(mask) => mask.soft_key_mask.0.map(|id| id.value()),
+        _ => None,
+    };
+    if let Some(softkey_id) = softkey_id {
+        ui.separator();
+        let softkeys = ag_iso_stack::object_pool::ObjectId::new(softkey_id)
+            .ok()
+            .and_then(|id| project.get_pool().object_by_id(id));
+        match softkeys {
+            Some(softkey_mask @ Object::SoftKeyMask(_)) => {
+                let selected_softkey_mask = std::cell::Cell::new(false);
+                let section_id = egui::Id::new((OBJECT_HIERARCHY_ID, root, "softkey-mask"));
+                let opens_softkeys = open_selection
+                    && selected.is_some_and(|selected| {
+                        softkey_id == selected
+                            || match softkey_mask {
+                                Object::SoftKeyMask(softkeys) => {
+                                    softkeys.objects.iter().any(|id| {
+                                        project.get_pool().object_by_id(*id).is_some_and(|key| {
+                                            mask_branch_contains(
+                                                project,
+                                                key,
+                                                selected,
+                                                &mut HashSet::new(),
+                                            )
+                                        })
+                                    })
+                                }
+                                _ => false,
+                            }
+                    });
+                if opens_softkeys {
+                    let mut state =
+                        egui::collapsing_header::CollapsingState::load_with_default_open(
+                            ui.ctx(),
+                            section_id,
+                            true,
+                        );
+                    state.set_open(true);
+                    state.store(ui.ctx());
+                }
+                ag_iso_terminal_designer::ui_style::collapsing_section(
+                    ui,
+                    section_id,
+                    opens_softkeys,
+                    |ui| {
+                        if render_selectable_object(ui, softkey_mask, project) {
+                            selected_softkey_mask.set(true);
+                        }
+                    },
+                    |ui| {
+                        let Object::SoftKeyMask(softkeys) = softkey_mask else {
+                            return;
+                        };
+                        for (slot, key_id) in softkeys.objects.iter().enumerate() {
+                            let key = project.get_pool().object_by_id(*key_id);
+                            match key {
+                                Some(Object::ObjectPointer(pointer))
+                                    if pointer.value.0.is_none() =>
+                                {
+                                    ui.weak(format!("Slot {}: Empty", slot + 1));
+                                }
+                                Some(key) => visit(ui, key, slot + 1, Some(slot)),
+                                None => {
+                                    ui.colored_label(
+                                        ui.visuals().error_fg_color,
+                                        format!(
+                                            "Missing key in slot {}: {}",
+                                            slot + 1,
+                                            key_id.value()
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    },
+                );
+                if selected_softkey_mask.get() {
+                    mask_view.navigate(project, softkey_id);
+                }
+            }
+            Some(_) => {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("Object {softkey_id} is not a SoftKeyMask"),
+                );
+            }
+            None => {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("Missing linked soft-key mask: {softkey_id}"),
+                );
+            }
+        };
     }
 }
 
-fn update_object_hierarchy_headers(
-    ctx: &egui::Context,
-    parent_id: egui::Id,
-    object: &Object,
-    pool: &ObjectPool,
-    new_selected: NullableObjectId,
-) -> bool {
-    let mut is_selected_or_descendant = new_selected == object.id().into();
-
-    let refs = object.referenced_objects();
-    if !refs.is_empty() {
-        let id = parent_id.with(object.id().value());
-
-        // Update in a depth-first manner
-        for obj_id in refs {
-            if let Some(obj) = pool.object_by_id(obj_id) {
-                is_selected_or_descendant |=
-                    update_object_hierarchy_headers(ctx, id, obj, pool, new_selected);
-            }
+fn render_mask_list(ui: &mut egui::Ui, project: &EditorProject, mask_view: &mut MaskViewState) {
+    let filter_id = egui::Id::new("mask_list_filter");
+    let previous_filter_id = egui::Id::new("mask_list_previous_filter");
+    let mut filter = ui
+        .data(|data| data.get_temp::<String>(filter_id))
+        .unwrap_or_default();
+    let previous_filter = ui
+        .data(|data| data.get_temp::<String>(previous_filter_id))
+        .unwrap_or_default();
+    ui.label("Masks to preview");
+    ui.horizontal(|ui| {
+        let clear_width = if filter.is_empty() {
+            0.0
+        } else {
+            28.0 + ui.spacing().item_spacing.x
+        };
+        ui.add(
+            egui::TextEdit::singleline(&mut filter)
+                .hint_text("Filter masks by name or ID…")
+                .desired_width((ui.available_width() - clear_width).max(0.0)),
+        );
+        if !filter.is_empty()
+            && ag_iso_terminal_designer::ui_style::icon_button(
+                ui,
+                ag_iso_terminal_designer::ui_style::Icon::Close,
+                "Clear mask filter",
+            )
+            .clicked()
+        {
+            filter.clear();
         }
-
-        if is_selected_or_descendant {
-            if let Some(mut state) = egui::collapsing_header::CollapsingState::load(ctx, id) {
-                if !state.is_open() {
-                    state.set_open(true);
-                    state.store(ctx);
+    });
+    ui.data_mut(|data| data.insert_temp(filter_id, filter.clone()));
+    let query = filter.to_lowercase();
+    let masks: Vec<_> = project
+        .get_pool()
+        .objects()
+        .iter()
+        .filter(|object| matches!(object, Object::DataMask(_) | Object::AlarmMask(_)))
+        .filter(|object| {
+            query.is_empty()
+                || ag_iso_terminal_designer::object_picker::matches_object(project, object, &query)
+        })
+        .collect();
+    let scroll = egui::ScrollArea::vertical()
+        .id_salt("mask_list_scroll")
+        .max_height((ui.available_height() / 3.0).min(200.0).max(40.0));
+    let scroll = if filter != previous_filter {
+        scroll.vertical_scroll_offset(0.0)
+    } else {
+        scroll
+    };
+    scroll.show(ui, |ui| {
+        if masks.is_empty() {
+            ui.weak(if query.is_empty() {
+                "No data or alarm masks"
+            } else {
+                "No matching masks"
+            });
+        }
+        for mask in masks {
+            let id = mask.id().value();
+            ui.horizontal(|ui| {
+                let mut visible = mask_view.visible.contains(&id);
+                if ui.checkbox(&mut visible, "").changed() {
+                    mask_view.set_visible(id, visible);
                 }
-            }
+                let kind = if matches!(mask, Object::DataMask(_)) {
+                    "Data"
+                } else {
+                    "Alarm"
+                };
+                let label = format!(
+                    "{kind} {}: {}",
+                    project.format_object_id(id),
+                    project.object_display_name(mask)
+                );
+                let response = ui.selectable_label(mask_view.focused == Some(id), label);
+                if response.clicked() {
+                    if mask_view.focused == Some(id) {
+                        mask_view.unfocus();
+                    } else {
+                        mask_view.focus(id);
+                        project.get_mut_selected().set(mask.id().into());
+                    }
+                }
+            });
         }
-    }
-
-    is_selected_or_descendant
+    });
+    ui.data_mut(|data| data.insert_temp(previous_filter_id, filter));
 }
 
 fn collect_selected_to_root_chains(
@@ -1380,6 +1760,7 @@ fn render_selected_ancestry_panel(ui: &mut egui::Ui, project: &EditorProject) {
 
 impl eframe::App for DesignerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.mask_view.begin_frame();
         self.preferences.apply(ctx);
         ctx.style_mut(|style| {
             style.interaction.selectable_labels = false;
@@ -1795,6 +2176,8 @@ impl eframe::App for DesignerApp {
         }
         if let Some(pool) = &mut self.project {
             pool.set_object_id_format(self.preferences.object_id_format);
+            let selected_before_navigation = pool.get_selected();
+            let mut explicit_navigation = false;
             if ctx.input(|i| i.pointer.button_released(egui::PointerButton::Extra1)) {
                 pool.set_previous_selected();
             } else if ctx.input(|i| i.pointer.button_released(egui::PointerButton::Extra2)) {
@@ -1819,6 +2202,7 @@ impl eframe::App for DesignerApp {
                 },
             ) {
                 pool.get_mut_selected().set(selected);
+                explicit_navigation = true;
             }
 
             if pool.commit_queued("Edit object pool") {
@@ -1840,16 +2224,21 @@ impl eframe::App for DesignerApp {
             if let Some(error) = pool.take_operation_error() {
                 self.error_message = Some(error);
             }
-            if pool.update_selected() {
-                // Make sure all collapsing headers for the selected object are open
-                if let Some(working_set) = pool.get_pool().working_set_object() {
-                    update_object_hierarchy_headers(
-                        ctx,
-                        egui::Id::new(OBJECT_HIERARCHY_ID),
-                        &Object::WorkingSet(working_set.clone()),
-                        pool.get_pool(),
-                        pool.get_selected(),
-                    );
+            if pool.update_selected()
+                || pool.get_selected() != selected_before_navigation
+                || explicit_navigation
+            {
+                if let Some(selected) = pool.get_selected().0 {
+                    if let Some(root) = self.mask_view.navigate(pool, selected.value()) {
+                        if let Ok(materialized) = pool.materialize() {
+                            self.canvas.navigate_to_object(
+                                pool,
+                                &materialized,
+                                root,
+                                selected.value(),
+                            );
+                        }
+                    }
                 }
                 ctx.request_repaint();
             }
@@ -1979,6 +2368,9 @@ impl DesignerApp {
         };
         match pane {
             Pane::Objects => {
+                self.mask_view.reconcile(pool);
+                render_mask_list(ui, pool, &mut self.mask_view);
+                ui.separator();
                 let filter_id = egui::Id::new("objects_list_filter");
                 let mut filter_text = ui
                     .data(|data| data.get_temp::<String>(filter_id))
@@ -2052,44 +2444,10 @@ impl DesignerApp {
                         data.insert_temp(egui::Id::new("tree_row_bounds"), ui.max_rect())
                     });
                     if !query.is_empty() {
-                        render_filtered_object_list(ui, pool, &query);
+                        render_filtered_object_list(ui, pool, &query, &mut self.mask_view);
                         ui.separator();
                     }
-                    ag_iso_terminal_designer::ui_style::section_heading(ui, "Hierarchy");
-                    if let Some(working_set) = pool.get_pool().working_set_object() {
-                        render_object_hierarchy(
-                            ui,
-                            egui::Id::new(OBJECT_HIERARCHY_ID),
-                            &Object::WorkingSet(working_set.clone()),
-                            pool,
-                        );
-                    } else {
-                        ui.label("This pool has no Working Set.");
-                        if ui.button("Create Working Set").clicked() {
-                            let object_type = ObjectType::WorkingSet;
-                            self.new_object_dialog = Some((
-                                object_type,
-                                pool.generate_smart_name_for_new_object(object_type),
-                            ));
-                        }
-                    }
-                    let auxiliary_objects = pool.get_pool().objects_by_types(&[
-                        ObjectType::AuxiliaryFunctionType1,
-                        ObjectType::AuxiliaryInputType1,
-                        ObjectType::AuxiliaryFunctionType2,
-                        ObjectType::AuxiliaryInputType2,
-                    ]);
-                    if !auxiliary_objects.is_empty() {
-                        ui.separator();
-                        for object in auxiliary_objects {
-                            render_selectable_object(ui, object, pool);
-                        }
-                    }
-
-                    if query.is_empty() {
-                        ui.separator();
-                        render_filtered_object_list(ui, pool, &query);
-                    }
+                    render_focused_mask_hierarchy(ui, pool, &mut self.mask_view, &mut self.canvas);
                     ui.allocate_space(ui.available_size());
                 });
             }
@@ -2181,39 +2539,14 @@ impl DesignerApp {
             Pane::Canvas => {
                 self.canvas_visible = true;
                 let materialized = pool.materialize();
-                let effective = match &materialized {
-                    Ok(m) => &m.pool,
+                match &materialized {
+                    Ok(materialized) => {
+                        self.mask_view.reconcile(pool);
+                        self.canvas
+                            .show_masks(ui, pool, materialized, &mut self.mask_view);
+                    }
                     Err(error) => {
                         ui.colored_label(ui.visuals().error_fg_color, error.to_string());
-                        return;
-                    }
-                };
-                if effective.objects_by_type(ObjectType::DataMask).is_empty() {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        "Missing data masks, please load a pool file or add a new mask...",
-                    );
-                } else {
-                    match effective.working_set_object() {
-                        Some(mask) => match effective.object_by_id(mask.active_mask) {
-                            Some(obj) => {
-                                if let Ok(materialized) = &materialized {
-                                    self.canvas.show(ui, pool, materialized, obj.id().value());
-                                }
-                            }
-                            None => {
-                                ui.colored_label(
-                                    ui.visuals().error_fg_color,
-                                    format!("Missing data mask: {:?}", mask),
-                                );
-                            }
-                        },
-                        None => {
-                            ui.colored_label(
-                                ui.visuals().error_fg_color,
-                                "No working sets, please add a new working set...",
-                            );
-                        }
                     }
                 }
             }

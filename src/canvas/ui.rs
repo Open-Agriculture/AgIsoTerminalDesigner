@@ -1,4 +1,5 @@
 use super::layout::*;
+use super::MaskViewState;
 use super::{
     edits::{self, position, CanvasEdit, PlacementTarget},
     geometry::{self, Scene, SceneItem},
@@ -7,6 +8,7 @@ use crate::object_rendering::Colorable;
 use crate::{components::MaterializedProject, EditorProject};
 use ag_iso_stack::object_pool::{object_attributes::Point, NullableObjectId, ObjectId};
 use egui::{Key, Modifiers, Pos2, Rect, Stroke, Vec2};
+use std::collections::HashMap;
 
 /// Transient viewport, occurrence selection, and gesture drafts for one project.
 /// Reset this state when replacing the project; no canvas state is serialized.
@@ -27,6 +29,11 @@ pub struct CanvasState {
     snap_objects: bool,
     snap_spacing: bool,
     fit: Option<bool>,
+    fit_all: bool,
+    initially_fitted: bool,
+    pages: HashMap<u16, (Option<u16>, usize)>,
+    preferred_slot: Option<(u16, usize, Option<u16>)>,
+    pair_layout: Vec<(u16, Vec2, Rect)>,
 }
 
 impl Default for CanvasState {
@@ -48,6 +55,11 @@ impl Default for CanvasState {
             snap_objects: true,
             snap_spacing: true,
             fit: None,
+            fit_all: false,
+            initially_fitted: false,
+            pages: HashMap::new(),
+            preferred_slot: None,
+            pair_layout: Vec::new(),
         }
     }
 }
@@ -65,6 +77,7 @@ struct FieldDraft {
     width: Option<u16>,
     height: Option<u16>,
     changed: bool,
+    finish_pending: bool,
 }
 struct Gesture {
     kind: GestureKind,
@@ -96,14 +109,170 @@ impl CanvasState {
         materialized: &MaterializedProject,
         root: u16,
     ) {
+        let mut view = MaskViewState::default();
+        view.visible = vec![root];
+        view.focused = Some(root);
+        self.show_frame(ui, project, materialized, &mut view, false);
+    }
+
+    /// Render visible mask/soft-key pairs in a shared viewport. View choices and
+    /// key pages are transient; placement edits retain parent-local coordinates.
+    pub fn show_masks(
+        &mut self,
+        ui: &mut egui::Ui,
+        project: &mut EditorProject,
+        materialized: &MaterializedProject,
+        view: &mut MaskViewState,
+    ) {
+        view.reconcile(project);
+        self.show_frame(ui, project, materialized, view, true);
+    }
+
+    /// Reveal a soft-key occurrence selected in the hierarchy. Slot indices are
+    /// from the linked SoftKeyMask, before paging or pointer resolution.
+    pub fn select_softkey_slot(&mut self, project: &EditorProject, root: u16, slot: usize) {
+        let keys = super::softkeys::build(project, project.get_pool(), root, 0);
+        let capacity = usize::from(project.soft_key_layout().physical_key_count)
+            - usize::from(keys.navigation);
+        let page = (slot / capacity).min(keys.pages - 1);
+        self.pages.insert(root, (keys.mask_id, page));
+        if self.mask == Some(root) {
+            self.softkey_mask = keys.mask_id;
+            self.change_softkey_page(page);
+        }
+        self.preferred_slot = Some((
+            root,
+            slot,
+            project.get_mut_selected().get().0.map(|id| id.value()),
+        ));
+        self.inspector = None;
+    }
+
+    /// Reveal the first soft-key page containing an externally selected object,
+    /// retaining the current page when the object already occurs there.
+    pub fn navigate_to_object(
+        &mut self,
+        project: &EditorProject,
+        materialized: &MaterializedProject,
+        root: u16,
+        object: u16,
+    ) {
+        // Explicit hierarchy slot selection takes precedence over ID navigation.
+        if self
+            .preferred_slot
+            .is_some_and(|(owner, _, selected)| owner == root && selected == Some(object))
+        {
+            return;
+        }
+        self.preferred_slot = None;
+        let current = self.pages.get(&root).map(|p| p.1).unwrap_or(0);
+        let keys = super::softkeys::build(project, &materialized.pool, root, current);
+        let contains = |page| {
+            super::softkeys::build(project, &materialized.pool, root, page)
+                .slots
+                .iter()
+                .any(|slot| match slot.content {
+                    super::softkeys::SlotContent::Key(key) => {
+                        super::mask_view::subtree_contains(&materialized.pool, key, object)
+                    }
+                    _ => false,
+                })
+        };
+        if !contains(keys.page) {
+            if let Some(page) = (0..keys.pages).find(|page| contains(*page)) {
+                self.pages.insert(root, (keys.mask_id, page));
+                if self.mask == Some(root) {
+                    self.softkey_mask = keys.mask_id;
+                    self.change_softkey_page(page);
+                }
+            }
+        }
+    }
+
+    fn switch_mask(&mut self, mask: Option<u16>) {
+        if self.mask == mask {
+            return;
+        }
+        self.cancel_interaction();
+        self.selected.clear();
+        self.context.clear();
+        self.inspector = None;
+        self.error = None;
+        self.mask = mask;
+        let (linked, page) = mask
+            .and_then(|id| self.pages.get(&id).copied())
+            .unwrap_or((None, 0));
+        self.softkey_mask = linked;
+        self.softkey_page = page;
+        if let Some(root) = self.mask {
+            self.pages.insert(root, (self.softkey_mask, page));
+        }
+    }
+
+    fn show_frame(
+        &mut self,
+        ui: &mut egui::Ui,
+        project: &mut EditorProject,
+        materialized: &MaterializedProject,
+        view: &mut MaskViewState,
+        captions: bool,
+    ) {
+        let frame_revision = project.revision();
         if !ui.input(|i| i.focused) {
-            self.gesture = None;
-            self.field_draft = None;
+            self.cancel_interaction();
         }
-        if self.mask != Some(root) {
-            *self = Self::default();
-            self.mask = Some(root);
+        self.pages.retain(|id, _| {
+            ObjectId::new(*id)
+                .ok()
+                .and_then(|id| project.get_pool().object_by_id(id))
+                .is_some()
+        });
+        let mut pairs = Vec::new();
+        let mut x = 0.0;
+        let mask_rect = Rect::from_min_size(
+            Pos2::ZERO,
+            egui::vec2(project.mask_size as f32, project.mask_size as f32),
+        );
+        for &root in &view.visible {
+            let (linked, page) = self.pages.get(&root).copied().unwrap_or((None, 0));
+            let mut keys = super::softkeys::build(project, &materialized.pool, root, page);
+            if linked != keys.mask_id {
+                keys = super::softkeys::build(project, &materialized.pool, root, 0);
+                if self.mask == Some(root) {
+                    self.cancel_interaction();
+                    self.selected.clear();
+                    self.context.clear();
+                }
+            }
+            self.pages.insert(root, (keys.mask_id, keys.page));
+            let rect = if keys.rect.is_positive() {
+                mask_rect.union(keys.rect)
+            } else {
+                mask_rect
+            };
+            let offset = egui::vec2(x, if captions { 24.0 } else { 0.0 });
+            pairs.push((root, offset, rect));
+            x += rect.width() + 32.0;
+            if let Some(error) = keys.error {
+                ui.colored_label(
+                    crate::ui_style::palette(ui).error,
+                    format!("{}: {error}", project.format_object_id(root)),
+                );
+            }
         }
+        if self.pair_layout != pairs {
+            self.cancel_interaction();
+            self.pair_layout.clone_from(&pairs);
+        }
+        self.switch_mask(view.focused.filter(|id| view.visible.contains(id)));
+        if let Some(root) = self.mask {
+            let (linked, page) = self.pages[&root];
+            if self.softkey_mask != linked || self.softkey_page != page {
+                self.softkey_mask = linked;
+                self.change_softkey_page(page);
+            }
+        }
+        let mut root = self.mask.unwrap_or(u16::MAX);
         if self.revision != project.revision() {
             self.gesture = None;
             self.selected.clear();
@@ -121,9 +290,6 @@ impl CanvasState {
         }
         if self.softkey_page != softkeys.page {
             self.change_softkey_page(softkeys.page);
-        }
-        if let Some(error) = &softkeys.error {
-            ui.colored_label(crate::ui_style::palette(ui).error, error);
         }
         if softkeys.pages > 1 {
             let mut page = softkeys.page;
@@ -153,7 +319,7 @@ impl CanvasState {
                 softkeys = super::softkeys::build(project, &materialized.pool, root, page);
             }
         }
-        let scene = geometry::build_page(project, materialized, root, self.softkey_page);
+        let mut scene = geometry::build_page(project, materialized, root, self.softkey_page);
         self.selected
             .retain(|p| scene.items.iter().any(|i| &i.path == p));
         if !scene.items.iter().any(|i| i.path == self.context) {
@@ -165,17 +331,17 @@ impl CanvasState {
             self.selected = scene
                 .items
                 .iter()
+                .filter(|i| self.preferred_slot.is_none_or(|(owner, slot, selected)| {
+                    owner != root || selected != inspector ||
+                        i.path.starts_with(&[super::softkeys::PATH_PREFIX, slot])
+                }))
                 .find(|i| (i.target.is_some() || i.path.first() == Some(&super::softkeys::PATH_PREFIX)) && (Some(i.object_id) == inspector || inspector.and_then(|id| materialized.source_map.by_object_id.get(&id)).is_some_and(|source| matches!((source, &i.target), (crate::components::MaterializedSource::ComponentNode { instance_id, .. }, Some(PlacementTarget::Component { instance_id: target })) if instance_id == target))))
                 .map(|i| vec![i.path.clone()])
                 .unwrap_or_default();
         }
-        let items = self.selection(&scene);
+        let mut items = self.selection(&scene);
         let mut commands = vec![];
         self.toolbar(ui, project, &scene, &items, &mut commands);
-        if !commands.is_empty() {
-            self.commit(project, "Edit layout", std::mem::take(&mut commands));
-            ui.ctx().request_repaint();
-        }
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
@@ -193,34 +359,48 @@ impl CanvasState {
             self.cancel_interaction();
         }
         self.viewport = viewport;
-        let canvas_id = response.id;
         let visuals = ui.visuals();
         let selection_color = visuals.selection.stroke.color;
         let guide_color = visuals.warn_fg_color;
-        let mask_fill = visuals.extreme_bg_color;
         let workspace_fill = visuals.faint_bg_color;
-        let mask_rect = scene
-            .items
-            .first()
-            .map(|i| i.rect)
-            .unwrap_or(Rect::from_min_size(
-                Pos2::ZERO,
-                egui::vec2(project.mask_size as f32, project.mask_size as f32),
-            ));
-        if let Some(selection) = self.fit.take() {
-            let fit_rect = if selection {
-                bounds(&items).unwrap_or(mask_rect)
-            } else {
-                if softkeys.rect.is_positive() {
-                    mask_rect.union(softkeys.rect)
-                } else {
-                    mask_rect
+        let mut offset = pairs
+            .iter()
+            .find(|(id, _, _)| *id == root)
+            .map(|(_, offset, _)| *offset)
+            .unwrap_or(Vec2::ZERO);
+        if captions && !self.initially_fitted && !pairs.is_empty() {
+            self.fit_all = true;
+            self.initially_fitted = true;
+        }
+        let all_bounds = pairs
+            .iter()
+            .map(|(_, offset, rect)| {
+                let mut rect = rect.translate(*offset);
+                if captions {
+                    rect.min.y -= 24.0;
                 }
+                rect
+            })
+            .reduce(|a, b| a.union(b));
+        if self.fit_all || self.fit.is_some() {
+            let fit_rect = if self.fit_all {
+                all_bounds
+            } else if self.fit == Some(true) {
+                bounds(&items).map(|rect| rect.translate(offset))
+            } else {
+                pairs
+                    .iter()
+                    .find(|(id, _, _)| *id == root)
+                    .map(|(_, offset, rect)| rect.translate(*offset))
             };
-            self.zoom = ((viewport.width() - 48.0) / fit_rect.width().max(1.0))
-                .min((viewport.height() - 48.0) / fit_rect.height().max(1.0))
-                .clamp(0.1, 8.0);
-            self.pan = viewport.size() * 0.5 - fit_rect.center().to_vec2() * self.zoom;
+            self.fit_all = false;
+            self.fit = None;
+            if let Some(fit_rect) = fit_rect {
+                self.zoom = ((viewport.width() - 48.0) / fit_rect.width().max(1.0))
+                    .min((viewport.height() - 48.0) / fit_rect.height().max(1.0))
+                    .clamp(0.1, 8.0);
+                self.pan = viewport.size() * 0.5 - fit_rect.center().to_vec2() * self.zoom;
+            }
         }
         let input = ui.input(|i| {
             (
@@ -245,7 +425,35 @@ impl CanvasState {
                 self.pan += scroll;
             }
         }
-        let origin = viewport.min + self.pan;
+        if pointer.button_pressed(egui::PointerButton::Primary) && response.hovered() && !space {
+            if let Some(p) = pointer.interact_pos() {
+                let world = Pos2::ZERO + (p - viewport.min - self.pan) / self.zoom;
+                if let Some(&(clicked, clicked_offset, _)) = pairs
+                    .iter()
+                    .find(|(_, offset, rect)| rect.translate(*offset).contains(world))
+                {
+                    if self.mask != Some(clicked) {
+                        // Losing a numeric field's focus must not commit its
+                        // unfinished draft when the pointer changes mask owner.
+                        commands.clear();
+                        view.focus(clicked);
+                        self.switch_mask(Some(clicked));
+                        root = clicked;
+                        offset = clicked_offset;
+                        softkeys = super::softkeys::build(
+                            project,
+                            &materialized.pool,
+                            root,
+                            self.softkey_page,
+                        );
+                        scene =
+                            geometry::build_page(project, materialized, root, self.softkey_page);
+                        items.clear();
+                    }
+                }
+            }
+        }
+        let origin = viewport.min + self.pan + offset * self.zoom;
         let zoom = self.zoom;
         let to_pool = |p: Pos2| Pos2::ZERO + (p - origin) / zoom;
         let hover = pointer
@@ -253,12 +461,16 @@ impl CanvasState {
             .filter(|p| viewport.contains(*p))
             .map(to_pool);
         let hit = hover.and_then(|p| self.hit(&scene, p, modifiers.ctrl || modifiers.command));
-        let can_key = response.has_focus() || self.gesture.is_some();
+        let can_key = self.mask.is_some() && (response.has_focus() || self.gesture.is_some());
         if can_key {
             self.keys(ui, project, &scene, modifiers, &mut commands);
         }
-        if pointer.button_pressed(egui::PointerButton::Primary) && response.hovered() {
+        if pointer.button_pressed(egui::PointerButton::Primary)
+            && response.hovered()
+            && (self.mask.is_some() || space)
+        {
             response.request_focus();
+            self.preferred_slot = None;
             if let Some(p) = pointer.interact_pos() {
                 let pool_pos = to_pool(p);
                 if let Some(slot) = softkeys
@@ -503,116 +715,57 @@ impl CanvasState {
             .and_then(|g| g.draft.as_ref())
             .map(|d| &d.0)
             .unwrap_or(materialized);
-        let transform = egui::emath::TSTransform::new(viewport.min.to_vec2() + self.pan, self.zoom);
         let workspace_painter = ui.painter().with_clip_rect(viewport);
         workspace_painter.rect_filled(viewport, 0.0, workspace_fill);
-        let mask_screen_rect =
-            egui::emath::TSTransform::new(viewport.min.to_vec2() + self.pan, self.zoom) * mask_rect;
-        workspace_painter.rect_filled(mask_screen_rect.intersect(viewport), 1.0, mask_fill);
-        workspace_painter.rect_stroke(
-            mask_screen_rect,
-            1.0,
-            ui.visuals().widgets.noninteractive.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .id_salt(canvas_id.with("objects"))
-                .max_rect(mask_rect),
-        );
-        child.set_clip_rect(
-            (transform.inverse() * viewport.intersect(ui.clip_rect())).intersect(mask_rect),
-        );
-        child.disable();
-        child.set_opacity(1.0);
-        child.with_visual_transform(transform, |child| {
-            if let Some(object) = ObjectId::new(root)
-                .ok()
-                .and_then(|id| display.pool.object_by_id(id))
-            {
-                crate::object_rendering::render_object_with_version(
-                    child,
-                    &display.pool,
-                    object,
-                    Point::default(),
-                    project.vt_version,
-                );
-            }
-        });
-        if softkeys.rect.is_positive() {
-            workspace_painter.rect_filled(
-                transform * softkeys.rect,
-                0.0,
-                crate::effective_colour::colour(&display.pool, softkeys.background).convert(),
+        for &(pair_root, pair_offset, _) in &pairs {
+            let pair_transform = egui::emath::TSTransform::new(
+                viewport.min.to_vec2() + self.pan + pair_offset * self.zoom,
+                self.zoom,
             );
-        }
-        for slot in &softkeys.slots {
-            let rect = transform * slot.rect;
-            workspace_painter.rect_stroke(
-                rect,
-                0.0,
-                ui.visuals().widgets.noninteractive.bg_stroke,
-                egui::StrokeKind::Outside,
+            let page = self.pages.get(&pair_root).map(|p| p.1).unwrap_or(0);
+            let pair_keys = super::softkeys::build(project, &display.pool, pair_root, page);
+            self.paint_pair(
+                ui,
+                project,
+                display,
+                pair_root,
+                viewport,
+                mask_rect,
+                pair_transform,
+                &pair_keys,
             );
-            match slot.content {
-                super::softkeys::SlotContent::Key(id) => {
-                    let mut key_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .id_salt(("softkey", slot.index))
-                            .max_rect(slot.rect),
-                    );
-                    key_ui.set_clip_rect(
-                        (transform.inverse() * viewport.intersect(ui.clip_rect()))
-                            .intersect(slot.rect),
-                    );
-                    key_ui.disable();
-                    key_ui.set_opacity(1.0);
-                    key_ui.with_visual_transform(transform, |key_ui| {
-                        if let Some(object) = ObjectId::new(id)
-                            .ok()
-                            .and_then(|id| display.pool.object_by_id(id))
-                        {
-                            crate::object_rendering::render_object_with_version(
-                                key_ui,
-                                &display.pool,
-                                object,
-                                Point::default(),
-                                project.vt_version,
-                            );
-                        }
-                    });
-                }
-                super::softkeys::SlotContent::Previous | super::softkeys::SlotContent::Next => {
-                    workspace_painter.rect_filled(rect, 0.0, ui.visuals().widgets.inactive.bg_fill);
-                    let previous = matches!(slot.content, super::softkeys::SlotContent::Previous);
-                    let enabled = if previous {
-                        softkeys.page > 0
-                    } else {
-                        softkeys.navigation == 1 || softkeys.page + 1 < softkeys.pages
-                    };
+            if captions {
+                if let Some(object) = ObjectId::new(pair_root)
+                    .ok()
+                    .and_then(|id| display.pool.object_by_id(id))
+                {
+                    let name = project.get_object_info(object).get_name(object);
                     workspace_painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        if previous { "◀" } else { "▶" },
-                        egui::FontId::proportional(18.0 * self.zoom),
-                        if enabled {
-                            ui.visuals().text_color()
+                        pair_transform * egui::pos2(0.0, -6.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        format!("{} · {}", name, project.format_object_id(pair_root)),
+                        egui::FontId::proportional(14.0),
+                        if self.mask == Some(pair_root) {
+                            selection_color
                         } else {
-                            ui.visuals().weak_text_color()
+                            ui.visuals().text_color()
                         },
                     );
                 }
-                super::softkeys::SlotContent::Invalid => {
-                    workspace_painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "Invalid key",
-                        egui::FontId::proportional(10.0 * self.zoom),
-                        crate::ui_style::palette(ui).error,
-                    );
-                }
-                super::softkeys::SlotContent::Empty => {}
             }
+        }
+        let transform = egui::emath::TSTransform::new(
+            viewport.min.to_vec2() + self.pan + offset * self.zoom,
+            self.zoom,
+        );
+        if pairs.is_empty() {
+            workspace_painter.text(
+                viewport.center(),
+                egui::Align2::CENTER_CENTER,
+                "Check a mask in the Objects pane to preview it.",
+                egui::FontId::proportional(14.0),
+                ui.visuals().weak_text_color(),
+            );
         }
         let painter = ui.painter().with_clip_rect(viewport);
         let screen = |r: Rect| transform * r;
@@ -791,7 +944,10 @@ impl CanvasState {
                 );
                 ui.close();
             }
-            if ui.button("Fit mask · Shift+1").clicked() {
+            if ui
+                .add_enabled(self.mask.is_some(), egui::Button::new("Fit mask · Shift+1"))
+                .clicked()
+            {
                 self.fit = Some(false);
                 ui.close();
             }
@@ -811,7 +967,7 @@ impl CanvasState {
                 if let Some(h) = resize_handle(
                     &items[0],
                     p,
-                    viewport.min + self.pan,
+                    viewport.min + self.pan + offset * self.zoom,
                     self.zoom,
                     dimensions(project, &items[0]),
                 ) {
@@ -819,13 +975,142 @@ impl CanvasState {
                 }
             }
         }
+        if project.revision() != frame_revision {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn paint_pair(
+        &self,
+        ui: &mut egui::Ui,
+        project: &EditorProject,
+        display: &MaterializedProject,
+        root: u16,
+        viewport: Rect,
+        mask_rect: Rect,
+        transform: egui::emath::TSTransform,
+        softkeys: &super::softkeys::SoftKeys,
+    ) {
+        let workspace_painter = ui.painter().with_clip_rect(viewport);
+        let mask_fill = ui.visuals().extreme_bg_color;
+        let mask_screen_rect = transform * mask_rect;
+        workspace_painter.rect_filled(mask_screen_rect.intersect(viewport), 1.0, mask_fill);
+        workspace_painter.rect_stroke(
+            mask_screen_rect,
+            1.0,
+            ui.visuals().widgets.noninteractive.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("mask_objects", root))
+                .max_rect(mask_rect),
+        );
+        child.set_clip_rect(
+            (transform.inverse() * viewport.intersect(ui.clip_rect())).intersect(mask_rect),
+        );
+        child.disable();
+        child.set_opacity(1.0);
+        child.with_visual_transform(transform, |child| {
+            if let Some(object) = ObjectId::new(root)
+                .ok()
+                .and_then(|id| display.pool.object_by_id(id))
+            {
+                crate::object_rendering::render_object_with_version(
+                    child,
+                    &display.pool,
+                    object,
+                    Point::default(),
+                    project.vt_version,
+                );
+            }
+        });
+        if softkeys.rect.is_positive() {
+            workspace_painter.rect_filled(
+                transform * softkeys.rect,
+                0.0,
+                crate::effective_colour::colour(&display.pool, softkeys.background).convert(),
+            );
+        }
+        for slot in &softkeys.slots {
+            let rect = transform * slot.rect;
+            workspace_painter.rect_stroke(
+                rect,
+                0.0,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Outside,
+            );
+            match slot.content {
+                super::softkeys::SlotContent::Key(id) => {
+                    let mut key_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .id_salt(("softkey", root, slot.index))
+                            .max_rect(slot.rect),
+                    );
+                    key_ui.set_clip_rect(
+                        (transform.inverse() * viewport.intersect(ui.clip_rect()))
+                            .intersect(slot.rect),
+                    );
+                    key_ui.disable();
+                    key_ui.set_opacity(1.0);
+                    key_ui.with_visual_transform(transform, |key_ui| {
+                        if let Some(object) = ObjectId::new(id)
+                            .ok()
+                            .and_then(|id| display.pool.object_by_id(id))
+                        {
+                            crate::object_rendering::render_object_with_version(
+                                key_ui,
+                                &display.pool,
+                                object,
+                                Point::default(),
+                                project.vt_version,
+                            );
+                        }
+                    });
+                }
+                super::softkeys::SlotContent::Previous | super::softkeys::SlotContent::Next => {
+                    workspace_painter.rect_filled(rect, 0.0, ui.visuals().widgets.inactive.bg_fill);
+                    let previous = matches!(slot.content, super::softkeys::SlotContent::Previous);
+                    let enabled = if previous {
+                        softkeys.page > 0
+                    } else {
+                        softkeys.navigation == 1 || softkeys.page + 1 < softkeys.pages
+                    };
+                    workspace_painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if previous { "◀" } else { "▶" },
+                        egui::FontId::proportional(18.0 * self.zoom),
+                        if enabled {
+                            ui.visuals().text_color()
+                        } else {
+                            ui.visuals().weak_text_color()
+                        },
+                    );
+                }
+                super::softkeys::SlotContent::Invalid => {
+                    workspace_painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Invalid key",
+                        egui::FontId::proportional(10.0 * self.zoom),
+                        crate::ui_style::palette(ui).error,
+                    );
+                }
+                super::softkeys::SlotContent::Empty => {}
+            }
+        }
     }
 
     fn change_softkey_page(&mut self, page: usize) {
         self.cancel_interaction();
         self.softkey_page = page;
+        if let Some(root) = self.mask {
+            self.pages.insert(root, (self.softkey_mask, page));
+        }
         self.selected.clear();
         self.context.clear();
+        self.preferred_slot = None;
     }
 
     fn selection(&self, scene: &Scene) -> Vec<SceneItem> {
@@ -930,7 +1215,10 @@ impl CanvasState {
             if ui.small_button("100%").clicked() {
                 self.zoom = 1.0;
             }
-            if ui.small_button("Fit mask").clicked() {
+            if ui
+                .add_enabled(self.mask.is_some(), egui::Button::new("Fit mask"))
+                .clicked()
+            {
                 self.fit = Some(false);
             }
             if ui
@@ -938,6 +1226,9 @@ impl CanvasState {
                 .clicked()
             {
                 self.fit = Some(true);
+            }
+            if ui.small_button("Fit all").clicked() {
+                self.fit_all = true;
             }
             ui.separator();
             ui.strong("SNAP");
@@ -994,16 +1285,21 @@ impl CanvasState {
                             width: w,
                             height: h,
                             changed: false,
+                            finish_pending: false,
                         });
                     }
                     let draft = self.field_draft.as_mut().unwrap();
-                    let mut finish = false;
+                    // A different dock pane can change mask focus later in this
+                    // frame. Defer focus-loss completion so it can cancel first.
+                    let mut finish = draft.finish_pending;
+                    draft.finish_pending = false;
                     if let Some((x, y)) = &mut draft.position {
                         for (name, value) in [("X", x), ("Y", y)] {
                             ui.label(name);
                             let r = ui.add(egui::DragValue::new(value).speed(1.0));
                             draft.changed |= r.changed();
-                            finish |= r.drag_stopped() || r.lost_focus();
+                            finish |= r.drag_stopped();
+                            draft.finish_pending |= r.lost_focus();
                         }
                     }
                     for (name, value) in [("W", &mut draft.width), ("H", &mut draft.height)] {
@@ -1011,7 +1307,8 @@ impl CanvasState {
                             ui.label(name);
                             let r = ui.add(egui::DragValue::new(value).range(0..=u16::MAX));
                             draft.changed |= r.changed();
-                            finish |= r.drag_stopped() || r.lost_focus();
+                            finish |= r.drag_stopped();
+                            draft.finish_pending |= r.lost_focus();
                         }
                     }
                     if ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -1019,6 +1316,10 @@ impl CanvasState {
                         draft.width = w;
                         draft.height = h;
                         draft.changed = false;
+                        draft.finish_pending = false;
+                    }
+                    if draft.changed && draft.finish_pending {
+                        ui.ctx().request_repaint();
                     }
                     if draft.changed && finish {
                         if draft.width != w || draft.height != h {

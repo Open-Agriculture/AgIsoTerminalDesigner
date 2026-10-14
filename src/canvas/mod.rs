@@ -3,7 +3,9 @@
 pub mod edits;
 mod geometry;
 mod layout;
+pub mod mask_view;
 mod softkeys;
 mod ui;
 
+pub use mask_view::MaskViewState;
 pub use ui::CanvasState;
