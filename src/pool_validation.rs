@@ -338,13 +338,12 @@ pub(crate) fn remap_compatibility_diagnostic_ids(
     diagnostics: &mut [ValidationDiagnostic],
     id_changes: &[(u16, u16)],
 ) {
+    let mapping: std::collections::HashMap<_, _> = id_changes.iter().copied().collect();
     for diagnostic in diagnostics {
-        for &(old_id, new_id) in id_changes {
-            if let Some(ids) = &mut diagnostic.affected_objects {
-                for id in ids {
-                    if *id == old_id {
-                        *id = new_id;
-                    }
+        if let Some(ids) = &mut diagnostic.affected_objects {
+            for id in ids {
+                if let Some(new_id) = mapping.get(id) {
+                    *id = *new_id;
                 }
             }
         }

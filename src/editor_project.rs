@@ -6,7 +6,7 @@ use crate::components::*;
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
@@ -25,15 +25,36 @@ use crate::{project_file::ProjectFile, smart_naming, ObjectIdFormat, ObjectInfo,
 
 const MAX_UNDO_REDO_SELECTED: usize = 20;
 
+/// Failure to find a free ID inside a type's configured automatic range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectIdAllocationError {
+    pub object_type: ObjectType,
+    pub range: crate::ObjectIdRange,
+}
+
+impl std::fmt::Display for ObjectIdAllocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No free {:?} object ID in configured range {}",
+            self.object_type, self.range
+        )
+    }
+}
+
+impl std::error::Error for ObjectIdAllocationError {}
+
 #[derive(Clone, PartialEq)]
 struct ProjectContentCheckpoint {
     pool: ObjectPool,
     object_names: Vec<(u16, String)>,
     allowed_references: Vec<(u16, Vec<ObjectId>)>,
+    overridden_ids: Vec<u16>,
     mask_size: u16,
     soft_key_size: (u16, u16),
     soft_key_layout: SoftKeyLayout,
     vt_version: VtVersion,
+    object_id_ranges: crate::ObjectIdRanges,
     components: ComponentSource,
     graphics: crate::graphics::GraphicLibrary,
 }
@@ -46,12 +67,13 @@ struct ComponentCheckpoint {
     info: HashMap<ObjectId, ObjectInfo>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct DesignDimensions {
     mask_size: u16,
     soft_key_size: (u16, u16),
     vt_version: VtVersion,
     soft_key_layout: SoftKeyLayout,
+    object_id_ranges: crate::ObjectIdRanges,
 }
 
 /// Derived state belongs to one authoritative project state, never to its copies.
@@ -103,15 +125,15 @@ pub struct EditorProject {
     soft_key_layout: SoftKeyLayout,
     /// Application preference, excluded from project content and history.
     object_id_format: ObjectIdFormat,
+    /// Application preference, excluded from project content and history.
+    show_object_ids: bool,
+    object_id_ranges: crate::ObjectIdRanges,
     object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
     /// Metadata draft edited by the UI and committed through operations.
     mut_object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
 
     /// Used to keep track of the object that is being renamed
     renaming_object: RefCell<Option<(eframe::egui::Id, ObjectId, String)>>,
-
-    /// Cached next available ID for efficient allocation
-    next_available_id: RefCell<u16>,
 
     /// Cached default object names for efficient lookup
     default_object_names: RefCell<HashMap<ObjectId, String>>,
@@ -165,15 +187,7 @@ impl From<ObjectPool> for EditorProject {
                     (width.max(size.0), height.max(size.1))
                 });
 
-        // Find the highest ID in use to initialize next_available_id
-        let max_id = pool
-            .objects()
-            .iter()
-            .map(|obj| obj.id().value())
-            .max()
-            .unwrap_or(0);
-
-        let project = EditorProject {
+        let mut project = EditorProject {
             cache: RefCell::default(),
             pool,
             components: Default::default(),
@@ -190,10 +204,11 @@ impl From<ObjectPool> for EditorProject {
             soft_key_size,
             soft_key_layout: SoftKeyLayout::default(),
             object_id_format: ObjectIdFormat::default(),
+            show_object_ids: false,
+            object_id_ranges: crate::ObjectIdRanges::defaults(),
             object_info: RefCell::new(HashMap::new()),
             mut_object_info: RefCell::new(HashMap::new()),
             renaming_object: RefCell::new(None),
-            next_available_id: RefCell::new(max_id.saturating_add(1)),
             default_object_names: RefCell::new(HashMap::new()),
             image_load_request: RefCell::new(None),
             graphic_assign_request: Cell::new(None),
@@ -208,6 +223,7 @@ impl From<ObjectPool> for EditorProject {
             revision: Cell::new(0),
             operation_history: RefCell::new(OperationHistory::new(10)), // Default 10 transaction history
         };
+        project.apply_smart_naming_to_all_objects();
         project.mark_saved();
         project
     }
@@ -253,6 +269,7 @@ impl EditorProject {
         project.components = state.components.clone();
         project.graphics = state.graphics.clone();
         project.vt_version = state.vt_version;
+        project.object_id_ranges = state.object_id_ranges.clone();
         project.mask_size = state.mask_size;
         project.soft_key_size = state.soft_key_size;
         project.soft_key_layout = state.soft_key_layout;
@@ -272,6 +289,8 @@ impl EditorProject {
             soft_key_layout: self.soft_key_layout,
             vt_version: self.vt_version,
             object_id_format: self.object_id_format,
+            show_object_ids: self.show_object_ids,
+            object_id_ranges: self.object_id_ranges.clone(),
             object_info: RefCell::new(self.object_info.borrow().clone()),
             mut_object_info: RefCell::new(self.object_info.borrow().clone()),
             ..Self::default()
@@ -291,21 +310,105 @@ impl EditorProject {
         self.object_id_format = format;
     }
 
+    /// Configured inclusive automatic allocation ranges.
+    pub fn object_id_ranges(&self) -> &crate::ObjectIdRanges {
+        &self.object_id_ranges
+    }
+
+    /// Apply ID ranges as a single undoable project settings change.
+    pub fn set_object_id_ranges(&mut self, ranges: crate::ObjectIdRanges) -> Result<(), String> {
+        self.set_project_configuration_with_id_ranges(
+            self.mask_size,
+            self.soft_key_size,
+            self.vt_version,
+            self.soft_key_layout,
+            ranges,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Restore all type ranges to their defaults as one undoable change.
+    pub fn reset_object_id_ranges(&mut self) -> Result<(), String> {
+        self.set_object_id_ranges(crate::ObjectIdRanges::defaults())
+    }
+
+    /// Update target version and ID ranges together, validating their combined
+    /// constraints before changing project state.
+    pub fn set_object_id_configuration(
+        &mut self,
+        version: VtVersion,
+        ranges: crate::ObjectIdRanges,
+    ) -> Result<(), String> {
+        self.set_project_configuration_with_id_ranges(
+            self.mask_size,
+            self.soft_key_size,
+            version,
+            self.soft_key_layout,
+            ranges,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Whether the object's current ID was explicitly assigned by the user.
+    pub fn object_id_is_overridden(&self, id: ObjectId) -> bool {
+        self.mut_object_info
+            .borrow()
+            .get(&id)
+            .is_some_and(|info| info.id_overridden)
+    }
+
+    /// Mark or clear an explicit ID assignment on an existing object.
+    pub fn set_object_id_overridden(&mut self, id: ObjectId, overridden: bool) -> bool {
+        if self.pool.object_by_id(id).is_none() {
+            return false;
+        }
+        if self.object_id_is_overridden(id) == overridden {
+            return true;
+        }
+        self.execute_ui_transaction(OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description: Some(if overridden {
+                format!("Keep object ID {} fixed", id.value())
+            } else {
+                format!("Return object ID {} to automatic assignment", id.value())
+            }),
+            operations: vec![Operation::SetObjectIdAssignment {
+                object_id: id.value(),
+                new_id: id.value(),
+                overridden,
+            }],
+        })
+    }
+
     /// Format an object identifier for the editor UI, including null sentinels.
     pub fn format_object_id(&self, id: u16) -> String {
         self.object_id_format.format(id)
     }
 
-    /// UI name with the preferred ID radix for unnamed objects. Explicit names
-    /// (including generated names) are returned verbatim.
+    /// Return the smart object name, optionally followed by its formatted ID.
+    pub fn show_object_ids(&self) -> bool {
+        self.show_object_ids
+    }
+
+    pub fn set_show_object_ids(&mut self, show: bool) {
+        self.show_object_ids = show;
+    }
+
     pub fn object_display_name(&self, object: &Object) -> String {
-        self.get_object_info(object).name.unwrap_or_else(|| {
-            format!(
-                "{}: {:?}",
-                self.format_object_id(object.id().value()),
-                object.object_type()
-            )
-        })
+        let info = self
+            .mut_object_info
+            .borrow()
+            .get(&object.id())
+            .cloned()
+            .unwrap_or_else(|| ObjectInfo::new(object));
+        let name = info.name.unwrap_or_else(|| {
+            smart_naming::get_object_type_name(object.object_type()).to_string()
+        });
+        if self.show_object_ids {
+            format!("{} ({})", name, self.format_object_id(object.id().value()))
+        } else {
+            name
+        }
     }
     pub fn component_source(&self) -> &ComponentSource {
         &self.components
@@ -334,7 +437,7 @@ impl EditorProject {
     fn reconcile_cache(&self) {
         let state = (self.revision(), self.dimensions());
         let mut cache = self.cache.borrow_mut();
-        if cache.state != Some(state) {
+        if cache.state != Some(state.clone()) {
             *cache = ProjectCache {
                 state: Some(state),
                 ..Default::default()
@@ -449,7 +552,6 @@ impl EditorProject {
         self.sync_component_selection();
         self.object_info.replace(state.info.clone());
         self.mut_object_info.replace(state.info);
-        self.update_next_available_id();
         self.default_object_names.borrow_mut().clear();
         self.refresh_dirty();
         self.bump_revision();
@@ -479,13 +581,14 @@ impl EditorProject {
             &mut after.graphics,
             &mut after.info,
         )?;
-        prepare_compiled_ids(&after.pool, &mut after.source)?;
+        prepare_compiled_ids(&after.pool, &mut after.source, &self.object_id_ranges)?;
         let candidate = materialize_source_with_graphics(
             &after.pool,
             &after.source,
             self.vt_version,
             &after.info,
             &after.graphics,
+            &self.object_id_ranges,
         )?;
         let baseline_materialized = self.materialize_shared().ok();
         let baseline = baseline_materialized
@@ -570,35 +673,147 @@ impl EditorProject {
         self.revision.set(self.revision.get().wrapping_add(1));
     }
 
-    /// Allocate a new unique object ID efficiently
-    pub fn allocate_object_id(&self) -> ObjectId {
-        let occupied = |id| {
-            self.pool.object_by_id(ObjectId::new(id).unwrap()).is_some()
-                || self
-                    .components
-                    .instances
-                    .iter()
-                    .any(|i| i.compiled_ids.values().any(|v| *v == id))
-        };
-        let start = (*self.next_available_id.borrow()).max(1);
-        let id = (start..u16::MAX)
-            .find(|id| !occupied(*id))
-            .or_else(|| crate::operations::operation::first_available_object_id(occupied))
-            .expect("No available VT object IDs");
-        self.next_available_id.replace(id.saturating_add(1));
-        ObjectId::new(id).unwrap()
-    }
-
-    /// Update the next available ID cache based on the current pool
-    fn update_next_available_id(&self) {
-        let max_id = self
+    /// IDs already used or reserved by queued create operations, including
+    /// deterministic reservations for queued automatic creates.
+    fn reserved_object_ids(&self) -> std::collections::BTreeSet<u16> {
+        let mut reserved: std::collections::BTreeSet<_> = self
             .pool
             .objects()
             .iter()
-            .map(|obj| obj.id().value())
-            .max()
-            .unwrap_or(0);
-        self.next_available_id.replace(max_id.saturating_add(1));
+            .map(|object| object.id().value())
+            .chain(
+                self.components
+                    .instances
+                    .iter()
+                    .flat_map(|instance| instance.compiled_ids.values().copied()),
+            )
+            .collect();
+        let queued = self.queued_operations.borrow();
+        reserved.extend(queued.iter().filter_map(|operation| match operation {
+            Operation::CreateObject {
+                object_id: Some(id),
+                ..
+            } => Some(*id),
+            _ => None,
+        }));
+        for operation in queued.iter() {
+            if let Operation::CreateObject {
+                object_id: None,
+                object_type,
+                ..
+            } = operation
+            {
+                let range = self.object_id_ranges.range_for(*object_type);
+                if let Some(id) = (range.start..=range.end).find(|id| !reserved.contains(id)) {
+                    reserved.insert(id);
+                }
+            }
+        }
+        reserved
+    }
+
+    /// Return the lowest free ID in this type's inclusive automatic range.
+    /// Existing primitive, compiled component and queued creation IDs are
+    /// reserved. Exhaustion returns an error without changing the project.
+    pub fn allocate_object_id(
+        &self,
+        object_type: ObjectType,
+    ) -> Result<ObjectId, ObjectIdAllocationError> {
+        let range = self.object_id_ranges.range_for(object_type);
+        let occupied = self.reserved_object_ids();
+        let id = (range.start..=range.end)
+            .find(|id| !occupied.contains(id))
+            .ok_or(ObjectIdAllocationError { object_type, range })?;
+        Ok(ObjectId::new(id).expect("validated automatic ID range"))
+    }
+
+    /// Build the deterministic global reassignment preview for the current project.
+    pub fn plan_id_reassignment(
+        &self,
+        include_overrides: bool,
+    ) -> Result<crate::IdReassignmentPlan, String> {
+        let plan = crate::IdReassignmentPlan::build(
+            &self.pool,
+            &self.components,
+            &self.object_info.borrow(),
+            &self.object_id_ranges,
+            self.vt_version,
+            include_overrides,
+        )?;
+        if !plan.mappings.is_empty() {
+            self.prepare_transaction(&OperationTransaction {
+                schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+                description: Some("Preview object ID reassignment".into()),
+                operations: vec![Operation::RemapObjectIds {
+                    mappings: plan.mappings.clone(),
+                    target_types: plan.target_types.clone(),
+                }],
+            })
+            .map_err(|diagnostics| diagnostics.legacy_operation_error().to_string())?;
+        }
+        Ok(plan)
+    }
+
+    /// Apply a reassignment preview as one undoable, atomic project change.
+    pub fn apply_id_reassignment(
+        &mut self,
+        plan: crate::IdReassignmentPlan,
+    ) -> Result<bool, String> {
+        if plan.mappings.is_empty() {
+            return Ok(false);
+        }
+        self.execute_transaction(OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description: Some("Reassign object IDs".into()),
+            operations: vec![Operation::RemapObjectIds {
+                mappings: plan.mappings,
+                target_types: plan.target_types,
+            }],
+        })
+        .map(|_| true)
+        .map_err(|error| error.to_string())
+    }
+
+    /// Queue an explicit ID assignment from shared-reference UI code.
+    pub fn queue_object_id_assignment(&self, id: ObjectId, new_id: ObjectId, overridden: bool) {
+        self.queue_operation(Operation::SetObjectIdAssignment {
+            object_id: id.value(),
+            new_id: new_id.value(),
+            overridden,
+        });
+    }
+
+    /// Queue automatic reassignment to the first free ID in the object's type range.
+    pub fn queue_use_automatic_object_id(&self, id: ObjectId) -> Result<ObjectId, String> {
+        let object = self
+            .pool
+            .object_by_id(id)
+            .ok_or_else(|| format!("Object {} no longer exists", id.value()))?;
+        let range = self.object_id_ranges.range_for(object.object_type());
+        let assigned = (range.start..=range.end)
+            .find(|candidate| {
+                *candidate != id.value()
+                    && self
+                        .pool
+                        .object_by_id(ObjectId::new(*candidate).unwrap())
+                        .is_none()
+                    && !self.components.instances.iter().any(|instance| {
+                        instance
+                            .compiled_ids
+                            .values()
+                            .any(|compiled| compiled == candidate)
+                    })
+            })
+            .ok_or_else(|| {
+                format!(
+                    "No fresh IDs remain in the {:?} range {}–{}",
+                    object.object_type(),
+                    range.start,
+                    range.end
+                )
+            })?;
+        self.queue_object_id_assignment(id, ObjectId::new(assigned).unwrap(), false);
+        Ok(ObjectId::new(assigned).unwrap())
     }
 
     /// Get the current selected object
@@ -626,15 +841,23 @@ impl EditorProject {
             .map(|(id, info)| (id.value(), info.allowed_references.clone()))
             .collect();
         allowed_references.sort_by_key(|(id, _)| *id);
+        let mut overridden_ids: Vec<_> = object_info
+            .iter()
+            .filter(|(_, info)| info.id_overridden)
+            .map(|(id, _)| id.value())
+            .collect();
+        overridden_ids.sort_unstable();
 
         ProjectContentCheckpoint {
             pool: self.pool.clone(),
             object_names,
             allowed_references,
+            overridden_ids,
             mask_size: self.mask_size,
             soft_key_size: self.soft_key_size,
             soft_key_layout: self.soft_key_layout,
             vt_version: self.vt_version,
+            object_id_ranges: self.object_id_ranges.clone(),
             components: self.components.clone(),
             graphics: self.graphics.clone(),
         }
@@ -755,6 +978,7 @@ impl EditorProject {
             soft_key_size: self.soft_key_size,
             vt_version: self.vt_version,
             soft_key_layout: self.soft_key_layout,
+            object_id_ranges: self.object_id_ranges.clone(),
         }
     }
 
@@ -763,6 +987,7 @@ impl EditorProject {
         self.soft_key_size = dimensions.soft_key_size;
         self.vt_version = dimensions.vt_version;
         self.soft_key_layout = dimensions.soft_key_layout;
+        self.object_id_ranges = dimensions.object_id_ranges;
         self.bump_revision();
         self.refresh_dirty();
     }
@@ -805,6 +1030,25 @@ impl EditorProject {
         vt_version: VtVersion,
         soft_key_layout: SoftKeyLayout,
     ) -> ComponentResult<()> {
+        self.set_project_configuration_with_id_ranges(
+            mask_size,
+            soft_key_size,
+            vt_version,
+            soft_key_layout,
+            self.object_id_ranges.clone(),
+        )
+    }
+
+    /// Apply project dimensions, target version, layout, and per-type ID
+    /// allocation ranges atomically as one undo action.
+    pub fn set_project_configuration_with_id_ranges(
+        &mut self,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+        vt_version: VtVersion,
+        soft_key_layout: SoftKeyLayout,
+        object_id_ranges: crate::ObjectIdRanges,
+    ) -> ComponentResult<()> {
         if !(2..=6).contains(&u8::from(vt_version)) {
             return Err(ComponentError::new(
                 "UNSUPPORTED_VT_VERSION",
@@ -820,12 +1064,16 @@ impl EditorProject {
         soft_key_layout
             .validate()
             .map_err(|message| ComponentError::new("INVALID_SOFT_KEY_LAYOUT", message))?;
+        object_id_ranges
+            .validate(vt_version)
+            .map_err(|message| ComponentError::new("INVALID_OBJECT_ID_RANGES", message))?;
         let before = self.dimensions();
         let after = DesignDimensions {
             mask_size,
             soft_key_size,
             vt_version,
             soft_key_layout,
+            object_id_ranges,
         };
         if before == after {
             return Ok(());
@@ -869,7 +1117,7 @@ impl EditorProject {
         }
         let transaction_id = uuid::Uuid::new_v4().to_string();
         self.dimension_history
-            .insert(transaction_id.clone(), (before, after));
+            .insert(transaction_id.clone(), (before, after.clone()));
         self.operation_history
             .borrow_mut()
             .push(AppliedTransaction {
@@ -982,12 +1230,12 @@ impl EditorProject {
     /// creation is immediately undoable and does not depend on the end-of-frame
     /// draft diff finding the new object again.
     pub fn create_object(&mut self, object_type: ObjectType, name: String) -> Option<ObjectId> {
-        let object_id = self.allocate_object_id();
+        let object_id = self.allocate_object_id(object_type).ok()?;
         let transaction = OperationTransaction {
             schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
             description: Some(format!("Create {object_type:?}")),
             operations: vec![Operation::CreateObject {
-                object_id: Some(object_id.value()),
+                object_id: None,
                 object_type,
                 name,
             }],
@@ -1283,6 +1531,12 @@ impl EditorProject {
         // Generate names for remaining objects without recounting the whole map.
         for object in self.pool.objects() {
             let object_type = object.object_type();
+            if object_info
+                .get(&object.id())
+                .is_some_and(|info| info.name.is_some())
+            {
+                continue;
+            }
             let new_name = smart_naming::generate_smart_name_from_count(
                 object_type,
                 &existing_names,
@@ -1363,7 +1617,7 @@ impl EditorProject {
             self.selected_object.0
         };
 
-        let mut project = ProjectFile::new_with_soft_key_layout(
+        let mut project = ProjectFile::new_with_id_ranges(
             &self.pool,
             &object_info,
             self.mask_size,
@@ -1371,6 +1625,7 @@ impl EditorProject {
             self.soft_key_layout,
             self.vt_version,
             selected,
+            self.object_id_ranges.clone(),
         )?;
         project.components = self.components.clone();
         project.graphics = self.graphics.clone();
@@ -1427,6 +1682,7 @@ impl EditorProject {
         }
         editor_project.soft_key_layout = settings.soft_key_layout;
         editor_project.vt_version = settings.vt_version();
+        editor_project.object_id_ranges = settings.object_id_ranges.clone();
 
         // Restore object metadata
         let metadata = project.get_metadata();
@@ -1442,6 +1698,7 @@ impl EditorProject {
                 info.description = meta.description.clone();
                 info.tags = meta.tags.clone();
                 info.allowed_references = meta.allowed_references.clone();
+                info.id_overridden = meta.id_overridden;
             }
         }
         drop(object_info);
@@ -1556,18 +1813,36 @@ impl EditorProject {
                 recovered.push(asset);
             }
         }
-        let before = (!recovered.is_empty()).then(|| self.component_checkpoint());
+        let id_remap = crate::id_reassignment::compose_id_mappings(&applied.forward_operations);
+        let before =
+            (!recovered.is_empty() || !id_remap.is_empty()).then(|| self.component_checkpoint());
 
-        // Replace pool and metadata with results
-        self.pool = modified_pool;
+        if !id_remap.is_empty() {
+            crate::id_reassignment::remap_component_source(
+                &mut self.components,
+                &id_remap,
+                &self.pool,
+                self.vt_version,
+            )
+            .expect("prepared component ID remap must remain valid");
+            let map: HashMap<_, _> = id_remap.iter().copied().collect();
+            let old_bindings = std::mem::take(&mut self.graphics.legacy_bindings);
+            self.graphics.legacy_bindings = old_bindings
+                .into_iter()
+                .map(|(id, binding)| (map.get(&id).copied().unwrap_or(id), binding))
+                .collect();
+        }
         for asset in recovered {
             self.graphics.assets.insert(asset.id, asset);
         }
 
+        // Replace pool and metadata with results after component Macro streams
+        // have been resolved against the original identities.
+        self.pool = modified_pool;
+
         self.object_info.replace(modified_object_info);
         self.mut_object_info
             .replace(self.object_info.borrow().clone());
-        self.update_next_available_id();
         self.default_object_names.borrow_mut().clear();
         self.remap_selection_for_operations(&applied.forward_operations);
 
@@ -1594,34 +1869,160 @@ impl EditorProject {
         transaction: &OperationTransaction,
     ) -> Result<PreparedTransaction, TransactionDiagnostics> {
         let mut transaction = transaction.clone();
-        let mut reserved: std::collections::BTreeSet<u16> = self
-            .pool
-            .objects()
-            .iter()
-            .map(|o| o.id().value())
-            .chain(
-                self.components
+        for operation in &transaction.operations {
+            if let Operation::RemapObjectIds { mappings, .. } = operation {
+                let compiled: HashSet<_> = self
+                    .components
                     .instances
                     .iter()
-                    .flat_map(|i| i.compiled_ids.values().copied()),
-            )
-            .collect();
+                    .flat_map(|instance| instance.compiled_ids.values().copied())
+                    .collect();
+                if let Some((old_id, _)) = mappings.iter().find(|(old_id, _)| {
+                    ObjectId::new(*old_id)
+                        .ok()
+                        .is_none_or(|id| self.pool.object_by_id(id).is_none())
+                        && !compiled.contains(old_id)
+                }) {
+                    return Err(component_transaction_error(ComponentError::new(
+                        "OBJECT_NOT_FOUND",
+                        format!("Object ID {old_id} is no longer present"),
+                    )));
+                }
+            }
+        }
+        let mut reserved = self.reserved_object_ids();
+        // Reserve explicit operation IDs before choosing any automatic IDs, so
+        // a preceding automatic create cannot consume a later explicit ID.
+        reserved.extend(
+            transaction
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::CreateObject {
+                        object_id: Some(id),
+                        ..
+                    } => Some(*id),
+                    _ => None,
+                }),
+        );
+        let mut create_id_overrides = HashMap::new();
         for operation in &mut transaction.operations {
-            if let Operation::CreateObject { object_id, .. } = operation {
+            if let Operation::CreateObject {
+                object_id,
+                object_type,
+                ..
+            } = operation
+            {
+                let explicit = object_id.is_some();
                 if object_id.is_none() {
-                    *object_id = crate::operations::operation::first_available_object_id(|id| {
-                        reserved.contains(&id)
-                    });
+                    let range = self.object_id_ranges.range_for(*object_type);
+                    *object_id = (range.start..=range.end).find(|id| !reserved.contains(id));
                     if object_id.is_none() {
                         return Err(component_transaction_error(ComponentError::new(
-                            "COMPONENT_COMPILED_ID_COLLISION",
-                            "VT ID space exhausted",
+                            "OBJECT_ID_RANGE_EXHAUSTED",
+                            ObjectIdAllocationError {
+                                object_type: *object_type,
+                                range,
+                            }
+                            .to_string(),
                         )));
                     }
                 }
-                reserved.insert(object_id.unwrap());
+                let object_id = object_id.unwrap();
+                create_id_overrides.insert(object_id, explicit);
+                reserved.insert(object_id);
             }
         }
+        let mut normalized_operations = Vec::with_capacity(transaction.operations.len());
+        for operation in std::mem::take(&mut transaction.operations) {
+            let auto_assigned = match &operation {
+                Operation::CreateObject {
+                    object_id: Some(id),
+                    ..
+                } => create_id_overrides.get(id) == Some(&false),
+                _ => false,
+            };
+            let assigned_id = match &operation {
+                Operation::CreateObject {
+                    object_id: Some(id),
+                    ..
+                } if auto_assigned => Some(*id),
+                _ => None,
+            };
+            normalized_operations.push(operation);
+            if let Some(id) = assigned_id {
+                normalized_operations.push(Operation::SetObjectIdAssignment {
+                    object_id: id,
+                    new_id: id,
+                    overridden: false,
+                });
+            }
+        }
+        // Supply authoritative compiled object types to individual remaps too.
+        // Keep identity changes sequential across the transaction and simultaneous
+        // within each batch, including when command values target component nodes.
+        let mut target_types: HashMap<u16, ObjectType> = self
+            .pool
+            .objects()
+            .iter()
+            .map(|object| (object.id().value(), object.object_type()))
+            .collect();
+        for instance in &self.components.instances {
+            if let Some(definition) = self.components.definitions.get(&instance.component_id) {
+                for node in &definition.nodes {
+                    if let Some(id) = instance.compiled_ids.get(&node.id) {
+                        target_types.insert(*id, node.object_type);
+                    }
+                }
+            }
+        }
+        let mut identity_operations = Vec::with_capacity(normalized_operations.len());
+        for operation in normalized_operations {
+            let (mappings, assignment) = match &operation {
+                Operation::ChangeObjectId { old_id, new_id } if old_id != new_id => {
+                    (vec![(*old_id, *new_id)], None)
+                }
+                Operation::SetObjectIdAssignment {
+                    object_id,
+                    new_id,
+                    overridden,
+                } if object_id != new_id => {
+                    (vec![(*object_id, *new_id)], Some((*new_id, *overridden)))
+                }
+                Operation::RemapObjectIds { mappings, .. } => (mappings.clone(), None),
+                _ => (vec![], None),
+            };
+            if mappings.is_empty() {
+                if let Operation::CreateObject {
+                    object_id: Some(id),
+                    object_type,
+                    ..
+                } = &operation
+                {
+                    target_types.insert(*id, *object_type);
+                }
+                identity_operations.push(operation);
+            } else {
+                let types = target_types.iter().map(|(id, ty)| (*id, *ty)).collect();
+                identity_operations.push(Operation::RemapObjectIds {
+                    mappings: mappings.clone(),
+                    target_types: types,
+                });
+                let map: HashMap<_, _> = mappings.into_iter().collect();
+                target_types = target_types
+                    .into_iter()
+                    .map(|(id, ty)| (map.get(&id).copied().unwrap_or(id), ty))
+                    .collect();
+                if let Some((id, overridden)) = assignment {
+                    identity_operations.push(Operation::SetObjectIdAssignment {
+                        object_id: id,
+                        new_id: id,
+                        overridden,
+                    });
+                }
+            }
+        }
+        transaction.operations = identity_operations;
         let prepared = OperationExecutor::new().prepare_transaction_with_soft_key_size(
             &self.pool,
             &self.object_info.borrow(),
@@ -1632,12 +2033,26 @@ impl EditorProject {
             },
             self.soft_key_size,
         )?;
+        let mut candidate_components = self.components.clone();
+        let id_changes = crate::id_reassignment::compose_id_mappings(&transaction.operations);
+        if !id_changes.is_empty() {
+            crate::id_reassignment::remap_component_source(
+                &mut candidate_components,
+                &id_changes,
+                &self.pool,
+                self.vt_version,
+            )
+            .map_err(|error| {
+                component_transaction_error(ComponentError::new("COMPONENT_ID_REMAP", error))
+            })?;
+        }
         let candidate = materialize_source_with_graphics(
             &prepared.pool,
-            &self.components,
+            &candidate_components,
             self.vt_version,
             &prepared.object_info,
             &self.graphics,
+            &self.object_id_ranges,
         )
         .map_err(component_transaction_error)?;
         let baseline_materialized = self.materialize_shared().ok();
@@ -1645,14 +2060,6 @@ impl EditorProject {
             .as_ref()
             .map(|m| &m.pool)
             .unwrap_or(&self.pool);
-        let id_changes: Vec<_> = transaction
-            .operations
-            .iter()
-            .filter_map(|operation| match operation {
-                Operation::ChangeObjectId { old_id, new_id } => Some((*old_id, *new_id)),
-                _ => None,
-            })
-            .collect();
         let mut baseline_diagnostics = self
             .compatibility_diagnostics_from_pool(baseline)
             .map_err(component_transaction_error)?;
@@ -1662,6 +2069,7 @@ impl EditorProject {
         );
         let mut candidate_project = self.canvas_preview_copy();
         candidate_project.pool = prepared.pool.clone();
+        candidate_project.components = candidate_components;
         candidate_project
             .object_info
             .replace(prepared.object_info.clone());
@@ -1711,7 +2119,7 @@ impl EditorProject {
             if let Some((before, _)) = self
                 .dimension_history
                 .get(&applied_tx.transaction_id)
-                .copied()
+                .cloned()
             {
                 drop(history);
                 self.restore_dimensions(before);
@@ -1752,7 +2160,6 @@ impl EditorProject {
             self.object_info.replace(object_info);
             self.mut_object_info
                 .replace(self.object_info.borrow().clone());
-            self.update_next_available_id();
             self.default_object_names.borrow_mut().clear();
             drop(history);
             self.remap_selection_for_operations(&inverse_tx.operations);
@@ -1773,7 +2180,7 @@ impl EditorProject {
             if let Some((_, after)) = self
                 .dimension_history
                 .get(&applied_tx.transaction_id)
-                .copied()
+                .cloned()
             {
                 drop(history);
                 self.restore_dimensions(after);
@@ -1811,7 +2218,6 @@ impl EditorProject {
             self.object_info.replace(object_info);
             self.mut_object_info
                 .replace(self.object_info.borrow().clone());
-            self.update_next_available_id();
             self.default_object_names.borrow_mut().clear();
             drop(history);
             self.remap_selection_for_operations(&applied_tx.forward_operations);
@@ -1824,13 +2230,27 @@ impl EditorProject {
 
     fn remap_selection_for_operations(&mut self, operations: &[Operation]) {
         for operation in operations {
-            if let Operation::ChangeObjectId { old_id, new_id } = operation {
-                if self.selected_object.0.map(|id| id.value()) == Some(*old_id) {
-                    let selected = NullableObjectId::new(*new_id);
-                    self.selected_object = selected;
-                    self.pending_selected_object.set(selected);
-                }
-            }
+            let mappings: Vec<_> = match operation {
+                Operation::ChangeObjectId { old_id, new_id }
+                | Operation::SetObjectIdAssignment {
+                    object_id: old_id,
+                    new_id,
+                    ..
+                } => vec![(*old_id, *new_id)],
+                Operation::RemapObjectIds { mappings, .. } => mappings.clone(),
+                _ => continue,
+            };
+            let map_selection = |selection: NullableObjectId| {
+                selection.0.map_or(selection, |id| {
+                    mappings
+                        .iter()
+                        .find(|(old_id, _)| *old_id == id.value())
+                        .map_or(selection, |(_, new_id)| NullableObjectId::new(*new_id))
+                })
+            };
+            self.selected_object = map_selection(self.selected_object);
+            self.pending_selected_object
+                .set(map_selection(self.pending_selected_object.get()));
         }
     }
 
@@ -1851,6 +2271,7 @@ impl EditorProject {
             mask_size: self.mask_size,
             soft_key_size: self.soft_key_size,
             soft_key_layout: self.soft_key_layout,
+            object_id_ranges: self.object_id_ranges.clone(),
             selected: self.selected_object.0,
         }
     }
@@ -2288,6 +2709,7 @@ mod tests {
                 soft_key_size: (80, 96),
                 vt_version: VtVersion::Version6,
                 soft_key_layout: layout,
+                object_id_ranges: crate::ObjectIdRanges::defaults(),
             }
         );
         let saved = project.save_project().unwrap();
@@ -2353,11 +2775,31 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("soft_key_size");
+        legacy["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("object_id_ranges");
+        for metadata in legacy["object_metadata"]
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            metadata.as_object_mut().unwrap().remove("id_overridden");
+        }
         legacy["settings"]["mask_size"] = serde_json::json!(240);
         let restored = EditorProject::load_project(serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert_eq!(restored.mask_size, 240);
         assert_eq!(restored.soft_key_size(), (90, 110));
         assert_eq!(restored.soft_key_layout(), SoftKeyLayout::default());
+        assert_eq!(
+            restored.object_id_ranges(),
+            &crate::ObjectIdRanges::defaults()
+        );
+        assert!(restored
+            .get_pool()
+            .object_by_id(ObjectId::new(10).unwrap())
+            .is_some());
+        assert!(!restored.object_id_is_overridden(ObjectId::new(10).unwrap()));
         assert!(!restored.is_dirty());
     }
 
@@ -2368,6 +2810,124 @@ mod tests {
         assert!(project.is_dirty());
         project.mark_saved();
         assert!(!project.is_dirty());
+    }
+
+    #[test]
+    fn type_ranges_allocate_independently_persist_and_undo_without_renumbering() {
+        let button = object_with_id(ObjectType::Button, 6000);
+        let mut pool = ObjectPool::default();
+        pool.add(button.clone());
+        let mut project = EditorProject::from(pool);
+        project.mark_saved();
+
+        assert_eq!(
+            project
+                .allocate_object_id(ObjectType::Macro)
+                .unwrap()
+                .value(),
+            0
+        );
+        assert_eq!(
+            project
+                .allocate_object_id(ObjectType::Button)
+                .unwrap()
+                .value(),
+            6001
+        );
+        assert!(project.set_object_id_overridden(button.id(), true));
+        let mut ranges = project.object_id_ranges().clone();
+        ranges.set_range(
+            ObjectType::Button,
+            crate::ObjectIdRange {
+                start: 6100,
+                end: 6199,
+            },
+        );
+        project.set_object_id_ranges(ranges.clone()).unwrap();
+        assert_eq!(
+            project.get_pool().object_by_id(button.id()).unwrap().id(),
+            button.id()
+        );
+
+        let saved = project.save_project().unwrap();
+        let loaded = EditorProject::load_project(saved).unwrap();
+        assert_eq!(loaded.object_id_ranges(), &ranges);
+        assert!(loaded.object_id_is_overridden(button.id()));
+        assert_eq!(
+            loaded.get_pool().object_by_id(button.id()).unwrap().id(),
+            button.id()
+        );
+
+        assert!(project.undo_operation());
+        assert_eq!(
+            project.object_id_ranges(),
+            &crate::ObjectIdRanges::defaults()
+        );
+        assert_eq!(
+            project.get_pool().object_by_id(button.id()).unwrap().id(),
+            button.id()
+        );
+        assert!(project.redo_operation());
+        assert_eq!(project.object_id_ranges(), &ranges);
+        assert!(project.set_object_id_overridden(button.id(), false));
+        assert!(!project.object_id_is_overridden(button.id()));
+        assert!(project.undo_operation());
+        assert!(project.object_id_is_overridden(button.id()));
+        assert!(project.redo_operation());
+        assert!(!project.object_id_is_overridden(button.id()));
+    }
+
+    #[test]
+    fn allocator_reports_type_range_exhaustion() {
+        let button = object_with_id(ObjectType::Button, 6000);
+        let mut pool = ObjectPool::default();
+        pool.add(button);
+        let mut project = EditorProject::from(pool);
+        let mut ranges = project.object_id_ranges().clone();
+        ranges.set_range(
+            ObjectType::Button,
+            crate::ObjectIdRange {
+                start: 6000,
+                end: 6000,
+            },
+        );
+        project.set_object_id_ranges(ranges).unwrap();
+        let error = project.allocate_object_id(ObjectType::Button).unwrap_err();
+        assert_eq!(error.object_type, ObjectType::Button);
+        assert_eq!(error.range.start, 6000);
+        assert!(error.to_string().contains("No free Button object ID"));
+    }
+
+    #[test]
+    fn automatic_create_stays_unoverridden_through_redo() {
+        let mut project = EditorProject::new_pool();
+        let id = project
+            .create_object(ObjectType::Button, "Button test".into())
+            .unwrap();
+        assert!(!project.object_id_is_overridden(id));
+        assert!(project.undo_operation());
+        assert!(project.redo_operation());
+        assert!(!project.object_id_is_overridden(id));
+    }
+
+    #[test]
+    fn allocator_reserves_ids_for_queued_automatic_creates() {
+        let mut project = EditorProject::new_pool();
+        project.queue_operation(Operation::CreateObject {
+            object_id: None,
+            object_type: ObjectType::Button,
+            name: "Queued button".into(),
+        });
+        assert_eq!(
+            project
+                .allocate_object_id(ObjectType::Button)
+                .unwrap()
+                .value(),
+            6001
+        );
+        assert!(project.commit_queued("Create queued button"));
+        let next = project.allocate_object_id(ObjectType::Button).unwrap();
+        assert_eq!(next.value(), 6001);
     }
 
     fn object_with_id(object_type: ObjectType, id: u16) -> Object {
@@ -2615,6 +3175,84 @@ mod tests {
         assert!(project.redo_operation());
         assert!(project.get_pool().object_by_id(new_id).is_some());
         assert_eq!(project.get_selected(), NullableObjectId::new(30));
+    }
+
+    #[test]
+    fn simultaneous_id_swap_updates_selection_once_and_round_trips_history() {
+        let first = object_with_id(ObjectType::NumberVariable, 10);
+        let second = object_with_id(ObjectType::NumberVariable, 20);
+        let mut pool = ObjectPool::default();
+        pool.add(first);
+        pool.add(second);
+        let mut project = EditorProject::from(pool);
+        project
+            .get_mut_selected()
+            .replace(NullableObjectId::new(10));
+        project.update_selected();
+
+        project
+            .execute_transaction(OperationTransaction {
+                schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+                description: Some("Swap IDs".into()),
+                operations: vec![Operation::RemapObjectIds {
+                    mappings: vec![(10, 20), (20, 10)],
+                    target_types: vec![
+                        (10, ObjectType::NumberVariable),
+                        (20, ObjectType::NumberVariable),
+                    ],
+                }],
+            })
+            .unwrap();
+        assert!(project
+            .get_pool()
+            .object_by_id(ObjectId::new(10).unwrap())
+            .is_some());
+        assert!(project
+            .get_pool()
+            .object_by_id(ObjectId::new(20).unwrap())
+            .is_some());
+        assert_eq!(project.get_selected(), NullableObjectId::new(20));
+
+        assert!(project.undo_operation());
+        assert_eq!(project.get_selected(), NullableObjectId::new(10));
+        assert!(project.redo_operation());
+        assert_eq!(project.get_selected(), NullableObjectId::new(20));
+    }
+
+    #[test]
+    fn reassignment_preview_rejects_malformed_macro_without_mutation() {
+        let button = object_with_id(ObjectType::Button, 10);
+        let mut macro_object = object_with_id(ObjectType::Macro, 11);
+        if let Object::Macro(macro_object) = &mut macro_object {
+            macro_object.commands = vec![0xFF];
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(button);
+        pool.add(macro_object);
+        let mut project = EditorProject::from(pool);
+        let before = project.get_pool().as_iop();
+
+        assert!(project.plan_id_reassignment(false).is_err());
+        assert_eq!(project.get_pool().as_iop(), before);
+        assert!(!project.undo_available());
+    }
+
+    #[test]
+    fn object_id_override_flag_is_persisted_and_undoable() {
+        let object = object_with_id(ObjectType::Button, 10);
+        let mut pool = ObjectPool::default();
+        pool.add(object.clone());
+        let mut project = EditorProject::from(pool);
+        assert!(project.set_object_id_overridden(object.id(), true));
+        assert!(project.object_id_is_overridden(object.id()));
+        assert!(project.undo_operation());
+        assert!(!project.object_id_is_overridden(object.id()));
+        assert!(project.redo_operation());
+        assert!(project.object_id_is_overridden(object.id()));
+
+        let saved = project.save_project().unwrap();
+        let restored = EditorProject::load_project(saved).unwrap();
+        assert!(restored.object_id_is_overridden(object.id()));
     }
 
     #[test]

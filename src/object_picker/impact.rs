@@ -73,12 +73,7 @@ fn prepare_comparison(
                 .object_by_id(id)
                 .or_else(|| before.object_by_id(id))
                 .unwrap();
-            let label = format!(
-                "{} (#{} · {:?})",
-                candidate.object_display_name(object),
-                candidate.format_object_id(value),
-                object.object_type()
-            );
+            let label = candidate.object_display_name(object);
             (id, label)
         })
         .collect();

@@ -24,27 +24,31 @@ pub struct ObjectInfo {
 
     /// Ordered editor-only targets for an ObjectPointer. Empty means unrestricted.
     pub allowed_references: Vec<ObjectId>,
+
+    /// True when the user explicitly assigned this object's current ID.
+    /// This is authoring metadata and is not serialized into the object pool.
+    pub id_overridden: bool,
 }
 
 impl ObjectInfo {
-    pub fn new(object: &Object) -> Self {
+    pub fn new(_object: &Object) -> Self {
         ObjectInfo {
             unique_id: Uuid::new_v4(),
             name: None,
             description: None,
             tags: vec![],
             allowed_references: vec![],
+            id_overridden: false,
         }
     }
 
-    /// Get the name of the object.
-    /// If the object has no name, a default name is generated.
-    /// Default Format: "{object_id}: {object_type}"
+    /// Return the authoring name, falling back to the object type for metadata
+    /// that has not yet received a generated name. Names never depend on IDs.
     pub fn get_name(&self, object: &Object) -> String {
         if let Some(ref n) = self.name {
             n.clone()
         } else {
-            format!("{:?}: {:?}", u16::from(object.id()), object.object_type())
+            crate::smart_naming::get_object_type_name(object.object_type()).to_owned()
         }
     }
 
@@ -64,6 +68,7 @@ impl ObjectInfo {
             && self.description == other.description
             && self.tags == other.tags
             && self.allowed_references == other.allowed_references
+            && self.id_overridden == other.id_overridden
     }
 }
 

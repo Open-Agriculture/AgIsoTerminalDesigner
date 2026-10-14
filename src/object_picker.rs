@@ -153,19 +153,7 @@ pub fn object_label(project: &EditorProject, id: Option<ObjectId>) -> String {
         |id| {
             project.get_pool().object_by_id(id).map_or_else(
                 || format!("Missing object #{}", project.format_object_id(id.value())),
-                |object| {
-                    let name = project.object_display_name(object);
-                    if project.get_object_info(object).name.is_some() {
-                        format!(
-                            "{} (#{} · {:?})",
-                            name,
-                            project.format_object_id(id.value()),
-                            object.object_type()
-                        )
-                    } else {
-                        name
-                    }
-                },
+                |object| project.object_display_name(object),
             )
         },
     )
@@ -352,11 +340,7 @@ pub fn objects(
             if row(
                 ui,
                 &name,
-                &format!(
-                    "#{} · {:?}",
-                    project.format_object_id(object.id().value()),
-                    object.object_type()
-                ),
+                &format!("{:?}", object.object_type()),
                 selected == Some(object.id()),
                 |ui, rect| {
                     object_preview_with_version(
@@ -490,6 +474,17 @@ mod tests {
     #[test]
     fn name_and_id_search_respects_caller_eligibility() {
         let mut project = fixture();
+        assert_eq!(
+            object_label(&project, Some(ObjectId::new(12).unwrap())),
+            "Wide Button"
+        );
+        project.set_object_id_format(crate::ObjectIdFormat::Hexadecimal);
+        project.set_show_object_ids(true);
+        assert_eq!(
+            object_label(&project, Some(ObjectId::new(12).unwrap())),
+            "Wide Button (0x000C)"
+        );
+        project.set_show_object_ids(false);
         let ctx = egui::Context::default();
         use crate::ObjectIdFormat::{Decimal, Hexadecimal};
         for (format, query, pictures_only, expected, excluded) in [

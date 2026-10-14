@@ -90,16 +90,40 @@ they are not stored in `.aitp` projects. Invalid saved layouts fall back to defa
 Selected object rows have a continuous highlight spanning the tree width,
 including indentation, so the selection remains visible in deeply nested trees.
 
-View → Object IDs and Project Settings → Authoring edit the same application
-preference. Decimal is the default; hexadecimal displays IDs as `0x00AF`.
-Labels, reference selectors, ID search and editable ID fields use the selected
-format. Unprefixed numeric ID input uses the selected radix; `0x` or `0X` always
-means hexadecimal. Existing ID uniqueness, range and null-reference rules still
-apply. Explicit object names, generated names, serialized IDs and exports are unchanged.
+View → Object IDs and Project Settings → Authoring control whether numeric IDs
+appear alongside object names. IDs are hidden by default. The decimal or
+hexadecimal preference controls their display; hexadecimal displays IDs as
+`0x00AF`. Labels, reference selectors, ID search and editable ID fields use the
+selected format. Unprefixed numeric ID input uses the selected radix; `0x` or
+`0X` always means hexadecimal. Existing ID uniqueness, range and null-reference
+rules still apply. Explicit object names, generated names, serialized IDs and
+exports are unchanged.
 
-Theme, workspace layout and ID format persist locally across restarts and project
-changes. They do not dirty a project or enter its undo history. Canvas zoom, pan
-and snapping retain their existing controls.
+Automatic ID ranges are project settings. Every object type has an inclusive
+range within `0–65534`, and ranges cannot overlap. Defaults assign each ordinary
+type its type-number block (`type × 1000` through `+999`), Working Set objects
+`256–999`, and macros `0–255`. VT2–VT4 projects keep macro IDs within `0–255`;
+VT5 and later projects may configure a larger macro range. Applying range edits
+validates them with the other project settings and records one undoable change.
+Changing a range affects future automatic assignments and never renumbers
+existing objects. Reset to defaults replaces the draft ranges; Cancel discards
+them.
+
+The object inspector shows the assigned ID separately from its name. **Override
+ID** permits an unused ID outside the automatic range, subject to the target VT
+version. **Use automatic ID** chooses a fresh free ID in the type's range.
+Overrides persist in the project and participate in undo/redo.
+
+**Reassign object IDs…** previews names, old/new IDs and preserved overrides,
+including compiled component nodes. Manual overrides are preserved unless
+explicitly included. Errors in allocation, references or macro packets block
+reassignment before mutation. Applying a valid preview updates references in one
+undoable change. Regenerate external ECU ID headers after reassignment.
+
+Theme, workspace layout, ID format and the Show object IDs preference persist
+locally across restarts and project changes. They do not dirty a project or
+enter its undo history. Canvas zoom, pan and snapping retain their existing
+controls.
 
 ## Planned configuration
 
@@ -110,7 +134,7 @@ explanations. They do not have serialized configuration or affect the object poo
 | --- | --- | --- |
 | Compatibility | Colour capability, supported fonts/styles, input capabilities, terminal object support | Terminal capability profiles |
 | Languages | Supported/default languages, translation resources | Language resource management and variant generation |
-| Authoring | ID allocation ranges, naming conventions | Configurable allocation and naming policies |
+| Authoring | Naming conventions | Configurable naming policies |
 | Export | Export groups, language variants, generated-code options | Export profiles and variant/code generation |
 | Shared resources | Colour styles, font presets, reusable graphic defaults | Project-wide resource defaults and styles |
 

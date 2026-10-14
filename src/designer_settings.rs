@@ -1,7 +1,9 @@
 //! Application preferences and the project settings window.
 
-use ag_iso_stack::object_pool::vt_version::VtVersion;
-use ag_iso_terminal_designer::{EditorProject, ObjectIdFormat, SoftKeyArrangement, SoftKeyLayout};
+use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectType};
+use ag_iso_terminal_designer::{
+    EditorProject, ObjectIdFormat, ObjectIdRanges, SoftKeyArrangement, SoftKeyLayout,
+};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +18,8 @@ pub struct AppPreferences {
     pub show_components: bool,
     pub show_properties: bool,
     pub show_ancestry: bool,
+    /// Show numeric IDs alongside object names in authoring labels.
+    pub show_object_ids: bool,
     #[cfg(not(target_arch = "wasm32"))]
     pub show_proposal: bool,
     pub object_id_format: ObjectIdFormat,
@@ -30,6 +34,7 @@ impl Default for AppPreferences {
             show_components: true,
             show_properties: true,
             show_ancestry: true,
+            show_object_ids: false,
             #[cfg(not(target_arch = "wasm32"))]
             show_proposal: true,
             object_id_format: ObjectIdFormat::Decimal,
@@ -43,13 +48,14 @@ impl AppPreferences {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DimensionsDraft {
     pub mask: u16,
     pub soft_key_width: u16,
     pub soft_key_height: u16,
     pub vt_version: VtVersion,
     pub soft_key_layout: SoftKeyLayout,
+    pub object_id_ranges: ObjectIdRanges,
 }
 
 impl DimensionsDraft {
@@ -61,6 +67,7 @@ impl DimensionsDraft {
             soft_key_height,
             vt_version: project.vt_version(),
             soft_key_layout: project.soft_key_layout(),
+            object_id_ranges: project.object_id_ranges().clone(),
         }
     }
 }
@@ -209,12 +216,42 @@ pub fn show_project_settings(
                         });
                 });
                 ui.small("Application preference shared with View → Object IDs.");
-                ui.add_enabled_ui(false, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("ID allocation ranges");
-                        ui.add_enabled(false, egui::Button::new("Configure…"));
-                        ui.label("Not configured");
+                ui.checkbox(&mut preferences.show_object_ids, "Show object IDs");
+                ui.small("Append each assigned ID to object names in trees, lists, and pickers.");
+                ag_iso_terminal_designer::ui_style::section_heading(ui, "Automatic ID ranges");
+                ui.horizontal(|ui| {
+                    ui.label("Inclusive ranges by object type");
+                    if ui.button("Reset to defaults").clicked() {
+                        values.object_id_ranges = ObjectIdRanges::defaults();
+                    }
+                });
+                egui::Grid::new("project_object_id_ranges")
+                    .num_columns(3)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Object type");
+                        ui.strong("First ID");
+                        ui.strong("Last ID");
+                        ui.end_row();
+                        for object_type in ObjectType::values() {
+                            let mut range = values.object_id_ranges.range_for(object_type);
+                            ui.label(format!("{object_type:?}"));
+                            ui.add(egui::DragValue::new(&mut range.start).range(0..=65534));
+                            ui.add(egui::DragValue::new(&mut range.end).range(0..=65534));
+                            values.object_id_ranges.set_range(object_type, range);
+                            ui.end_row();
+                        }
                     });
+                match values.object_id_ranges.validate(values.vt_version) {
+                    Ok(()) => {
+                        ui.small("Ranges are inclusive, unique across types, and exclude reserved ID 65535. VT2–VT4 macro ranges must stay within 0–255.");
+                    }
+                    Err(error) => {
+                        ui.colored_label(ag_iso_terminal_designer::ui_style::palette(ui).error, error);
+                    }
+                }
+                ui.small("Changing ranges affects future automatic assignments. Existing IDs are preserved.");
+                ui.add_enabled_ui(false, |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Naming conventions");
                         ui.add_enabled(false, egui::Button::new("Configure…"));
@@ -267,11 +304,12 @@ pub fn show_project_settings(
             if values.mask == 0 || values.soft_key_width == 0 || values.soft_key_height == 0 {
                 *error_message = Some("Project dimensions must be positive.".into());
                 *draft = Some(values);
-            } else if let Err(error) = project.set_project_configuration(
+            } else if let Err(error) = project.set_project_configuration_with_id_ranges(
                 values.mask,
                 (values.soft_key_width, values.soft_key_height),
                 values.vt_version,
                 values.soft_key_layout,
+                values.object_id_ranges.clone(),
             ) {
                 *error_message = Some(error.to_string());
                 *draft = Some(values);

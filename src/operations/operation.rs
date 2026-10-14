@@ -79,6 +79,21 @@ pub enum Operation {
     /// Change an object's identity and rewrite every inbound reference.
     ChangeObjectId { old_id: u16, new_id: u16 },
 
+    /// Remap multiple object identities simultaneously. This supports swaps and
+    /// larger cycles without exposing temporary IDs to the pool.
+    RemapObjectIds {
+        mappings: Vec<(u16, u16)>,
+        #[serde(default)]
+        target_types: Vec<(u16, ObjectType)>,
+    },
+
+    /// Assign a specific ID and persist whether the assignment is manual.
+    SetObjectIdAssignment {
+        object_id: u16,
+        new_id: u16,
+        overridden: bool,
+    },
+
     /// Change serialization/display order without copying the object pool.
     ReorderObjects { object_ids: Vec<u16> },
 
@@ -208,6 +223,9 @@ pub struct OperationContext {
     pub affected_objects: HashSet<ObjectId>,
     /// Project VT version used for relationship validation.
     pub vt_version: VtVersion,
+    /// Default project ranges for direct executor use. EditorProject replaces
+    /// implicit IDs with reserved range-aware assignments before execution.
+    pub object_id_ranges: crate::ObjectIdRanges,
 }
 
 impl Default for OperationContext {
@@ -216,6 +234,7 @@ impl Default for OperationContext {
             inverse_operations: Vec::new(),
             affected_objects: HashSet::new(),
             vt_version: VtVersion::Version6,
+            object_id_ranges: crate::ObjectIdRanges::defaults(),
         }
     }
 }
@@ -385,11 +404,6 @@ fn target_list_from_resolved(objects: ObjectReferenceList) -> ObjectTargetList {
     }
 }
 
-/// Authoritative lowest-free allocator, shared with editor component reservations.
-pub fn first_available_object_id(mut occupied: impl FnMut(u16) -> bool) -> Option<u16> {
-    (1..u16::MAX).find(|id| !occupied(*id))
-}
-
 impl Operation {
     /// Apply this operation to working pool and metadata
     /// Returns the inverse operation
@@ -411,9 +425,14 @@ impl Operation {
                 let target_id = if let Some(id) = object_id {
                     ObjectId::new(*id).map_err(|_| OperationError::ObjectNotFound(*id))?
                 } else {
-                    first_available_object_id(|value| {
-                        pool.object_by_id(ObjectId::new(value).unwrap()).is_some()
-                    })
+                    {
+                        let range = context.object_id_ranges.range_for(*object_type);
+                        (range.start..=range.end).find(|value| {
+                            ObjectId::new(*value)
+                                .ok()
+                                .is_some_and(|id| pool.object_by_id(id).is_none())
+                        })
+                    }
                     .and_then(|value| ObjectId::new(value).ok())
                     .ok_or(OperationError::PropertyError {
                         object_id: 0,
@@ -452,6 +471,7 @@ impl Operation {
 
                 let mut info = ObjectInfo::new(&obj);
                 info.name = (!name.is_empty()).then(|| name.clone());
+                info.id_overridden = object_id.is_some();
                 object_info.insert(target_id, info);
 
                 // Inverse is DeleteObject without captured state (will be captured on re-deletion)
@@ -848,6 +868,13 @@ impl Operation {
                     return Err(OperationError::ObjectAlreadyExists(new_id.value()));
                 }
 
+                remap_macro_commands(
+                    pool,
+                    &HashMap::from([(old_id.value(), new_id.value())]),
+                    &[],
+                    context.vt_version,
+                )?;
+
                 for object in pool.objects_mut() {
                     let references_changed = replace_references(object, old_id, new_id)?;
                     if references_changed {
@@ -883,6 +910,131 @@ impl Operation {
                 Ok(Operation::ChangeObjectId {
                     old_id: new_id.value(),
                     new_id: old_id.value(),
+                })
+            }
+
+            Operation::RemapObjectIds {
+                mappings,
+                target_types,
+            } => {
+                let mut remap = HashMap::new();
+                let mut source_ids = HashSet::new();
+                let mut target_ids = HashSet::new();
+                let component_ids: HashSet<_> = target_types.iter().map(|(id, _)| *id).collect();
+                for (old, new) in mappings {
+                    let old_id =
+                        ObjectId::new(*old).map_err(|_| OperationError::ObjectNotFound(*old))?;
+                    ObjectId::new(*new).map_err(|_| OperationError::ObjectNotFound(*new))?;
+                    if old == new || !source_ids.insert(*old) || !target_ids.insert(*new) {
+                        return Err(OperationError::InvalidObjectOrder);
+                    }
+                    if pool.object_by_id(old_id).is_none() && !component_ids.contains(old) {
+                        return Err(OperationError::ObjectNotFound(*old));
+                    }
+                    remap.insert(old_id, ObjectId::new(*new).unwrap());
+                }
+                if mappings.is_empty()
+                    || target_ids.iter().any(|target| {
+                        ObjectId::new(*target)
+                            .ok()
+                            .is_some_and(|id| pool.object_by_id(id).is_some())
+                            && !source_ids.contains(target)
+                    })
+                {
+                    return Err(OperationError::InvalidObjectOrder);
+                }
+
+                remap_macro_commands(
+                    pool,
+                    &mappings.iter().copied().collect(),
+                    target_types,
+                    context.vt_version,
+                )?;
+
+                // Rewrite every reference from the original mapping in one pass,
+                // so swaps cannot cascade into a second mapping entry.
+                for object in pool.objects_mut() {
+                    let old_object_id = object.id();
+                    let references_changed = remap_references(object, &remap)?;
+                    if references_changed {
+                        context.affected_objects.insert(old_object_id);
+                    }
+                    if let Some(new_id) = remap.get(&old_object_id) {
+                        object.mut_id().set_value(new_id.value()).map_err(|error| {
+                            OperationError::PropertyError {
+                                object_id: old_object_id.value(),
+                                property: "id".into(),
+                                reason: format!("{error:?}"),
+                            }
+                        })?;
+                        context.affected_objects.insert(*new_id);
+                    }
+                }
+
+                let previous_info = std::mem::take(object_info);
+                for (id, mut info) in previous_info {
+                    for allowed in &mut info.allowed_references {
+                        if let Some(new_id) = remap.get(allowed) {
+                            *allowed = *new_id;
+                        }
+                    }
+                    let new_id = remap.get(&id).copied().unwrap_or(id);
+                    if new_id != id {
+                        context.affected_objects.insert(id);
+                        context.affected_objects.insert(new_id);
+                    }
+                    object_info.insert(new_id, info);
+                }
+                context.affected_objects.extend(remap.keys().copied());
+                context.affected_objects.extend(remap.values().copied());
+                let id_mapping: HashMap<_, _> = mappings.iter().copied().collect();
+                let inverse_target_types = target_types
+                    .iter()
+                    .map(|(id, object_type)| {
+                        (id_mapping.get(id).copied().unwrap_or(*id), *object_type)
+                    })
+                    .collect();
+                Ok(Operation::RemapObjectIds {
+                    mappings: mappings.iter().map(|(old, new)| (*new, *old)).collect(),
+                    target_types: inverse_target_types,
+                })
+            }
+
+            Operation::SetObjectIdAssignment {
+                object_id,
+                new_id,
+                overridden,
+            } => {
+                let old_id = ObjectId::new(*object_id)
+                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+                if pool.object_by_id(old_id).is_none() {
+                    return Err(OperationError::ObjectNotFound(*object_id));
+                }
+                ObjectId::new(*new_id).map_err(|_| OperationError::ObjectNotFound(*new_id))?;
+                let previous_override = object_info
+                    .get(&old_id)
+                    .is_some_and(|info| info.id_overridden);
+                if old_id.value() != *new_id {
+                    Operation::ChangeObjectId {
+                        old_id: old_id.value(),
+                        new_id: *new_id,
+                    }
+                    .apply(pool, object_info, context)?;
+                }
+                let assigned_id = ObjectId::new(*new_id).unwrap();
+                let assigned_object = pool
+                    .object_by_id(assigned_id)
+                    .ok_or(OperationError::ObjectNotFound(*new_id))?
+                    .clone();
+                let info = object_info
+                    .entry(assigned_id)
+                    .or_insert_with(|| ObjectInfo::new(&assigned_object));
+                info.id_overridden = *overridden;
+                context.affected_objects.insert(assigned_id);
+                Ok(Operation::SetObjectIdAssignment {
+                    object_id: *new_id,
+                    new_id: old_id.value(),
+                    overridden: previous_override,
                 })
             }
 
@@ -1507,21 +1659,77 @@ fn replace_references(
     old_id: ObjectId,
     new_id: ObjectId,
 ) -> Result<bool, OperationError> {
-    let mut changed = crate::object_properties::replace_object_reference(object, old_id, new_id)
-        .map_err(|error| OperationError::PropertyError {
+    remap_references(object, &HashMap::from([(old_id, new_id)]))
+}
+
+fn remap_macro_commands(
+    pool: &mut ObjectPool,
+    mapping: &HashMap<u16, u16>,
+    target_types: &[(u16, ObjectType)],
+    version: VtVersion,
+) -> Result<(), OperationError> {
+    if mapping.is_empty() {
+        return Ok(());
+    }
+    let mut object_types: HashMap<u16, ObjectType> = pool
+        .objects()
+        .iter()
+        .map(|object| (object.id().value(), object.object_type()))
+        .collect();
+    object_types.extend(target_types.iter().copied());
+    let mut commands = Vec::new();
+    for object in pool.objects() {
+        let Object::Macro(macro_object) = object else {
+            continue;
+        };
+        let remapped = crate::macro_id_remap::remap_macro_object_ids_checked(
+            &macro_object.commands,
+            mapping,
+            version,
+            &object_types,
+        )
+        .map_err(|reason| OperationError::PropertyError {
             object_id: object.id().value(),
-            property: "object reference".to_owned(),
-            reason: error.to_string(),
+            property: "commands".into(),
+            reason,
         })?;
+        if remapped != macro_object.commands {
+            commands.push((object.id(), remapped));
+        }
+    }
+    for (id, bytes) in commands {
+        if let Some(Object::Macro(macro_object)) = pool.object_mut_by_id(id) {
+            macro_object.commands = bytes;
+        }
+    }
+    Ok(())
+}
+
+fn remap_references(
+    object: &mut Object,
+    remap: &HashMap<ObjectId, ObjectId>,
+) -> Result<bool, OperationError> {
+    let mut changed =
+        crate::object_properties::remap_object_references(object, remap).map_err(|error| {
+            OperationError::PropertyError {
+                object_id: object.id().value(),
+                property: "object reference".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+
+    let update_id = |id: &mut ObjectId, changed: &mut bool| {
+        if let Some(new_id) = remap.get(id) {
+            *id = *new_id;
+            *changed = true;
+        }
+    };
 
     with_positioned_children!(
         object,
         value => {
             for child in &mut value.object_refs {
-                if child.id == old_id {
-                    child.id = new_id;
-                    changed = true;
-                }
+                update_id(&mut child.id, &mut changed);
             }
         },
         ()
@@ -1530,45 +1738,35 @@ fn replace_references(
     match object {
         Object::SoftKeyMask(value) => {
             for child in &mut value.objects {
-                if *child == old_id {
-                    *child = new_id;
-                    changed = true;
-                }
+                update_id(child, &mut changed);
             }
         }
         Object::KeyGroup(value) => {
             for child in &mut value.objects {
-                if *child == old_id {
-                    *child = new_id;
-                    changed = true;
-                }
+                update_id(child, &mut changed);
             }
         }
         Object::InputList(value) => {
-            replace_nullable_references(&mut value.list_items, old_id, new_id, &mut changed)
+            remap_nullable_references(&mut value.list_items, remap, &mut changed)
         }
         Object::OutputList(value) => {
-            replace_nullable_references(&mut value.list_items, old_id, new_id, &mut changed)
+            remap_nullable_references(&mut value.list_items, remap, &mut changed)
         }
         Object::WindowMask(value) => {
-            replace_nullable_references(&mut value.objects, old_id, new_id, &mut changed)
+            remap_nullable_references(&mut value.objects, remap, &mut changed)
         }
         Object::ExternalObjectDefinition(value) => {
-            replace_nullable_references(&mut value.objects, old_id, new_id, &mut changed)
+            remap_nullable_references(&mut value.objects, remap, &mut changed)
         }
         Object::ObjectLabelReferenceList(value) => {
             for label in &mut value.object_labels {
-                if label.id == old_id {
-                    label.id = new_id;
-                    changed = true;
-                }
+                update_id(&mut label.id, &mut changed);
                 for reference in [
                     &mut label.string_variable_reference,
                     &mut label.graphic_representation,
                 ] {
-                    if reference.0 == Some(old_id) {
-                        reference.0 = Some(new_id);
-                        changed = true;
+                    if let Some(id) = &mut reference.0 {
+                        update_id(id, &mut changed);
                     }
                 }
             }
@@ -1580,7 +1778,8 @@ fn replace_references(
             object,
             value => {
                 for macro_ref in &mut value.macro_refs {
-                    if u16::from(macro_ref.macro_id) == old_id.value() {
+                    let old = u16::from(macro_ref.macro_id);
+                    if let Some(new_id) = ObjectId::new(old).ok().and_then(|id| remap.get(&id)) {
                         macro_ref.macro_id = new_id.value();
                         changed = true;
                     }
@@ -1592,16 +1791,17 @@ fn replace_references(
     Ok(changed)
 }
 
-fn replace_nullable_references(
+fn remap_nullable_references(
     references: &mut [NullableObjectId],
-    old_id: ObjectId,
-    new_id: ObjectId,
+    remap: &HashMap<ObjectId, ObjectId>,
     changed: &mut bool,
 ) {
     for reference in references {
-        if reference.0 == Some(old_id) {
-            reference.0 = Some(new_id);
-            *changed = true;
+        if let Some(id) = &mut reference.0 {
+            if let Some(new_id) = remap.get(id) {
+                *id = *new_id;
+                *changed = true;
+            }
         }
     }
 }

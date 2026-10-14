@@ -861,7 +861,8 @@ impl_properties! {
     ag_iso_stack::object_pool::object::ExternalObjectPointer {
         default_object_id => object_reference!(),
         external_reference_name_id => object_reference!(ExternalReferenceName),
-        external_object_id => object_reference!()
+        // Numeric identity in the external ECU's pool, not a local picker target.
+        external_object_id
     }
 }
 
@@ -1113,7 +1114,6 @@ pub(crate) fn replace_object_reference(
         ) {
             continue;
         }
-
         let value = dispatch_property!(object, get_property, descriptor.name)?;
         if value.is_null() {
             continue;
@@ -1125,6 +1125,48 @@ pub(crate) fn replace_object_reference(
             }
         })?;
         if reference_id == old_id {
+            dispatch_property!(
+                object,
+                set_property,
+                descriptor.name,
+                serde_json::to_value(new_id).map_err(|error| {
+                    PropertyAccessError::InvalidValue {
+                        property: descriptor.name,
+                        reason: error.to_string(),
+                    }
+                })?
+            )?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Remap all property-backed object references simultaneously. Structural
+/// reference collections are handled by the operations layer.
+pub(crate) fn remap_object_references(
+    object: &mut Object,
+    remap: &std::collections::HashMap<ObjectId, ObjectId>,
+) -> Result<bool, PropertyAccessError> {
+    let mut changed = false;
+    for descriptor in get_property_descriptors(object.object_type()) {
+        if !matches!(
+            &descriptor.semantic,
+            PropertySemantic::ObjectReference { .. }
+        ) {
+            continue;
+        }
+        let value = dispatch_property!(object, get_property, descriptor.name)?;
+        if value.is_null() {
+            continue;
+        }
+        let reference_id = serde_json::from_value::<ObjectId>(value).map_err(|error| {
+            PropertyAccessError::InvalidValue {
+                property: descriptor.name,
+                reason: error.to_string(),
+            }
+        })?;
+        if let Some(new_id) = remap.get(&reference_id) {
             dispatch_property!(
                 object,
                 set_property,

@@ -99,6 +99,7 @@ pub fn apply(
     }
     let mut touched = Vec::new();
     let vt_version = project.vt_version;
+    let id_ranges = project.object_id_ranges().clone();
     project
         .edit_source(description, |pool, source, _graphics, info| {
             // Placements refer to the batch's starting child indices. Apply
@@ -138,8 +139,9 @@ pub fn apply(
                         remove_target(pool, source, target, vt_version)?
                     }
                     CanvasEdit::Duplicate { target, x, y } => {
-                        let duplicate =
-                            duplicate_target(pool, source, info, target, *x, *y, vt_version)?;
+                        let duplicate = duplicate_target(
+                            pool, source, info, target, *x, *y, vt_version, &id_ranges,
+                        )?;
                         if let Some(index) = touched.iter().position(|existing| existing == target)
                         {
                             touched[index] = duplicate;
@@ -301,6 +303,7 @@ fn duplicate_target(
     x: i16,
     y: i16,
     vt_version: VtVersion,
+    id_ranges: &crate::ObjectIdRanges,
 ) -> ComponentResult<PlacementTarget> {
     match target {
         PlacementTarget::Component { instance_id } => {
@@ -352,12 +355,23 @@ fn duplicate_target(
             let mut context = OperationContext::default();
             let mut operation_info = HashMap::new();
             for old in &graph_ids {
-                let new = crate::operations::operation::first_available_object_id(|id| {
-                    reserved.contains(&id) || mapping.values().any(|mapped| *mapped == id)
-                })
-                .ok_or_else(|| {
-                    ComponentError::new("CANVAS_ID_EXHAUSTED", "No free VT object IDs remain")
-                })?;
+                let old_object = pool
+                    .object_by_id(object_id(*old)?)
+                    .ok_or_else(invalid_placement)?;
+                let object_type = old_object.object_type();
+                let range = id_ranges.range_for(object_type);
+                let new = (range.start..=range.end)
+                    .find(|id| {
+                        !reserved.contains(id) && !mapping.values().any(|mapped| mapped == id)
+                    })
+                    .ok_or_else(|| {
+                        ComponentError::new(
+                            "CANVAS_ID_RANGE_EXHAUSTED",
+                            format!(
+                                "No free {object_type:?} ID remains in configured range {range}"
+                            ),
+                        )
+                    })?;
                 Operation::ChangeObjectId {
                     old_id: *old,
                     new_id: new,
@@ -374,6 +388,9 @@ fn duplicate_target(
                     .object_by_id(new_object_id)
                     .ok_or_else(invalid_placement)?;
                 let mut metadata = ObjectInfo::new(copied_object);
+                // The duplicate receives an automatically allocated identity,
+                // regardless of whether its source ID was manually assigned.
+                metadata.id_overridden = false;
                 if let Some(original) = copied_info.get(&old_object_id) {
                     metadata.description = original.description.clone();
                     metadata.tags = original.tags.clone();
@@ -752,6 +769,7 @@ mod tests {
                 original.name = Some("control".to_owned());
                 original.description = Some("Reusable control".to_owned());
                 original.tags = vec!["input".to_owned()];
+                original.id_overridden = true;
                 info.insert(object_id(2)?, original);
                 let mut collision = ObjectInfo::new(pool.object_by_id(object_id(4)?).unwrap());
                 collision.name = Some("control copy".to_owned());
@@ -800,6 +818,7 @@ mod tests {
             Some("Reusable control")
         );
         assert_eq!(copied_metadata.tags, vec!["input"]);
+        assert!(!copied_metadata.id_overridden);
     }
 
     #[test]

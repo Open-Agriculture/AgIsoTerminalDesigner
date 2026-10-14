@@ -2,7 +2,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use crate::{ObjectInfo, SoftKeyLayout};
+use crate::{ObjectIdRanges, ObjectInfo, SoftKeyLayout};
 use ag_iso_stack::object_pool::{object::Object, vt_version::VtVersion, ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -55,6 +55,10 @@ pub struct ObjectMetadata {
     /// Ordered editor-only ObjectPointer targets; empty preserves unrestricted selection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_references: Vec<ObjectId>,
+
+    /// Whether this object keeps an explicitly assigned ID.
+    #[serde(default)]
+    pub id_overridden: bool,
 }
 
 /// Project-level settings
@@ -78,6 +82,11 @@ pub struct ProjectSettings {
 
     /// Last selected object ID
     pub last_selected: Option<u16>,
+
+    /// Inclusive per-type automatic ID allocation ranges. Missing in legacy
+    /// project files, which receive the current defaults without ID changes.
+    #[serde(default)]
+    pub object_id_ranges: ObjectIdRanges,
 }
 
 impl ProjectFile {
@@ -112,6 +121,35 @@ impl ProjectFile {
         vt_version: VtVersion,
         selected: Option<ObjectId>,
     ) -> Result<Self, serde_json::Error> {
+        Self::new_with_id_ranges(
+            pool,
+            object_info,
+            mask_size,
+            soft_key_size,
+            soft_key_layout,
+            vt_version,
+            selected,
+            ObjectIdRanges::defaults(),
+        )
+    }
+
+    /// Create a project file with the complete authoring settings.
+    pub fn new_with_id_ranges(
+        pool: &ObjectPool,
+        object_info: &HashMap<ObjectId, ObjectInfo>,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+        soft_key_layout: SoftKeyLayout,
+        vt_version: VtVersion,
+        selected: Option<ObjectId>,
+        object_id_ranges: ObjectIdRanges,
+    ) -> Result<Self, serde_json::Error> {
+        object_id_ranges.validate(vt_version).map_err(|message| {
+            serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message,
+            ))
+        })?;
         // Convert ObjectInfo map to ObjectMetadata map
         let mut object_metadata = BTreeMap::new();
         for (id, info) in object_info {
@@ -121,6 +159,7 @@ impl ProjectFile {
                 description: info.description.clone(),
                 tags: info.tags.clone(),
                 allowed_references: info.allowed_references.clone(),
+                id_overridden: info.id_overridden,
             };
             object_metadata.insert(id.value(), metadata);
         }
@@ -138,6 +177,7 @@ impl ProjectFile {
                 vt_version: vt_version.into(),
                 soft_key_layout,
                 last_selected: selected.map(|id| id.value()),
+                object_id_ranges,
             },
         })
     }
@@ -209,6 +249,16 @@ impl ProjectFile {
                     message,
                 ))
             })?;
+        project
+            .settings
+            .object_id_ranges
+            .validate(project.settings.vt_version())
+            .map_err(|message| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    message,
+                ))
+            })?;
         Ok(project)
     }
 }
@@ -221,6 +271,7 @@ impl Default for ProjectSettings {
             vt_version: default_vt_version_number(),
             soft_key_layout: SoftKeyLayout::default(),
             last_selected: None,
+            object_id_ranges: ObjectIdRanges::defaults(),
         }
     }
 }

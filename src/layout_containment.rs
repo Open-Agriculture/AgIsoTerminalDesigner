@@ -247,13 +247,11 @@ fn remap_placement_ids(
     remapped
 }
 
-fn remap_id(mut id: u16, id_changes: &[(u16, u16)]) -> u16 {
-    for (old_id, new_id) in id_changes {
-        if id == *old_id {
-            id = *new_id;
-        }
-    }
-    id
+fn remap_id(id: u16, id_changes: &[(u16, u16)]) -> u16 {
+    id_changes
+        .iter()
+        .find(|(old, _)| *old == id)
+        .map_or(id, |(_, new)| *new)
 }
 
 /// Strictly validates references introduced by the current edit, even when a

@@ -103,6 +103,8 @@ pub struct DesignerApp {
     #[cfg(not(target_arch = "wasm32"))]
     proposal_reject: bool,
     project_settings_open: bool,
+    reassign_ids_open: bool,
+    reassign_include_overrides: bool,
     dimensions_draft: Option<DimensionsDraft>,
     #[cfg(not(target_arch = "wasm32"))]
     last_proposal_id: Option<String>,
@@ -210,8 +212,79 @@ impl DesignerApp {
             self.discard_on_replace = false;
         }
     }
+    fn show_id_reassignment(&mut self, ctx: &egui::Context) {
+        if !self.reassign_ids_open {
+            return;
+        }
+        let Some(project) = self.project.as_ref() else {
+            self.reassign_ids_open = false;
+            return;
+        };
+        let mut apply = None;
+        let mut cancel = false;
+        egui::Window::new("Reassign object IDs")
+            .open(&mut self.reassign_ids_open)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.checkbox(&mut self.reassign_include_overrides, "Include manual overrides");
+                ui.small("Manual overrides are preserved by default. External ECU code needs regenerated ID headers after reassignment.");
+                match project.plan_id_reassignment(self.reassign_include_overrides) {
+                    Ok(plan) => {
+                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                            egui::Grid::new("id_reassignment_preview").striped(true).show(ui, |ui| {
+                                ui.strong("Name");
+                                ui.strong("Old ID");
+                                ui.strong("New ID");
+                                ui.strong("Assignment");
+                                ui.end_row();
+                                for row in &plan.rows {
+                                    ui.label(&row.name);
+                                    ui.monospace(project.format_object_id(row.old_id));
+                                    ui.monospace(project.format_object_id(row.new_id));
+                                    let assignment = if row.overridden && !plan.includes_overrides {
+                                        "Override preserved"
+                                    } else if row.overridden {
+                                        "Override reassigned"
+                                    } else if row.component_node.is_some() {
+                                        "Component node"
+                                    } else {
+                                        "Automatic"
+                                    };
+                                    ui.label(assignment);
+                                    ui.end_row();
+                                }
+                            });
+                        });
+                        if ui.add_enabled(!plan.mappings.is_empty(), egui::Button::new("Apply reassignment")).clicked() {
+                            apply = Some(plan);
+                        }
+                    }
+                    Err(error) => {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        if let Some(plan) = apply {
+            match self.project.as_mut().unwrap().apply_id_reassignment(plan) {
+                Ok(_) => {
+                    self.reassign_ids_open = false;
+                    self.mask_view = MaskViewState::default();
+                    self.canvas.cancel_interaction();
+                }
+                Err(error) => self.error_message = Some(error.to_string()),
+            }
+        }
+        if cancel {
+            self.reassign_ids_open = false;
+        }
+    }
+
     fn close_project_settings(&mut self) {
         self.project_settings_open = false;
+        self.reassign_ids_open = false;
         self.dimensions_draft = None;
     }
 
@@ -363,6 +436,8 @@ impl DesignerApp {
             #[cfg(not(target_arch = "wasm32"))]
             proposal_reject: false,
             project_settings_open: false,
+            reassign_ids_open: false,
+            reassign_include_overrides: false,
             dimensions_draft: None,
             #[cfg(not(target_arch = "wasm32"))]
             last_proposal_id: None,
@@ -1030,11 +1105,7 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
         false
     } else {
         let is_selected = project.get_selected() == object.id().into();
-        let label_text = format!(
-            "{}: {}",
-            project.format_object_id(object.id().value()),
-            project.object_display_name(object)
-        );
+        let label_text = project.object_display_name(object);
         let response = tree_row(ui, is_selected, label_text);
 
         if response.clicked() {
@@ -1556,11 +1627,7 @@ fn render_mask_list(ui: &mut egui::Ui, project: &EditorProject, mask_view: &mut 
                 } else {
                     "Alarm"
                 };
-                let label = format!(
-                    "{kind} {}: {}",
-                    project.format_object_id(id),
-                    project.object_display_name(mask)
-                );
+                let label = format!("{kind}: {}", project.object_display_name(mask));
                 let response = ui.selectable_label(mask_view.focused == Some(id), label);
                 if response.clicked() {
                     if mask_view.focused == Some(id) {
@@ -1771,6 +1838,7 @@ impl eframe::App for DesignerApp {
         self.show_iop_import(ctx);
         if let Some(project) = &mut self.project {
             project.set_object_id_format(self.preferences.object_id_format);
+            project.set_show_object_ids(self.preferences.show_object_ids);
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(bridge) = &mut self.automation_bridge {
@@ -2089,6 +2157,11 @@ impl eframe::App for DesignerApp {
                                     }
                                 });
                         });
+                        if ui.button("Reassign object IDs…").clicked() {
+                            self.reassign_ids_open = true;
+                            self.reassign_include_overrides = false;
+                            ui.close();
+                        }
                         if ui.button("Project Settings…").clicked() {
                             self.project_settings_open = true;
                             self.dimensions_draft =
@@ -2157,6 +2230,8 @@ impl eframe::App for DesignerApp {
             });
         });
 
+        self.show_id_reassignment(ctx);
+
         let requested_pane = designer_settings::show_project_settings(
             ctx,
             &mut self.project_settings_open,
@@ -2176,6 +2251,7 @@ impl eframe::App for DesignerApp {
         }
         if let Some(pool) = &mut self.project {
             pool.set_object_id_format(self.preferences.object_id_format);
+            pool.set_show_object_ids(self.preferences.show_object_ids);
             let selected_before_navigation = pool.get_selected();
             let mut explicit_navigation = false;
             if ctx.input(|i| i.pointer.button_released(egui::PointerButton::Extra1)) {
@@ -2571,11 +2647,7 @@ impl DesignerApp {
                     }
                     if let Some(id) = pool.get_selected().0 {
                         if let Some(object) = pool.get_pool().object_by_id(id) {
-                            ui.label(format!(
-                                "{} · {}",
-                                pool.format_object_id(id.value()),
-                                pool.object_display_name(object)
-                            ));
+                            ui.label(pool.object_display_name(object));
                         }
                     } else {
                         ui.weak("Select an object to inspect its ancestry.");
@@ -2833,6 +2905,8 @@ impl DesignerApp {
                 }
             });
             ui.menu_button("Object IDs", |ui| {
+                ui.checkbox(&mut self.preferences.show_object_ids, "Show object IDs");
+                ui.separator();
                 for (format, label) in [
                     (ag_iso_terminal_designer::ObjectIdFormat::Decimal, "Decimal"),
                     (

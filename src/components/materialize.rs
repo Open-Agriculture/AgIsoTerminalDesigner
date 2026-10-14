@@ -1,15 +1,18 @@
 use super::*;
 use crate::object_properties::{get_object_property, get_property_descriptors};
 use crate::operations::{resolve_target, OperationContext};
+use crate::ObjectIdRanges;
 use crate::{EditorProject, ObjectTarget, Operation, PropertySemantic};
 use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectId, ObjectPool};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 
-/// Same lowest-free, non-null allocation order used by primitive CreateObject.
+/// Assign missing component-node IDs from each node's configured type range.
+/// Existing compiled IDs remain explicit reservations and are never changed.
 pub fn prepare_compiled_ids(
     pool: &ObjectPool,
     source: &mut ComponentSource,
+    ranges: &ObjectIdRanges,
 ) -> ComponentResult<()> {
     let mut used: BTreeSet<u16> = pool.objects().iter().map(|o| o.id().value()).collect();
     source.instances.sort_by_key(|i| i.id);
@@ -32,27 +35,47 @@ pub fn prepare_compiled_ids(
             }
         }
     }
-    for instance in &mut source.instances {
-        let mut nodes: Vec<_> = source.definitions[&instance.component_id]
-            .nodes
-            .iter()
-            .map(|n| n.id)
-            .collect();
+    let mut allocations = Vec::new();
+    for (instance_index, instance) in source.instances.iter().enumerate() {
+        let definition = source
+            .definitions
+            .get(&instance.component_id)
+            .ok_or_else(|| {
+                ComponentError::new("COMPONENT_NOT_FOUND", "Instance definition is missing")
+            })?;
+        let mut nodes: Vec<_> = definition.nodes.iter().map(|n| n.id).collect();
         nodes.sort();
         for node in nodes {
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                instance.compiled_ids.entry(node)
-            {
-                let id = crate::operations::operation::first_available_object_id(|id| {
-                    used.contains(&id)
-                })
-                .ok_or_else(|| {
-                    ComponentError::new("COMPONENT_COMPILED_ID_COLLISION", "VT ID space exhausted")
-                })?;
-                used.insert(id);
-                entry.insert(id);
+            if instance.compiled_ids.contains_key(&node) {
+                continue;
             }
+            let object_type = definition
+                .nodes
+                .iter()
+                .find(|candidate| candidate.id == node)
+                .map(|candidate| candidate.object_type)
+                .ok_or_else(|| {
+                    ComponentError::new("COMPONENT_NODE_INVALID", "Component node is missing")
+                })?;
+            let range = ranges.range_for(object_type);
+            let id = (range.start..=range.end)
+                .find(|id| !used.contains(id))
+                .ok_or_else(|| {
+                    ComponentError::new(
+                        "COMPONENT_ID_RANGE_EXHAUSTED",
+                        format!(
+                            "No free ID remains for {object_type:?} in configured range {range}"
+                        ),
+                    )
+                })?;
+            used.insert(id);
+            allocations.push((instance_index, node, id));
         }
+    }
+    for (instance_index, node, id) in allocations {
+        source.instances[instance_index]
+            .compiled_ids
+            .insert(node, id);
     }
     Ok(())
 }
@@ -76,7 +99,7 @@ pub(crate) fn preview_definition(
         overrides: Default::default(),
         compiled_ids: Default::default(),
     });
-    prepare_compiled_ids(project.get_pool(), &mut source)?;
+    prepare_compiled_ids(project.get_pool(), &mut source, project.object_id_ranges())?;
     let instance = &source.instances[0];
     let mut pool = project.get_pool().clone();
     compile_nodes(
@@ -97,6 +120,7 @@ pub fn materialize_project(project: &EditorProject) -> ComponentResult<Materiali
         project.vt_version,
         &project.component_object_info(),
         project.graphic_library(),
+        project.object_id_ranges(),
     )
 }
 
@@ -105,8 +129,16 @@ pub fn materialize_source(
     source: &ComponentSource,
     version: VtVersion,
     info: &HashMap<ObjectId, crate::ObjectInfo>,
+    ranges: &ObjectIdRanges,
 ) -> ComponentResult<MaterializedProject> {
-    materialize_source_with_graphics(canonical, source, version, info, &Default::default())
+    materialize_source_with_graphics(
+        canonical,
+        source,
+        version,
+        info,
+        &Default::default(),
+        ranges,
+    )
 }
 
 pub fn materialize_source_with_graphics(
@@ -115,6 +147,7 @@ pub fn materialize_source_with_graphics(
     version: VtVersion,
     info: &HashMap<ObjectId, crate::ObjectInfo>,
     graphics: &crate::graphics::GraphicLibrary,
+    ranges: &ObjectIdRanges,
 ) -> ComponentResult<MaterializedProject> {
     let mut result = MaterializedProject {
         pool: canonical.clone(),
@@ -317,7 +350,7 @@ pub fn materialize_source_with_graphics(
             overrides: Default::default(),
             compiled_ids: Default::default(),
         });
-        prepare_compiled_ids(canonical, &mut probe)?;
+        prepare_compiled_ids(canonical, &mut probe, ranges)?;
         let mut pool = canonical.clone();
         compile_nodes(
             &mut pool,
@@ -865,6 +898,88 @@ pub fn source_map(source: &ComponentSource) -> MaterializedSourceMap {
 mod preview_tests {
     use super::*;
     use ag_iso_stack::object_pool::{object::Object, ObjectType};
+
+    fn one_node_source(object_type: ObjectType) -> ComponentSource {
+        let component_id = ComponentId::default();
+        let node_id = ComponentNodeId::default();
+        let definition = ComponentDefinition {
+            schema_version: 1,
+            id: component_id,
+            name: "Test component".into(),
+            description: String::new(),
+            category_path: vec![],
+            tags: vec![],
+            revision: 0,
+            root_node: node_id,
+            nodes: vec![ComponentNode {
+                id: node_id,
+                name: "Node".into(),
+                object_type,
+                properties: Default::default(),
+                children: vec![],
+                references: Default::default(),
+                macro_references: vec![],
+                object_list: None,
+            }],
+            parameters: vec![],
+        };
+        ComponentSource {
+            definitions: [(component_id, definition)].into_iter().collect(),
+            instances: vec![ComponentInstance {
+                id: ComponentInstanceId::default(),
+                component_id,
+                parent: EditorParentRef::Primitive(0),
+                child_index: None,
+                x: 0,
+                y: 0,
+                overrides: Default::default(),
+                compiled_ids: Default::default(),
+            }],
+        }
+    }
+
+    #[test]
+    fn compiled_ids_use_type_range_and_report_exhaustion_without_fallback() {
+        let mut pool = ObjectPool::default();
+        let mut occupied = crate::default_object(ObjectType::Button);
+        occupied.mut_id().set_value(40_000).unwrap();
+        pool.add(occupied);
+        let mut source = one_node_source(ObjectType::Button);
+        let mut ranges = ObjectIdRanges::default();
+        ranges.set_range(
+            ObjectType::Button,
+            crate::ObjectIdRange {
+                start: 40_000,
+                end: 40_001,
+            },
+        );
+
+        prepare_compiled_ids(&pool, &mut source, &ranges).unwrap();
+        assert_eq!(
+            source.instances[0]
+                .compiled_ids
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![40_001]
+        );
+
+        let mut exhausted = one_node_source(ObjectType::Button);
+        let definition = exhausted.definitions.values_mut().next().unwrap();
+        let mut second_node = definition.nodes[0].clone();
+        second_node.id = ComponentNodeId::default();
+        definition.nodes.push(second_node);
+        ranges.set_range(
+            ObjectType::Button,
+            crate::ObjectIdRange {
+                start: 40_001,
+                end: 40_001,
+            },
+        );
+        let error = prepare_compiled_ids(&pool, &mut exhausted, &ranges).unwrap_err();
+        assert_eq!(error.code, "COMPONENT_ID_RANGE_EXHAUSTED");
+        assert!(exhausted.instances[0].compiled_ids.is_empty());
+    }
 
     #[test]
     fn standalone_preview_uses_normal_compiler_without_project_mutations() {

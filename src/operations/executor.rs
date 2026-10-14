@@ -208,6 +208,42 @@ impl PlacementProvenance {
                     }
                 }
             }
+            (Operation::RemapObjectIds { mappings, .. }, _) => {
+                let remap: HashMap<_, _> = mappings.iter().copied().collect();
+                let old = std::mem::take(&mut self.0);
+                for (parent, refs) in old {
+                    let mapped_parent = remap.get(&parent).copied().unwrap_or(parent);
+                    let refs = refs
+                        .into_iter()
+                        .map(|(mut reference, is_new)| {
+                            if let Some(new_id) = remap.get(&reference.id.value()) {
+                                reference.id =
+                                    ObjectId::new(*new_id).expect("applied object ID is valid");
+                            }
+                            (reference, is_new)
+                        })
+                        .collect();
+                    self.0.insert(mapped_parent, refs);
+                }
+            }
+            (
+                Operation::SetObjectIdAssignment {
+                    object_id, new_id, ..
+                },
+                _,
+            ) => {
+                if let Some(refs) = self.0.remove(object_id) {
+                    self.0.insert(*new_id, refs);
+                }
+                for refs in self.0.values_mut() {
+                    for (reference, _) in refs {
+                        if reference.id.value() == *object_id {
+                            reference.id =
+                                ObjectId::new(*new_id).expect("applied object ID is valid");
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         let mut updated = HashMap::new();
@@ -424,14 +460,7 @@ impl OperationExecutor {
             soft_key_size,
         )
         .map_err(containment_transaction_error)?;
-        let id_changes: Vec<_> = transaction
-            .operations
-            .iter()
-            .filter_map(|operation| match operation {
-                Operation::ChangeObjectId { old_id, new_id } => Some((*old_id, *new_id)),
-                _ => None,
-            })
-            .collect();
+        let id_changes = crate::id_reassignment::compose_id_mappings(&transaction.operations);
         crate::layout_containment::validate_change_with_id_changes_and_soft_key_size(
             pool,
             &candidate_pool,
@@ -586,6 +615,8 @@ fn operation_type(operation: &Operation) -> String {
         }
         Operation::RestoreObjectReference { .. } => "RestoreObjectReference",
         Operation::ChangeObjectId { .. } => "ChangeObjectId",
+        Operation::RemapObjectIds { .. } => "RemapObjectIds",
+        Operation::SetObjectIdAssignment { .. } => "SetObjectIdAssignment",
         Operation::ReorderObjects { .. } => "ReorderObjects",
         Operation::AddChild { .. } => "AddChild",
         Operation::RemoveChild { .. } => "RemoveChild",

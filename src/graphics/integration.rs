@@ -133,18 +133,35 @@ impl GraphicService {
         asset_id: GraphicAssetId,
     ) -> crate::components::ComponentResult<u16> {
         let mut created_id = None;
+        let ranges = project.object_id_ranges().clone();
         project.edit_source(
             "Create PictureGraphic from graphic",
-            |pool, _, graphics, info| {
+            |pool, source, graphics, info| {
                 let asset = graphics.assets.get(&asset_id).cloned().ok_or_else(|| {
                     ComponentError::new("GRAPHIC_ASSET_NOT_FOUND", "Unknown graphic")
                 })?;
-                let id = crate::operations::operation::first_available_object_id(|id| {
-                    pool.object_by_id(ObjectId::new(id).unwrap()).is_some()
-                })
-                .ok_or_else(|| {
-                    ComponentError::new("OBJECT_ID_EXHAUSTED", "No object ID is available")
-                })?;
+                let range = ranges.range_for(ObjectType::PictureGraphic);
+                let id = (range.start..=range.end)
+                    .find(|id| {
+                        !pool
+                            .objects()
+                            .iter()
+                            .any(|object| object.id().value() == *id)
+                            && !source.instances.iter().any(|instance| {
+                                instance
+                                    .compiled_ids
+                                    .values()
+                                    .any(|reserved| reserved == id)
+                            })
+                    })
+                    .ok_or_else(|| {
+                        ComponentError::new(
+                            "OBJECT_ID_RANGE_EXHAUSTED",
+                            format!(
+                                "No free PictureGraphic ID remains in configured range {range}"
+                            ),
+                        )
+                    })?;
                 let mut object = crate::default_object(ObjectType::PictureGraphic);
                 object.mut_id().set_value(id).map_err(|error| {
                     ComponentError::new("OBJECT_ID_INVALID", format!("{error:?}"))

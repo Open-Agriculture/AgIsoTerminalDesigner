@@ -486,8 +486,14 @@ fn materialized_property_errors_map_back_to_component_instance_node_and_property
         .unwrap()
         .properties
         .insert("height".into(), json!(-1));
-    let error =
-        materialize_source(p.get_pool(), &source, p.vt_version(), &Default::default()).unwrap_err();
+    let error = materialize_source(
+        p.get_pool(),
+        &source,
+        p.vt_version(),
+        &Default::default(),
+        p.object_id_ranges(),
+    )
+    .unwrap_err();
     assert_eq!(error.component_id, Some(component));
     assert_eq!(error.instance_id, Some(instance));
     assert_eq!(error.node_id, Some(root));
@@ -698,9 +704,15 @@ fn invalid_source_cycles_and_compiled_collisions_are_rejected() {
             y: 0,
         });
     assert_eq!(
-        materialize_source(p.get_pool(), &source, p.vt_version(), &Default::default())
-            .unwrap_err()
-            .code,
+        materialize_source(
+            p.get_pool(),
+            &source,
+            p.vt_version(),
+            &Default::default(),
+            p.object_id_ranges(),
+        )
+        .unwrap_err()
+        .code,
         "COMPONENT_INTERNAL_REFERENCE_INVALID"
     );
     let mut source = p.component_source().clone();
@@ -710,9 +722,15 @@ fn invalid_source_cycles_and_compiled_collisions_are_rejected() {
         .next()
         .unwrap() = 2;
     assert_eq!(
-        materialize_source(p.get_pool(), &source, p.vt_version(), &Default::default())
-            .unwrap_err()
-            .code,
+        materialize_source(
+            p.get_pool(),
+            &source,
+            p.vt_version(),
+            &Default::default(),
+            p.object_id_ranges(),
+        )
+        .unwrap_err()
+        .code,
         "COMPONENT_COMPILED_ID_COLLISION"
     );
 }
@@ -802,4 +820,33 @@ fn component_selection_survives_navigation_and_clears_on_delete() {
     ));
     ComponentService::delete_component_instance(&mut p, instance).unwrap();
     assert!(p.editor_selection().is_none());
+}
+
+#[test]
+fn reassignment_includes_compiled_nodes_and_round_trips_as_one_change() {
+    let (mut project, _, instance) = captured();
+    let before = project.save_project().unwrap();
+    let plan = project.plan_id_reassignment(false).unwrap();
+    assert!(plan.rows.iter().any(|row| row.component_node.is_some()));
+    let mappings: BTreeMap<_, _> = plan.mappings.iter().copied().collect();
+    project.apply_id_reassignment(plan).unwrap();
+    let source = project.component_source();
+    let compiled = source
+        .instances
+        .iter()
+        .find(|item| item.id == instance)
+        .unwrap();
+    assert_eq!(compiled.parent, EditorParentRef::Primitive(mappings[&2]));
+    let materialized = project.materialize().unwrap();
+    for old in [2, 100, 101, 102] {
+        assert!(materialized
+            .pool
+            .object_by_id(ObjectId::new(mappings[&old]).unwrap())
+            .is_some());
+    }
+    let after = project.save_project().unwrap();
+    assert!(project.undo_operation());
+    assert_eq!(project.save_project().unwrap(), before);
+    assert!(project.redo_operation());
+    assert_eq!(project.save_project().unwrap(), after);
 }

@@ -272,13 +272,14 @@ impl ComponentService {
         let root = plan.instance.compiled_ids[&plan.definition.root_node];
         let version = project.vt_version;
         let info = project.component_object_info();
+        let ranges = project.object_id_ranges().clone();
         project.edit_components("Create component from selection", |pool, source| {
             Operation::RemoveChild { parent_id: parent, child_id: root }.apply(pool, &mut Default::default(), &mut Default::default()).map_err(|e| ComponentError::new("COMPONENT_CAPTURE_INVALID", e.to_string()))?;
             for id in plan.remove_ids { pool.remove(ObjectId::new(id).unwrap()); }
             source.definitions.insert(plan.definition.id, plan.definition);
             source.instances.push(plan.instance);
-            prepare_compiled_ids(pool, source)?;
-            let materialized = materialize_source(pool, source, version, &info)?;
+            prepare_compiled_ids(pool, source, &ranges)?;
+            let materialized = materialize_source(pool, source, version, &info, &ranges)?;
             let instance = source.instances.iter().find(|i| i.id == id).unwrap();
             let mut captured = ag_iso_stack::object_pool::ObjectPool::default();
             for generated in instance.compiled_ids.values() { captured.add(materialized.pool.object_by_id(ObjectId::new(*generated).unwrap()).unwrap().clone()); }

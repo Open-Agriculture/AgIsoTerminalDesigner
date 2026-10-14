@@ -176,6 +176,38 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             continue;
         };
         let label = human_readable_property_name(editor.property);
+        if object_type == ObjectType::ExternalObjectPointer
+            && editor.property == "external_object_id"
+        {
+            let key = ui.make_persistent_id((id.value(), editor.property));
+            let mut foreign_id = ui
+                .data(|data| data.get_temp::<u16>(key))
+                .unwrap_or_else(|| value.as_u64().map_or(u16::MAX, |value| value as u16));
+            ui.horizontal(|ui| {
+                ui.label(&label);
+                let format = design.object_id_format();
+                let response = ui.add(
+                    egui::DragValue::new(&mut foreign_id)
+                        .range(0..=u16::MAX)
+                        .custom_formatter(move |value, _| format.format(value as u16))
+                        .custom_parser(move |text| format.parse(text).ok().map(f64::from)),
+                );
+                if response.changed() {
+                    ui.data_mut(|data| data.insert_temp(key, foreign_id));
+                }
+                if drag_value_finished(&response) {
+                    let value = if foreign_id == u16::MAX {
+                        serde_json::Value::Null
+                    } else {
+                        foreign_id.into()
+                    };
+                    queue(design, id, editor.property, value);
+                    ui.data_mut(|data| data.remove::<u16>(key));
+                }
+            });
+            ui.small("Object ID in the external ECU's pool; 65535 means no reference.");
+            continue;
+        }
         if !crate::vt_compatibility::supported_property(
             object_type,
             editor.property,
@@ -533,25 +565,11 @@ fn row_actions(ui: &mut egui::Ui, index: usize, len: usize, action: &mut Option<
 }
 
 fn object_label(design: &EditorProject, object: &Object) -> String {
-    let name = design.object_display_name(object);
-    if design.get_object_info(object).name.is_some() {
-        format!(
-            "{}: {:?} - {name}",
-            design.format_object_id(object.id().value()),
-            object.object_type(),
-        )
-    } else {
-        name
-    }
+    design.object_display_name(object)
 }
 
 fn object_selector_label(design: &EditorProject, object: &Object) -> String {
-    let name = design.object_display_name(object);
-    if design.get_object_info(object).name.is_some() {
-        format!("{} - {name}", design.format_object_id(object.id().value()))
-    } else {
-        name
-    }
+    design.object_display_name(object)
 }
 
 fn select_object(design: &EditorProject, id: ObjectId) {
@@ -889,7 +907,7 @@ fn render_object_list(
                 .striped(true)
                 .show(ui, |ui| {
                     for (index, object_id) in objects.iter().copied().enumerate() {
-                        ui.label(design.format_object_id(object_id.value()));
+                        ui.label((index + 1).to_string());
                         if let Some(new_id) = render_object_selector(
                             ui,
                             ("required_object", index),
@@ -933,10 +951,7 @@ fn render_object_list(
                 .striped(true)
                 .show(ui, |ui| {
                     for (index, object_id) in objects.iter().copied().enumerate() {
-                        ui.label(object_id.0.map_or_else(
-                            || "None".to_owned(),
-                            |id| design.format_object_id(id.value()),
-                        ));
+                        ui.label((index + 1).to_string());
                         let mut selected = object_id;
                         let label = object_id.0.map_or_else(
                             || "None".to_owned(),
@@ -1295,8 +1310,21 @@ fn render_identity(
             _ => None,
         })
         .unwrap_or_else(|| id.value());
+    let overridden = design
+        .get_pool()
+        .object_by_id(id)
+        .is_some_and(|object| design.get_object_info(object).id_overridden);
     ui.horizontal(|ui| {
-        ui.label("Object ID");
+        ui.label("Assigned ID");
+        ui.monospace(design.format_object_id(id.value()));
+        ui.label(if overridden {
+            "Manual override"
+        } else {
+            "Automatic"
+        });
+        ui.label(format!("Type: {object_type:?}"));
+    });
+    ui.horizontal(|ui| {
         let format = design.object_id_format();
         let response = ui.add(
             egui::DragValue::new(&mut value)
@@ -1307,33 +1335,51 @@ fn render_identity(
         if response.changed() {
             ui.data_mut(|data| data.insert_temp(key, PendingValue::Number(value.into())));
         }
-
         let conflict = value != id.value()
-            && ObjectId::new(value)
-                .ok()
-                .is_some_and(|new_id| design.get_pool().object_by_id(new_id).is_some());
+            && design.materialize_shared().map_or(true, |pool| {
+                ObjectId::new(value)
+                    .ok()
+                    .is_some_and(|candidate| pool.pool.object_by_id(candidate).is_some())
+            });
+        let invalid_macro = object_type == ObjectType::Macro
+            && design.vt_version() < ag_iso_stack::object_pool::vt_version::VtVersion::Version5
+            && value > 255;
+        if ui
+            .add_enabled(
+                !conflict && !invalid_macro,
+                egui::Button::new("Override ID"),
+            )
+            .clicked()
+        {
+            design.queue_operation(Operation::SetObjectIdAssignment {
+                object_id: id.value(),
+                new_id: value,
+                overridden: true,
+            });
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+        }
+        if ui.button("Use automatic ID").clicked() {
+            match design.allocate_object_id(object_type) {
+                Ok(new_id) => design.queue_operation(Operation::SetObjectIdAssignment {
+                    object_id: id.value(),
+                    new_id: new_id.value(),
+                    overridden: false,
+                }),
+                Err(error) => {
+                    ui.data_mut(|data| data.insert_temp(key.with("error"), error.to_string()))
+                }
+            }
+        }
         if conflict {
             ui.colored_label(ui.visuals().error_fg_color, "ID already in use");
         }
-
-        if drag_value_finished(&response) {
-            if value != id.value() {
-                if let Ok(new_id) = ObjectId::new(value) {
-                    if design.get_pool().object_by_id(new_id).is_none() {
-                        design.queue_operation(Operation::ChangeObjectId {
-                            old_id: id.value(),
-                            new_id: value,
-                        });
-                        design
-                            .get_mut_selected()
-                            .set(NullableObjectId(Some(new_id)));
-                    }
-                }
-            }
-            ui.data_mut(|data| data.remove::<PendingValue>(key));
+        if invalid_macro {
+            ui.colored_label(ui.visuals().error_fg_color, "VT2–4 macro IDs must be 0–255");
         }
-        ui.label(format!("Type: {object_type:?}"));
     });
+    if let Some(error) = ui.data(|data| data.get_temp::<String>(key.with("error"))) {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    }
 }
 
 fn queue(design: &EditorProject, id: ObjectId, property: &str, value: serde_json::Value) {
@@ -2460,6 +2506,23 @@ mod tests {
             serde_json::from_slice(&project.save_project().unwrap()).unwrap();
         saved["settings"]["vt_version"] = version.into();
         EditorProject::load_project(serde_json::to_vec(&saved).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn identity_controls_show_assignment_and_override_actions() {
+        let project = project_at_version(object(ObjectType::Button, 6000), 6);
+        let frame = editor_frame(&egui::Context::default(), &project, vec![]);
+        for label in [
+            "Assigned ID",
+            "Automatic",
+            "Override ID",
+            "Use automatic ID",
+        ] {
+            assert!(
+                frame.iter().any(|(text, _)| text == label),
+                "missing {label}"
+            );
+        }
     }
 
     #[test]

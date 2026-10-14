@@ -82,10 +82,10 @@ pub fn validate_macro_commands(bytes: &[u8], version: VtVersion) -> Result<(), S
     Ok(())
 }
 
-struct CommandSpec {
-    name: &'static str,
-    minimum_version: VtVersion,
-    length: usize,
+pub(crate) struct CommandSpec {
+    pub(crate) name: &'static str,
+    pub(crate) minimum_version: VtVersion,
+    pub(crate) length: usize,
 }
 
 const VT2: VtVersion = VtVersion::Version2;
@@ -95,7 +95,7 @@ const VT6: VtVersion = VtVersion::Version6;
 
 /// Annex F command bytes and data lengths. Responses and commands marked
 /// “No” in the Annex F Allowed in a Macro field are intentionally absent.
-fn command_spec(command: u8) -> Option<CommandSpec> {
+pub(crate) fn command_spec(command: u8) -> Option<CommandSpec> {
     let (name, minimum_version, length) = match command {
         0x90 => ("Select Active Working Set", VT6, 9),
         0xA0 => ("Hide/Show Object", VT2, 8),
@@ -135,7 +135,7 @@ fn command_spec(command: u8) -> Option<CommandSpec> {
     })
 }
 
-fn graphics_subcommand_length(bytes: &[u8], offset: usize) -> Result<usize, String> {
+pub(crate) fn graphics_subcommand_length(bytes: &[u8], offset: usize) -> Result<usize, String> {
     require(bytes, offset, 1, "Graphics Context sub-command")?;
     let subcommand = bytes[offset];
     let length = match subcommand {

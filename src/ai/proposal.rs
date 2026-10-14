@@ -35,8 +35,8 @@ pub fn propose_transaction(
     state: &AiDesignState,
     transaction: OperationTransaction,
 ) -> Result<AiProposal, TransactionDiagnostics> {
-    let mut prepared =
-        crate::EditorProject::from_ai_source(state).prepare_transaction(&transaction)?;
+    let editor_project = crate::EditorProject::from_ai_source(state);
+    let mut prepared = editor_project.prepare_transaction(&transaction)?;
     let canonical_pool = prepared.pool.clone();
     let materialized = crate::components::materialize_source_with_graphics(
         &canonical_pool,
@@ -44,6 +44,7 @@ pub fn propose_transaction(
         state.vt_version,
         &prepared.object_info,
         &state.graphics,
+        &state.object_id_ranges,
     )
     .map_err(crate::editor_project::component_transaction_error)?;
     prepared.pool = materialized.pool;
@@ -116,6 +117,7 @@ pub fn propose_refinement(
         canonical_pool: Some(base.canonical_pool.clone()),
         components: base.components.clone(),
         graphics: base.graphics.clone(),
+        object_id_ranges: state.object_id_ranges.clone(),
         revision: state.revision,
         pool: base.prepared.pool.clone(),
         object_info: base.prepared.object_info.clone(),

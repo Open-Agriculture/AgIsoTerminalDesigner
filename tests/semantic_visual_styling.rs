@@ -11,6 +11,7 @@ fn state() -> AiDesignState {
         canonical_pool: None,
         components: Default::default(),
         graphics: Default::default(),
+        object_id_ranges: Default::default(),
         revision: 1,
         pool: Default::default(),
         object_info: Default::default(),
