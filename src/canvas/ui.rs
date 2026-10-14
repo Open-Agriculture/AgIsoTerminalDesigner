@@ -3,14 +3,17 @@ use super::{
     edits::{self, position, CanvasEdit, PlacementTarget},
     geometry::{self, Scene, SceneItem},
 };
+use crate::object_rendering::Colorable;
 use crate::{components::MaterializedProject, EditorProject};
 use ag_iso_stack::object_pool::{object_attributes::Point, NullableObjectId, ObjectId};
-use egui::{Color32, Key, Modifiers, Pos2, Rect, Stroke, Vec2};
+use egui::{Key, Modifiers, Pos2, Rect, Stroke, Vec2};
 
 /// Transient viewport, occurrence selection, and gesture drafts for one project.
 /// Reset this state when replacing the project; no canvas state is serialized.
 pub struct CanvasState {
     mask: Option<u16>,
+    softkey_mask: Option<u16>,
+    softkey_page: usize,
     revision: u64,
     selected: Vec<Vec<usize>>,
     context: Vec<usize>,
@@ -30,6 +33,8 @@ impl Default for CanvasState {
     fn default() -> Self {
         Self {
             mask: None,
+            softkey_mask: None,
+            softkey_page: 0,
             revision: 0,
             selected: vec![],
             context: vec![],
@@ -107,7 +112,48 @@ impl CanvasState {
             self.field_draft = None;
             self.revision = project.revision();
         }
-        let scene = geometry::build(project, materialized, root);
+        let mut softkeys =
+            super::softkeys::build(project, &materialized.pool, root, self.softkey_page);
+        if self.softkey_mask != softkeys.mask_id {
+            self.softkey_mask = softkeys.mask_id;
+            self.change_softkey_page(0);
+            softkeys = super::softkeys::build(project, &materialized.pool, root, 0);
+        }
+        if self.softkey_page != softkeys.page {
+            self.change_softkey_page(softkeys.page);
+        }
+        if let Some(error) = &softkeys.error {
+            ui.colored_label(crate::ui_style::palette(ui).error, error);
+        }
+        if softkeys.pages > 1 {
+            let mut page = softkeys.page;
+            ui.horizontal(|ui| {
+                if softkeys.navigation == 0
+                    && ui
+                        .add_enabled(page > 0, egui::Button::new("Previous keys"))
+                        .clicked()
+                {
+                    page -= 1;
+                }
+                ui.label(format!(
+                    "Softkeys · page {} / {}",
+                    softkeys.page + 1,
+                    softkeys.pages
+                ));
+                if softkeys.navigation == 0
+                    && ui
+                        .add_enabled(page + 1 < softkeys.pages, egui::Button::new("Next keys"))
+                        .clicked()
+                {
+                    page += 1;
+                }
+            });
+            if page != self.softkey_page {
+                self.change_softkey_page(page);
+                softkeys = super::softkeys::build(project, &materialized.pool, root, page);
+            }
+        }
+        let scene = geometry::build_page(project, materialized, root, self.softkey_page);
         self.selected
             .retain(|p| scene.items.iter().any(|i| &i.path == p));
         if !scene.items.iter().any(|i| i.path == self.context) {
@@ -119,7 +165,7 @@ impl CanvasState {
             self.selected = scene
                 .items
                 .iter()
-                .find(|i| i.target.is_some() && (Some(i.object_id) == inspector || inspector.and_then(|id| materialized.source_map.by_object_id.get(&id)).is_some_and(|source| matches!((source, &i.target), (crate::components::MaterializedSource::ComponentNode { instance_id, .. }, Some(PlacementTarget::Component { instance_id: target })) if instance_id == target))))
+                .find(|i| (i.target.is_some() || i.path.first() == Some(&super::softkeys::PATH_PREFIX)) && (Some(i.object_id) == inspector || inspector.and_then(|id| materialized.source_map.by_object_id.get(&id)).is_some_and(|source| matches!((source, &i.target), (crate::components::MaterializedSource::ComponentNode { instance_id, .. }, Some(PlacementTarget::Component { instance_id: target })) if instance_id == target))))
                 .map(|i| vec![i.path.clone()])
                 .unwrap_or_default();
         }
@@ -131,7 +177,7 @@ impl CanvasState {
             ui.ctx().request_repaint();
         }
         if let Some(error) = &self.error {
-            ui.colored_label(Color32::LIGHT_RED, error);
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
         let size = ui.available_size().max(egui::vec2(100.0, 100.0));
         let (viewport, _) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -165,7 +211,11 @@ impl CanvasState {
             let fit_rect = if selection {
                 bounds(&items).unwrap_or(mask_rect)
             } else {
-                mask_rect
+                if softkeys.rect.is_positive() {
+                    mask_rect.union(softkeys.rect)
+                } else {
+                    mask_rect
+                }
             };
             self.zoom = ((viewport.width() - 48.0) / fit_rect.width().max(1.0))
                 .min((viewport.height() - 48.0) / fit_rect.height().max(1.0))
@@ -211,6 +261,29 @@ impl CanvasState {
             response.request_focus();
             if let Some(p) = pointer.interact_pos() {
                 let pool_pos = to_pool(p);
+                if let Some(slot) = softkeys
+                    .slots
+                    .iter()
+                    .find(|slot| slot.rect.contains(pool_pos))
+                {
+                    let page = match slot.content {
+                        super::softkeys::SlotContent::Previous => {
+                            self.softkey_page.saturating_sub(1)
+                        }
+                        super::softkeys::SlotContent::Next if softkeys.navigation == 1 => {
+                            (self.softkey_page + 1) % softkeys.pages
+                        }
+                        super::softkeys::SlotContent::Next => {
+                            (self.softkey_page + 1).min(softkeys.pages - 1)
+                        }
+                        _ => self.softkey_page,
+                    };
+                    if page != self.softkey_page {
+                        self.change_softkey_page(page);
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                }
                 let handle = if items.len() == 1 {
                     resize_handle(
                         &items[0],
@@ -236,6 +309,11 @@ impl CanvasState {
                         }
                     } else if !self.selected.contains(&hit.path) {
                         self.selected = vec![hit.path.clone()];
+                    }
+                    if hit.target.is_none()
+                        && hit.path.first() == Some(&super::softkeys::PATH_PREFIX)
+                    {
+                        self.context = hit.path.clone();
                     }
                     GestureKind::Move
                 } else {
@@ -461,20 +539,100 @@ impl CanvasState {
                 );
             }
         });
+        if softkeys.rect.is_positive() {
+            workspace_painter.rect_filled(
+                transform * softkeys.rect,
+                0.0,
+                crate::effective_colour::colour(&display.pool, softkeys.background).convert(),
+            );
+        }
+        for slot in &softkeys.slots {
+            let rect = transform * slot.rect;
+            workspace_painter.rect_stroke(
+                rect,
+                0.0,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Outside,
+            );
+            match slot.content {
+                super::softkeys::SlotContent::Key(id) => {
+                    let mut key_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .id_salt(("softkey", slot.index))
+                            .max_rect(slot.rect),
+                    );
+                    key_ui.set_clip_rect(
+                        (transform.inverse() * viewport.intersect(ui.clip_rect()))
+                            .intersect(slot.rect),
+                    );
+                    key_ui.disable();
+                    key_ui.set_opacity(1.0);
+                    key_ui.with_visual_transform(transform, |key_ui| {
+                        if let Some(object) = ObjectId::new(id)
+                            .ok()
+                            .and_then(|id| display.pool.object_by_id(id))
+                        {
+                            crate::object_rendering::render_object_with_version(
+                                key_ui,
+                                &display.pool,
+                                object,
+                                Point::default(),
+                                project.vt_version,
+                            );
+                        }
+                    });
+                }
+                super::softkeys::SlotContent::Previous | super::softkeys::SlotContent::Next => {
+                    workspace_painter.rect_filled(rect, 0.0, ui.visuals().widgets.inactive.bg_fill);
+                    let previous = matches!(slot.content, super::softkeys::SlotContent::Previous);
+                    let enabled = if previous {
+                        softkeys.page > 0
+                    } else {
+                        softkeys.navigation == 1 || softkeys.page + 1 < softkeys.pages
+                    };
+                    workspace_painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if previous { "◀" } else { "▶" },
+                        egui::FontId::proportional(18.0 * self.zoom),
+                        if enabled {
+                            ui.visuals().text_color()
+                        } else {
+                            ui.visuals().weak_text_color()
+                        },
+                    );
+                }
+                super::softkeys::SlotContent::Invalid => {
+                    workspace_painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Invalid key",
+                        egui::FontId::proportional(10.0 * self.zoom),
+                        crate::ui_style::palette(ui).error,
+                    );
+                }
+                super::softkeys::SlotContent::Empty => {}
+            }
+        }
         let painter = ui.painter().with_clip_rect(viewport);
         let screen = |r: Rect| transform * r;
         let draft_scene = self
             .gesture
             .as_ref()
             .and_then(|g| g.draft.as_ref())
-            .map(|(m, _)| geometry::build(project, m, root));
+            .map(|(m, _)| geometry::build_page(project, m, root, self.softkey_page));
         let display_scene = draft_scene.as_ref().unwrap_or(&scene);
         let display_items =
             if let Some((_, targets)) = self.gesture.as_ref().and_then(|g| g.draft.as_ref()) {
                 display_scene
                     .items
                     .iter()
-                    .filter(|i| i.target.as_ref().is_some_and(|t| targets.contains(t)))
+                    .filter(|i| {
+                        i.target.as_ref().is_some_and(|t| targets.contains(t))
+                            && self.selected.iter().any(|path| {
+                                super::softkeys::area(path) == super::softkeys::area(&i.path)
+                            })
+                    })
                     .cloned()
                     .collect()
             } else {
@@ -663,6 +821,13 @@ impl CanvasState {
         }
     }
 
+    fn change_softkey_page(&mut self, page: usize) {
+        self.cancel_interaction();
+        self.softkey_page = page;
+        self.selected.clear();
+        self.context.clear();
+    }
+
     fn selection(&self, scene: &Scene) -> Vec<SceneItem> {
         scene
             .items
@@ -673,7 +838,8 @@ impl CanvasState {
     }
     fn hit<'a>(&self, scene: &'a Scene, pos: Pos2, deep: bool) -> Option<&'a SceneItem> {
         let leaf = scene.items.iter().rev().find(|i| {
-            i.target.is_some()
+            (i.target.is_some()
+                || i.path.first() == Some(&super::softkeys::PATH_PREFIX) && i.path.len() == 2)
                 && i.hit_rect.width() >= 0.0
                 && i.hit_rect.height() >= 0.0
                 && i.hit_rect.expand(3.0 / self.zoom).contains(pos)
@@ -689,10 +855,15 @@ impl CanvasState {
         }) {
             return Some(selected);
         }
-        let depth = if leaf.path.starts_with(&self.context) {
-            self.context.len() + 1
+        let base_depth = if leaf.path.first() == Some(&super::softkeys::PATH_PREFIX) {
+            3.min(leaf.path.len())
         } else {
             1
+        };
+        let depth = if leaf.path.starts_with(&self.context) {
+            (self.context.len() + 1).max(base_depth)
+        } else {
+            base_depth
         };
         scene
             .items
@@ -721,11 +892,16 @@ impl CanvasState {
                 self.error = None;
                 self.revision = project.revision();
                 if let (Some(root), Ok(m)) = (self.mask, project.materialize()) {
-                    let scene = geometry::build(project, &m, root);
+                    let scene = geometry::build_page(project, &m, root, self.softkey_page);
                     self.selected = scene
                         .items
                         .iter()
-                        .filter(|i| i.target.as_ref().is_some_and(|t| targets.contains(t)))
+                        .filter(|i| {
+                            i.target.as_ref().is_some_and(|t| targets.contains(t))
+                                && self.selected.iter().any(|path| {
+                                    super::softkeys::area(path) == super::softkeys::area(&i.path)
+                                })
+                        })
                         .map(|i| i.path.clone())
                         .collect();
                     self.sync_selection(project, &scene);
@@ -874,7 +1050,7 @@ impl CanvasState {
                             .count();
                         if references > 1 {
                             ui.colored_label(
-                                Color32::YELLOW,
+                                ui.visuals().warn_fg_color,
                                 format!("Shared dimensions · {references} references"),
                             );
                         } else {

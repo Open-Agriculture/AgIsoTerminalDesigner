@@ -19,6 +19,7 @@ pub struct AiProposal {
     pub summary: AiProposalSummary,
     /// Number of visual-review corrections included in this staged proposal.
     pub refinement_round: u8,
+    pub soft_key_layout: crate::SoftKeyLayout,
 }
 #[derive(Debug, Clone, Default)]
 pub struct AiProposalSummary {
@@ -96,6 +97,7 @@ pub fn propose_transaction(
         prepared,
         summary,
         refinement_round: 0,
+        soft_key_layout: state.soft_key_layout,
     })
 }
 
@@ -120,6 +122,7 @@ pub fn propose_refinement(
         vt_version: state.vt_version,
         mask_size: state.mask_size,
         soft_key_size: state.soft_key_size,
+        soft_key_layout: base.soft_key_layout,
         selected: state.selected,
     };
     // First validate against P1. This is the important validation boundary for

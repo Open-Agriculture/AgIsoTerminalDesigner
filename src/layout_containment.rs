@@ -143,7 +143,34 @@ pub(crate) fn validate_change(
     before_mask: u16,
     after_mask: u16,
 ) -> Result<(), ContainmentError> {
-    validate_change_with_id_changes(before, after, before_mask, after_mask, &[])
+    validate_change_with_id_changes_and_soft_key_size(
+        before,
+        after,
+        before_mask,
+        after_mask,
+        &[],
+        None,
+    )
+}
+
+/// Like [`validate_change`], using separate old and candidate dimensions for
+/// every Key's child content area.
+pub(crate) fn validate_change_with_soft_key_size(
+    before: &ObjectPool,
+    after: &ObjectPool,
+    before_mask: u16,
+    after_mask: u16,
+    before_soft_key_size: (u16, u16),
+    after_soft_key_size: (u16, u16),
+) -> Result<(), ContainmentError> {
+    validate_change_with_id_changes_and_soft_key_size(
+        before,
+        after,
+        before_mask,
+        after_mask,
+        &[],
+        Some((before_soft_key_size, after_soft_key_size)),
+    )
 }
 
 /// Validates a change while preserving placement identity across object ID
@@ -155,8 +182,29 @@ pub(crate) fn validate_change_with_id_changes(
     after_mask: u16,
     id_changes: &[(u16, u16)],
 ) -> Result<(), ContainmentError> {
-    let before_placements = remap_placement_ids(placements(before, before_mask), id_changes);
-    let after_placements = placements(after, after_mask);
+    validate_change_with_id_changes_and_soft_key_size(
+        before,
+        after,
+        before_mask,
+        after_mask,
+        id_changes,
+        None,
+    )
+}
+
+pub(crate) fn validate_change_with_id_changes_and_soft_key_size(
+    before: &ObjectPool,
+    after: &ObjectPool,
+    before_mask: u16,
+    after_mask: u16,
+    id_changes: &[(u16, u16)],
+    soft_key_sizes: Option<((u16, u16), (u16, u16))>,
+) -> Result<(), ContainmentError> {
+    let before_placements = remap_placement_ids(
+        placements(before, before_mask, soft_key_sizes.map(|sizes| sizes.0)),
+        id_changes,
+    );
+    let after_placements = placements(after, after_mask, soft_key_sizes.map(|sizes| sizes.1));
     for (key, current) in after_placements {
         let previous = before_placements
             .get(&key)
@@ -216,7 +264,16 @@ pub(crate) fn validate_new_placements(
     mask_size: u16,
     new_refs: &HashSet<(u16, usize)>,
 ) -> Result<(), ContainmentError> {
-    for placements in placements(after, mask_size).into_values() {
+    validate_new_placements_with_soft_key_size(after, mask_size, new_refs, None)
+}
+
+pub(crate) fn validate_new_placements_with_soft_key_size(
+    after: &ObjectPool,
+    mask_size: u16,
+    new_refs: &HashSet<(u16, usize)>,
+    soft_key_size: Option<(u16, u16)>,
+) -> Result<(), ContainmentError> {
+    for placements in placements(after, mask_size, soft_key_size).into_values() {
         for placement in placements {
             if new_refs.contains(&(placement.parent_id, placement.child_index))
                 && placement.overflow != [0; 4]
@@ -253,7 +310,11 @@ struct Placement {
     overflow: [i32; 4],
 }
 
-fn placements(pool: &ObjectPool, mask_size: u16) -> HashMap<PlacementKey, Vec<Placement>> {
+fn placements(
+    pool: &ObjectPool,
+    mask_size: u16,
+    soft_key_size: Option<(u16, u16)>,
+) -> HashMap<PlacementKey, Vec<Placement>> {
     let mut output = HashMap::new();
     let mut visited_parents = HashSet::new();
     for object in pool
@@ -286,17 +347,29 @@ fn placements(pool: &ObjectPool, mask_size: u16) -> HashMap<PlacementKey, Vec<Pl
     // Detached bounded objects still own child lists. Treat their origins as
     // zero so their contents remain constrained without inventing a mask.
     for object in pool.objects() {
-        if !matches!(object, Object::Button(_) | Object::Container(_)) {
+        if !matches!(object, Object::Button(_) | Object::Container(_))
+            && !(soft_key_size.is_some() && matches!(object, Object::Key(_)))
+        {
             continue;
         }
         if crate::operations::object_refs(object).is_none() {
             continue;
         }
         let id = object.id().value();
-        if visited_parents.contains(&id) {
+        if visited_parents.contains(&id) && !matches!(object, Object::Key(_)) {
             continue;
         }
-        let size = bounds_for_object(pool, object);
+        let size = if matches!(object, Object::Key(_)) {
+            let (width, height) = soft_key_size.unwrap_or((0, 0));
+            Bounds {
+                x: 0,
+                y: 0,
+                width: width as i32,
+                height: height as i32,
+            }
+        } else {
+            bounds_for_object(pool, object)
+        };
         let outer = Bounds { x: 0, y: 0, ..size };
         traverse_parent(
             pool,
@@ -333,6 +406,7 @@ fn traverse_parent(
     visited_parents.insert(parent_id);
     let parent_content = match parent {
         Object::Button(_) | Object::Container(_) => content_bounds(parent, parent_outer),
+        Object::Key(_) => inherited_content,
         // Key and auxiliary designator children inherit the viewport available
         // at their placement, matching the canvas renderer's clip geometry.
         _ => inherited_content,
@@ -653,6 +727,38 @@ mod tests {
             mask.object_refs[0].offset.x = 96;
         }
         assert!(validate_change(&before, &repaired, 100, 100).is_err());
+    }
+
+    #[test]
+    fn key_contents_use_the_configured_size_and_preserve_only_existing_overflow() {
+        let mut key = object(ObjectType::Key, 2);
+        let mut child = object(ObjectType::OutputRectangle, 3);
+        if let Object::Key(key) = &mut key {
+            key.object_refs.push(reference(3, 15, 2));
+        }
+        if let Object::OutputRectangle(rect) = &mut child {
+            rect.width = 10;
+            rect.height = 10;
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(key);
+        pool.add(child);
+
+        // The imported five-pixel overflow is grandfathered, but may not grow.
+        assert!(
+            validate_change_with_soft_key_size(&pool, &pool, 100, 100, (20, 20), (20, 20)).is_ok()
+        );
+        assert!(
+            validate_change_with_soft_key_size(&pool, &pool, 100, 100, (20, 20), (18, 20)).is_err()
+        );
+        let mut worsened = pool.clone();
+        if let Some(Object::Key(key)) = worsened.object_mut_by_id(ObjectId::new(2).unwrap()) {
+            key.object_refs[0].offset.x = 17;
+        }
+        let error =
+            validate_change_with_soft_key_size(&pool, &worsened, 100, 100, (20, 20), (20, 20))
+                .unwrap_err();
+        assert_eq!((error.parent_id, error.child_id), (2, 3));
     }
 
     #[test]

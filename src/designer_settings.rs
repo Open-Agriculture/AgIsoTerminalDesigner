@@ -1,7 +1,7 @@
 //! Application preferences and the project settings window.
 
 use ag_iso_stack::object_pool::vt_version::VtVersion;
-use ag_iso_terminal_designer::{EditorProject, ObjectIdFormat};
+use ag_iso_terminal_designer::{EditorProject, ObjectIdFormat, SoftKeyArrangement, SoftKeyLayout};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,7 @@ pub struct DimensionsDraft {
     pub soft_key_width: u16,
     pub soft_key_height: u16,
     pub vt_version: VtVersion,
+    pub soft_key_layout: SoftKeyLayout,
 }
 
 impl DimensionsDraft {
@@ -59,6 +60,7 @@ impl DimensionsDraft {
             soft_key_width,
             soft_key_height,
             vt_version: project.vt_version(),
+            soft_key_layout: project.soft_key_layout(),
         }
     }
 }
@@ -106,7 +108,27 @@ pub fn show_project_settings(
                     ui.add(egui::DragValue::new(&mut values.soft_key_height).range(0..=u16::MAX));
                     ui.label("px");
                 });
-                ui.small("Softkey dimensions are saved design values; softkey preview is not available yet.");
+                ag_iso_terminal_designer::ui_style::section_heading(ui, "Softkey layout");
+                ui.horizontal(|ui| {
+                    ui.label("Arrangement");
+                    ui.selectable_value(&mut values.soft_key_layout.arrangement, SoftKeyArrangement::Right, "Right columns");
+                    ui.selectable_value(&mut values.soft_key_layout.arrangement, SoftKeyArrangement::Bottom, "Bottom rows");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Physical keys");
+                    ui.add(egui::DragValue::new(&mut values.soft_key_layout.physical_key_count).range(1..=64));
+                    ui.label("Keys per column/row");
+                    ui.add(egui::DragValue::new(&mut values.soft_key_layout.keys_per_line).range(1..=values.soft_key_layout.physical_key_count));
+                    ui.label("Navigation keys");
+                    ui.add(egui::DragValue::new(&mut values.soft_key_layout.navigation_key_count).range(0..=2.min(values.soft_key_layout.physical_key_count.saturating_sub(1))));
+                });
+                values.soft_key_layout.keys_per_line = values.soft_key_layout.keys_per_line.min(values.soft_key_layout.physical_key_count).max(1);
+                values.soft_key_layout.navigation_key_count = values.soft_key_layout.navigation_key_count.min(2).min(values.soft_key_layout.physical_key_count.saturating_sub(1));
+                if values.soft_key_layout.validate().is_err() {
+                    ui.colored_label(ag_iso_terminal_designer::ui_style::palette(ui).error, "Choose 1–64 physical keys, a valid row/column size, and fewer navigation keys than physical keys.");
+                } else if u8::from(values.vt_version) >= u8::from(VtVersion::Version4) && values.soft_key_layout.physical_key_count < 6 {
+                    ui.colored_label(ui.visuals().warn_fg_color, "Terminal minimum advisory: VT4+ terminals require at least 6 physical softkeys.");
+                }
                 if values.mask == 0 || values.soft_key_width == 0 || values.soft_key_height == 0 {
                     ui.colored_label(ag_iso_terminal_designer::ui_style::palette(ui).error, "Dimensions must be positive.");
                 }
@@ -127,6 +149,7 @@ pub fn show_project_settings(
                 ui.horizontal(|ui| {
                     ui.label("Target VT version");
                     egui::ComboBox::from_id_salt("project_vt_version")
+                        .icon(ag_iso_terminal_designer::ui_style::combo_box_icon)
                         .selected_text(format!("VT{}", u8::from(values.vt_version)))
                         .show_ui(ui, |ui| {
                             for number in 2..=6 {
@@ -163,16 +186,6 @@ pub fn show_project_settings(
                 );
                 disabled_section(
                     ui,
-                    "Softkey layout",
-                    "Physical terminal key layouts are not available yet.",
-                    &[
-                        ("Physical softkey count", DisabledControl::Number),
-                        ("Navigation-key count", DisabledControl::Number),
-                        ("Key arrangement", DisabledControl::Choice(&["Not configured"])),
-                    ],
-                );
-                disabled_section(
-                    ui,
                     "Languages",
                     "Project language and translation management are not available yet.",
                     &[
@@ -185,6 +198,7 @@ pub fn show_project_settings(
                 ui.horizontal(|ui| {
                     ui.label("Object ID format");
                     egui::ComboBox::from_id_salt("settings_object_id_format")
+                        .icon(ag_iso_terminal_designer::ui_style::combo_box_icon)
                         .selected_text(match preferences.object_id_format {
                             ag_iso_terminal_designer::ObjectIdFormat::Decimal => "Decimal",
                             ag_iso_terminal_designer::ObjectIdFormat::Hexadecimal => "Hexadecimal (0x00AF)",
@@ -253,10 +267,11 @@ pub fn show_project_settings(
             if values.mask == 0 || values.soft_key_width == 0 || values.soft_key_height == 0 {
                 *error_message = Some("Project dimensions must be positive.".into());
                 *draft = Some(values);
-            } else if let Err(error) = project.set_project_settings(
+            } else if let Err(error) = project.set_project_configuration(
                 values.mask,
                 (values.soft_key_width, values.soft_key_height),
                 values.vt_version,
+                values.soft_key_layout,
             ) {
                 *error_message = Some(error.to_string());
                 *draft = Some(values);
@@ -278,7 +293,6 @@ pub fn show_project_settings(
 
 #[derive(Clone, Copy)]
 enum DisabledControl {
-    Number,
     Choice(&'static [&'static str]),
     Configure,
 }
@@ -295,14 +309,10 @@ fn disabled_section(
             ui.horizontal(|ui| {
                 ui.label(*label);
                 match control {
-                    DisabledControl::Number => {
-                        let mut value = 0_u16;
-                        ui.add(egui::DragValue::new(&mut value).range(0..=u16::MAX));
-                        ui.label("Not configured");
-                    }
                     DisabledControl::Choice(options) => {
                         let mut selected = 0;
                         egui::ComboBox::from_id_salt((title, index))
+                            .icon(ag_iso_terminal_designer::ui_style::combo_box_icon)
                             .selected_text(options[selected])
                             .show_ui(ui, |ui| {
                                 for (option_index, option) in options.iter().enumerate() {

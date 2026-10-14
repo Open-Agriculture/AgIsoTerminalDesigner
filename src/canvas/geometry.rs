@@ -34,10 +34,20 @@ pub(crate) struct SceneItem {
 
 /// Build visible pool-coordinate occurrences for a mask and its rendered children.
 /// Component internals are represented by one item at their virtual root placement.
+#[cfg(test)]
 pub(crate) fn build(
     project: &EditorProject,
     materialized: &MaterializedProject,
     root: u16,
+) -> Scene {
+    build_page(project, materialized, root, 0)
+}
+
+pub(crate) fn build_page(
+    project: &EditorProject,
+    materialized: &MaterializedProject,
+    root: u16,
+    page: usize,
 ) -> Scene {
     let Some(root_object) = object_by_id(materialized, root) else {
         return Scene { items: Vec::new() };
@@ -63,6 +73,22 @@ pub(crate) fn build(
         None,
         true,
     );
+    let keys = super::softkeys::build(project, &materialized.pool, root, page);
+    for slot in keys.slots {
+        if let super::softkeys::SlotContent::Key(id) = slot.content {
+            builder.ancestry.clear();
+            builder.ancestry.insert(id);
+            builder.push_object(
+                id,
+                slot.rect.min,
+                slot.rect,
+                slot.rect,
+                vec![super::softkeys::PATH_PREFIX, slot.index],
+                None,
+                false,
+            );
+        }
+    }
     Scene {
         items: builder.items,
     }
@@ -252,6 +278,9 @@ impl SceneBuilder<'_> {
     }
 
     fn size_of(&self, object: &Object, visiting: &mut HashSet<u16>) -> (u16, u16) {
+        if matches!(object, Object::Key(_)) {
+            return self.project.soft_key_size();
+        }
         if let Some(size) = object.as_sized_object() {
             return (size.width(), size.height());
         }

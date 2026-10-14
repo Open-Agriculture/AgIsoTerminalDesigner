@@ -6,16 +6,19 @@ ISOBUS import/export workflows. Project contains Add Object and Project Settings
 
 ## Project dimensions
 
-Project Settings edits the square data/alarm-mask design size and the softkey
-designator width and height with numeric inputs. Apply validates all dimensions
-and records one undo action; Cancel discards the dimension draft. Dimensions are
-positive 16-bit integers in design pixels. Changing them changes design bounds,
-without scaling objects. Mask reductions cannot introduce or increase placement
-overflow. Softkey dimensions are saved metadata; their canvas preview is pending.
+Project Settings edits the square data/alarm-mask design size and softkey
+designator dimensions, arrangement, physical key count, keys per column or row,
+and navigation-key count. Apply validates the configuration and records one undo
+action; Cancel discards the draft. Dimensions are positive 16-bit integers in
+design pixels. Changing them changes design bounds without scaling objects.
+Mask and softkey-content reductions cannot introduce or increase placement
+overflow.
 
-New projects use a 500 × 500 mask, 60 × 60 softkeys, and VT6. Existing projects
-retain their mask and VT version. If softkey dimensions are missing, the editor
-infers each axis independently from Key contents, with a 60 × 60 baseline.
+New projects use a 500 × 500 mask, 60 × 60 softkeys, 12 physical keys on the
+right in two columns of six, two navigation keys, and VT6. Existing projects
+retain their mask, softkey layout and VT version. Missing softkey dimensions are
+inferred per axis from Key contents, with a 60 × 60 baseline; missing layout
+settings use the new-project defaults.
 Project Settings selects VT2 through VT6. Apply checks compatibility before
 changing the version and dimensions together as one undo action. Cancel discards
 the draft. Incompatible changes report the affected objects and attributes;
@@ -24,6 +27,11 @@ objects are never silently converted or deleted.
 Object creation, attribute choices, references, macro events, and previews use
 the selected target. Checks cover the designer's existing objects, including
 version-specific flags, fonts, encodings, macro commands, and containment rules.
+Controls and choices unavailable for the target VT are hidden. Properties and
+Add Object show a collapsed **Unavailable in VT…** note listing relevant features
+and their supported versions. Existing incompatible values remain visible with
+warnings and controls for repair; hiding never changes stored values. Planned
+Project Settings placeholders remain visible and are not assigned a VT version.
 Optional hardware capabilities remain separate from specification compatibility.
 Missing object renderers are not implemented by choosing a newer VT version.
 
@@ -95,13 +103,12 @@ and snapping retain their existing controls.
 
 ## Planned configuration
 
-These settings have disabled controls with **Not configured** explanations.
-They do not have serialized configuration or affect the object pool yet.
+The remaining settings below have disabled controls with **Not configured**
+explanations. They do not have serialized configuration or affect the object pool.
 
 | Section | Planned settings | Required capability |
 | --- | --- | --- |
 | Compatibility | Colour capability, supported fonts/styles, input capabilities, terminal object support | Terminal capability profiles |
-| Softkey layout | Physical key count, navigation-key count, key arrangement | Softkey canvas preview and terminal layout profiles |
 | Languages | Supported/default languages, translation resources | Language resource management and variant generation |
 | Authoring | ID allocation ranges, naming conventions | Configurable allocation and naming policies |
 | Export | Export groups, language variants, generated-code options | Export profiles and variant/code generation |

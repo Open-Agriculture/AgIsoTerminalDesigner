@@ -142,6 +142,7 @@ impl DesignerApp {
                 ui.label(name.as_str());
                 ui.label("Select the target VT version used to encode this pool.");
                 egui::ComboBox::from_id_salt("import_vt_version")
+                    .icon(ag_iso_terminal_designer::ui_style::combo_box_icon)
                     .selected_text(format!("VT{}", u8::from(*version)))
                     .show_ui(ui, |ui| {
                         for number in 2..=6 {
@@ -1051,6 +1052,34 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
     }
 }
 
+/// Show flat object-list results without filtering the navigation hierarchy.
+fn render_filtered_object_list(ui: &mut egui::Ui, project: &EditorProject, query: &str) {
+    let matches: Vec<_> = project
+        .get_pool()
+        .objects()
+        .iter()
+        .filter(|object| {
+            ag_iso_terminal_designer::object_picker::matches_object(project, object, query)
+        })
+        .collect();
+    let title = if query.is_empty() {
+        "All objects".to_owned()
+    } else {
+        format!("Matching objects ({})", matches.len())
+    };
+    ag_iso_terminal_designer::ui_style::section_heading(ui, &title);
+    if matches.is_empty() {
+        ui.weak(if query.is_empty() {
+            "No objects"
+        } else {
+            "No matching objects"
+        });
+    }
+    for object in matches {
+        render_selectable_object(ui, object, project);
+    }
+}
+
 fn render_object_hierarchy(
     ui: &mut egui::Ui,
     parent_id: egui::Id,
@@ -1078,15 +1107,19 @@ fn render_object_hierarchy(
         });
     } else {
         let id = parent_id.with(project.get_object_info(object).get_unique_id());
-        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
-            .show_header(ui, |ui| {
+        ag_iso_terminal_designer::ui_style::collapsing_section(
+            ui,
+            id,
+            false,
+            |ui| {
                 render_selectable_object(ui, object, project);
-            })
-            .body(|ui| {
+            },
+            |ui| {
                 for instance in &instances {
                     let definition =
                         &project.component_source().definitions[&instance.component_id];
                     egui::CollapsingHeader::new(&definition.name)
+                        .icon(ag_iso_terminal_designer::ui_style::collapsing_icon)
                         .id_salt(instance.id)
                         .show(ui, |ui| {
                             for node in &definition.nodes {
@@ -1124,7 +1157,8 @@ fn render_object_hierarchy(
                         }
                     }
                 }
-            });
+            },
+        );
     }
 }
 
@@ -1265,11 +1299,14 @@ fn render_selected_ancestry_hierarchy(
     }
 
     let id = parent_id.with(project.get_object_info(object).get_unique_id());
-    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
-        .show_header(ui, |ui| {
+    ag_iso_terminal_designer::ui_style::collapsing_section(
+        ui,
+        id,
+        true,
+        |ui| {
             render_selectable_object(ui, object, project);
-        })
-        .body(|ui| {
+        },
+        |ui| {
             for (idx, parent) in parents.iter().enumerate() {
                 if path_guard.contains(parent) {
                     ui.colored_label(
@@ -1293,7 +1330,8 @@ fn render_selected_ancestry_hierarchy(
                 );
                 path_guard.remove(parent);
             }
-        });
+        },
+    );
 }
 
 fn render_selected_ancestry_panel(ui: &mut egui::Ui, project: &EditorProject) {
@@ -1637,9 +1675,22 @@ impl eframe::App for DesignerApp {
                 ui.menu_button("Project", |ui| {
                     ui.add_enabled_ui(self.project.is_some(), |ui| {
                         ui.menu_button("Add Object", |ui| {
+                            let version = self.project.as_ref().unwrap().vt_version();
+                            let unavailable = ObjectType::values()
+                                .into_iter()
+                                .filter(|object_type| !ag_iso_terminal_designer::vt_compatibility::supported_object_type(*object_type, version))
+                                .filter_map(|object_type| {
+                                    ag_iso_terminal_designer::vt_compatibility::availability_description(|v| {
+                                        ag_iso_terminal_designer::vt_compatibility::supported_object_type(object_type, v)
+                                    }).map(|availability| format!("{object_type:?} — {availability}"))
+                                })
+                                .collect();
                             egui::ScrollArea::vertical()
                                 .max_height(400.0)
                                 .show(ui, |ui| {
+                                    ag_iso_terminal_designer::ui_style::vt_availability_note(
+                                        ui, "add_object_vt_availability", version, unavailable,
+                                    );
                                     for object_type in ObjectType::values() {
                                         if !ag_iso_terminal_designer::vt_compatibility::supported_object_type(
                                             object_type, self.project.as_ref().unwrap().vt_version(),
@@ -1812,6 +1863,10 @@ impl eframe::App for DesignerApp {
             .set(self.project.as_ref().is_some_and(EditorProject::is_dirty));
     }
 
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.faint_bg_color.to_normalized_gamma_f32()
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, designer_settings::STORAGE_KEY, &self.preferences);
         eframe::set_value(storage, workspace::STORAGE_KEY, &self.workspace);
@@ -1924,11 +1979,83 @@ impl DesignerApp {
         };
         match pane {
             Pane::Objects => {
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                let filter_id = egui::Id::new("objects_list_filter");
+                let mut filter_text = ui
+                    .data(|data| data.get_temp::<String>(filter_id))
+                    .unwrap_or_default();
+                let previous_filter = filter_text.clone();
+                ui.label("Filter object list");
+                ui.horizontal(|ui| {
+                    let show_clear = !filter_text.is_empty();
+                    let clear_width = if !show_clear {
+                        0.0
+                    } else {
+                        28.0 + ui.spacing().item_spacing.x
+                    };
+                    ui.add(
+                        egui::TextEdit::singleline(&mut filter_text)
+                            .hint_text("Name or ID…")
+                            .desired_width((ui.available_width() - clear_width).max(0.0)),
+                    );
+                    if show_clear
+                        && ag_iso_terminal_designer::ui_style::icon_button(
+                            ui,
+                            ag_iso_terminal_designer::ui_style::Icon::Close,
+                            "Clear object filter",
+                        )
+                        .clicked()
+                    {
+                        filter_text.clear();
+                    }
+                });
+                ui.data_mut(|data| data.insert_temp(filter_id, filter_text.clone()));
+                ui.horizontal_wrapped(|ui| {
+                    let shortcut =
+                        egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F);
+                    if ui
+                        .button("Find…")
+                        .on_hover_text(format!(
+                            "Find an object with previews ({})",
+                            ctx.format_shortcut(&shortcut)
+                        ))
+                        .clicked()
+                    {
+                        ag_iso_terminal_designer::object_picker::open(
+                            &ctx,
+                            egui::Id::new("find_project_object"),
+                        );
+                    }
+                    ui.menu_button("Sort", |ui| {
+                        if ui.button("Sort by name").clicked() {
+                            pool.sort_objects_by_name();
+                            ui.close();
+                        }
+                        if ui.button("Sort by ID").clicked() {
+                            pool.sort_objects_by_id();
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Sort object list");
+                });
+                ui.separator();
+                let query = filter_text.to_lowercase();
+                let scroll = egui::ScrollArea::vertical();
+                let scroll = if filter_text != previous_filter {
+                    scroll.vertical_scroll_offset(0.0)
+                } else {
+                    scroll
+                };
+                scroll.show(ui, |ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                     ui.data_mut(|data| {
                         data.insert_temp(egui::Id::new("tree_row_bounds"), ui.max_rect())
                     });
+                    if !query.is_empty() {
+                        render_filtered_object_list(ui, pool, &query);
+                        ui.separator();
+                    }
+                    ag_iso_terminal_designer::ui_style::section_heading(ui, "Hierarchy");
                     if let Some(working_set) = pool.get_pool().working_set_object() {
                         render_object_hierarchy(
                             ui,
@@ -1958,64 +2085,11 @@ impl DesignerApp {
                             render_selectable_object(ui, object, pool);
                         }
                     }
-                    ui.separator();
 
-                    // Filter objects in the pool by name
-                    let filter_id = ui.id().with("filter_text");
-                    let mut filter_text = ui
-                        .data(|data| data.get_temp::<String>(filter_id))
-                        .unwrap_or_default();
-
-                    ui.horizontal(|ui| {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(ui.spacing().scroll.bar_width);
-                            ui.menu_button("Sort", |ui| {
-                                if ui.button("Sort by name").clicked() {
-                                    pool.sort_objects_by_name();
-                                    ui.close();
-                                }
-                                if ui.button("Sort by id").clicked() {
-                                    pool.sort_objects_by_id();
-                                    ui.close();
-                                }
-                            })
-                            .response
-                            .on_hover_text("Sort objects");
-
-                            if ui
-                                .button("Find…")
-                                .on_hover_text("Find an object with previews (Ctrl+F)")
-                                .clicked()
-                            {
-                                ag_iso_terminal_designer::object_picker::open(
-                                    &ctx,
-                                    egui::Id::new("find_project_object"),
-                                );
-                            }
-                            let response = ui.add(
-                                egui::TextEdit::singleline(&mut filter_text)
-                                    .hint_text("Filter by name or ID…")
-                                    .desired_width(ui.available_width()),
-                            );
-                            if response.changed() {
-                                ui.data_mut(|data| {
-                                    data.insert_temp(filter_id, filter_text.clone())
-                                });
-                            }
-                        });
-                    });
-
-                    let filter_text = filter_text.to_lowercase();
-                    for object in pool.get_pool().objects() {
-                        if ag_iso_terminal_designer::object_picker::matches_object(
-                            pool,
-                            object,
-                            &filter_text,
-                        ) {
-                            render_selectable_object(ui, object, pool);
-                        }
+                    if query.is_empty() {
+                        ui.separator();
+                        render_filtered_object_list(ui, pool, &query);
                     }
-
                     ui.allocate_space(ui.available_size());
                 });
             }
@@ -2147,8 +2221,16 @@ impl DesignerApp {
                 ui.horizontal(|ui| {
                     if ag_iso_terminal_designer::ui_style::icon_button(
                         ui,
-                        ag_iso_terminal_designer::ui_style::Icon::More,
-                        "Expand or collapse ancestry details",
+                        if self.workspace.ancestry_expanded {
+                            ag_iso_terminal_designer::ui_style::Icon::ChevronDown
+                        } else {
+                            ag_iso_terminal_designer::ui_style::Icon::ChevronRight
+                        },
+                        if self.workspace.ancestry_expanded {
+                            "Collapse ancestry details"
+                        } else {
+                            "Expand ancestry details"
+                        },
                     )
                     .clicked()
                     {
@@ -2355,10 +2437,11 @@ impl DesignerApp {
             std::mem::replace(&mut self.workspace.dock, egui_dock::DockState::new(vec![]));
         self.canvas_visible = false;
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
+            .frame(egui::Frame::NONE.fill(ctx.style().visuals.faint_bg_color))
             .show(ctx, |ui| {
                 egui_dock::DockArea::new(&mut dock)
                     .id(egui::Id::new("designer_dock"))
+                    .show_leaf_collapse_buttons(false)
                     .style(egui_dock::Style::from_egui(ui.style()))
                     .window_bounds(ui.max_rect())
                     .show_inside(ui, &mut PaneViewer { app: self });

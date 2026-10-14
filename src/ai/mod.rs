@@ -28,6 +28,7 @@ pub struct AiDesignState {
     pub mask_size: u16,
     /// Saved design metadata, retained when making proposal/project copies.
     pub soft_key_size: (u16, u16),
+    pub soft_key_layout: crate::SoftKeyLayout,
     pub selected: Option<ObjectId>,
 }
 pub use design_analysis::{

@@ -44,9 +44,75 @@ impl Pane {
 
 #[derive(Serialize, Deserialize)]
 pub struct Workspace {
+    #[serde(deserialize_with = "deserialize_expanded_dock")]
     pub dock: DockState<Pane>,
     pub ancestry_expanded: bool,
 }
+
+/// Loads a dock layout with all panes expanded. egui_dock keeps collapse state
+/// inside private tree fields, so normalize its serialized representation before
+/// deserializing it. The rest of the saved layout, including split fractions,
+/// active tabs, and window state, is left untouched.
+fn deserialize_expanded_dock<'de, D>(deserializer: D) -> Result<DockState<Pane>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Read directly from the persistence format first (eframe uses RON). Most
+    // workspaces need no normalization, so keep those layouts on the normal path.
+    let dock = DockState::<Pane>::deserialize(deserializer)?;
+    if !dock
+        .iter_surfaces()
+        .flat_map(|surface| surface.iter_nodes())
+        .any(egui_dock::Node::is_collapsed)
+    {
+        return Ok(dock);
+    }
+
+    // egui_dock exposes node collapse state, but the tree's aggregate collapse
+    // fields are private. Normalize those fields through a JSON value only when
+    // a saved node is actually collapsed.
+    let mut dock = dock;
+    sanitize_nonfinite_dock_geometry(&mut dock);
+    let mut value = serde_json::to_value(dock).map_err(serde::de::Error::custom)?;
+    clear_dock_collapse_state(&mut value);
+    DockState::<Pane>::deserialize(value).map_err(serde::de::Error::custom)
+}
+
+fn sanitize_nonfinite_dock_geometry(dock: &mut DockState<Pane>) {
+    for surface in dock.iter_surfaces_mut() {
+        for node in surface.iter_nodes_mut() {
+            if node.rect().is_some_and(|rect| !rect.is_finite()) {
+                node.set_rect(egui::Rect::ZERO);
+            }
+            if let egui_dock::Node::Leaf(leaf) = node {
+                if !leaf.viewport.is_finite() {
+                    leaf.viewport = egui::Rect::ZERO;
+                }
+            }
+        }
+    }
+}
+
+fn clear_dock_collapse_state(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, value) in object {
+                match key.as_str() {
+                    "collapsed" | "fully_collapsed" => *value = serde_json::Value::Bool(false),
+                    "collapsed_leaf_count" => *value = serde_json::Value::from(0),
+                    _ => clear_dock_collapse_state(value),
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                clear_dock_collapse_state(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 impl Workspace {
     pub fn new(preferences: &AppPreferences) -> Self {
         let mut dock = DockState::new(vec![Pane::Canvas]);
@@ -186,6 +252,80 @@ mod tests {
         let (surface, node, tab) = restored.dock.find_tab(&Pane::Graphics).unwrap();
         assert_eq!(restored.dock[surface][node].get_leaf().unwrap().active, tab);
     }
+
+    #[test]
+    fn saved_collapsed_layout_restores_expanded_without_changing_other_state() {
+        let preferences = AppPreferences {
+            show_graphics: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            show_proposal: true,
+            ..Default::default()
+        };
+        let mut workspace = Workspace::new(&preferences);
+        workspace.open(Pane::Properties);
+        workspace.ancestry_expanded = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(window) = workspace
+            .dock
+            .get_window_state_mut(egui_dock::SurfaceIndex(1))
+        {
+            window.set_position(egui::pos2(123.0, 234.0));
+            window.set_size(egui::vec2(456.0, 345.0));
+        }
+
+        for surface in workspace.dock.iter_surfaces_mut() {
+            for (index, node) in surface.iter_nodes_mut().enumerate() {
+                // Existing panes have been shown and have finite geometry.
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(index as f32 * 100.0, 0.0),
+                    egui::vec2(90.0, 80.0),
+                );
+                node.set_rect(rect);
+                if let egui_dock::Node::Leaf(leaf) = node {
+                    leaf.viewport = rect;
+                }
+            }
+        }
+        // Splitting in a newly opened pane can leave its initial geometry at
+        // Rect::NOTHING until the next frame.
+        workspace.dock.main_surface_mut().split_right(
+            NodeIndex::root(),
+            0.63,
+            vec![Pane::Graphics],
+        );
+        let mut expected_dock = workspace.dock.clone();
+        sanitize_nonfinite_dock_geometry(&mut expected_dock);
+        for surface in workspace.dock.iter_surfaces_mut() {
+            for node in surface.iter_nodes_mut() {
+                match node {
+                    egui_dock::Node::Leaf(_) => node.set_collapsed(true),
+                    egui_dock::Node::Horizontal(_) | egui_dock::Node::Vertical(_) => {
+                        node.set_collapsed(true);
+                        node.set_collapsed_leaf_count(1);
+                    }
+                    egui_dock::Node::Empty => {}
+                }
+            }
+        }
+        let mut storage = Storage::default();
+        eframe::set_value(&mut storage, STORAGE_KEY, &workspace);
+
+        let restored: Workspace = eframe::get_value(&storage, STORAGE_KEY).unwrap();
+        assert!(restored.valid());
+        assert!(restored.ancestry_expanded);
+        assert!(restored
+            .dock
+            .iter_surfaces()
+            .flat_map(|surface| surface.iter_nodes())
+            .all(|node| !node.is_collapsed() && node.collapsed_leaf_count() == 0));
+
+        // This also checks that tab order and active selections, split fractions,
+        // and (on native builds) floating window placement survive restoration.
+        let mut expected = serde_json::to_value(expected_dock).unwrap();
+        clear_dock_collapse_state(&mut expected);
+        assert_eq!(serde_json::to_value(&restored.dock).unwrap(), expected);
+    }
+
     #[test]
     fn reopening_does_not_duplicate_panes_and_invalid_layout_is_rejected() {
         let mut workspace = Workspace::new(&AppPreferences::default());

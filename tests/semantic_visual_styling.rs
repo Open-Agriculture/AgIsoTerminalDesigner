@@ -17,6 +17,7 @@ fn state() -> AiDesignState {
         vt_version: VtVersion::Version6,
         mask_size: 480,
         soft_key_size: (60, 60),
+        soft_key_layout: Default::default(),
         selected: None,
     };
     add(&mut s, ObjectType::WorkingSet, 1);

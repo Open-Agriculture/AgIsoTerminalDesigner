@@ -11,6 +11,31 @@ use ag_iso_stack::object_pool::{
 };
 use std::collections::{HashSet, VecDeque};
 
+/// Describe the supported targets in the designer's VT2–VT6 range.
+///
+/// Returns `None` when no supported target satisfies `supports`. This does not
+/// imply support for optional terminal hardware capabilities.
+pub fn availability_description(mut supports: impl FnMut(VtVersion) -> bool) -> Option<String> {
+    let versions: Vec<u8> = (2..=6)
+        .filter(|number| supports(VtVersion::try_from(*number).unwrap()))
+        .collect();
+    let first = *versions.first()?;
+    if versions == (first..=6).collect::<Vec<_>>() {
+        Some(format!("Available from VT{first}"))
+    } else if versions.len() == 1 {
+        Some(format!("Available only in VT{first}"))
+    } else {
+        Some(format!(
+            "Available in {}",
+            versions
+                .iter()
+                .map(|number| format!("VT{number}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
 /// Whether an object type is available in object pools for a VT version.
 ///
 /// Annex A.1 footnotes are represented as introduction boundaries. Optional

@@ -49,6 +49,37 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
     let properties = get_property_descriptors(object_type);
 
     render_identity(ui, id, object_type, design);
+    let mut unavailable = unavailable_features(object, design.vt_version);
+    if object_type == ObjectType::ObjectPointer {
+        for target in design.get_object_info(object).allowed_references {
+            if let Some(target) = design.get_pool().object_by_id(target) {
+                if !crate::vt_compatibility::supported_object_type(
+                    target.object_type(),
+                    design.vt_version,
+                ) {
+                    if let Some(availability) =
+                        crate::vt_compatibility::availability_description(|version| {
+                            crate::vt_compatibility::supported_object_type(
+                                target.object_type(),
+                                version,
+                            )
+                        })
+                    {
+                        unavailable.push(format!(
+                            "Allowed references: {:?} — {availability}",
+                            target.object_type()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    crate::ui_style::vt_availability_note(
+        ui,
+        ("object_vt_availability", id.value()),
+        design.vt_version,
+        unavailable,
+    );
     ui.separator();
     if let Object::PictureGraphic(picture) = object {
         let current_format = picture.format;
@@ -150,14 +181,13 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             editor.property,
             design.vt_version,
         ) {
-            ui.horizontal(|ui| {
-                ui.label(&label);
-                ui.label(value.to_string()).on_hover_text(format!(
-                    "This property is unavailable in VT{} and is shown for repair context.",
-                    u8::from(design.vt_version)
-                ));
+            let default = crate::default_object(object_type);
+            if get_object_property(&default, editor.property).ok().as_ref() == Some(&value) {
+                continue;
+            }
+            repair_warning(ui, &label, design.vt_version, |version| {
+                crate::vt_compatibility::supported_property(object_type, editor.property, version)
             });
-            continue;
         }
         if editor.property == "value" {
             if let Some(decoded) = decoded_string_value(object, design.get_pool()) {
@@ -175,6 +205,13 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             }
         }
         if object_type == ObjectType::InputBoolean && editor.property == "value" {
+            if value.as_u64().is_some_and(|value| value > 1)
+                && design.vt_version < VtVersion::Version4
+            {
+                repair_warning(ui, &label, design.vt_version, |version| {
+                    crate::vt_compatibility::supported_input_boolean_value(2, version)
+                });
+            }
             let maximum = if design.vt_version < VtVersion::Version4 {
                 1.0
             } else {
@@ -190,6 +227,25 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                 design,
             );
             continue;
+        }
+        if matches!(editor.editor, EditorKind::ObjectReference) {
+            if let Some(target) = value
+                .as_u64()
+                .and_then(|value| ObjectId::new(value as u16).ok())
+                .and_then(|target| design.get_pool().object_by_id(target))
+            {
+                if !crate::vt_compatibility::supported_object_type(
+                    target.object_type(),
+                    design.vt_version,
+                ) {
+                    repair_warning(ui, &label, design.vt_version, |version| {
+                        crate::vt_compatibility::supported_object_type(
+                            target.object_type(),
+                            version,
+                        )
+                    });
+                }
+            }
         }
         ui.push_id(editor.property, |ui| match editor.editor {
             EditorKind::Colour => render_colour(ui, &label, &value, id, editor.property, design),
@@ -209,12 +265,28 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                 }
             }
             EditorKind::Enum => {
+                if !enum_value_supported(object_type, editor.property, &value, design.vt_version) {
+                    repair_warning(ui, &label, design.vt_version, |version| {
+                        enum_value_supported(object_type, editor.property, &value, version)
+                    });
+                }
                 ui.horizontal(|ui| {
                     let label_response = ui.label(&label);
                     egui::ComboBox::from_id_salt(editor.property)
+                        .icon(crate::ui_style::combo_box_icon)
                         .selected_text(enum_choice_label(&value))
                         .show_ui(ui, |ui| {
                             for choice in &property.enum_choices {
+                                if choice != &value
+                                    && !enum_value_supported(
+                                        object_type,
+                                        editor.property,
+                                        choice,
+                                        design.vt_version,
+                                    )
+                                {
+                                    continue;
+                                }
                                 let valid = choice == &value
                                     || (enum_value_supported(
                                         object_type,
@@ -1022,6 +1094,7 @@ fn render_add_macro_reference(
     ui.horizontal(|ui| {
         ui.label("Add macro:");
         egui::ComboBox::from_id_salt(("new_macro_event", id.value()))
+            .icon(crate::ui_style::combo_box_icon)
             .selected_text(
                 selected_event
                     .map_or_else(|| "Select event".to_owned(), |event| format!("{event:?}")),
@@ -1100,6 +1173,33 @@ fn render_macro_references(
     };
     ui.label("Macros");
     let events = crate::possible_events::get_possible_events_for_version(object, design.vt_version);
+    for (index, reference) in references.iter().enumerate() {
+        if !crate::vt_compatibility::supported_event(object, reference.event_id, design.vt_version)
+        {
+            repair_warning(
+                ui,
+                &format!("Macro {}: {:?}", index + 1, reference.event_id),
+                design.vt_version,
+                |version| {
+                    crate::vt_compatibility::supported_event(object, reference.event_id, version)
+                },
+            );
+        }
+        if reference.macro_id > u8::MAX.into() && design.vt_version < VtVersion::Version5 {
+            repair_warning(
+                ui,
+                &format!("Macro {}: extended reference", index + 1),
+                design.vt_version,
+                |version| {
+                    crate::vt_compatibility::supported_property(
+                        object.object_type(),
+                        "extended_macro_reference",
+                        version,
+                    )
+                },
+            );
+        }
+    }
     let mut action = None;
     egui::Grid::new(("macro_grid", id.value()))
         .striped(true)
@@ -1108,6 +1208,7 @@ fn render_macro_references(
             for (index, reference) in references.iter().enumerate() {
                 let mut edited = reference.clone();
                 egui::ComboBox::from_id_salt(("macro_event", index))
+                    .icon(crate::ui_style::combo_box_icon)
                     .selected_text(format!("{:?}", reference.event_id))
                     .show_ui(ui, |ui| {
                         for event in &events {
@@ -1276,6 +1377,11 @@ fn enum_value_supported(
     version: VtVersion,
 ) -> bool {
     match property {
+        "font_size" => serde_json::from_value(value.clone())
+            .ok()
+            .is_some_and(|font_size| {
+                crate::vt_compatibility::supported_font_size(font_size, version)
+            }),
         "font_type" => serde_json::from_value(value.clone())
             .ok()
             .is_some_and(|font_type| {
@@ -1283,6 +1389,126 @@ fn enum_value_supported(
             }),
         _ => crate::vt_compatibility::supported_property(object_type, property, version),
     }
+}
+
+fn repair_warning(
+    ui: &mut egui::Ui,
+    label: &str,
+    version: VtVersion,
+    supports: impl FnMut(VtVersion) -> bool,
+) {
+    let availability = crate::vt_compatibility::availability_description(supports)
+        .unwrap_or_else(|| "Unavailable in supported VT versions".to_owned());
+    ui.colored_label(
+        ui.visuals().warn_fg_color,
+        format!(
+            "{label}: incompatible with VT{}. {availability}. Change the value to repair it.",
+            u8::from(version)
+        ),
+    );
+}
+
+fn unavailable_features(object: &Object, version: VtVersion) -> Vec<String> {
+    use crate::vt_compatibility as compatibility;
+    let object_type = object.object_type();
+    let mut entries = Vec::new();
+    let mut add = |label: String, supports: &dyn Fn(VtVersion) -> bool| {
+        if !supports(version) {
+            if let Some(availability) = compatibility::availability_description(supports) {
+                entries.push(format!("{label} — {availability}"));
+            }
+        }
+    };
+    add(format!("{object_type:?} objects"), &|v| {
+        compatibility::supported_object_type(object_type, v)
+    });
+    let descriptors = get_property_descriptors(object_type);
+    for editor in property_editor_descriptors(object_type) {
+        let label = human_readable_property_name(editor.property);
+        add(label.clone(), &|v| {
+            compatibility::supported_property(object_type, editor.property, v)
+        });
+        let Ok(value) = get_object_property(object, editor.property) else {
+            continue;
+        };
+        match editor.editor {
+            EditorKind::Enum => {
+                if let Some(descriptor) =
+                    descriptors.iter().find(|item| item.name == editor.property)
+                {
+                    for choice in &descriptor.enum_choices {
+                        let choice_label = if editor.property == "font_size"
+                            && choice.get("Proportional").is_some()
+                        {
+                            "Proportional font sizes".to_owned()
+                        } else {
+                            format!("{label}: {}", enum_choice_label(choice))
+                        };
+                        add(choice_label, &|v| {
+                            enum_value_supported(object_type, editor.property, choice, v)
+                        });
+                    }
+                }
+            }
+            EditorKind::FlagSet => {
+                if let Some(fields) = value.as_object() {
+                    for (field, value) in fields {
+                        if value.is_boolean()
+                            && !(editor.property == "font_style" && field == "proportional")
+                        {
+                            add(
+                                format!("{label}: {}", human_readable_property_name(field)),
+                                &|v| {
+                                    compatibility::supported_property_flag(
+                                        object_type,
+                                        editor.property,
+                                        field,
+                                        v,
+                                    )
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            EditorKind::Justification => {
+                add("Vertical alignment".to_owned(), &|v| {
+                    compatibility::supported_vertical_alignment(
+                        ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Middle,
+                        v,
+                    )
+                });
+            }
+            _ => {}
+        }
+        if let Some(descriptor) = descriptors.iter().find(|item| item.name == editor.property) {
+            if let PropertySemantic::ObjectReference { allowed_types } = &descriptor.semantic {
+                for target_type in allowed_types {
+                    add(format!("{label}: {target_type:?} references"), &|v| {
+                        compatibility::supported_object_type(*target_type, v)
+                    });
+                }
+            }
+        }
+    }
+    if crate::operations::operation::macro_refs(object).is_some() {
+        for event in crate::possible_events::get_possible_events(object) {
+            add(format!("Macro event: {event:?}"), &|v| {
+                compatibility::supported_event(object, event, v)
+            });
+        }
+        add("Macro references with IDs above 255".to_owned(), &|v| {
+            compatibility::supported_property(object_type, "extended_macro_reference", v)
+        });
+    }
+    if object_type == ObjectType::InputBoolean {
+        add("Boolean values above 1".to_owned(), &|v| {
+            compatibility::supported_input_boolean_value(2, v)
+        });
+    }
+    entries.sort();
+    entries.dedup();
+    entries
 }
 
 /// Only offer a new value when the normal transaction validator accepts it for
@@ -1582,6 +1808,24 @@ fn render_flag_field(
 ) -> Option<serde_json::Value> {
     let label = human_readable_property_name(field);
     if let Some(mut enabled) = value.as_bool() {
+        if !crate::vt_compatibility::supported_property_flag(
+            object_type,
+            property,
+            field,
+            design.vt_version,
+        ) {
+            if !enabled {
+                return None;
+            }
+            repair_warning(ui, &label, design.vt_version, |version| {
+                crate::vt_compatibility::supported_property_flag(
+                    object_type,
+                    property,
+                    field,
+                    version,
+                )
+            });
+        }
         let mut updated = fields.clone();
         let candidate_enabled = !enabled;
         updated.insert(field.to_owned(), candidate_enabled.into());
@@ -1611,6 +1855,7 @@ fn render_flag_field(
         .horizontal(|ui| {
             let label_response = ui.label(&label);
             egui::ComboBox::from_id_salt(&label)
+                .icon(crate::ui_style::combo_box_icon)
                 .selected_text(selected_label)
                 .show_ui(ui, |ui| {
                     for choice in choices {
@@ -1832,6 +2077,7 @@ fn render_pointer_reference(
                 |target| crate::object_picker::object_label(design, Some(target)),
             );
             egui::ComboBox::from_id_salt((id.value(), property, "allowed_reference"))
+                .icon(crate::ui_style::combo_box_icon)
                 .selected_text(selected_label)
                 .show_ui(ui, |ui| {
                     if ui.selectable_label(selected_id.is_none(), "None").clicked()
@@ -1851,6 +2097,14 @@ fn render_pointer_reference(
                             .on_disabled_hover_text("This allowed object no longer exists.");
                             continue;
                         };
+                        if selected_id != Some(*target)
+                            && !crate::vt_compatibility::supported_object_type(
+                                candidate.object_type(),
+                                design.vt_version,
+                            )
+                        {
+                            continue;
+                        }
                         let choice = crate::object_picker::object_label(design, Some(*target));
                         let reason = if !allowed_types.is_empty()
                             && !allowed_types.contains(&candidate.object_type())
@@ -1995,9 +2249,18 @@ fn render_justification(
         .get("vertical")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("Top");
+    if design.vt_version < VtVersion::Version4 && vertical != "Top" {
+        repair_warning(ui, "Vertical alignment", design.vt_version, |version| {
+            crate::vt_compatibility::supported_vertical_alignment(
+                ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Middle,
+                version,
+            )
+        });
+    }
     ui.horizontal(|ui| {
         let horizontal_label = ui.label(label);
         egui::ComboBox::from_id_salt(label)
+            .icon(crate::ui_style::combo_box_icon)
             .selected_text(horizontal)
             .show_ui(ui, |ui| {
                 for choice in ["Left", "Middle", "Right"] {
@@ -2010,8 +2273,12 @@ fn render_justification(
             })
             .response
             .labelled_by(horizontal_label.id);
+        if design.vt_version < VtVersion::Version4 && vertical == "Top" {
+            return;
+        }
         let vertical_label = ui.label("Vertical");
         egui::ComboBox::from_id_salt("Vertical")
+            .icon(crate::ui_style::combo_box_icon)
             .selected_text(vertical)
             .show_ui(ui, |ui| {
                 for choice in ["Top", "Middle", "Bottom"] {
@@ -2026,6 +2293,14 @@ fn render_justification(
                             ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Bottom
                         }
                     };
+                    if choice != vertical
+                        && !crate::vt_compatibility::supported_vertical_alignment(
+                            alignment,
+                            design.vt_version,
+                        )
+                    {
+                        continue;
+                    }
                     let valid = choice == vertical
                         || crate::vt_compatibility::supported_vertical_alignment(
                             alignment,
@@ -2102,6 +2377,282 @@ mod tests {
             button.height = 100;
         }
         object
+    }
+
+    fn editor_frame(
+        ctx: &egui::Context,
+        project: &EditorProject,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Rect)> {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(360.0, 1800.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_property_editor(
+                        ui,
+                        project.get_pool().objects().first().unwrap(),
+                        project,
+                    );
+                });
+            },
+        );
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| match shape.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn click_editor_text(
+        ctx: &egui::Context,
+        project: &EditorProject,
+        label: &str,
+    ) -> Vec<(String, egui::Rect)> {
+        let text = editor_frame(ctx, project, vec![]);
+        let pos = text
+            .iter()
+            .find(|(text, _)| text == label)
+            .unwrap_or_else(|| panic!("Missing {label}: {text:?}"))
+            .1
+            .center();
+        editor_frame(
+            ctx,
+            project,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        editor_frame(
+            ctx,
+            project,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        editor_frame(ctx, project, vec![])
+    }
+
+    fn project_at_version(object: Object, version: u8) -> EditorProject {
+        let mut pool = ObjectPool::default();
+        pool.add(object);
+        let project = EditorProject::from(pool);
+        load_at_version(&project, version)
+    }
+
+    fn load_at_version(project: &EditorProject, version: u8) -> EditorProject {
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&project.save_project().unwrap()).unwrap();
+        saved["settings"]["vt_version"] = version.into();
+        EditorProject::load_project(serde_json::to_vec(&saved).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn pointer_menu_hides_unsupported_targets_but_preserves_management() {
+        let mut pool = ObjectPool::default();
+        pool.add(object(ObjectType::ObjectPointer, 1));
+        pool.add(object(ObjectType::OutputList, 2));
+        pool.add(object(ObjectType::Button, 3));
+        let mut project = EditorProject::from(pool);
+        apply(
+            &mut project,
+            Operation::SetObjectPointerAllowedReferences {
+                object: ObjectTarget::id(1),
+                references: vec![ObjectTarget::id(2), ObjectTarget::id(3)],
+            },
+        );
+        let project = load_at_version(&project, 3);
+        let unsupported =
+            crate::object_picker::object_label(&project, Some(ObjectId::new(2).unwrap()));
+        let supported =
+            crate::object_picker::object_label(&project, Some(ObjectId::new(3).unwrap()));
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        let text = click_editor_text(&ctx, &project, "None");
+        // One label belongs to management; a second would be a dropdown choice.
+        assert_eq!(
+            text.iter().filter(|(text, _)| text == &unsupported).count(),
+            1
+        );
+        assert_eq!(
+            text.iter().filter(|(text, _)| text == &supported).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn vt_controls_hide_and_availability_note_expands() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.animation_time = 0.0);
+        let mut project = project_at_version(object(ObjectType::Button, 1), 3);
+        let text = editor_frame(&ctx, &project, vec![]);
+        assert!(!text
+            .iter()
+            .any(|(text, _)| text == "Disabled" || text.contains("Available from VT4")));
+        assert!(text.iter().any(|(text, _)| text == "Unavailable in VT3"));
+        let text = click_editor_text(&ctx, &project, "Unavailable in VT3");
+        assert!(text
+            .iter()
+            .any(|(text, _)| text == "Options: Disabled — Available from VT4"));
+        project.set_vt_version(VtVersion::Version4).unwrap();
+        assert!(editor_frame(&ctx, &project, vec![])
+            .iter()
+            .any(|(text, _)| text == "Disabled"));
+        project.undo();
+        assert!(!editor_frame(&ctx, &project, vec![])
+            .iter()
+            .any(|(text, _)| text == "Disabled"));
+        project.redo();
+        assert!(editor_frame(&ctx, &project, vec![])
+            .iter()
+            .any(|(text, _)| text == "Disabled"));
+    }
+
+    #[test]
+    fn imported_unsupported_flag_remains_repairable_then_hides() {
+        let mut button = object(ObjectType::Button, 1);
+        let Object::Button(value) = &mut button else {
+            unreachable!()
+        };
+        value.options.disabled = true;
+        let mut project = project_at_version(button, 3);
+        let original = project.save_project().unwrap();
+        let ctx = egui::Context::default();
+        let text = editor_frame(&ctx, &project, vec![]);
+        assert!(text.iter().any(|(text, _)| text == "Disabled"));
+        assert!(text
+            .iter()
+            .any(|(text, _)| text.contains("Disabled: incompatible with VT3. Available from VT4")));
+        assert_eq!(original, project.save_project().unwrap());
+        click_editor_text(&ctx, &project, "Disabled");
+        assert!(project.commit_queued("Repair disabled flag"));
+        assert!(!editor_frame(&ctx, &project, vec![])
+            .iter()
+            .any(|(text, _)| text == "Disabled"));
+        assert!(project.compatibility_diagnostics().unwrap().is_empty());
+        project.undo();
+        assert!(editor_frame(&ctx, &project, vec![])
+            .iter()
+            .any(|(text, _)| text == "Disabled"));
+    }
+
+    #[test]
+    fn legacy_vertical_selector_hides_unless_needed_for_repair() {
+        let string = object(ObjectType::OutputString, 1);
+        let ctx = egui::Context::default();
+        let project = project_at_version(string.clone(), 3);
+        assert!(!editor_frame(&ctx, &project, vec![])
+            .iter()
+            .any(|(text, _)| text == "Vertical"));
+        let project = project_at_version(string.clone(), 4);
+        assert!(editor_frame(&ctx, &project, vec![])
+            .iter()
+            .any(|(text, _)| text == "Vertical"));
+        let mut string = string;
+        let Object::OutputString(value) = &mut string else {
+            unreachable!()
+        };
+        value.justification.vertical =
+            ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Middle;
+        let mut project = project_at_version(string, 3);
+        let text = editor_frame(&ctx, &project, vec![]);
+        assert!(text.iter().any(|(text, _)| text == "Vertical"));
+        assert!(text
+            .iter()
+            .any(|(text, _)| text.contains("Vertical alignment: incompatible with VT3")));
+        let text = click_editor_text(&ctx, &project, "Middle");
+        assert!(!text.iter().any(|(text, _)| text == "Bottom"));
+        click_editor_text(&ctx, &project, "Top");
+        assert!(project.commit_queued("Repair vertical alignment"));
+        assert!(!editor_frame(&ctx, &project, vec![])
+            .iter()
+            .any(|(text, _)| text == "Vertical"));
+    }
+
+    #[test]
+    fn font_and_macro_notes_follow_version_boundaries() {
+        let font = object(ObjectType::FontAttributes, 1);
+        let features = unavailable_features(&font, VtVersion::Version3);
+        assert_eq!(
+            features
+                .iter()
+                .filter(|entry| entry.contains("Proportional font sizes"))
+                .count(),
+            1
+        );
+        assert!(features
+            .iter()
+            .any(|entry| entry.contains("Font Type: Greek — Available from VT4")));
+        assert_eq!(
+            unavailable_features(&font, VtVersion::Version4),
+            vec!["Macro references with IDs above 255 — Available from VT5",]
+        );
+        let mask = object(ObjectType::DataMask, 1);
+        let features = unavailable_features(&mask, VtVersion::Version4);
+        assert!(features
+            .iter()
+            .any(|entry| entry == "Macro event: OnPointingEventPress — Available from VT5"));
+        assert!(features
+            .iter()
+            .any(|entry| entry == "Macro references with IDs above 255 — Available from VT5"));
+        assert!(unavailable_features(&mask, VtVersion::Version5).is_empty());
+    }
+
+    #[test]
+    fn font_dropdown_filters_encodings_and_retains_imported_current_value() {
+        use ag_iso_stack::object_pool::object_attributes::FontType;
+        for (version, greek_visible) in [(3, false), (4, true)] {
+            let ctx = egui::Context::default();
+            let font = object(ObjectType::FontAttributes, 1);
+            let project = project_at_version(font, version);
+            let text = click_editor_text(&ctx, &project, "Latin1");
+            assert_eq!(
+                text.iter().any(|(text, _)| text == "Greek"),
+                greek_visible,
+                "{text:?}"
+            );
+        }
+        let mut font = object(ObjectType::FontAttributes, 1);
+        let Object::FontAttributes(value) = &mut font else {
+            unreachable!()
+        };
+        value.font_type = FontType::Greek;
+        let mut project = project_at_version(font, 3);
+        let ctx = egui::Context::default();
+        let text = editor_frame(&ctx, &project, vec![]);
+        assert!(
+            text.iter()
+                .any(|(text, _)| text
+                    .contains("Font Type: incompatible with VT3. Available from VT4"))
+        );
+        click_editor_text(&ctx, &project, "Greek");
+        click_editor_text(&ctx, &project, "Latin1");
+        assert!(project.commit_queued("Repair font encoding"));
+        let text = editor_frame(&ctx, &project, vec![]);
+        assert!(!text
+            .iter()
+            .any(|(text, _)| text == "Greek" || text.contains("incompatible with VT3")));
     }
 
     fn apply(project: &mut EditorProject, operation: Operation) {

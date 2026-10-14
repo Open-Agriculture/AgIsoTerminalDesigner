@@ -656,3 +656,64 @@ fn rendered_vt_button_does_not_capture_canvas_drag() {
     assert_eq!(h.offset(1), (220, 100));
     assert_eq!(h.state.selected, vec![vec![0]]);
 }
+
+#[test]
+fn softkey_contents_edit_in_local_coordinates_and_page_changes_clear_selection() {
+    let mut h = Harness::new(false);
+    let mut pool = h.project.get_pool().clone();
+    if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(1).unwrap()) {
+        mask.soft_key_mask = NullableObjectId::new(10);
+    }
+    let mut softmask = default_object(ObjectType::SoftKeyMask);
+    softmask.mut_id().set_value(10).unwrap();
+    if let Object::SoftKeyMask(mask) = &mut softmask {
+        mask.objects = vec![ObjectId::new(11).unwrap(); 13];
+    }
+    let mut key = default_object(ObjectType::Key);
+    key.mut_id().set_value(11).unwrap();
+    if let Object::Key(key) = &mut key {
+        key.background_colour = 2;
+        key.object_refs.push(ObjectRef {
+            id: ObjectId::new(2).unwrap(),
+            offset: Point { x: 5, y: 5 },
+        });
+    }
+    pool.add(softmask);
+    pool.add(key);
+    h.project = EditorProject::from(pool);
+    h.project.mask_size = 500;
+    h.state = CanvasState::default();
+    h.frame(vec![], Modifiers::NONE);
+    let keys = super::super::softkeys::build(&h.project, h.project.get_pool(), 1, 0);
+    let rect = keys.slots[0].rect;
+    let screen_rect = Rect::from_min_size(h.screen(rect.min), rect.size() * h.state.zoom);
+    let key_fill = crate::effective_colour::colour(h.project.get_pool(), 2).convert();
+    assert!(h.output.shapes.iter().any(|shape| matches!(&shape.shape,
+        egui::Shape::Rect(painted) if painted.rect == screen_rect && painted.fill == key_fill
+            && shape.clip_rect == screen_rect)));
+    let background = h.screen(rect.min + egui::vec2(55.0, 55.0));
+    h.pointer(background, Some(true), Modifiers::NONE);
+    h.pointer(background, Some(false), Modifiers::NONE);
+    assert_eq!(h.project.get_selected(), NullableObjectId::new(11));
+    let child = h.screen(rect.min + egui::vec2(15.0, 15.0));
+    h.pointer(child, Some(true), Modifiers::NONE);
+    h.pointer(child + egui::vec2(5.0, 0.0), None, Modifiers::CTRL);
+    h.pointer(child + egui::vec2(5.0, 0.0), Some(false), Modifiers::CTRL);
+    assert_eq!(
+        position(
+            &h.project,
+            &PlacementTarget::Primitive {
+                parent_id: 11,
+                child_index: 0
+            }
+        ),
+        Some((10, 5))
+    );
+    assert_eq!(h.project.get_selected(), NullableObjectId::new(2));
+    assert_eq!(h.state.selected.len(), 1);
+    let next = h.screen(keys.slots[11].rect.center());
+    h.pointer(next, Some(true), Modifiers::NONE);
+    h.pointer(next, Some(false), Modifiers::NONE);
+    assert_eq!(h.state.softkey_page, 1);
+    assert!(h.state.selected.is_empty());
+}

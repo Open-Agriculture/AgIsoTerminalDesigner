@@ -294,6 +294,30 @@ impl OperationExecutor {
         transaction: &OperationTransaction,
         context: &ValidationContext,
     ) -> Result<PreparedTransaction, TransactionDiagnostics> {
+        self.prepare_transaction_inner(pool, object_info, transaction, context, None)
+    }
+
+    /// Prepare a transaction using the project's configured Key content size.
+    /// Existing callers can keep using `prepare_transaction` for mask-only validation.
+    pub fn prepare_transaction_with_soft_key_size(
+        &self,
+        pool: &ObjectPool,
+        object_info: &HashMap<ObjectId, ObjectInfo>,
+        transaction: &OperationTransaction,
+        context: &ValidationContext,
+        soft_key_size: (u16, u16),
+    ) -> Result<PreparedTransaction, TransactionDiagnostics> {
+        self.prepare_transaction_inner(pool, object_info, transaction, context, Some(soft_key_size))
+    }
+
+    fn prepare_transaction_inner(
+        &self,
+        pool: &ObjectPool,
+        object_info: &HashMap<ObjectId, ObjectInfo>,
+        transaction: &OperationTransaction,
+        context: &ValidationContext,
+        soft_key_size: Option<(u16, u16)>,
+    ) -> Result<PreparedTransaction, TransactionDiagnostics> {
         if transaction.schema_version != CURRENT_OPERATION_SCHEMA_VERSION {
             return Err(TransactionDiagnostics::single(TransactionDiagnostic {
                 severity: DiagnosticSeverity::Error,
@@ -393,10 +417,11 @@ impl OperationExecutor {
                 }
             }
         }
-        crate::layout_containment::validate_new_placements(
+        crate::layout_containment::validate_new_placements_with_soft_key_size(
             &candidate_pool,
             context.mask_size,
             &placements.new_references(),
+            soft_key_size,
         )
         .map_err(containment_transaction_error)?;
         let id_changes: Vec<_> = transaction
@@ -407,12 +432,13 @@ impl OperationExecutor {
                 _ => None,
             })
             .collect();
-        crate::layout_containment::validate_change_with_id_changes(
+        crate::layout_containment::validate_change_with_id_changes_and_soft_key_size(
             pool,
             &candidate_pool,
             context.mask_size,
             context.mask_size,
             &id_changes,
+            soft_key_size.map(|size| (size, size)),
         )
         .map_err(containment_transaction_error)?;
         let candidate_validation = crate::pool_validation::validate_pool_state_for_version(
@@ -495,6 +521,24 @@ impl OperationExecutor {
     ) -> Result<(), TransactionDiagnostics> {
         self.prepare_transaction(pool, object_info, transaction, context)
             .map(|_| ())
+    }
+
+    pub fn validate_transaction_with_soft_key_size(
+        &self,
+        pool: &ObjectPool,
+        object_info: &HashMap<ObjectId, ObjectInfo>,
+        transaction: &OperationTransaction,
+        context: &ValidationContext,
+        soft_key_size: (u16, u16),
+    ) -> Result<(), TransactionDiagnostics> {
+        self.prepare_transaction_with_soft_key_size(
+            pool,
+            object_info,
+            transaction,
+            context,
+            soft_key_size,
+        )
+        .map(|_| ())
     }
 
     /// Compatibility facade. Preparation is the only validation/execution implementation.

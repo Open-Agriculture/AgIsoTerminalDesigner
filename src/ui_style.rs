@@ -1,6 +1,96 @@
 //! Shared application styling and small code-drawn UI helpers.
 
-use egui::{Color32, CornerRadius, Stroke, Theme, Ui, Vec2};
+use egui::{style::WidgetVisuals, Color32, CornerRadius, Stroke, Theme, Ui, Vec2};
+
+/// Paint a compact chevron for a combo box, pointing down while closed and up while open.
+/// The foreground comes from egui's current widget state so the icon follows interaction styling.
+pub fn combo_box_icon(ui: &Ui, rect: egui::Rect, visuals: &WidgetVisuals, open: bool) {
+    paint_chevron(
+        ui,
+        rect.center(),
+        4.0,
+        if open {
+            -std::f32::consts::FRAC_PI_2
+        } else {
+            std::f32::consts::FRAC_PI_2
+        },
+        Stroke::new(visuals.fg_stroke.width.max(1.4), visuals.fg_stroke.color),
+    );
+}
+
+/// Paint a disclosure chevron that rotates from right to down as the section opens.
+/// Its color follows the current interactive state of the header response.
+pub fn collapsing_icon(ui: &mut Ui, openness: f32, response: &egui::Response) {
+    let stroke = ui.style().interact(response).fg_stroke;
+    paint_chevron(
+        ui,
+        response.rect.center(),
+        4.0,
+        std::f32::consts::FRAC_PI_2 * openness.clamp(0.0, 1.0),
+        Stroke::new(stroke.width.max(1.4), stroke.color),
+    );
+}
+
+/// Render a custom header and an indented, animated body with an outline disclosure icon.
+/// The supplied ID owns the persistent expansion state; header widgets retain their own interactions.
+pub fn collapsing_section(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    default_open: bool,
+    header: impl FnOnce(&mut egui::Ui),
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+        ui.ctx(),
+        id,
+        default_open,
+    );
+    let response = ui.horizontal(|ui| {
+        let spacing = ui.spacing().item_spacing;
+        ui.spacing_mut().item_spacing.x = 0.0;
+        state.show_toggle_button(ui, collapsing_icon);
+        ui.spacing_mut().item_spacing = spacing;
+        header(ui);
+    });
+    state.show_body_indented(&response.response, ui, body);
+}
+
+fn paint_chevron(ui: &Ui, center: egui::Pos2, radius: f32, angle: f32, stroke: Stroke) {
+    let (sin, cos) = angle.sin_cos();
+    let rotate = |x: f32, y: f32| center + Vec2::new(x * cos - y * sin, x * sin + y * cos);
+    ui.painter().line_segment(
+        [rotate(-radius * 0.55, -radius), rotate(radius * 0.55, 0.0)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [rotate(radius * 0.55, 0.0), rotate(-radius * 0.55, radius)],
+        stroke,
+    );
+}
+
+/// Render a collapsed, contextual list of functionality restricted by the target VT.
+/// The caller supplies a stable ID for its editor and already formatted entries.
+pub fn vt_availability_note(
+    ui: &mut Ui,
+    id: impl std::hash::Hash,
+    version: ag_iso_stack::object_pool::vt_version::VtVersion,
+    mut entries: Vec<String>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort();
+    entries.dedup();
+    egui::CollapsingHeader::new(format!("Unavailable in VT{}", u8::from(version)))
+        .id_salt(id)
+        .icon(collapsing_icon)
+        .default_open(false)
+        .show(ui, |ui| {
+            for entry in entries {
+                ui.add(egui::Label::new(entry).wrap());
+            }
+        });
+}
 
 /// Semantic colors used by application surfaces and status messages.
 #[derive(Clone, Copy, Debug)]
@@ -163,6 +253,8 @@ pub enum Icon {
     More,
     ChevronLeft,
     ChevronRight,
+    ChevronDown,
+    ChevronUp,
 }
 
 /// Create a compact icon-only button with an accessible tooltip.
@@ -212,30 +304,16 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str) -> egui::Response {
                 }
             }
             Icon::ChevronLeft => {
-                ui.painter().line_segment(
-                    [
-                        center + Vec2::new(2.5, -half),
-                        center + Vec2::new(-2.5, 0.0),
-                    ],
-                    stroke,
-                );
-                ui.painter().line_segment(
-                    [center + Vec2::new(-2.5, 0.0), center + Vec2::new(2.5, half)],
-                    stroke,
-                );
+                paint_chevron(ui, center, half, std::f32::consts::PI, stroke);
             }
             Icon::ChevronRight => {
-                ui.painter().line_segment(
-                    [
-                        center + Vec2::new(-2.5, -half),
-                        center + Vec2::new(2.5, 0.0),
-                    ],
-                    stroke,
-                );
-                ui.painter().line_segment(
-                    [center + Vec2::new(2.5, 0.0), center + Vec2::new(-2.5, half)],
-                    stroke,
-                );
+                paint_chevron(ui, center, half, 0.0, stroke);
+            }
+            Icon::ChevronDown => {
+                paint_chevron(ui, center, half, std::f32::consts::FRAC_PI_2, stroke);
+            }
+            Icon::ChevronUp => {
+                paint_chevron(ui, center, half, -std::f32::consts::FRAC_PI_2, stroke);
             }
         }
     }

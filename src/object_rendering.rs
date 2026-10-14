@@ -739,9 +739,15 @@ impl RenderableObject for InputList {
 
 impl RenderableObject for Key {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
-
+        let available = ui.available_rect_before_wrap();
+        let rect = create_relative_rect(ui, position, available.size());
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.shrink_clip_rect(rect);
+            ui.painter().rect_filled(
+                rect,
+                0.0,
+                crate::effective_colour::colour(pool, self.background_colour).convert(),
+            );
             render_object_refs(ui, pool, &self.object_refs);
         });
     }

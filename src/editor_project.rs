@@ -20,7 +20,7 @@ use crate::operations::{
     OperationHistory, OperationTransaction, PreparedTransaction, TransactionDiagnostics,
     ValidationContext, CURRENT_OPERATION_SCHEMA_VERSION,
 };
-use crate::{project_file::ProjectFile, smart_naming, ObjectIdFormat, ObjectInfo};
+use crate::{project_file::ProjectFile, smart_naming, ObjectIdFormat, ObjectInfo, SoftKeyLayout};
 
 const MAX_UNDO_REDO_SELECTED: usize = 20;
 
@@ -31,6 +31,7 @@ struct ProjectContentCheckpoint {
     allowed_references: Vec<(u16, Vec<ObjectId>)>,
     mask_size: u16,
     soft_key_size: (u16, u16),
+    soft_key_layout: SoftKeyLayout,
     vt_version: VtVersion,
     components: ComponentSource,
     graphics: crate::graphics::GraphicLibrary,
@@ -49,6 +50,7 @@ struct DesignDimensions {
     mask_size: u16,
     soft_key_size: (u16, u16),
     vt_version: VtVersion,
+    soft_key_layout: SoftKeyLayout,
 }
 
 impl ComponentCheckpoint {
@@ -82,6 +84,7 @@ pub struct EditorProject {
     /// Authoritative project VT version. Old projects default to Version 6.
     pub(crate) vt_version: VtVersion,
     soft_key_size: (u16, u16),
+    soft_key_layout: SoftKeyLayout,
     /// Application preference, excluded from project content and history.
     object_id_format: ObjectIdFormat,
     object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
@@ -168,6 +171,7 @@ impl From<ObjectPool> for EditorProject {
             mask_size: mask_size.max(1),
             vt_version: VtVersion::Version6,
             soft_key_size,
+            soft_key_layout: SoftKeyLayout::default(),
             object_id_format: ObjectIdFormat::default(),
             object_info: RefCell::new(HashMap::new()),
             mut_object_info: RefCell::new(HashMap::new()),
@@ -234,6 +238,7 @@ impl EditorProject {
         project.vt_version = state.vt_version;
         project.mask_size = state.mask_size;
         project.soft_key_size = state.soft_key_size;
+        project.soft_key_layout = state.soft_key_layout;
         project.object_info.replace(state.object_info.clone());
         project.mut_object_info.replace(state.object_info.clone());
         project
@@ -247,6 +252,7 @@ impl EditorProject {
             graphics: self.graphics.clone(),
             mask_size: self.mask_size,
             soft_key_size: self.soft_key_size,
+            soft_key_layout: self.soft_key_layout,
             vt_version: self.vt_version,
             object_id_format: self.object_id_format,
             object_info: RefCell::new(self.object_info.borrow().clone()),
@@ -431,11 +437,13 @@ impl EditorProject {
                 error.message.clone(),
             ));
         }
-        crate::layout_containment::validate_change(
+        crate::layout_containment::validate_change_with_soft_key_size(
             &baseline,
             &candidate.pool,
             self.mask_size,
             self.mask_size,
+            self.soft_key_size,
+            self.soft_key_size,
         )
         .map_err(containment_component_error)?;
         after
@@ -548,6 +556,7 @@ impl EditorProject {
             allowed_references,
             mask_size: self.mask_size,
             soft_key_size: self.soft_key_size,
+            soft_key_layout: self.soft_key_layout,
             vt_version: self.vt_version,
             components: self.components.clone(),
             graphics: self.graphics.clone(),
@@ -588,10 +597,15 @@ impl EditorProject {
         self.set_design_dimensions(mask_size, self.soft_key_size)
     }
 
-    /// Saved softkey designator width and height in design pixels. These are
-    /// design metadata until a softkey canvas preview is implemented.
+    /// Saved softkey designator width and height in design pixels. Key contents
+    /// use these dimensions as their editing and preview bounds.
     pub fn soft_key_size(&self) -> (u16, u16) {
         self.soft_key_size
+    }
+
+    /// Physical Soft Key Mask arrangement used by the authoring preview.
+    pub fn soft_key_layout(&self) -> SoftKeyLayout {
+        self.soft_key_layout
     }
 
     /// Authoritative target version used for authoring, preview and IOP export.
@@ -663,6 +677,7 @@ impl EditorProject {
             mask_size: self.mask_size,
             soft_key_size: self.soft_key_size,
             vt_version: self.vt_version,
+            soft_key_layout: self.soft_key_layout,
         }
     }
 
@@ -670,6 +685,7 @@ impl EditorProject {
         self.mask_size = dimensions.mask_size;
         self.soft_key_size = dimensions.soft_key_size;
         self.vt_version = dimensions.vt_version;
+        self.soft_key_layout = dimensions.soft_key_layout;
         self.bump_revision();
         self.refresh_dirty();
     }
@@ -681,7 +697,7 @@ impl EditorProject {
     }
 
     /// Atomically apply positive mask and softkey dimensions as one undo action.
-    /// Mask reductions cannot introduce or increase placement overflow; no
+    /// Mask or key reductions cannot introduce or increase placement overflow; no
     /// objects are scaled. Failure or a no-op leaves content and revision intact.
     /// Standard terminal minima are advisory, not limits on design pixels.
     pub fn set_design_dimensions(
@@ -700,6 +716,18 @@ impl EditorProject {
         soft_key_size: (u16, u16),
         vt_version: VtVersion,
     ) -> ComponentResult<()> {
+        self.set_project_configuration(mask_size, soft_key_size, vt_version, self.soft_key_layout)
+    }
+
+    /// Apply mask dimensions, key dimensions, VT version and softkey layout
+    /// atomically as one undo action.
+    pub fn set_project_configuration(
+        &mut self,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+        vt_version: VtVersion,
+        soft_key_layout: SoftKeyLayout,
+    ) -> ComponentResult<()> {
         if !(2..=6).contains(&u8::from(vt_version)) {
             return Err(ComponentError::new(
                 "UNSUPPORTED_VT_VERSION",
@@ -712,11 +740,15 @@ impl EditorProject {
                 "Design dimensions must be greater than zero",
             ));
         }
+        soft_key_layout
+            .validate()
+            .map_err(|message| ComponentError::new("INVALID_SOFT_KEY_LAYOUT", message))?;
         let before = self.dimensions();
         let after = DesignDimensions {
             mask_size,
             soft_key_size,
             vt_version,
+            soft_key_layout,
         };
         if before == after {
             return Ok(());
@@ -746,13 +778,15 @@ impl EditorProject {
                 })
                 .map_err(|message| ComponentError::new("VT_VERSION_INCOMPATIBLE", message))?;
         }
-        if self.mask_size != mask_size {
+        if self.mask_size != mask_size || self.soft_key_size != soft_key_size {
             let materialized = self.materialize()?;
-            crate::layout_containment::validate_change(
+            crate::layout_containment::validate_change_with_soft_key_size(
                 &materialized.pool,
                 &materialized.pool,
                 self.mask_size,
                 mask_size,
+                self.soft_key_size,
+                soft_key_size,
             )
             .map_err(containment_component_error)?;
         }
@@ -763,11 +797,13 @@ impl EditorProject {
             .borrow_mut()
             .push(AppliedTransaction {
                 transaction_id,
-                description: Some(if self.vt_version != vt_version {
-                    "Change project settings".into()
-                } else {
-                    "Change design dimensions".into()
-                }),
+                description: Some(
+                    if self.vt_version != vt_version || self.soft_key_layout != soft_key_layout {
+                        "Change project settings".into()
+                    } else {
+                        "Change design dimensions".into()
+                    },
+                ),
                 forward_operations: vec![],
                 inverse_operations: vec![],
                 affected_objects: vec![],
@@ -1238,11 +1274,12 @@ impl EditorProject {
             self.selected_object.0
         };
 
-        let mut project = ProjectFile::new(
+        let mut project = ProjectFile::new_with_soft_key_layout(
             &self.pool,
             &object_info,
             self.mask_size,
             self.soft_key_size,
+            self.soft_key_layout,
             self.vt_version,
             selected,
         )?;
@@ -1299,6 +1336,7 @@ impl EditorProject {
         if let Some(soft_key_size) = settings.soft_key_size {
             editor_project.soft_key_size = soft_key_size;
         }
+        editor_project.soft_key_layout = settings.soft_key_layout;
         editor_project.vt_version = settings.vt_version();
 
         // Restore object metadata
@@ -1495,7 +1533,7 @@ impl EditorProject {
                 reserved.insert(object_id.unwrap());
             }
         }
-        let prepared = OperationExecutor::new().prepare_transaction(
+        let prepared = OperationExecutor::new().prepare_transaction_with_soft_key_size(
             &self.pool,
             &self.object_info.borrow(),
             &transaction,
@@ -1503,6 +1541,7 @@ impl EditorProject {
                 vt_version: self.vt_version,
                 mask_size: self.mask_size,
             },
+            self.soft_key_size,
         )?;
         let candidate = materialize_source_with_graphics(
             &prepared.pool,
@@ -1552,12 +1591,13 @@ impl EditorProject {
                 error.message.clone(),
             )));
         }
-        crate::layout_containment::validate_change_with_id_changes(
+        crate::layout_containment::validate_change_with_id_changes_and_soft_key_size(
             &baseline,
             &candidate.pool,
             self.mask_size,
             self.mask_size,
             &id_changes,
+            Some((self.soft_key_size, self.soft_key_size)),
         )
         .map_err(crate::operations::executor::containment_transaction_error)?;
         Ok(prepared)
@@ -1720,6 +1760,7 @@ impl EditorProject {
             vt_version: self.vt_version,
             mask_size: self.mask_size,
             soft_key_size: self.soft_key_size,
+            soft_key_layout: self.soft_key_layout,
             selected: self.selected_object.0,
         }
     }
@@ -2046,10 +2087,20 @@ mod tests {
         assert_eq!(project.revision(), revision);
         assert!(!project.is_dirty());
 
-        project.set_design_dimensions(640, (80, 96)).unwrap();
+        let layout = SoftKeyLayout {
+            arrangement: crate::SoftKeyArrangement::Bottom,
+            physical_key_count: 8,
+            keys_per_line: 4,
+            navigation_key_count: 1,
+        };
+        project
+            .set_project_configuration(640, (80, 96), VtVersion::Version6, layout)
+            .unwrap();
         assert!(project.is_dirty());
         let revision = project.revision();
-        project.set_design_dimensions(640, (80, 96)).unwrap();
+        project
+            .set_project_configuration(640, (80, 96), VtVersion::Version6, layout)
+            .unwrap();
         assert!(project.set_design_dimensions(320, (0, 60)).is_err());
         assert_eq!(project.revision(), revision);
         assert_eq!(
@@ -2058,12 +2109,14 @@ mod tests {
                 mask_size: 640,
                 soft_key_size: (80, 96),
                 vt_version: VtVersion::Version6,
+                soft_key_layout: layout,
             }
         );
         let saved = project.save_project().unwrap();
         let restored = EditorProject::load_project(saved).unwrap();
         assert_eq!(restored.mask_size, 640);
         assert_eq!(restored.soft_key_size(), (80, 96));
+        assert_eq!(restored.soft_key_layout(), layout);
         assert_eq!(project.canvas_preview_copy().soft_key_size(), (80, 96));
         assert_eq!(
             EditorProject::from_ai_source(&project.ai_design_state()).soft_key_size(),
@@ -2077,12 +2130,14 @@ mod tests {
         assert!(project.undo_operation());
         assert_eq!(project.mask_size, 640);
         assert_eq!(project.soft_key_size(), (80, 96));
+        assert_eq!(project.soft_key_layout(), layout);
         assert!(project.get_pool().object_by_id(id).is_some());
         assert!(project.undo_operation());
         assert!(project.get_pool().object_by_id(id).is_none());
         assert!(project.undo_operation());
         assert_eq!(project.mask_size, 500);
         assert_eq!(project.soft_key_size(), (60, 60));
+        assert_eq!(project.soft_key_layout(), SoftKeyLayout::default());
         assert!(!project.is_dirty());
         assert!(!project.undo_available());
         assert!(project.redo_operation());
@@ -2090,6 +2145,7 @@ mod tests {
         assert!(project.redo_operation());
         assert_eq!(project.mask_size, 800);
         assert_eq!(project.soft_key_size(), (100, 120));
+        assert_eq!(project.soft_key_layout(), layout);
         assert!(project.get_pool().object_by_id(id).is_some());
     }
 
@@ -2123,6 +2179,7 @@ mod tests {
         let restored = EditorProject::load_project(serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert_eq!(restored.mask_size, 240);
         assert_eq!(restored.soft_key_size(), (90, 110));
+        assert_eq!(restored.soft_key_layout(), SoftKeyLayout::default());
         assert!(!restored.is_dirty());
     }
 

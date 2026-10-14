@@ -2,7 +2,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use crate::ObjectInfo;
+use crate::{ObjectInfo, SoftKeyLayout};
 use ag_iso_stack::object_pool::{object::Object, vt_version::VtVersion, ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -72,6 +72,10 @@ pub struct ProjectSettings {
     #[serde(default = "default_vt_version_number")]
     pub vt_version: u8,
 
+    /// Optional preview arrangement for referenced Soft Key Masks.
+    #[serde(default)]
+    pub soft_key_layout: SoftKeyLayout,
+
     /// Last selected object ID
     pub last_selected: Option<u16>,
 }
@@ -84,6 +88,27 @@ impl ProjectFile {
         object_info: &HashMap<ObjectId, ObjectInfo>,
         mask_size: u16,
         soft_key_size: (u16, u16),
+        vt_version: VtVersion,
+        selected: Option<ObjectId>,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new_with_soft_key_layout(
+            pool,
+            object_info,
+            mask_size,
+            soft_key_size,
+            SoftKeyLayout::default(),
+            vt_version,
+            selected,
+        )
+    }
+
+    /// Create a project file with an explicit preview softkey layout.
+    pub fn new_with_soft_key_layout(
+        pool: &ObjectPool,
+        object_info: &HashMap<ObjectId, ObjectInfo>,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+        soft_key_layout: SoftKeyLayout,
         vt_version: VtVersion,
         selected: Option<ObjectId>,
     ) -> Result<Self, serde_json::Error> {
@@ -111,6 +136,7 @@ impl ProjectFile {
                 mask_size,
                 soft_key_size: Some(soft_key_size),
                 vt_version: vt_version.into(),
+                soft_key_layout,
                 last_selected: selected.map(|id| id.value()),
             },
         })
@@ -173,6 +199,16 @@ impl ProjectFile {
                 ),
             )));
         }
+        project
+            .settings
+            .soft_key_layout
+            .validate()
+            .map_err(|message| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    message,
+                ))
+            })?;
         Ok(project)
     }
 }
@@ -183,6 +219,7 @@ impl Default for ProjectSettings {
             mask_size: 500,
             soft_key_size: Some((60, 60)),
             vt_version: default_vt_version_number(),
+            soft_key_layout: SoftKeyLayout::default(),
             last_selected: None,
         }
     }

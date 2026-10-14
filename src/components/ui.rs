@@ -118,61 +118,59 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
             continue;
         }
         let preview = definition_preview(ui.ctx(), project, &definition);
-        egui::collapsing_header::CollapsingState::load_with_default_open(
-            ui.ctx(),
+        let vt_version = project.vt_version;
+        crate::ui_style::collapsing_section(
+            ui,
             ui.id().with(definition.id),
             false,
-        )
-        .show_header(ui, |ui| {
-            crate::object_picker::preview(ui, |ui, rect| {
-                paint_definition_preview(
-                    ui,
-                    rect,
-                    &preview,
-                    definition.root_node,
-                    project.vt_version,
-                )
-            });
-            ui.vertical(|ui| {
-                ui.label(format!("{} / {}", category, definition.name));
-                ui.weak(definition.id.to_string());
-            });
-        })
-        .body(|ui| {
-            ui.label(&definition.description);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Instantiate").clicked() {
-                    let parent = project.get_selected().0.map(|id| id.value());
-                    if let Some(parent) = parent {
-                        if let Err(e) = ComponentService::instantiate_component(
-                            project,
-                            definition.id,
-                            parent,
-                            0,
-                            0,
-                            Default::default(),
-                        ) {
+            |ui| {
+                crate::object_picker::preview(ui, |ui, rect| {
+                    paint_definition_preview(ui, rect, &preview, definition.root_node, vt_version)
+                });
+                ui.vertical(|ui| {
+                    ui.label(format!("{} / {}", category, definition.name));
+                    ui.weak(definition.id.to_string());
+                });
+            },
+            |ui| {
+                ui.label(&definition.description);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Instantiate").clicked() {
+                        let parent = project.get_selected().0.map(|id| id.value());
+                        if let Some(parent) = parent {
+                            if let Err(e) = ComponentService::instantiate_component(
+                                project,
+                                definition.id,
+                                parent,
+                                0,
+                                0,
+                                Default::default(),
+                            ) {
+                                error = Some(e.to_string());
+                            }
+                        } else {
+                            error = Some("Select an ordinary positioned parent first".into());
+                        }
+                    }
+                    if ui.button("Edit master").clicked() {
+                        open_editor(ui, &definition);
+                    }
+                    if ui.button("Duplicate").clicked() {
+                        if let Err(e) =
+                            ComponentService::duplicate_definition(project, definition.id)
+                        {
                             error = Some(e.to_string());
                         }
-                    } else {
-                        error = Some("Select an ordinary positioned parent first".into());
                     }
-                }
-                if ui.button("Edit master").clicked() {
-                    open_editor(ui, &definition);
-                }
-                if ui.button("Duplicate").clicked() {
-                    if let Err(e) = ComponentService::duplicate_definition(project, definition.id) {
-                        error = Some(e.to_string());
+                    if ui.button("Delete").clicked() {
+                        if let Err(e) = ComponentService::delete_definition(project, definition.id)
+                        {
+                            error = Some(e.to_string());
+                        }
                     }
-                }
-                if ui.button("Delete").clicked() {
-                    if let Err(e) = ComponentService::delete_definition(project, definition.id) {
-                        error = Some(e.to_string());
-                    }
-                }
-            });
-        });
+                });
+            },
+        );
     }
     ui.separator();
     let instances = project.component_source().instances.clone();
@@ -182,6 +180,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
         let label = format!("{} ({}, {})", definition.name, instance.x, instance.y);
         egui::CollapsingHeader::new(label)
             .id_salt(instance.id)
+            .icon(crate::ui_style::collapsing_icon)
             .show(ui, |ui| {
                 if ui
                     .selectable_label(
@@ -273,7 +272,7 @@ fn paint_definition_preview(
                 egui::Align2::CENTER_CENTER,
                 "No preview",
                 egui::FontId::proportional(10.0),
-                egui::Color32::DARK_GRAY,
+                crate::ui_style::palette(ui).muted_text,
             );
         }
     }
@@ -407,6 +406,7 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                 node.name, node.object_type
                             ))
                             .id_salt(node.id)
+                            .icon(crate::ui_style::collapsing_icon)
                             .show(ui, |ui| {
                                 ui.text_edit_singleline(&mut node.name);
                                 for (property, value) in &mut node.properties {
@@ -523,6 +523,7 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                             ty = ag_iso_stack::object_pool::ObjectType::OutputString;
                         }
                         egui::ComboBox::from_id_salt("node_type")
+                            .icon(crate::ui_style::combo_box_icon)
                             .selected_text(format!("{ty:?}"))
                             .show_ui(ui, |ui| {
                                 for choice in ag_iso_stack::object_pool::ObjectType::values() {
@@ -709,7 +710,7 @@ fn value_editor_with_font(
             }
             Err(error) => {
                 ui.colored_label(
-                    egui::Color32::DARK_RED,
+                    ui.visuals().error_fg_color,
                     format!("Cannot edit encoded string: {error}"),
                 );
             }
@@ -947,6 +948,7 @@ fn manual_parameter_form(
         }
         if let Some(node) = definition.nodes.iter().find(|n| n.id == draft.1) {
             egui::ComboBox::from_id_salt("parameter_property")
+                .icon(crate::ui_style::combo_box_icon)
                 .selected_text(if draft.2.is_empty() {
                     "Choose property"
                 } else {
@@ -966,6 +968,7 @@ fn manual_parameter_form(
                     }
                 });
             egui::ComboBox::from_id_salt("parameter_kind")
+                .icon(crate::ui_style::combo_box_icon)
                 .selected_text(format!("{:?}", draft.3))
                 .show_ui(ui, |ui| {
                     for kind in [
@@ -1165,7 +1168,7 @@ pub fn inspector(
                 }
                 Err(error) => {
                     ui.colored_label(
-                        egui::Color32::DARK_RED,
+                        ui.visuals().error_fg_color,
                         format!("Cannot edit encoded string: {error}"),
                     );
                 }

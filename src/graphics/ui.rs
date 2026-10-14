@@ -1,7 +1,7 @@
-use super::{GraphicAssetId, integration::GraphicService, preview};
+use super::{integration::GraphicService, preview, GraphicAssetId};
 use crate::object_picker::checkerboard;
-use crate::{EditorProject, object_picker};
-use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectType, object::Object};
+use crate::{object_picker, EditorProject};
+use ag_iso_stack::object_pool::{object::Object, NullableObjectId, ObjectId, ObjectType};
 use eframe::egui;
 
 /// The panel and all PictureGraphic pickers share this unfiltered enumeration.

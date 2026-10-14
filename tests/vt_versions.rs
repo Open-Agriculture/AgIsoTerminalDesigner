@@ -14,6 +14,26 @@ fn object_id(value: u16) -> ObjectId {
 }
 
 #[test]
+fn availability_labels_include_introductions_and_vt2_only_objects() {
+    use ag_iso_terminal_designer::vt_compatibility::{
+        availability_description, supported_object_type,
+    };
+    for (object_type, expected) in [
+        (ObjectType::OutputList, "Available from VT4"),
+        (ObjectType::Animation, "Available from VT5"),
+        (ObjectType::ColourPalette, "Available from VT6"),
+        (ObjectType::AuxiliaryFunctionType1, "Available only in VT2"),
+    ] {
+        assert_eq!(
+            availability_description(|version| supported_object_type(object_type, version))
+                .as_deref(),
+            Some(expected)
+        );
+    }
+    assert_eq!(availability_description(|_| false), None);
+}
+
+#[test]
 fn versioned_records_match_specification_bytes_and_round_trip() {
     use ag_iso_stack::object_pool::object_attributes::{Event, MacroRef};
     let mut boolean = default_object(ObjectType::InputBoolean);
@@ -285,7 +305,7 @@ fn raw_iop_rejects_truncated_records_and_unknown_object_types() {
 }
 
 #[test]
-fn configuration_ui_enables_button_options_at_the_specified_version() {
+fn configuration_ui_hides_button_options_until_the_specified_version() {
     // Table B.14 introduces Suppress Border at VT4. Exercise the actual
     // property editor checkbox, rather than only its compatibility helper.
     for number in 2..=6 {
@@ -404,7 +424,14 @@ fn configuration_ui_enables_button_options_at_the_specified_version() {
                     }
                     _ => None,
                 });
-                assert!(position.is_some(), "missing checkbox for VT{number}");
+                assert_eq!(
+                    position.is_some(),
+                    number >= 4,
+                    "checkbox visibility for VT{number}"
+                );
+                if number < 4 {
+                    break;
+                }
             }
         }
         assert_eq!(project.update_pool(), number >= 4, "VT{number}");

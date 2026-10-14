@@ -3,6 +3,7 @@
 pub mod edits;
 mod geometry;
 mod layout;
+mod softkeys;
 mod ui;
 
 pub use ui::CanvasState;
