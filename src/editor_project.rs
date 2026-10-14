@@ -1334,13 +1334,14 @@ impl EditorProject {
                 let reference = if value.is_null() {
                     None
                 } else {
-                    let reference_id: ObjectId = serde_json::from_value(value).map_err(|error| {
-                        OperationError::PropertyError {
-                            object_id: source_id.value(),
-                            property: descriptor.name.to_owned(),
-                            reason: error.to_string(),
-                        }
-                    })?;
+                    let reference_id: ObjectId =
+                        serde_json::from_value(value).map_err(|error| {
+                            OperationError::PropertyError {
+                                object_id: source_id.value(),
+                                property: descriptor.name.to_owned(),
+                                reason: error.to_string(),
+                            }
+                        })?;
                     Some(ObjectTarget::id(reference_id.value()))
                 };
                 operations.push(Operation::SetObjectReference {
@@ -2595,11 +2596,7 @@ mod tests {
             }],
         });
         project.execute_transaction(setup).unwrap();
-        attribute = project
-            .get_pool()
-            .object_by_id(source_id)
-            .unwrap()
-            .clone();
+        attribute = project.get_pool().object_by_id(source_id).unwrap().clone();
 
         let descriptors = crate::object_properties::get_property_descriptors(attribute_type);
         let duplicate_id = project.duplicate_shared_attribute(source_id).unwrap();
@@ -2657,8 +2654,14 @@ mod tests {
         let consumer_id = ObjectId::new(30_003).unwrap();
         let mut pool = ObjectPool::default();
         pool.add(object_with_id(ObjectType::FillAttributes, fill_id.value()));
-        pool.add(object_with_id(ObjectType::PictureGraphic, picture_id.value()));
-        pool.add(object_with_id(ObjectType::GraphicsContext, consumer_id.value()));
+        pool.add(object_with_id(
+            ObjectType::PictureGraphic,
+            picture_id.value(),
+        ));
+        pool.add(object_with_id(
+            ObjectType::GraphicsContext,
+            consumer_id.value(),
+        ));
         let mut project = EditorProject::from(pool);
         let mut references = OperationTransaction::new(Some("Connect fill attribute".into()));
         references.add_operation(Operation::SetObjectReference {
@@ -2748,7 +2751,10 @@ mod tests {
                 .get_object_info(project.get_pool().object_by_id(second).unwrap())
                 .name
                 .unwrap();
-            assert_ne!(first_name, second_name, "{object_type:?} names must be unique");
+            assert_ne!(
+                first_name, second_name,
+                "{object_type:?} names must be unique"
+            );
         }
     }
 

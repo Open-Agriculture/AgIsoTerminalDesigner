@@ -2125,42 +2125,20 @@ impl eframe::App for DesignerApp {
                         }
                     });
                 });
-                ui.menu_button("Project", |ui| {
+                let add_object_shortcut =
+                    egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::N);
+                let open_add_object = self.project.is_some()
+                    && self.new_object_dialog.is_none()
+                    && ctx.input_mut(|input| input.consume_shortcut(&add_object_shortcut));
+                let project_menu = ui.menu_button("Project", |ui| {
                     ui.add_enabled_ui(self.project.is_some(), |ui| {
-                        ui.menu_button("Add Object", |ui| {
-                            let version = self.project.as_ref().unwrap().vt_version();
-                            let unavailable = ObjectType::values()
-                                .into_iter()
-                                .filter(|object_type| !ag_iso_terminal_designer::vt_compatibility::supported_object_type(*object_type, version))
-                                .filter_map(|object_type| {
-                                    ag_iso_terminal_designer::vt_compatibility::availability_description(|v| {
-                                        ag_iso_terminal_designer::vt_compatibility::supported_object_type(object_type, v)
-                                    }).map(|availability| format!("{object_type:?} — {availability}"))
-                                })
-                                .collect();
-                            egui::ScrollArea::vertical()
-                                .max_height(400.0)
-                                .show(ui, |ui| {
-                                    ag_iso_terminal_designer::ui_style::vt_availability_note(
-                                        ui, "add_object_vt_availability", version, unavailable,
-                                    );
-                                    for object_type in ObjectType::values() {
-                                        if !ag_iso_terminal_designer::vt_compatibility::supported_object_type(
-                                            object_type, self.project.as_ref().unwrap().vt_version(),
-                                        ) { continue; }
-                                        if ui.button(format!("{:?}", object_type)).clicked() {
-                                            let default_name = self
-                                                .project
-                                                .as_ref()
-                                                .unwrap()
-                                                .generate_smart_name_for_new_object(object_type);
-                                            self.new_object_dialog =
-                                                Some((object_type, default_name));
-                                            ui.close();
-                                        }
-                                    }
-                                });
-                        });
+                        egui::containers::menu::SubMenuButton::from_button(
+                            egui::Button::new("Add Object").right_text(format!(
+                                "{}  ⏵",
+                                ctx.format_shortcut(&add_object_shortcut),
+                            )),
+                        )
+                        .ui(ui, |ui| self.show_add_object_menu(ui));
                         if ui.button("Reassign object IDs…").clicked() {
                             self.reassign_ids_open = true;
                             self.reassign_include_overrides = false;
@@ -2174,6 +2152,16 @@ impl eframe::App for DesignerApp {
                         }
                     });
                 });
+                if self.project.is_some() {
+                    let popup_id = egui::Id::new("add_object_shortcut_menu");
+                    if open_add_object {
+                        egui::Popup::open_id(ctx, popup_id);
+                    }
+                    egui::Popup::menu(&project_menu.response)
+                        .id(popup_id)
+                        .open_memory(None)
+                        .show(|ui| self.show_add_object_menu(ui));
+                }
                 self.show_view_menu(ui, ctx);
                 ui.separator();
                 let dirty_marker = if self.project.as_ref().is_some_and(EditorProject::is_dirty) {
@@ -2871,6 +2859,40 @@ impl DesignerApp {
             self.canvas.cancel_interaction();
         }
     }
+    fn show_add_object_menu(&mut self, ui: &mut egui::Ui) {
+        let version = self.project.as_ref().unwrap().vt_version();
+        egui::ScrollArea::vertical()
+            .max_height(400.0)
+            .show(ui, |ui| {
+                for object_type in ObjectType::values() {
+                    let supported = ag_iso_terminal_designer::vt_compatibility::supported_object_type(
+                        object_type, version,
+                    );
+                    let response = ui.add_enabled(
+                        supported,
+                        egui::Button::new(format!("{object_type:?}")),
+                    );
+                    if !supported && response.contains_pointer() {
+                        if let Some(availability) = ag_iso_terminal_designer::vt_compatibility::availability_description(|v| {
+                            ag_iso_terminal_designer::vt_compatibility::supported_object_type(object_type, v)
+                        }) {
+                            response.show_tooltip_text(availability);
+                        }
+                    }
+                    if response.clicked() {
+                        let default_name = self
+                            .project
+                            .as_ref()
+                            .unwrap()
+                            .generate_smart_name_for_new_object(object_type);
+                        self.new_object_dialog =
+                            Some((object_type, default_name));
+                        ui.close();
+                    }
+                }
+            });
+    }
+
     fn show_view_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.menu_button("View", |ui| {
             ui.menu_button("Theme", |ui| {

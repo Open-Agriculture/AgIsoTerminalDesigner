@@ -3,6 +3,7 @@
 The top bar contains **File**, **Project**, and **View**, followed by the project
 name, unsaved-change marker, and Undo/Redo. File keeps the existing project and
 ISOBUS import/export workflows. Project contains Add Object and Project Settings.
+Ctrl+N opens the Add Object picker when a project is open.
 
 ## Project dimensions
 
@@ -27,9 +28,11 @@ objects are never silently converted or deleted.
 Object creation, attribute choices, references, macro events, and previews use
 the selected target. Checks cover the designer's existing objects, including
 version-specific flags, fonts, encodings, macro commands, and containment rules.
-Controls and choices unavailable for the target VT are hidden. Properties and
-Add Object show a collapsed **Unavailable in VT…** note listing relevant features
-and their supported versions. Existing incompatible values remain visible with
+Controls and choices unavailable for the target VT are hidden, except in Add
+Object, which shows unavailable object types as disabled items. Hovering over a
+disabled item immediately shows its supported versions. Properties show a collapsed
+**Unavailable in VT…** note listing relevant features and their supported versions.
+Existing incompatible values remain visible with
 warnings and controls for repair; hiding never changes stored values. Planned
 Project Settings placeholders remain visible and are not assigned a VT version.
 Optional hardware capabilities remain separate from specification compatibility.
@@ -109,10 +112,14 @@ Changing a range affects future automatic assignments and never renumbers
 existing objects. Reset to defaults replaces the draft ranges; Cancel discards
 them.
 
-The object inspector shows the assigned ID separately from its name. **Override
-ID** permits an unused ID outside the automatic range, subject to the target VT
-version. **Use automatic ID** chooses a fresh free ID in the type's range.
-Overrides persist in the project and participate in undo/redo.
+The object inspector shows the assigned ID separately from its name. The ID
+field displays the automatic ID and remains disabled until **Override ID** is
+checked. Checking it keeps the current ID and enables editing to an unused ID,
+including IDs outside the automatic range, subject to the target VT version.
+Valid edits apply on Enter, focus loss or drag completion. Unchecking **Override
+ID** chooses a fresh free ID in the type's range and disables editing. If no free
+ID is available, the override remains active and an error is shown. Overrides
+persist in the project and participate in undo/redo.
 
 **Reassign object IDs…** previews names, old/new IDs and preserved overrides,
 including compiled component nodes. Manual overrides are preserved unless

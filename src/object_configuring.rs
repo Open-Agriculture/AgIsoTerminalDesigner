@@ -1304,16 +1304,16 @@ fn render_identity(
     design: &EditorProject,
 ) {
     let key = ui.make_persistent_id(("object_id", id.value()));
-    let mut value = ui
-        .data(|data| match data.get_temp::<PendingValue>(key) {
-            Some(PendingValue::Number(value)) => Some(value as u16),
-            _ => None,
-        })
-        .unwrap_or_else(|| id.value());
-    let overridden = design
+    let mut overridden = design
         .get_pool()
         .object_by_id(id)
         .is_some_and(|object| design.get_object_info(object).id_overridden);
+    let mut value = ui
+        .data(|data| match data.get_temp::<PendingValue>(key) {
+            Some(PendingValue::Number(value)) if overridden => Some(value as u16),
+            _ => None,
+        })
+        .unwrap_or_else(|| id.value());
     ui.horizontal(|ui| {
         ui.label("Assigned ID");
         ui.monospace(design.format_object_id(id.value()));
@@ -1325,8 +1325,31 @@ fn render_identity(
         ui.label(format!("Type: {object_type:?}"));
     });
     ui.horizontal(|ui| {
+        let toggled = ui.checkbox(&mut overridden, "Override ID").changed();
+        if toggled {
+            let assignment = if overridden {
+                Ok(id)
+            } else {
+                design.allocate_object_id(object_type)
+            };
+            match assignment {
+                Ok(new_id) => {
+                    design.queue_object_id_assignment(id, new_id, overridden);
+                    value = new_id.value();
+                    ui.data_mut(|data| {
+                        data.remove::<PendingValue>(key);
+                        data.remove::<String>(key.with("error"));
+                    });
+                }
+                Err(error) => {
+                    overridden = true;
+                    ui.data_mut(|data| data.insert_temp(key.with("error"), error.to_string()));
+                }
+            }
+        }
         let format = design.object_id_format();
-        let response = ui.add(
+        let response = ui.add_enabled(
+            overridden,
             egui::DragValue::new(&mut value)
                 .range(0..=65534)
                 .custom_formatter(|value, _| design.format_object_id(value as u16))
@@ -1344,31 +1367,22 @@ fn render_identity(
         let invalid_macro = object_type == ObjectType::Macro
             && design.vt_version() < ag_iso_stack::object_pool::vt_version::VtVersion::Version5
             && value > 255;
-        if ui
-            .add_enabled(
-                !conflict && !invalid_macro,
-                egui::Button::new("Override ID"),
-            )
-            .clicked()
+        if overridden
+            && !toggled
+            && value != id.value()
+            && !conflict
+            && !invalid_macro
+            && drag_value_finished(&response)
         {
             design.queue_operation(Operation::SetObjectIdAssignment {
                 object_id: id.value(),
                 new_id: value,
                 overridden: true,
             });
-            ui.data_mut(|data| data.remove::<PendingValue>(key));
-        }
-        if ui.button("Use automatic ID").clicked() {
-            match design.allocate_object_id(object_type) {
-                Ok(new_id) => design.queue_operation(Operation::SetObjectIdAssignment {
-                    object_id: id.value(),
-                    new_id: new_id.value(),
-                    overridden: false,
-                }),
-                Err(error) => {
-                    ui.data_mut(|data| data.insert_temp(key.with("error"), error.to_string()))
-                }
-            }
+            ui.data_mut(|data| {
+                data.remove::<PendingValue>(key);
+                data.remove::<String>(key.with("error"));
+            });
         }
         if conflict {
             ui.colored_label(ui.visuals().error_fg_color, "ID already in use");
@@ -2468,6 +2482,14 @@ mod tests {
             .unwrap_or_else(|| panic!("Missing {label}: {text:?}"))
             .1
             .center();
+        click_editor_at(ctx, project, pos)
+    }
+
+    fn click_editor_at(
+        ctx: &egui::Context,
+        project: &EditorProject,
+        pos: egui::Pos2,
+    ) -> Vec<(String, egui::Rect)> {
         editor_frame(
             ctx,
             project,
@@ -2509,20 +2531,186 @@ mod tests {
     }
 
     #[test]
-    fn identity_controls_show_assignment_and_override_actions() {
+    fn identity_controls_show_assignment_and_override_checkbox() {
         let project = project_at_version(object(ObjectType::Button, 6000), 6);
         let frame = editor_frame(&egui::Context::default(), &project, vec![]);
-        for label in [
-            "Assigned ID",
-            "Automatic",
-            "Override ID",
-            "Use automatic ID",
-        ] {
+        for label in ["Assigned ID", "Automatic", "Override ID"] {
             assert!(
                 frame.iter().any(|(text, _)| text == label),
                 "missing {label}"
             );
         }
+        assert!(!frame.iter().any(|(text, _)| text == "Use automatic ID"));
+    }
+
+    fn edit_identity_id(
+        ctx: &egui::Context,
+        project: &EditorProject,
+        input: &str,
+    ) -> Vec<(String, egui::Rect)> {
+        let current = project.get_pool().objects().first().unwrap().id().value();
+        let frame = editor_frame(ctx, project, vec![]);
+        // The assigned-ID label precedes the editable field with the same text.
+        let pos = frame
+            .iter()
+            .rev()
+            .find(|(text, _)| text == &project.format_object_id(current))
+            .unwrap()
+            .1
+            .center();
+        click_editor_at(ctx, project, pos);
+        editor_frame(
+            ctx,
+            project,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text(input.to_owned()),
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        editor_frame(ctx, project, vec![])
+    }
+
+    #[test]
+    fn identity_id_is_editable_only_with_override_enabled() {
+        let mut project = project_at_version(object(ObjectType::Button, 6000), 6);
+        let ctx = egui::Context::default();
+        edit_identity_id(&ctx, &project, "6100");
+        assert!(!project.commit_queued("Disabled ID edit"));
+
+        click_editor_text(&ctx, &project, "Override ID");
+        assert!(project.commit_queued("Enable override"));
+        assert!(project.object_id_is_overridden(ObjectId::new(6000).unwrap()));
+        edit_identity_id(&ctx, &project, "6100");
+        assert!(project.commit_queued("Edit override"));
+        assert!(project
+            .get_pool()
+            .object_by_id(ObjectId::new(6100).unwrap())
+            .is_some());
+        assert!(project.object_id_is_overridden(ObjectId::new(6100).unwrap()));
+
+        click_editor_text(&ctx, &project, "Override ID");
+        assert!(project.commit_queued("Return to automatic"));
+        let automatic = project.get_pool().objects().first().unwrap().id();
+        assert_eq!(automatic.value(), 6000);
+        assert!(!project.object_id_is_overridden(automatic));
+        edit_identity_id(&ctx, &project, "6200");
+        assert!(!project.commit_queued("Disabled automatic ID edit"));
+        assert!(project.undo_operation());
+        assert!(project.object_id_is_overridden(ObjectId::new(6100).unwrap()));
+        assert!(project.redo_operation());
+        assert!(!project.object_id_is_overridden(automatic));
+    }
+
+    #[test]
+    fn identity_override_rejects_duplicate_and_legacy_macro_ids() {
+        for (object_type, version, input, error) in [
+            (ObjectType::Button, 6, "6001", "ID already in use"),
+            (ObjectType::Macro, 4, "256", "VT2–4 macro IDs must be 0–255"),
+        ] {
+            let mut pool = ObjectPool::default();
+            pool.add(object(object_type, 10));
+            pool.add(object(ObjectType::Button, 6001));
+            let mut project = load_at_version(&EditorProject::from(pool), version);
+            let ctx = egui::Context::default();
+            click_editor_text(&ctx, &project, "Override ID");
+            assert!(project.commit_queued("Enable override"));
+            let frame = edit_identity_id(&ctx, &project, input);
+            assert!(frame.iter().any(|(text, _)| text == error), "{frame:?}");
+            assert!(!project.commit_queued("Invalid override"));
+            assert!(project
+                .get_pool()
+                .object_by_id(ObjectId::new(10).unwrap())
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn identity_override_drag_applies_only_on_release() {
+        let mut project = project_at_version(object(ObjectType::Button, 6000), 6);
+        let ctx = egui::Context::default();
+        click_editor_text(&ctx, &project, "Override ID");
+        assert!(project.commit_queued("Enable override"));
+        let frame = editor_frame(&ctx, &project, vec![]);
+        let start = frame
+            .iter()
+            .rev()
+            .find(|(text, _)| text == "6000")
+            .unwrap()
+            .1
+            .center();
+        editor_frame(
+            &ctx,
+            &project,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let end = start + egui::vec2(30.0, 0.0);
+        editor_frame(&ctx, &project, vec![egui::Event::PointerMoved(end)]);
+        assert!(!project.commit_queued("Unfinished ID drag"));
+        editor_frame(
+            &ctx,
+            &project,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(project.commit_queued("Finished ID drag"));
+        assert_ne!(
+            project.get_pool().objects().first().unwrap().id().value(),
+            6000
+        );
+    }
+
+    #[test]
+    fn identity_override_remains_enabled_when_automatic_range_is_full() {
+        let mut project = project_at_version(object(ObjectType::Button, 6000), 6);
+        let mut ranges = project.object_id_ranges().clone();
+        ranges.set_range(
+            ObjectType::Button,
+            crate::ObjectIdRange {
+                start: 6000,
+                end: 6000,
+            },
+        );
+        project.set_object_id_ranges(ranges).unwrap();
+        let ctx = egui::Context::default();
+        click_editor_text(&ctx, &project, "Override ID");
+        assert!(project.commit_queued("Enable override"));
+        let error = project
+            .allocate_object_id(ObjectType::Button)
+            .unwrap_err()
+            .to_string();
+        let frame = click_editor_text(&ctx, &project, "Override ID");
+        assert!(!project.commit_queued("Failed automatic assignment"));
+        assert!(project.object_id_is_overridden(ObjectId::new(6000).unwrap()));
+        assert!(frame.iter().any(|(text, _)| text == &error), "{frame:?}");
+        edit_identity_id(&ctx, &project, "6100");
+        assert!(project.commit_queued("Edit retained override"));
+        let frame = editor_frame(&ctx, &project, vec![]);
+        assert!(!frame.iter().any(|(text, _)| text == &error));
     }
 
     #[test]
