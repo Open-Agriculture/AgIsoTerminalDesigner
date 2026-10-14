@@ -48,6 +48,7 @@ pub struct DimensionsDraft {
     pub mask: u16,
     pub soft_key_width: u16,
     pub soft_key_height: u16,
+    pub vt_version: VtVersion,
 }
 
 impl DimensionsDraft {
@@ -57,6 +58,7 @@ impl DimensionsDraft {
             mask: project.mask_size,
             soft_key_width,
             soft_key_height,
+            vt_version: project.vt_version(),
         }
     }
 }
@@ -108,7 +110,7 @@ pub fn show_project_settings(
                 if values.mask == 0 || values.soft_key_width == 0 || values.soft_key_height == 0 {
                     ui.colored_label(ag_iso_terminal_designer::ui_style::palette(ui).error, "Dimensions must be positive.");
                 }
-                let (mask_minimum, key_minimum) = if project.vt_version == VtVersion::Version6 {
+                let (mask_minimum, key_minimum) = if values.vt_version == VtVersion::Version6 {
                     (480, (60, 60))
                 } else {
                     (200, (60, 32))
@@ -122,13 +124,37 @@ pub fn show_project_settings(
 
                 ui.separator();
                 ag_iso_terminal_designer::ui_style::section_heading(ui, "Compatibility");
-                ui.label(format!("Target VT version: VT{} (read-only)", u8::from(project.vt_version)));
+                ui.horizontal(|ui| {
+                    ui.label("Target VT version");
+                    egui::ComboBox::from_id_salt("project_vt_version")
+                        .selected_text(format!("VT{}", u8::from(values.vt_version)))
+                        .show_ui(ui, |ui| {
+                            for number in 2..=6 {
+                                let version = VtVersion::try_from(number).unwrap();
+                                ui.selectable_value(&mut values.vt_version, version, format!("VT{number}"));
+                            }
+                        });
+                });
+                ui.small("Apply checks the whole project. Incompatible version changes are blocked.");
+                match project.compatibility_diagnostics() {
+                    Ok(diagnostics) => {
+                        for diagnostic in diagnostics {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                ag_iso_terminal_designer::pool_validation::format_validation_diagnostic(
+                                    &diagnostic,
+                                    project.object_id_format(),
+                                ),
+                            );
+                        }
+                    }
+                    Err(error) => { ui.colored_label(ui.visuals().warn_fg_color, error.to_string()); }
+                }
                 disabled_section(
                     ui,
                     "Terminal capabilities",
                     "Terminal capability profiles are not available yet.",
                     &[
-                        ("VT version selection", DisabledControl::Choice(&["Not configured"])),
                         ("Terminal colour capability", DisabledControl::Choice(&["Not configured"])),
                         ("Supported fonts and styles", DisabledControl::Configure),
                         ("Input capabilities", DisabledControl::Configure),
@@ -227,9 +253,11 @@ pub fn show_project_settings(
             if values.mask == 0 || values.soft_key_width == 0 || values.soft_key_height == 0 {
                 *error_message = Some("Project dimensions must be positive.".into());
                 *draft = Some(values);
-            } else if let Err(error) = project
-                .set_design_dimensions(values.mask, (values.soft_key_width, values.soft_key_height))
-            {
+            } else if let Err(error) = project.set_project_settings(
+                values.mask,
+                (values.soft_key_width, values.soft_key_height),
+                values.vt_version,
+            ) {
                 *error_message = Some(error.to_string());
                 *draft = Some(values);
             } else {

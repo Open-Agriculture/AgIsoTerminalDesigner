@@ -487,7 +487,7 @@ fn materialized_property_errors_map_back_to_component_instance_node_and_property
         .properties
         .insert("height".into(), json!(-1));
     let error =
-        materialize_source(p.get_pool(), &source, p.vt_version, &Default::default()).unwrap_err();
+        materialize_source(p.get_pool(), &source, p.vt_version(), &Default::default()).unwrap_err();
     assert_eq!(error.component_id, Some(component));
     assert_eq!(error.instance_id, Some(instance));
     assert_eq!(error.node_id, Some(root));
@@ -660,7 +660,7 @@ fn captured_macro_remains_explicit_external_and_is_not_copied() {
     pool.add(action);
     if let Some(Object::Button(button)) = pool.object_mut_by_id(ObjectId::new(100).unwrap()) {
         button.macro_refs.push(MacroRef {
-            event_id: Event::OnActivate,
+            event_id: Event::OnKeyPress,
             macro_id: 8,
         });
     }
@@ -698,7 +698,7 @@ fn invalid_source_cycles_and_compiled_collisions_are_rejected() {
             y: 0,
         });
     assert_eq!(
-        materialize_source(p.get_pool(), &source, p.vt_version, &Default::default())
+        materialize_source(p.get_pool(), &source, p.vt_version(), &Default::default())
             .unwrap_err()
             .code,
         "COMPONENT_INTERNAL_REFERENCE_INVALID"
@@ -710,7 +710,7 @@ fn invalid_source_cycles_and_compiled_collisions_are_rejected() {
         .next()
         .unwrap() = 2;
     assert_eq!(
-        materialize_source(p.get_pool(), &source, p.vt_version, &Default::default())
+        materialize_source(p.get_pool(), &source, p.vt_version(), &Default::default())
             .unwrap_err()
             .code,
         "COMPONENT_COMPILED_ID_COLLISION"

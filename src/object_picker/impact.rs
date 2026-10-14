@@ -1,5 +1,5 @@
 //! Read-only before/after comparisons using normal project edits and rendering.
-use super::{checkerboard, fit_rect, object_preview};
+use super::{checkerboard, fit_rect, object_preview_with_version};
 use crate::EditorProject;
 use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool};
 use egui::{Rect, Vec2};
@@ -120,7 +120,12 @@ pub fn review_change(
     };
     match &cached.result {
         Ok(comparison) => {
-            review_comparison(ui, comparison, project.object_id_format());
+            review_comparison(
+                ui,
+                comparison,
+                project.object_id_format(),
+                project.vt_version,
+            );
             true
         }
         Err(error) => {
@@ -146,7 +151,12 @@ pub fn review_queued(
     })
 }
 
-fn review_comparison(ui: &mut egui::Ui, comparison: &Comparison, format: crate::ObjectIdFormat) {
+fn review_comparison(
+    ui: &mut egui::Ui,
+    comparison: &Comparison,
+    format: crate::ObjectIdFormat,
+    version: ag_iso_stack::object_pool::vt_version::VtVersion,
+) {
     ui.separator();
     if comparison.changed.is_empty() {
         ui.label("This selection does not change the rendered objects.");
@@ -161,6 +171,7 @@ fn review_comparison(ui: &mut egui::Ui, comparison: &Comparison, format: crate::
             *id,
             label,
             format,
+            version,
         );
     }
 }
@@ -182,6 +193,7 @@ fn draw_comparison(
     id: ObjectId,
     label: &str,
     format: crate::ObjectIdFormat,
+    version: ag_iso_stack::object_pool::vt_version::VtVersion,
 ) {
     let old = before.object_by_id(id);
     let new = after.object_by_id(id);
@@ -209,15 +221,16 @@ fn draw_comparison(
                     let fitted = fit_rect(rect, common_size);
                     let scale = fitted.width() / common_size.x;
                     if ui.is_rect_visible(rect) {
-                        object_preview(
+                        object_preview_with_version(
                             ui,
                             Rect::from_min_size(fitted.min, size.max(Vec2::splat(1.0)) * scale),
                             pool,
                             object,
+                            version,
                         );
                     }
                     super::hover_preview(response, |ui, rect| {
-                        object_preview(ui, rect, pool, object)
+                        object_preview_with_version(ui, rect, pool, object, version)
                     });
                     ui.small(format!("{} × {}", size.x, size.y));
                     let refs = object

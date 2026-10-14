@@ -21,8 +21,42 @@ use eframe::egui::Color32;
 use eframe::egui::TextWrapMode;
 use eframe::egui::UiBuilder;
 
-/// Border inset used by the preview's fixed Version 3 button rendering.
+/// Border inset used by the preview's button rendering.
 pub(crate) const BUTTON_BORDER_INSET: f32 = 4.0;
+fn render_version_id() -> egui::Id {
+    egui::Id::new("vt_render_version")
+}
+
+/// Render a pool object using the requested target VT version. The version is
+/// scoped to this egui context for the duration of rendering, including child
+/// objects. Direct legacy `RenderableObject::render` calls use VT6, the safe
+/// default for the designer's historical previews.
+pub fn render_object_with_version(
+    ui: &mut egui::Ui,
+    pool: &ObjectPool,
+    object: &Object,
+    position: Point<i16>,
+    version: VtVersion,
+) {
+    let previous = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<VtVersion>(render_version_id());
+        data.insert_temp(render_version_id(), version);
+        previous
+    });
+    object.render(ui, pool, position);
+    ui.ctx().data_mut(|data| match previous {
+        Some(previous) => data.insert_temp(render_version_id(), previous),
+        None => {
+            data.remove_temp::<VtVersion>(render_version_id());
+        }
+    });
+}
+
+fn render_version(ui: &egui::Ui) -> VtVersion {
+    ui.ctx()
+        .data(|data| data.get_temp::<VtVersion>(render_version_id()))
+        .unwrap_or(VtVersion::Version6)
+}
 
 thread_local! {
     /// Prevent malformed cyclic object references from recursing forever.
@@ -57,8 +91,13 @@ pub trait RenderableObject {
 /// Render one mask through the same object-rendering implementation used by
 /// the editor.  This deliberately accepts a supplied pool so staged AI
 /// candidates never need to be installed in `EditorProject`.
-pub fn render_mask(ui: &mut egui::Ui, pool: &ObjectPool, mask: &Object) {
-    mask.render(ui, pool, Point::default());
+pub fn render_mask_with_version(
+    ui: &mut egui::Ui,
+    pool: &ObjectPool,
+    mask: &Object,
+    version: VtVersion,
+) {
+    render_object_with_version(ui, pool, mask, Point::default(), version);
 }
 
 impl RenderableObject for Object {
@@ -69,6 +108,22 @@ impl RenderableObject for Object {
 
         // Make sure text is truncated if it doesn't fit for all object renderings (useful for error labels)
         ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+
+        let version = render_version(ui);
+        if !crate::vt_compatibility::supported_object_type(self.object_type(), version) {
+            ui.painter().text(
+                ui.min_rect().min + egui::vec2(position.x as f32, position.y as f32),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "{:?} is unavailable in VT{}",
+                    self.object_type(),
+                    u8::from(version)
+                ),
+                egui::FontId::proportional(12.0),
+                ui.visuals().warn_fg_color,
+            );
+            return;
+        }
 
         match self {
             Object::WorkingSet(o) => o.render(ui, pool, position),
@@ -101,25 +156,33 @@ impl RenderableObject for Object {
             Object::InputAttributes(o) => (),
             Object::ObjectPointer(o) => o.render(ui, pool, position),
             Object::Macro(o) => (),
-            Object::AuxiliaryFunctionType1(o) => (),
-            Object::AuxiliaryInputType1(o) => (),
             Object::AuxiliaryFunctionType2(o) => o.render(ui, pool, position),
             Object::AuxiliaryInputType2(o) => o.render(ui, pool, position),
             Object::AuxiliaryControlDesignatorType2(o) => o.render(ui, pool, position),
-            Object::WindowMask(o) => (),
-            Object::KeyGroup(o) => (),
-            Object::GraphicsContext(o) => (),
             Object::ExtendedInputAttributes(o) => (),
             Object::ColourMap(o) => (),
             Object::ObjectLabelReferenceList(o) => (),
             Object::ExternalObjectDefinition(o) => (),
             Object::ExternalReferenceName(o) => (),
-            Object::ExternalObjectPointer(o) => (),
-            Object::Animation(o) => (),
             Object::ColourPalette(o) => (),
             Object::GraphicData(o) => (),
             Object::WorkingSetSpecialControls(o) => (),
-            Object::ScaledGraphic(o) => (),
+            Object::AuxiliaryFunctionType1(_)
+            | Object::AuxiliaryInputType1(_)
+            | Object::WindowMask(_)
+            | Object::KeyGroup(_)
+            | Object::GraphicsContext(_)
+            | Object::ExternalObjectPointer(_)
+            | Object::Animation(_)
+            | Object::ScaledGraphic(_) => {
+                ui.painter().text(
+                    ui.min_rect().min + egui::vec2(position.x as f32, position.y as f32),
+                    egui::Align2::LEFT_TOP,
+                    format!("Preview unavailable: {:?}", self.object_type()),
+                    egui::FontId::proportional(12.0),
+                    ui.visuals().warn_fg_color,
+                );
+            }
         }
     }
 }
@@ -293,7 +356,7 @@ impl RenderableObject for Container {
 
 impl RenderableObject for Button {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let vt_version = VtVersion::Version3;
+        let vt_version = render_version(ui);
 
         let rect = create_relative_rect(
             ui,
@@ -405,13 +468,27 @@ impl RenderableObject for Button {
 
 impl RenderableObject for InputBoolean {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let vt_version = render_version(ui);
         let is_true = if let Some(var_id) = self.variable_reference.0 {
             match pool.object_by_id(var_id) {
-                Some(Object::NumberVariable(num_var)) => num_var.value > 0,
-                _ => self.value,
+                Some(Object::NumberVariable(num_var)) if vt_version >= VtVersion::Version4 => {
+                    num_var.value > 0
+                }
+                Some(Object::NumberVariable(num_var)) => num_var.value == 1,
+                _ => {
+                    if vt_version >= VtVersion::Version4 {
+                        self.value > 0
+                    } else {
+                        self.value == 1
+                    }
+                }
             }
         } else {
-            self.value
+            if vt_version >= VtVersion::Version4 {
+                self.value > 0
+            } else {
+                self.value == 1
+            }
         };
 
         let side = self.width as f32;
@@ -424,7 +501,7 @@ impl RenderableObject for InputBoolean {
 
             // If the boolean is true, we display a checkmark in the center
             if is_true {
-                let fg_color = match pool.object_by_id(self.foreground_colour) {
+                let fg_color = match pool.object_by_nullable_id(self.foreground_colour) {
                     Some(Object::FontAttributes(font_attr)) => {
                         crate::effective_colour::colour(pool, font_attr.font_colour).convert()
                     }
@@ -443,7 +520,7 @@ impl RenderableObject for InputBoolean {
             }
 
             // If disabled, overlay a semi-transparent layer
-            if !self.enabled {
+            if vt_version >= VtVersion::Version4 && !self.enabled {
                 ui.painter().rect_filled(
                     rect,
                     0.0,
@@ -478,7 +555,7 @@ impl RenderableObject for InputNumber {
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             // Look up the font attributes. If missing, show an error.
-            let font_attributes = match pool.object_by_id(self.font_attributes) {
+            let font_attributes = match pool.object_by_nullable_id(self.font_attributes) {
                 Some(Object::FontAttributes(fa)) => fa,
                 _ => {
                     ui.colored_label(
@@ -690,7 +767,7 @@ impl RenderableObject for ObjectPointer {
 
 impl RenderableObject for OutputString {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        crate::output_string_rendering::render(self, ui, pool, position);
+        crate::output_string_rendering::render(self, ui, pool, position, render_version(ui));
     }
 }
 
@@ -704,7 +781,7 @@ impl RenderableObject for OutputNumber {
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             // 1. Get the font attributes
-            let font_attributes = match pool.object_by_id(self.font_attributes) {
+            let font_attributes = match pool.object_by_nullable_id(self.font_attributes) {
                 Some(Object::FontAttributes(fa)) => fa,
                 _ => {
                     ui.colored_label(
@@ -887,7 +964,42 @@ impl RenderableObject for OutputList {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "OutputList not implemented");
+            ui.shrink_clip_rect(rect);
+            if render_version(ui) < VtVersion::Version4 {
+                ui.colored_label(Color32::RED, "OutputList requires VT4 or later");
+                return;
+            }
+            let index = self
+                .variable_reference
+                .0
+                .and_then(|id| match pool.object_by_id(id) {
+                    Some(Object::NumberVariable(variable)) => Some(variable.value),
+                    _ => None,
+                })
+                .unwrap_or(u32::from(self.value));
+            let Some(item) = usize::try_from(index)
+                .ok()
+                .and_then(|index| self.list_items.get(index))
+                .and_then(|id| id.0)
+            else {
+                return;
+            };
+            match pool.object_by_id(item) {
+                Some(Object::ObjectPointer(pointer)) => {
+                    if let Some(id) = pointer.value.0 {
+                        if let Some(object) = pool.object_by_id(id) {
+                            object.render(ui, pool, Point::default());
+                        }
+                    }
+                }
+                Some(object) => object.render(ui, pool, Point::default()),
+                None => {
+                    ui.colored_label(
+                        Color32::RED,
+                        format!("Missing OutputList item #{}", item.value()),
+                    );
+                }
+            };
         });
     }
 }
@@ -901,7 +1013,7 @@ impl RenderableObject for OutputLine {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let line_attributes = match pool.object_by_id(self.line_attributes) {
+            let line_attributes = match pool.object_by_nullable_id(self.line_attributes) {
                 Some(Object::LineAttributes(attr)) => attr,
                 _ => {
                     // If we don't have valid line attributes, just show an error and return
@@ -971,7 +1083,7 @@ impl RenderableObject for OutputRectangle {
         );
 
         // Paint the border of the rectangle
-        let line_attributes = match pool.object_by_id(self.line_attributes) {
+        let line_attributes = match pool.object_by_nullable_id(self.line_attributes) {
             Some(Object::LineAttributes(l)) => l,
             _ => {
                 ui.colored_label(
@@ -1035,7 +1147,7 @@ impl RenderableObject for OutputPolygon {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let line_attributes = match pool.object_by_id(self.line_attributes) {
+            let line_attributes = match pool.object_by_nullable_id(self.line_attributes) {
                 Some(Object::LineAttributes(attr)) => attr,
                 _ => {
                     ui.colored_label(

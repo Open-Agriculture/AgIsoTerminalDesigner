@@ -341,13 +341,16 @@ fn position(value: i32) -> ComponentResult<i16> {
         )
     })
 }
-fn apply(pool: &mut ObjectPool, version: VtVersion, operation: Operation) -> ComponentResult<()> {
+fn apply(pool: &mut ObjectPool, _version: VtVersion, operation: Operation) -> ComponentResult<()> {
     operation
         .apply(
             pool,
             &mut HashMap::new(),
             &mut OperationContext {
-                vt_version: version,
+                // Materialization preserves authoring drafts. The target's
+                // restrictions are checked on the completed pool, so an
+                // incompatible imported component remains available to repair.
+                vt_version: VtVersion::Version6,
                 ..Default::default()
             },
         )
@@ -390,14 +393,18 @@ fn compile_nodes(
     let mut nodes: Vec<_> = definition.nodes.iter().collect();
     nodes.sort_by_key(|n| n.id);
     for node in &nodes {
+        // Compilation restores authoring content, including incompatible
+        // imported drafts. Version compatibility is checked at edit/export
+        // boundaries rather than discarding content during materialization.
+        let mut object = crate::default_object(node.object_type);
+        object
+            .mut_id()
+            .set_value(instance.compiled_ids[&node.id])
+            .map_err(|error| ComponentError::new("COMPONENT_NODE_INVALID", format!("{error:?}")))?;
         apply(
             pool,
             version,
-            Operation::CreateObject {
-                object_id: Some(instance.compiled_ids[&node.id]),
-                object_type: node.object_type,
-                name: String::new(),
-            },
+            Operation::RestoreObject { object, info: None },
         )
         .map_err(|e| locate(e, definition, instance, node.id, None))?;
     }
@@ -675,7 +682,12 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
                     }
                     ComponentParameterKind::Text => value.is_string(),
                     ComponentParameterKind::Number => value.is_number(),
-                    ComponentParameterKind::Boolean => value.is_boolean(),
+                    ComponentParameterKind::Boolean => {
+                        value.is_boolean()
+                            || (node.object_type
+                                == ag_iso_stack::object_pool::ObjectType::InputBoolean
+                                && p.property == "value")
+                    }
                     _ => false,
                 }
             }
@@ -789,7 +801,9 @@ fn validate_pool(
     source: &ComponentSource,
 ) -> ComponentResult<()> {
     for diagnostic in crate::pool_validation::validate_pool_state_for_version(pool, version) {
-        if diagnostic.severity == crate::ValidationSeverity::Error {
+        if diagnostic.severity == crate::ValidationSeverity::Error
+            && !diagnostic.code.starts_with("VT_")
+        {
             let mut error =
                 ComponentError::new("COMPONENT_MATERIALIZATION_FAILED", diagnostic.message);
             for id in diagnostic.affected_objects.unwrap_or_default() {

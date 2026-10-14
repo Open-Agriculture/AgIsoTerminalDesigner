@@ -65,7 +65,7 @@ pub fn render_preview_ui(
     let mask = pool.object_by_id(id).ok_or(PreviewError::MissingMask)?;
     let (w, h) = dimensions(state.mask_size);
     ui.allocate_ui(egui::vec2(w as f32, h as f32), |ui| {
-        crate::object_rendering::render_mask(ui, pool, mask)
+        crate::object_rendering::render_mask_with_version(ui, pool, mask, state.vt_version)
     });
     Ok(())
 }

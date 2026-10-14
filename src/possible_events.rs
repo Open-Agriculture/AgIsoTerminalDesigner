@@ -2,7 +2,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use ag_iso_stack::object_pool::{object::*, object_attributes::Event};
+use ag_iso_stack::object_pool::{object::*, object_attributes::Event, vt_version::VtVersion};
 
 pub trait PossibleEvents {
     fn get_possible_events() -> Vec<Event>;
@@ -51,6 +51,14 @@ pub fn get_possible_events(object: &Object) -> Vec<Event> {
         Object::ScaledGraphic(_) => ScaledGraphic::get_possible_events(),
         _ => Vec::new(),
     }
+}
+
+/// Return events that this object can author for the selected VT version.
+pub fn get_possible_events_for_version(object: &Object, version: VtVersion) -> Vec<Event> {
+    get_possible_events(object)
+        .into_iter()
+        .filter(|event| crate::vt_compatibility::supported_event(object, *event, version))
+        .collect()
 }
 
 impl PossibleEvents for WorkingSet {

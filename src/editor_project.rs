@@ -44,10 +44,11 @@ struct ComponentCheckpoint {
     info: HashMap<ObjectId, ObjectInfo>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct DesignDimensions {
     mask_size: u16,
     soft_key_size: (u16, u16),
+    vt_version: VtVersion,
 }
 
 impl ComponentCheckpoint {
@@ -65,7 +66,7 @@ impl ComponentCheckpoint {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct EditorProject {
     pool: ObjectPool,
     components: ComponentSource,
@@ -79,7 +80,7 @@ pub struct EditorProject {
     redo_selected_history: Vec<NullableObjectId>,
     pub mask_size: u16,
     /// Authoritative project VT version. Old projects default to Version 6.
-    pub vt_version: VtVersion,
+    pub(crate) vt_version: VtVersion,
     soft_key_size: (u16, u16),
     /// Application preference, excluded from project content and history.
     object_id_format: ObjectIdFormat,
@@ -123,6 +124,15 @@ pub struct EditorProject {
 
     /// Bounded operation-based undo/redo history.
     pub operation_history: RefCell<OperationHistory>,
+}
+
+impl Default for EditorProject {
+    fn default() -> Self {
+        let mut project = Self::from(ObjectPool::new());
+        project.mask_size = 500;
+        project.mark_saved();
+        project
+    }
 }
 
 impl From<ObjectPool> for EditorProject {
@@ -183,6 +193,40 @@ impl From<ObjectPool> for EditorProject {
 }
 
 impl EditorProject {
+    /// Import target-version IOP records atomically. Structurally valid but
+    /// incompatible content is retained for repair and cannot be exported.
+    pub fn import_iop(data: Vec<u8>, version: VtVersion) -> Result<Self, String> {
+        Self::import_iop_with_id_format(data, version, ObjectIdFormat::default())
+    }
+
+    /// Import an IOP using the selected object-ID format for error messages
+    /// and the resulting project's UI. The format does not affect wire data.
+    pub fn import_iop_with_id_format(
+        data: Vec<u8>,
+        version: VtVersion,
+        object_id_format: ObjectIdFormat,
+    ) -> Result<Self, String> {
+        if !(2..=6).contains(&u8::from(version)) {
+            return Err("Choose VT2 through VT6".into());
+        }
+        let pool =
+            ObjectPool::try_from_iop_for_version(data, version).map_err(|error| {
+                match error.object_id {
+                    Some(id) => format!(
+                        "object {} at byte {}: {:?}",
+                        object_id_format.format(id),
+                        error.offset,
+                        error.source
+                    ),
+                    None => format!("byte {}: {:?}", error.offset, error.source),
+                }
+            })?;
+        let mut project = Self::from(pool);
+        project.vt_version = version;
+        project.object_id_format = object_id_format;
+        project.mark_saved();
+        Ok(project)
+    }
     pub(crate) fn from_ai_source(state: &AiDesignState) -> Self {
         let mut project = Self::from(state.canonical_pool.as_ref().unwrap_or(&state.pool).clone());
         project.components = state.components.clone();
@@ -252,9 +296,23 @@ impl EditorProject {
     /// Export the materialized pool, rejecting strings whose encoded byte
     /// length exceeds the ISO field limit.
     pub fn export_iop(&self) -> ComponentResult<Vec<u8>> {
-        self.materialize()?.pool.try_as_iop().map_err(|message| {
-            crate::components::ComponentError::new("STRING_EXPORT_INVALID", message)
-        })
+        let materialized = self.materialize()?;
+        let diagnostics = self.compatibility_diagnostics_from_pool(&materialized.pool)?;
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::ValidationSeverity::Error)
+            .map(|d| crate::pool_validation::format_validation_diagnostic(d, self.object_id_format))
+            .collect();
+        if !errors.is_empty() {
+            return Err(ComponentError::new(
+                "VT_EXPORT_INCOMPATIBLE",
+                errors.join("\n"),
+            ));
+        }
+        let pool = crate::vt_strings::prepare_pool_for_export(&materialized.pool, self.vt_version)
+            .map_err(|message| ComponentError::new("VT_STRING_ENCODING", message))?;
+        pool.try_as_iop_for_version(self.vt_version)
+            .map_err(|error| ComponentError::new("VT_EXPORT_INVALID", error.to_string()))
     }
     pub fn editor_selection(&self) -> Option<EditorSelection> {
         if let Some((instance_id, node_id)) = self.component_selection.get() {
@@ -352,6 +410,27 @@ impl EditorProject {
             .materialize()
             .map(|m| m.pool)
             .unwrap_or_else(|_| before.pool.clone());
+        let baseline_diagnostics = self.compatibility_diagnostics_from_pool(&baseline)?;
+        let mut candidate_project = self.canvas_preview_copy();
+        candidate_project.pool = after.pool.clone();
+        candidate_project.components = after.source.clone();
+        candidate_project.graphics = after.graphics.clone();
+        candidate_project.object_info.replace(after.info.clone());
+        let candidate_diagnostics =
+            candidate_project.compatibility_diagnostics_from_pool(&candidate.pool)?;
+        let new_errors = crate::pool_validation::new_or_worsened_compatibility_diagnostics(
+            &baseline_diagnostics,
+            &candidate_diagnostics,
+        );
+        if let Some(error) = new_errors
+            .iter()
+            .find(|d| d.severity == crate::ValidationSeverity::Error)
+        {
+            return Err(ComponentError::new(
+                "VT_COMPONENT_INCOMPATIBLE",
+                error.message.clone(),
+            ));
+        }
         crate::layout_containment::validate_change(
             &baseline,
             &candidate.pool,
@@ -515,16 +594,82 @@ impl EditorProject {
         self.soft_key_size
     }
 
+    /// Authoritative target version used for authoring, preview and IOP export.
+    pub fn vt_version(&self) -> VtVersion {
+        self.vt_version
+    }
+
+    /// Change the target version atomically after compatibility validation.
+    /// Failure leaves content, revision and undo history unchanged.
+    pub fn set_vt_version(&mut self, version: VtVersion) -> ComponentResult<()> {
+        self.set_project_settings(self.mask_size, self.soft_key_size, version)
+    }
+
+    /// Compatibility diagnostics for the materialized project, including components.
+    pub fn compatibility_diagnostics(&self) -> ComponentResult<Vec<crate::ValidationDiagnostic>> {
+        self.compatibility_diagnostics_from_pool(&self.materialize()?.pool)
+    }
+
+    fn compatibility_diagnostics_from_pool(
+        &self,
+        pool: &ObjectPool,
+    ) -> ComponentResult<Vec<crate::ValidationDiagnostic>> {
+        let mut diagnostics =
+            crate::pool_validation::validate_pool_state_for_version(pool, self.vt_version);
+        // Master defaults must also be compatible when live instances override
+        // them, or when a master is currently unused.
+        let baseline =
+            crate::pool_validation::validate_pool_state_for_version(&self.pool, self.vt_version);
+        for definition in self.components.definitions.values() {
+            let (preview, ids) = crate::components::preview_definition(self, definition)?;
+            let candidate =
+                crate::pool_validation::validate_pool_state_for_version(&preview, self.vt_version);
+            for mut diagnostic in crate::pool_validation::new_or_worsened_compatibility_diagnostics(
+                &baseline, &candidate,
+            ) {
+                // Preview IDs are disposable. Normalize them to stable node
+                // identities so unrelated primitive allocation cannot change
+                // the identity of an existing master-default violation.
+                let mut affected_nodes = Vec::new();
+                for (node, id) in &ids {
+                    if diagnostic
+                        .affected_objects
+                        .as_ref()
+                        .is_some_and(|affected| affected.contains(id))
+                    {
+                        affected_nodes.push(node);
+                    }
+                    if let Some(affected) = &mut diagnostic.affected_objects {
+                        affected.retain(|affected| affected != id);
+                    }
+                }
+                if !affected_nodes.is_empty() {
+                    let nodes = affected_nodes
+                        .iter()
+                        .map(|node| node.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    diagnostic.message = format!("Node {nodes}: {}", diagnostic.message);
+                }
+                diagnostic.message = format!("Component {}: {}", definition.id, diagnostic.message);
+                diagnostics.push(diagnostic);
+            }
+        }
+        Ok(diagnostics)
+    }
+
     fn dimensions(&self) -> DesignDimensions {
         DesignDimensions {
             mask_size: self.mask_size,
             soft_key_size: self.soft_key_size,
+            vt_version: self.vt_version,
         }
     }
 
     fn restore_dimensions(&mut self, dimensions: DesignDimensions) {
         self.mask_size = dimensions.mask_size;
         self.soft_key_size = dimensions.soft_key_size;
+        self.vt_version = dimensions.vt_version;
         self.bump_revision();
         self.refresh_dirty();
     }
@@ -544,6 +689,23 @@ impl EditorProject {
         mask_size: u16,
         soft_key_size: (u16, u16),
     ) -> ComponentResult<()> {
+        self.set_project_settings(mask_size, soft_key_size, self.vt_version)
+    }
+
+    /// Apply dimensions and VT2–VT6 as one undo action. A version change
+    /// requires a compatible materialized pool; dimensions never scale objects.
+    pub fn set_project_settings(
+        &mut self,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+        vt_version: VtVersion,
+    ) -> ComponentResult<()> {
+        if !(2..=6).contains(&u8::from(vt_version)) {
+            return Err(ComponentError::new(
+                "UNSUPPORTED_VT_VERSION",
+                "Choose VT2 through VT6",
+            ));
+        }
         if mask_size == 0 || soft_key_size.0 == 0 || soft_key_size.1 == 0 {
             return Err(ComponentError::new(
                 "INVALID_DESIGN_DIMENSIONS",
@@ -554,9 +716,35 @@ impl EditorProject {
         let after = DesignDimensions {
             mask_size,
             soft_key_size,
+            vt_version,
         };
         if before == after {
             return Ok(());
+        }
+        if self.vt_version != vt_version {
+            let mut candidate = self.canvas_preview_copy();
+            candidate.vt_version = vt_version;
+            let materialized = candidate.materialize()?;
+            let diagnostics = candidate.compatibility_diagnostics_from_pool(&materialized.pool)?;
+            let errors: Vec<_> = diagnostics
+                .iter()
+                .filter(|d| d.severity == crate::ValidationSeverity::Error)
+                .map(|d| {
+                    crate::pool_validation::format_validation_diagnostic(d, self.object_id_format)
+                })
+                .collect();
+            if !errors.is_empty() {
+                return Err(ComponentError::new(
+                    "VT_VERSION_INCOMPATIBLE",
+                    errors.join("\n"),
+                ));
+            }
+            crate::vt_strings::prepare_pool_for_export(&materialized.pool, vt_version)
+                .and_then(|pool| {
+                    pool.try_as_iop_for_version(vt_version)
+                        .map_err(|e| e.to_string())
+                })
+                .map_err(|message| ComponentError::new("VT_VERSION_INCOMPATIBLE", message))?;
         }
         if self.mask_size != mask_size {
             let materialized = self.materialize()?;
@@ -575,7 +763,11 @@ impl EditorProject {
             .borrow_mut()
             .push(AppliedTransaction {
                 transaction_id,
-                description: Some("Change design dimensions".into()),
+                description: Some(if self.vt_version != vt_version {
+                    "Change project settings".into()
+                } else {
+                    "Change design dimensions".into()
+                }),
                 forward_operations: vec![],
                 inverse_operations: vec![],
                 affected_objects: vec![],
@@ -1332,6 +1524,34 @@ impl EditorProject {
                 _ => None,
             })
             .collect();
+        let mut baseline_diagnostics = self
+            .compatibility_diagnostics_from_pool(&baseline)
+            .map_err(component_transaction_error)?;
+        crate::pool_validation::remap_compatibility_diagnostic_ids(
+            &mut baseline_diagnostics,
+            &id_changes,
+        );
+        let mut candidate_project = self.canvas_preview_copy();
+        candidate_project.pool = prepared.pool.clone();
+        candidate_project
+            .object_info
+            .replace(prepared.object_info.clone());
+        let candidate_diagnostics = candidate_project
+            .compatibility_diagnostics_from_pool(&candidate.pool)
+            .map_err(component_transaction_error)?;
+        let new_errors = crate::pool_validation::new_or_worsened_compatibility_diagnostics(
+            &baseline_diagnostics,
+            &candidate_diagnostics,
+        );
+        if let Some(error) = new_errors
+            .iter()
+            .find(|d| d.severity == crate::ValidationSeverity::Error)
+        {
+            return Err(component_transaction_error(ComponentError::new(
+                "VT_PROJECT_INCOMPATIBLE",
+                error.message.clone(),
+            )));
+        }
         crate::layout_containment::validate_change_with_id_changes(
             &baseline,
             &candidate.pool,
@@ -1382,7 +1602,10 @@ impl EditorProject {
             // Apply inverse operations directly without creating new history entry
             let mut pool = self.pool.clone();
             let mut object_info = self.object_info.borrow().clone();
-            let mut context = crate::operations::OperationContext::default();
+            let mut context = crate::operations::OperationContext {
+                vt_version: self.vt_version,
+                ..Default::default()
+            };
 
             for op in &inverse_tx.operations {
                 match op.apply(&mut pool, &mut object_info, &mut context) {
@@ -1438,7 +1661,10 @@ impl EditorProject {
             }
             let mut pool = self.pool.clone();
             let mut object_info = self.object_info.borrow().clone();
-            let mut context = crate::operations::OperationContext::default();
+            let mut context = crate::operations::OperationContext {
+                vt_version: self.vt_version,
+                ..Default::default()
+            };
 
             for op in &applied_tx.forward_operations {
                 match op.apply(&mut pool, &mut object_info, &mut context) {
@@ -1830,7 +2056,8 @@ mod tests {
             project.dimensions(),
             DesignDimensions {
                 mask_size: 640,
-                soft_key_size: (80, 96)
+                soft_key_size: (80, 96),
+                vt_version: VtVersion::Version6,
             }
         );
         let saved = project.save_project().unwrap();
@@ -2014,7 +2241,7 @@ mod tests {
             object: ObjectTarget::id(parent.id().value()),
             macro_refs: vec![MacroReferenceTarget {
                 macro_object: ObjectTarget::id(12),
-                event_id: Event::OnActivate,
+                event_id: Event::OnKeyPress,
             }],
         });
 
@@ -2035,7 +2262,7 @@ mod tests {
         if let Object::Button(button) = &mut parent {
             button.macro_refs.push(MacroRef {
                 macro_id: 12,
-                event_id: Event::OnActivate,
+                event_id: Event::OnKeyPress,
             });
         }
         let macro_object = object_with_id(ObjectType::Macro, 12);
@@ -2067,7 +2294,7 @@ mod tests {
             });
             button.macro_refs.push(MacroRef {
                 macro_id: 10,
-                event_id: Event::OnActivate,
+                event_id: Event::OnKeyPress,
             });
         }
         let mut required_list = object_with_id(ObjectType::SoftKeyMask, 21);

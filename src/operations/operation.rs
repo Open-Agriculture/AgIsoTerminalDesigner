@@ -427,7 +427,16 @@ impl Operation {
                 }
                 ensure_unique_name(name, None, object_info)?;
 
-                let mut obj = crate::default_object(*object_type);
+                let mut obj = crate::default_object_for_version(*object_type, context.vt_version)
+                    .ok_or_else(|| OperationError::PropertyError {
+                    object_id: target_id.value(),
+                    property: "object_type".into(),
+                    reason: format!(
+                        "{:?} is unavailable in VT{}",
+                        object_type,
+                        u8::from(context.vt_version)
+                    ),
+                })?;
                 obj.mut_id().set_value(target_id.value()).map_err(|_| {
                     OperationError::PropertyError {
                         object_id: target_id.value(),
@@ -1203,19 +1212,9 @@ impl Operation {
                     .iter()
                     .map(|reference| {
                         let macro_id = resolve_target(&reference.macro_object, pool, object_info)?;
-                        let macro_id_u8 = u8::try_from(macro_id.value()).map_err(|_| {
-                            OperationError::PropertyError {
-                                object_id,
-                                property: "macro_refs".to_owned(),
-                                reason: format!(
-                                    "Macro object ID {} does not fit in u8",
-                                    macro_id.value()
-                                ),
-                            }
-                        })?;
                         Ok(MacroRef {
                             event_id: reference.event_id,
-                            macro_id: macro_id_u8,
+                            macro_id: macro_id.value(),
                         })
                     })
                     .collect::<Result<_, OperationError>>()?;
@@ -1577,30 +1576,18 @@ fn replace_references(
         _ => {}
     }
 
-    if old_id.value() <= u8::MAX.into() {
-        let owner_id = object.id().value();
-        with_macro_references!(
+    with_macro_references!(
             object,
             value => {
                 for macro_ref in &mut value.macro_refs {
                     if u16::from(macro_ref.macro_id) == old_id.value() {
-                        macro_ref.macro_id = u8::try_from(new_id.value()).map_err(|_| {
-                            OperationError::PropertyError {
-                                object_id: owner_id,
-                                property: "macro_refs".to_owned(),
-                                reason: format!(
-                                    "Macro object ID {} cannot be represented in a macro reference",
-                                    new_id.value()
-                                ),
-                            }
-                        })?;
+                        macro_ref.macro_id = new_id.value();
                         changed = true;
                     }
                 }
             },
             ()
-        );
-    }
+    );
 
     Ok(changed)
 }

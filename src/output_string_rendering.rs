@@ -187,6 +187,7 @@ pub(crate) fn render(
     ui: &mut egui::Ui,
     pool: &ObjectPool,
     position: Point<i16>,
+    vt_version: ag_iso_stack::object_pool::vt_version::VtVersion,
 ) {
     // Never shorten the layout rectangle at a parent edge: clipping cannot alter
     // wrapping or justification.
@@ -207,7 +208,8 @@ pub(crate) fn render(
             Color32::RED,
         );
     };
-    let Some(Object::FontAttributes(font)) = pool.object_by_id(object.font_attributes) else {
+    let Some(Object::FontAttributes(font)) = pool.object_by_nullable_id(object.font_attributes)
+    else {
         error("Missing Font Attributes");
         return;
     };
@@ -310,16 +312,31 @@ pub(crate) fn render(
         |c| glyphs[&c].advance,
     );
     let block_height = lines.len() as f32 * height;
-    let mut y = match object.justification.vertical {
+    let vertical = if vt_version >= ag_iso_stack::object_pool::vt_version::VtVersion::Version4 {
+        object.justification.vertical
+    } else {
+        // Vertical justification was introduced in VT4. Top alignment is a
+        // stable convention for previews targeting earlier terminals.
+        VerticalAlignment::Top
+    };
+    let mut y = match vertical {
         VerticalAlignment::Middle => rect.center().y - block_height / 2.0,
         VerticalAlignment::Bottom => rect.bottom() - block_height,
         _ => rect.top(),
     };
+    let legacy_cell = if vt_version < ag_iso_stack::object_pool::vt_version::VtVersion::Version4 {
+        // Legacy justification is character based. For proportional fonts,
+        // use a stable half-em cell as a deterministic preview convention.
+        Some(cell_width.unwrap_or(height * 0.5).max(1.0))
+    } else {
+        None
+    };
     for line in lines {
         let width: f32 = line.iter().map(|c| glyphs[c].advance).sum();
+        let align_width = legacy_cell.map_or(width, |cell| line.len() as f32 * cell);
         let mut x = match object.justification.horizontal {
-            HorizontalAlignment::Middle => rect.center().x - width / 2.0,
-            HorizontalAlignment::Right => rect.right() - width,
+            HorizontalAlignment::Middle => rect.center().x - align_width / 2.0,
+            HorizontalAlignment::Right => rect.right() - align_width,
             _ => rect.left(),
         };
         let left = x;
@@ -403,7 +420,7 @@ mod tests {
         else {
             unreachable!()
         };
-        object.font_attributes = ObjectId::new(1).unwrap();
+        object.font_attributes = ObjectId::new(1).unwrap().into();
         object.width = 40;
         object.height = 24;
         object.value = "AB".into();
@@ -413,7 +430,13 @@ mod tests {
                 let rect = Rect::from_min_size(ui.max_rect().min, egui::vec2(20.0, 24.0));
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                     ui.set_clip_rect(rect);
-                    render(&object, ui, &pool, Point::default());
+                    render(
+                        &object,
+                        ui,
+                        &pool,
+                        Point::default(),
+                        ag_iso_stack::object_pool::vt_version::VtVersion::Version6,
+                    );
                 });
             });
         });

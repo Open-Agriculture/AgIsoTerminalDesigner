@@ -182,7 +182,7 @@ fn labels(s: &mut AiDesignState) {
     for n in [24, 25] {
         add(s, ObjectType::OutputString, n);
         if let Some(Object::OutputString(o)) = s.pool.object_mut_by_id(id(n)) {
-            o.font_attributes = id(23);
+            o.font_attributes = id(23).into();
             o.width = 80;
             o.height = 24;
             o.value = "Status".into();

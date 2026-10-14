@@ -48,7 +48,13 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
                         &definition.id.to_string(),
                         false,
                         |ui, rect| {
-                            paint_definition_preview(ui, rect, &preview, definition.root_node)
+                            paint_definition_preview(
+                                ui,
+                                rect,
+                                &preview,
+                                definition.root_node,
+                                project.vt_version,
+                            )
                         },
                     ) {
                         selected = Some(definition.id);
@@ -70,7 +76,13 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
             ui.label(definition.id.to_string());
             let preview = definition_preview(ui.ctx(), project, definition);
             crate::object_picker::review_preview(ui, |ui, rect| {
-                paint_definition_preview(ui, rect, &preview, definition.root_node)
+                paint_definition_preview(
+                    ui,
+                    rect,
+                    &preview,
+                    definition.root_node,
+                    project.vt_version,
+                )
             });
             true
         },
@@ -113,7 +125,13 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
         )
         .show_header(ui, |ui| {
             crate::object_picker::preview(ui, |ui, rect| {
-                paint_definition_preview(ui, rect, &preview, definition.root_node)
+                paint_definition_preview(
+                    ui,
+                    rect,
+                    &preview,
+                    definition.root_node,
+                    project.vt_version,
+                )
             });
             ui.vertical(|ui| {
                 ui.label(format!("{} / {}", category, definition.name));
@@ -236,6 +254,7 @@ fn paint_definition_preview(
     rect: egui::Rect,
     preview: &DefinitionPreview,
     node: ComponentNodeId,
+    version: ag_iso_stack::object_pool::vt_version::VtVersion,
 ) {
     match preview {
         Ok(preview) => {
@@ -245,7 +264,7 @@ fn paint_definition_preview(
                 .and_then(|id| ag_iso_stack::object_pool::ObjectId::new(*id).ok())
                 .and_then(|id| pool.object_by_id(id))
             {
-                crate::object_picker::object_preview(ui, rect, pool, object);
+                crate::object_picker::object_preview_with_version(ui, rect, pool, object, version);
             }
         }
         Err(_) => {
@@ -500,10 +519,16 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                             d.get_temp::<ag_iso_stack::object_pool::ObjectType>(type_key)
                                 .unwrap_or(ag_iso_stack::object_pool::ObjectType::OutputString)
                         });
+                        if !crate::vt_compatibility::supported_object_type(ty, project.vt_version) {
+                            ty = ag_iso_stack::object_pool::ObjectType::OutputString;
+                        }
                         egui::ComboBox::from_id_salt("node_type")
                             .selected_text(format!("{ty:?}"))
                             .show_ui(ui, |ui| {
                                 for choice in ag_iso_stack::object_pool::ObjectType::values() {
+                                    if !crate::vt_compatibility::supported_object_type(choice, project.vt_version) {
+                                        continue;
+                                    }
                                     ui.selectable_value(&mut ty, choice, format!("{choice:?}"));
                                 }
                             });
@@ -798,11 +823,47 @@ fn font_type_for_object(
         }
         _ => return Err("component node is not a string object".to_owned()),
     };
-    match pool.object_by_id(font_id) {
+    match pool.object_by_nullable_id(font_id) {
         Some(Object::FontAttributes(font)) => Ok(font.font_type),
         _ => Err("Font Attributes reference is missing or invalid".to_owned()),
     }
 }
+fn declared_parameter_default(
+    node: &ComponentNode,
+    property: &str,
+    kind: ComponentParameterKind,
+) -> serde_json::Value {
+    let value = node
+        .properties
+        .get(property)
+        .cloned()
+        .or_else(|| {
+            crate::object_properties::get_object_property(
+                &crate::default_object(node.object_type),
+                property,
+            )
+            .ok()
+        })
+        .unwrap_or(serde_json::Value::Null);
+
+    if kind == ComponentParameterKind::Boolean
+        && node.object_type == ObjectType::InputBoolean
+        && property == "value"
+    {
+        if let Some(number) = value.as_i64() {
+            return serde_json::Value::Bool(number != 0);
+        }
+        if let Some(number) = value.as_u64() {
+            return serde_json::Value::Bool(number != 0);
+        }
+        if let Some(number) = value.as_f64() {
+            return serde_json::Value::Bool(number != 0.0);
+        }
+    }
+
+    value
+}
+
 fn manual_parameter_form(
     ui: &mut egui::Ui,
     definition: &mut ComponentDefinition,
@@ -852,7 +913,13 @@ fn manual_parameter_form(
                             &node.id.to_string(),
                             node.id == draft.1,
                             |ui, rect| {
-                                paint_definition_preview(ui, rect, &preview, node.id);
+                                paint_definition_preview(
+                                    ui,
+                                    rect,
+                                    &preview,
+                                    node.id,
+                                    project.vt_version,
+                                );
                             },
                         ) {
                             selected = Some(node.id);
@@ -871,7 +938,7 @@ fn manual_parameter_form(
                 ui.label(node.id.to_string());
                 let preview = definition_preview(ui.ctx(), project, definition);
                 crate::object_picker::review_preview(ui, |ui, rect| {
-                    paint_definition_preview(ui, rect, &preview, *id)
+                    paint_definition_preview(ui, rect, &preview, *id, project.vt_version)
                 });
                 true
             },
@@ -951,17 +1018,7 @@ fn manual_parameter_form(
                         _ => serde_json::Value::Null,
                     }
                 } else {
-                    node.properties
-                        .get(&draft.2)
-                        .cloned()
-                        .or_else(|| {
-                            crate::object_properties::get_object_property(
-                                &crate::default_object(node.object_type),
-                                &draft.2,
-                            )
-                            .ok()
-                        })
-                        .unwrap_or(serde_json::Value::Null)
+                    declared_parameter_default(node, &draft.2, draft.3)
                 };
                 let parameter = ComponentParameter {
                     id: ComponentParameterId::default(),
@@ -1172,4 +1229,43 @@ fn report_error(ui: &mut egui::Ui, message: impl Into<String>) {
     let message = message.into();
     ui.data_mut(|d| d.insert_temp(egui::Id::new("component_error"), message.clone()));
     ui.colored_label(ui.visuals().error_fg_color, message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn input_boolean(value: serde_json::Value) -> ComponentNode {
+        ComponentNode {
+            id: ComponentNodeId::default(),
+            name: "Boolean".into(),
+            object_type: ObjectType::InputBoolean,
+            properties: BTreeMap::from([("value".into(), value)]),
+            children: Vec::new(),
+            references: BTreeMap::new(),
+            macro_references: Vec::new(),
+            object_list: None,
+        }
+    }
+
+    #[test]
+    fn boolean_parameter_default_converts_numeric_input_boolean_values() {
+        assert_eq!(
+            declared_parameter_default(
+                &input_boolean(serde_json::json!(0)),
+                "value",
+                ComponentParameterKind::Boolean,
+            ),
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            declared_parameter_default(
+                &input_boolean(serde_json::json!(3)),
+                "value",
+                ComponentParameterKind::Boolean,
+            ),
+            serde_json::json!(true)
+        );
+    }
 }

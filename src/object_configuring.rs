@@ -145,6 +145,20 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             continue;
         };
         let label = human_readable_property_name(editor.property);
+        if !crate::vt_compatibility::supported_property(
+            object_type,
+            editor.property,
+            design.vt_version,
+        ) {
+            ui.horizontal(|ui| {
+                ui.label(&label);
+                ui.label(value.to_string()).on_hover_text(format!(
+                    "This property is unavailable in VT{} and is shown for repair context.",
+                    u8::from(design.vt_version)
+                ));
+            });
+            continue;
+        }
         if editor.property == "value" {
             if let Some(decoded) = decoded_string_value(object, design.get_pool()) {
                 match decoded {
@@ -159,6 +173,23 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                 }
                 continue;
             }
+        }
+        if object_type == ObjectType::InputBoolean && editor.property == "value" {
+            let maximum = if design.vt_version < VtVersion::Version4 {
+                1.0
+            } else {
+                u8::MAX as f64
+            };
+            render_number(
+                ui,
+                &label,
+                &value,
+                0.0..=maximum,
+                id,
+                editor.property,
+                design,
+            );
+            continue;
         }
         ui.push_id(editor.property, |ui| match editor.editor {
             EditorKind::Colour => render_colour(ui, &label, &value, id, editor.property, design),
@@ -184,11 +215,26 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                         .selected_text(enum_choice_label(&value))
                         .show_ui(ui, |ui| {
                             for choice in &property.enum_choices {
-                                if ui
-                                    .selectable_label(choice == &value, enum_choice_label(choice))
-                                    .clicked()
-                                    && choice != &value
-                                {
+                                let valid = choice == &value
+                                    || (enum_value_supported(
+                                        object_type,
+                                        editor.property,
+                                        choice,
+                                        design.vt_version,
+                                    ) && property_choice_is_valid(
+                                        design,
+                                        id,
+                                        editor.property,
+                                        choice.clone(),
+                                    ));
+                                let response = ui.add_enabled(
+                                    valid,
+                                    egui::Button::selectable(
+                                        choice == &value,
+                                        enum_choice_label(choice),
+                                    ),
+                                );
+                                if response.clicked() && choice != &value {
                                     queue(design, id, editor.property, choice.clone());
                                 }
                             }
@@ -197,7 +243,9 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                         .labelled_by(label_response.id);
                 });
             }
-            EditorKind::FlagSet => render_flag_set(ui, &label, &value, id, editor.property, design),
+            EditorKind::FlagSet => {
+                render_flag_set(ui, &label, &value, id, object_type, editor.property, design)
+            }
             EditorKind::Justification => {
                 render_justification(ui, &label, &value, id, editor.property, design)
             }
@@ -248,7 +296,7 @@ fn decoded_string_value(
         _ => return None,
     };
     let font_type = font_id
-        .and_then(|id| match pool.object_by_id(id) {
+        .and_then(|id| match pool.object_by_nullable_id(id) {
             Some(Object::FontAttributes(font)) => Some(font.font_type),
             _ => None,
         })
@@ -507,6 +555,10 @@ fn child_picker(
         allow_none,
         |candidate| {
             allowed.contains(&candidate.object_type())
+                && crate::vt_compatibility::supported_object_type(
+                    candidate.object_type(),
+                    design.vt_version,
+                )
                 && candidate_is_valid(design, parent, candidate.id())
         },
         |ui, choice| {
@@ -589,7 +641,7 @@ fn render_positioned_children(
     let parent_id = parent.id();
     let allowed = crate::allowed_object_relationships::get_allowed_child_refs(
         parent.object_type(),
-        VtVersion::Version6,
+        design.vt_version,
     );
     let mut replacement = None;
     let mut position = None;
@@ -755,7 +807,7 @@ fn render_object_list(
     let parent_id = parent.id();
     let allowed = crate::allowed_object_relationships::get_allowed_child_refs(
         parent.object_type(),
-        VtVersion::Version6,
+        design.vt_version,
     );
     match objects {
         ObjectReferenceList::Required(objects) => {
@@ -928,8 +980,8 @@ fn queue_object_list(design: &EditorProject, id: ObjectId, objects: ObjectRefere
     });
 }
 
-fn macro_object(design: &EditorProject, macro_id: u8) -> Option<&Object> {
-    ObjectId::new(macro_id.into())
+fn macro_object(design: &EditorProject, macro_id: u16) -> Option<&Object> {
+    ObjectId::new(macro_id)
         .ok()
         .and_then(|id| design.get_pool().object_by_id(id))
         .filter(|object| object.object_type() == ObjectType::Macro)
@@ -949,7 +1001,7 @@ fn queue_macro_references(design: &EditorProject, id: ObjectId, macro_refs: Vec<
             .into_iter()
             .map(|reference| MacroReferenceTarget {
                 event_id: reference.event_id,
-                macro_object: ObjectTarget::id(reference.macro_id.into()),
+                macro_object: ObjectTarget::id(reference.macro_id),
             })
             .collect(),
     });
@@ -984,7 +1036,7 @@ fn render_add_macro_reference(
                     }
                 }
             });
-        if let Some(event_id) = selected_event {
+        if let Some(event_id) = selected_event.filter(|event| events.contains(event)) {
             if let Some(Some(candidate)) = crate::object_picker::button(
                 ui,
                 ("new_macro_object", id.value()),
@@ -998,7 +1050,17 @@ fn render_add_macro_reference(
                 false,
                 |candidate| {
                     candidate.object_type() == ObjectType::Macro
-                        && candidate.id().value() <= u8::MAX.into()
+                        && crate::vt_compatibility::supported_event(
+                            design
+                                .get_pool()
+                                .object_by_id(id)
+                                .expect("macro owner is rendered from the pool"),
+                            event_id,
+                            design.vt_version,
+                        )
+                        && (candidate.id().value() <= u8::MAX.into()
+                            || design.vt_version
+                                >= ag_iso_stack::object_pool::vt_version::VtVersion::Version5)
                 },
                 |ui, choice| {
                     crate::object_picker::impact::review_queued(ui, design, |candidate| {
@@ -1006,7 +1068,7 @@ fn render_add_macro_reference(
                             let mut updated = references.to_vec();
                             updated.push(MacroRef {
                                 event_id,
-                                macro_id: choice.value() as u8,
+                                macro_id: choice.value(),
                             });
                             queue_macro_references(candidate, id, updated);
                         }
@@ -1018,7 +1080,7 @@ fn render_add_macro_reference(
                 let mut updated = references.to_vec();
                 updated.push(MacroRef {
                     event_id,
-                    macro_id: candidate.value() as u8,
+                    macro_id: candidate.value(),
                 });
                 queue_macro_references(design, id, updated);
                 ui.data_mut(|data| data.remove::<Event>(event_key));
@@ -1037,7 +1099,7 @@ fn render_macro_references(
         return;
     };
     ui.label("Macros");
-    let events = crate::possible_events::get_possible_events(object);
+    let events = crate::possible_events::get_possible_events_for_version(object, design.vt_version);
     let mut action = None;
     egui::Grid::new(("macro_grid", id.value()))
         .striped(true)
@@ -1058,7 +1120,7 @@ fn render_macro_references(
                     || {
                         format!(
                             "{} - Missing macro",
-                            design.format_object_id(reference.macro_id.into())
+                            design.format_object_id(reference.macro_id)
                         )
                     },
                     |object| object_label(design, object),
@@ -1077,14 +1139,16 @@ fn render_macro_references(
                     false,
                     |candidate| {
                         candidate.object_type() == ObjectType::Macro
-                            && candidate.id().value() <= u8::MAX.into()
+                            && (candidate.id().value() <= u8::MAX.into()
+                                || design.vt_version
+                                    >= ag_iso_stack::object_pool::vt_version::VtVersion::Version5)
                     },
                     |ui, choice| {
                         crate::object_picker::impact::review_queued(ui, design, |candidate| {
                             if let Some(choice) = choice.0 {
                                 let mut updated = references.to_vec();
                                 updated[index] = edited.clone();
-                                updated[index].macro_id = choice.value() as u8;
+                                updated[index].macro_id = choice.value();
                                 queue_macro_references(candidate, id, updated);
                             }
                         })
@@ -1092,7 +1156,7 @@ fn render_macro_references(
                 )
                 .map(|id| id.0)
                 {
-                    edited.macro_id = candidate.value() as u8;
+                    edited.macro_id = candidate.value();
                 }
                 if let Some(macro_object) = macro_object {
                     if ui.link("View").clicked() {
@@ -1203,6 +1267,40 @@ fn queue(design: &EditorProject, id: ObjectId, property: &str, value: serde_json
             value,
         });
     }
+}
+
+fn enum_value_supported(
+    object_type: ObjectType,
+    property: &str,
+    value: &serde_json::Value,
+    version: VtVersion,
+) -> bool {
+    match property {
+        "font_type" => serde_json::from_value(value.clone())
+            .ok()
+            .is_some_and(|font_type| {
+                crate::vt_compatibility::supported_font_type(font_type, version)
+            }),
+        _ => crate::vt_compatibility::supported_property(object_type, property, version),
+    }
+}
+
+/// Only offer a new value when the normal transaction validator accepts it for
+/// the current target VT. This keeps legacy values visible while allowing a
+/// repair edit to move them back into the supported range.
+fn property_choice_is_valid(
+    design: &EditorProject,
+    id: ObjectId,
+    property: &str,
+    value: serde_json::Value,
+) -> bool {
+    let mut transaction = OperationTransaction::new(None);
+    transaction.add_operation(Operation::SetProperty {
+        object: ObjectTarget::id(id.value()),
+        property: property.to_owned(),
+        value,
+    });
+    design.validate_transaction(&transaction).is_ok()
 }
 
 /// Preserve the JSON number kind exposed by the property's Rust type. In
@@ -1476,13 +1574,35 @@ fn render_flag_field(
     ui: &mut egui::Ui,
     field: &str,
     value: &serde_json::Value,
+    fields: &serde_json::Map<String, serde_json::Value>,
+    id: ObjectId,
+    object_type: ObjectType,
+    property: &str,
+    design: &EditorProject,
 ) -> Option<serde_json::Value> {
     let label = human_readable_property_name(field);
     if let Some(mut enabled) = value.as_bool() {
-        return ui
-            .checkbox(&mut enabled, label)
-            .changed()
-            .then_some(enabled.into());
+        let mut updated = fields.clone();
+        let candidate_enabled = !enabled;
+        updated.insert(field.to_owned(), candidate_enabled.into());
+        let version_allows = !candidate_enabled
+            || crate::vt_compatibility::supported_property_flag(
+                object_type,
+                property,
+                field,
+                design.vt_version,
+            );
+        let response = ui.add_enabled(
+            version_allows
+                && property_choice_is_valid(
+                    design,
+                    id,
+                    property,
+                    serde_json::Value::Object(updated),
+                ),
+            egui::Checkbox::new(&mut enabled, label),
+        );
+        return response.changed().then_some(enabled.into());
     }
     let choices = flag_choices(field);
     let mut updated = None;
@@ -1495,7 +1615,17 @@ fn render_flag_field(
                 .show_ui(ui, |ui| {
                     for choice in choices {
                         let (label, help) = flag_choice_presentation(field, &choice);
-                        let mut response = ui.selectable_label(value == &choice, label);
+                        let mut candidate_fields = fields.clone();
+                        candidate_fields.insert(field.to_owned(), choice.clone());
+                        let valid = value == &choice
+                            || property_choice_is_valid(
+                                design,
+                                id,
+                                property,
+                                serde_json::Value::Object(candidate_fields),
+                            );
+                        let mut response = ui
+                            .add_enabled(valid, egui::Button::selectable(value == &choice, label));
                         if let Some(help) = help {
                             response = response.on_hover_text(help);
                         }
@@ -1525,6 +1655,7 @@ fn render_flag_set(
     label: &str,
     value: &serde_json::Value,
     id: ObjectId,
+    object_type: ObjectType,
     property: &str,
     design: &EditorProject,
 ) {
@@ -1535,11 +1666,18 @@ fn render_flag_set(
             for bit in (0..bits).rev() {
                 let mask = 1_u64 << bit;
                 let mut enabled = current & mask != 0;
-                if ui
-                    .checkbox(&mut enabled, format!("{bit}"))
-                    .on_hover_text(format!("Bit {bit}"))
-                    .changed()
-                {
+                let candidate = if enabled {
+                    current & !mask
+                } else {
+                    current | mask
+                };
+                let response = ui
+                    .add_enabled(
+                        property_choice_is_valid(design, id, property, candidate.into()),
+                        egui::Checkbox::new(&mut enabled, format!("{bit}")),
+                    )
+                    .on_hover_text(format!("Bit {bit}"));
+                if response.changed() {
                     let updated = if enabled {
                         current | mask
                     } else {
@@ -1557,12 +1695,15 @@ fn render_flag_set(
                 continue;
             }
             let edited = ui
-                .push_id(field, |ui| render_flag_field(ui, field, value))
+                .push_id(field, |ui| {
+                    render_flag_field(ui, field, value, fields, id, object_type, property, design)
+                })
                 .inner;
             if let Some(edited) = edited {
                 let mut updated = fields.clone();
                 updated.insert(field.clone(), edited);
-                queue(design, id, property, serde_json::Value::Object(updated));
+                let updated = serde_json::Value::Object(updated);
+                queue(design, id, property, updated);
             }
         }
     } else {
@@ -1612,12 +1753,11 @@ fn render_reference(
             allow_none,
             |candidate| {
                 (allowed_types.is_empty() || allowed_types.contains(&candidate.object_type()))
-                    && crate::pool_validation::would_create_circular_reference(
-                        design.get_pool(),
-                        id,
-                        candidate.id(),
+                    && crate::vt_compatibility::supported_object_type(
+                        candidate.object_type(),
+                        design.vt_version,
                     )
-                    .is_ok()
+                    && validate_pointer_target(design, id, property, candidate.id()).is_ok()
             },
             |ui, reference| {
                 crate::object_picker::impact::review_queued(ui, design, |candidate| {
@@ -1716,6 +1856,14 @@ fn render_pointer_reference(
                             && !allowed_types.contains(&candidate.object_type())
                         {
                             Some("This object type is not valid for this reference.".to_owned())
+                        } else if !crate::vt_compatibility::supported_object_type(
+                            candidate.object_type(),
+                            design.vt_version,
+                        ) {
+                            Some(format!(
+                                "This object type is unavailable in VT{}.",
+                                u8::from(design.vt_version)
+                            ))
                         } else {
                             validate_pointer_target(design, id, property, *target).err()
                         };
@@ -1760,6 +1908,10 @@ fn render_pointer_reference(
             |candidate| {
                 candidate.id() != id
                     && !references.contains(&candidate.id())
+                    && crate::vt_compatibility::supported_object_type(
+                        candidate.object_type(),
+                        design.vt_version,
+                    )
                     && (allowed_types.is_empty()
                         || allowed_types.contains(&candidate.object_type()))
                     && crate::pool_validation::would_create_circular_reference(
@@ -1811,7 +1963,14 @@ fn validate_pointer_target(
             diagnostics
                 .0
                 .first()
-                .map(|diagnostic| diagnostic.message.clone())
+                .map(|diagnostic| match diagnostic.object_id {
+                    Some(id) => format!(
+                        "Object {}: {}",
+                        design.format_object_id(id),
+                        diagnostic.message
+                    ),
+                    None => diagnostic.message.clone(),
+                })
                 .unwrap_or_else(|| "This reference is invalid.".to_owned())
         })
 }
@@ -1856,10 +2015,32 @@ fn render_justification(
             .selected_text(vertical)
             .show_ui(ui, |ui| {
                 for choice in ["Top", "Middle", "Bottom"] {
-                    if ui.selectable_label(vertical == choice, choice).clicked() {
+                    let alignment = match choice {
+                        "Top" => {
+                            ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Top
+                        }
+                        "Middle" => {
+                            ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Middle
+                        }
+                        _ => {
+                            ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Bottom
+                        }
+                    };
+                    let valid = choice == vertical
+                        || crate::vt_compatibility::supported_vertical_alignment(
+                            alignment,
+                            design.vt_version,
+                        );
+                    if ui
+                        .add_enabled(valid, egui::Button::selectable(vertical == choice, choice))
+                        .clicked()
+                    {
                         let mut updated = fields.clone();
                         updated.insert("vertical".to_owned(), choice.into());
-                        queue(design, id, property, serde_json::Value::Object(updated));
+                        let updated = serde_json::Value::Object(updated);
+                        if property_choice_is_valid(design, id, property, updated.clone()) {
+                            queue(design, id, property, updated);
+                        }
                     }
                 }
             })
@@ -1943,7 +2124,7 @@ mod tests {
         refs.iter()
             .map(|reference| MacroReferenceTarget {
                 event_id: reference.event_id,
-                macro_object: ObjectTarget::id(reference.macro_id.into()),
+                macro_object: ObjectTarget::id(reference.macro_id),
             })
             .collect()
     }

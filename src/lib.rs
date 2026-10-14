@@ -28,14 +28,17 @@ pub mod object_properties;
 pub mod operations;
 pub mod pool_validation;
 pub mod ui_style;
+pub mod vt_compatibility;
+pub mod vt_macro_commands;
+pub mod vt_strings;
 
 pub use editor_project::EditorProject;
 pub use interactive_rendering_simple::InteractiveMaskRenderer;
 pub use object_configuring::render_property_editor;
-pub use object_defaults::default_object;
+pub use object_defaults::{default_object, default_object_for_version};
 pub use object_id_format::ObjectIdFormat;
 pub use object_info::ObjectInfo;
-pub use object_rendering::RenderableObject;
+pub use object_rendering::{render_object_with_version, RenderableObject};
 
 // Operation system exports
 pub use ai::snapshot::{DesignSnapshot, PoolSnapshot};

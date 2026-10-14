@@ -1,7 +1,7 @@
 //! Schema DTOs generated from the same metadata and relationship rules as the executor.
 use super::AiDesignState;
 use crate::allowed_object_relationships::get_allowed_child_refs;
-use crate::possible_events::get_possible_events;
+use crate::possible_events::get_possible_events_for_version;
 use crate::{
     default_object,
     object_properties::{get_object_property, get_property_descriptors, PropertySemantic},
@@ -12,6 +12,7 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectSchemaSnapshot {
     pub object_type: String,
+    pub supported_for_target: bool,
     pub properties: Vec<PropertySchemaSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub colour_palette: Option<Value>,
@@ -59,6 +60,12 @@ pub fn get_object_schema(
                     PropertySemanticSnapshot::ObjectReference {
                         allowed_object_types: allowed_types
                             .into_iter()
+                            .filter(|t| {
+                                crate::vt_compatibility::supported_object_type(
+                                    **t,
+                                    state.vt_version,
+                                )
+                            })
                             .map(|t| format!("{:?}", t))
                             .collect(),
                     }
@@ -66,10 +73,28 @@ pub fn get_object_schema(
             };
             PropertySchemaSnapshot {
                 name: d.name.to_owned(),
-                writable: d.writable,
+                writable: d.writable
+                    && crate::vt_compatibility::supported_property(
+                        object_type,
+                        d.name,
+                        state.vt_version,
+                    ),
                 semantic,
                 default_value: get_object_property(&object, d.name).unwrap_or(Value::Null),
-                valid_range: if matches!(d.semantic, PropertySemantic::Colour) {
+                valid_range: if object_type == ObjectType::InputBoolean && d.name == "value" {
+                    Some((
+                        Value::from(0),
+                        Value::from(
+                            if state.vt_version
+                                < ag_iso_stack::object_pool::vt_version::VtVersion::Version4
+                            {
+                                1
+                            } else {
+                                255
+                            },
+                        ),
+                    ))
+                } else if matches!(d.semantic, PropertySemantic::Colour) {
                     Some((Value::from(0), Value::from(255)))
                 } else {
                     d.valid_range
@@ -82,13 +107,17 @@ pub fn get_object_schema(
     let list = crate::operations::object_list(&object).map(|v| ObjectListSchemaSnapshot {
         nullable: matches!(v, crate::operations::ObjectReferenceList::Nullable(_)),
     });
-    let events = get_possible_events(&object);
+    let events = get_possible_events_for_version(&object, state.vt_version);
     let colour_palette = properties
         .iter()
         .any(|property| matches!(property.semantic, PropertySemanticSnapshot::Colour))
         .then(|| serde_json::json!({"encoding":"Semantic name or #RRGGBB resolves against the effective renderer palette; explicit integer indices remain exact.","lookup":"resolve_colours","source":crate::effective_colour::source(&state.pool)}));
     Ok(ObjectSchemaSnapshot {
         object_type: format!("{:?}", object_type),
+        supported_for_target: crate::vt_compatibility::supported_object_type(
+            object_type,
+            state.vt_version,
+        ),
         properties,
         colour_palette,
         supports_positioned_children,

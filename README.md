@@ -73,9 +73,11 @@ Primitive copies receive fresh object IDs and metadata identities. Internal refe
 
 ### Output String preview
 
-Output Strings use the VT version 4 and later presentation rules from ISO 11783-6:2018 §4.6.19: per-line justification, wrapping at spaces and hyphens, control characters, and clipping to the object's dimensions. Font Attributes control character dimensions, styles, inversion, and flashing. The preview flashes on a one-second cycle; the font-size selector chooses fixed or proportional rendering.
+Output Strings use the selected VT version's presentation rules from ISO 11783-6:2018 §4.6.19: character-cell justification before VT4 and pixel-based justification from VT4, wrapping, control characters, and clipping to the object's dimensions. Font Attributes control character dimensions, styles, inversion, and flashing. The preview flashes on a one-second cycle; proportional fonts are available from VT4.
 
 Imported strings retain their original bytes and decode using their ISO-8859 font character set or UTF-16LE BOM. Editing text converts it to Unicode, exported as a UTF-16LE WideString (VT version 4 and later). Unsupported proprietary encodings display a diagnostic. Export rejects strings exceeding their encoded byte-length limit. A shared String Variable is decoded separately for each rendered field; its text editor uses the first referencing field's character set.
+
+Project Settings supports VT2–VT6 with compatibility checks, undo/redo, and version-aware authoring and preview. VT2/VT3 export uses the consumers' 8-bit font encodings and rejects unrepresentable text. Raw IOP import asks for its target version and rejects malformed records. Existing incompatible projects remain editable for repair; binary export waits until they are compatible. New `.aitp` saves use lossless authoring format v2, while v1 files remain readable. See [Designer settings](docs/project-settings.md).
 
 ### What's Next
 
@@ -83,7 +85,6 @@ The list below outlines some of the features and improvements that are planned t
 
 - Add the remaining objects for configuration and rendering.
 - Display a preview of the active soft key mask.
-- Allow changing VT version and adjust object pool configuration/rendering accordingly.
 - Implement the ability to give objects custom names.
 - Add a colour picker for colour attributes.
 - Add a search bar to quickly find objects.

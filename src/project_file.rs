@@ -3,12 +3,12 @@
 //! Authors: Daan Steenbergen
 
 use crate::ObjectInfo;
-use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectId, ObjectPool};
+use ag_iso_stack::object_pool::{object::Object, vt_version::VtVersion, ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 /// Project file format version
-const PROJECT_FILE_VERSION: u32 = 1;
+const PROJECT_FILE_VERSION: u32 = 2;
 
 /// AgIsoTerminalProject file format (.aitp)
 /// This format stores both the object pool and custom metadata
@@ -22,8 +22,13 @@ pub struct ProjectFile {
     #[serde(default)]
     pub graphics: crate::graphics::GraphicLibrary,
 
-    /// The object pool data as IOP bytes
+    /// Historical v1 codec bytes, independent of the saved target version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     object_pool_data: Vec<u8>,
+
+    /// Version-neutral v2 authoring objects, retaining invalid repair drafts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    objects: Option<Vec<Object>>,
 
     /// Custom metadata for objects (names, etc.)
     object_metadata: BTreeMap<u16, ObjectMetadata>,
@@ -73,7 +78,7 @@ pub struct ProjectSettings {
 
 impl ProjectFile {
     /// Create a new project file from an ObjectPool and metadata.
-    /// Returns an error if an encoded string exceeds its wire length field.
+    /// Authoring content is retained without imposing target IOP restrictions.
     pub fn new(
         pool: &ObjectPool,
         object_info: &HashMap<ObjectId, ObjectInfo>,
@@ -82,12 +87,6 @@ impl ProjectFile {
         vt_version: VtVersion,
         selected: Option<ObjectId>,
     ) -> Result<Self, serde_json::Error> {
-        let object_pool_data = pool.try_as_iop().map_err(|message| {
-            serde_json::Error::io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                message,
-            ))
-        })?;
         // Convert ObjectInfo map to ObjectMetadata map
         let mut object_metadata = BTreeMap::new();
         for (id, info) in object_info {
@@ -105,7 +104,8 @@ impl ProjectFile {
             version: PROJECT_FILE_VERSION,
             components: Default::default(),
             graphics: Default::default(),
-            object_pool_data,
+            object_pool_data: Vec::new(),
+            objects: Some(pool.objects().to_vec()),
             object_metadata,
             settings: ProjectSettings {
                 mask_size,
@@ -119,23 +119,24 @@ impl ProjectFile {
     /// Load object pool from project file
     /// Returns an error if the object pool data is corrupted or invalid
     pub fn load_pool(&self) -> Result<ObjectPool, String> {
-        // Validate minimum size for a valid IOP file
-        if self.object_pool_data.is_empty() {
-            return Ok(ObjectPool::default());
+        if self.version == 1 {
+            return ObjectPool::try_from_legacy_project_iop(self.object_pool_data.clone())
+                .map_err(|error| error.to_string());
         }
-        if self.object_pool_data.len() < 4 {
-            return Err("Object pool data is too small to be valid".to_string());
+        let objects = self
+            .objects
+            .as_ref()
+            .ok_or("Version 2 project is missing objects")?;
+        let mut pool = ObjectPool::new();
+        for object in objects {
+            if pool.object_by_id(object.id()).is_some() {
+                return Err(format!(
+                    "Duplicate project object ID {}",
+                    object.id().value()
+                ));
+            }
+            pool.add(object.clone());
         }
-
-        // Try to parse the object pool
-        let pool = ObjectPool::from_iop(self.object_pool_data.clone());
-
-        // Validate that we got a non-empty pool
-        // Note: This is a heuristic check since from_iop might return an empty pool for invalid data
-        if pool.objects().is_empty() && self.object_pool_data.len() > 4 {
-            return Err("Failed to parse object pool: no objects found in data".to_string());
-        }
-
         Ok(pool)
     }
 
@@ -156,7 +157,23 @@ impl ProjectFile {
 
     /// Deserialize project from JSON bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+        let project: Self = serde_json::from_slice(bytes)?;
+        if !(1..=PROJECT_FILE_VERSION).contains(&project.version) {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsupported project format version {}", project.version),
+            )));
+        }
+        if !(2..=6).contains(&project.settings.vt_version) {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Unsupported target VT{}; supported targets are VT2–VT6",
+                    project.settings.vt_version
+                ),
+            )));
+        }
+        Ok(project)
     }
 }
 
@@ -176,7 +193,7 @@ fn default_vt_version_number() -> u8 {
 }
 
 impl ProjectSettings {
-    /// VT6 is the explicit backwards-compatible fallback for missing/invalid legacy values.
+    /// Missing legacy values default to VT6; loaded values are checked in `from_bytes`.
     pub fn vt_version(&self) -> VtVersion {
         VtVersion::try_from(self.vt_version).unwrap_or(VtVersion::Version6)
     }

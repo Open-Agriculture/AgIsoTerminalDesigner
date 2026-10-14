@@ -3,7 +3,7 @@ use super::{
     edits::{self, position, CanvasEdit, PlacementTarget},
     geometry::{self, Scene, SceneItem},
 };
-use crate::{components::MaterializedProject, EditorProject, RenderableObject};
+use crate::{components::MaterializedProject, EditorProject};
 use ag_iso_stack::object_pool::{object_attributes::Point, NullableObjectId, ObjectId};
 use egui::{Color32, Key, Modifiers, Pos2, Rect, Stroke, Vec2};
 
@@ -452,7 +452,13 @@ impl CanvasState {
                 .ok()
                 .and_then(|id| display.pool.object_by_id(id))
             {
-                object.render(child, &display.pool, Point::default());
+                crate::object_rendering::render_object_with_version(
+                    child,
+                    &display.pool,
+                    object,
+                    Point::default(),
+                    project.vt_version,
+                );
             }
         });
         let painter = ui.painter().with_clip_rect(viewport);

@@ -415,31 +415,48 @@ impl OperationExecutor {
             &id_changes,
         )
         .map_err(containment_transaction_error)?;
-        let diagnostics: Vec<_> = crate::pool_validation::validate_pool_state_for_version(
+        let candidate_validation = crate::pool_validation::validate_pool_state_for_version(
             &candidate_pool,
             context.vt_version,
-        )
-        .into_iter()
-        .map(|d| TransactionDiagnostic {
-            severity: match d.severity {
-                crate::pool_validation::ValidationSeverity::Error => DiagnosticSeverity::Error,
-                crate::pool_validation::ValidationSeverity::Warning => DiagnosticSeverity::Warning,
-                crate::pool_validation::ValidationSeverity::Info => DiagnosticSeverity::Info,
-            },
-            code: if d.code.is_empty() {
-                "INVALID_RESULTING_POOL".into()
-            } else {
-                d.code
-            },
-            message: d.message,
-            operation_index: None,
-            operation_type: None,
-            object_id: None,
-            object_name: None,
-            property: None,
-            related_objects: d.affected_objects.unwrap_or_default(),
-        })
-        .collect();
+        );
+        let mut baseline_validation =
+            crate::pool_validation::validate_pool_state_for_version(pool, context.vt_version);
+        crate::pool_validation::remap_compatibility_diagnostic_ids(
+            &mut baseline_validation,
+            &id_changes,
+        );
+        let new_compatibility = crate::pool_validation::new_or_worsened_compatibility_diagnostics(
+            &baseline_validation,
+            &candidate_validation,
+        );
+        let validation_to_report = candidate_validation
+            .into_iter()
+            .filter(|diagnostic| !diagnostic.code.starts_with("VT_"))
+            .chain(new_compatibility);
+        let diagnostics: Vec<_> = validation_to_report
+            .into_iter()
+            .map(|d| TransactionDiagnostic {
+                severity: match d.severity {
+                    crate::pool_validation::ValidationSeverity::Error => DiagnosticSeverity::Error,
+                    crate::pool_validation::ValidationSeverity::Warning => {
+                        DiagnosticSeverity::Warning
+                    }
+                    crate::pool_validation::ValidationSeverity::Info => DiagnosticSeverity::Info,
+                },
+                code: if d.code.is_empty() {
+                    "INVALID_RESULTING_POOL".into()
+                } else {
+                    d.code
+                },
+                message: d.message,
+                operation_index: None,
+                operation_type: None,
+                object_id: None,
+                object_name: None,
+                property: None,
+                related_objects: d.affected_objects.unwrap_or_default(),
+            })
+            .collect();
         if diagnostics
             .iter()
             .any(|d| d.severity == DiagnosticSeverity::Error)

@@ -1,7 +1,8 @@
 //! Shared searchable selection window and aspect-preserving preview rows.
-use crate::{EditorProject, RenderableObject};
+use crate::EditorProject;
 use ag_iso_stack::object_pool::{
-    object::Object, object_attributes::Point, NullableObjectId, ObjectId, ObjectPool,
+    object::Object, object_attributes::Point, vt_version::VtVersion, NullableObjectId, ObjectId,
+    ObjectPool,
 };
 use egui::{self, Rect, Vec2};
 
@@ -181,7 +182,7 @@ pub fn review_object(
             return false;
         };
         review_preview(ui, |ui, rect| {
-            object_preview(ui, rect, project.get_pool(), object)
+            object_preview_with_version(ui, rect, project.get_pool(), object, project.vt_version)
         });
     } else {
         ui.label("Clear this selection.");
@@ -210,7 +211,11 @@ pub fn checkerboard(painter: &egui::Painter, rect: Rect) {
             painter.rect_filled(
                 tile,
                 0.0,
-                if (row + column) % 2 == 0 { base } else { alternate },
+                if (row + column) % 2 == 0 {
+                    base
+                } else {
+                    alternate
+                },
             );
         }
     }
@@ -227,6 +232,18 @@ pub fn texture(ui: &mut egui::Ui, rect: Rect, texture: &egui::TextureHandle) {
 
 /// Read-only miniature; render at natural size, then uniformly transform its shapes.
 pub fn object_preview(ui: &mut egui::Ui, rect: Rect, pool: &ObjectPool, object: &Object) {
+    object_preview_with_version(ui, rect, pool, object, VtVersion::Version6);
+}
+
+/// Version-aware fitted object preview. Direct calls to `object_preview` keep
+/// the historical VT6 default; project previews should pass their target.
+pub fn object_preview_with_version(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    pool: &ObjectPool,
+    object: &Object,
+    version: VtVersion,
+) {
     if let Object::PictureGraphic(picture) = object {
         if let Some(image) = crate::graphics::preview::picture_texture(ui.ctx(), picture, pool) {
             texture(ui, rect, &image);
@@ -256,7 +273,13 @@ pub fn object_preview(ui: &mut egui::Ui, rect: Rect, pool: &ObjectPool, object: 
     );
     preview.set_clip_rect(transform.inverse().mul_rect(rect.intersect(ui.clip_rect())));
     preview.with_visual_transform(transform, |ui| {
-        object.render(ui, pool, Point::default());
+        crate::object_rendering::render_object_with_version(
+            ui,
+            pool,
+            object,
+            Point::default(),
+            version,
+        );
     });
 }
 
@@ -335,7 +358,15 @@ pub fn objects(
                     object.object_type()
                 ),
                 selected == Some(object.id()),
-                |ui, rect| object_preview(ui, rect, project.get_pool(), object),
+                |ui, rect| {
+                    object_preview_with_version(
+                        ui,
+                        rect,
+                        project.get_pool(),
+                        object,
+                        project.vt_version,
+                    )
+                },
             ) {
                 result = Some(NullableObjectId(Some(object.id())));
             }

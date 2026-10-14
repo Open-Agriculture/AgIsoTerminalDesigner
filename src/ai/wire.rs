@@ -155,7 +155,7 @@ pub fn schema(schema: super::schema::ObjectSchemaSnapshot) -> Value {
             v
         })
         .collect();
-    let mut v = json!({"type":schema.object_type,"properties":properties});
+    let mut v = json!({"type":schema.object_type,"supported_for_target":schema.supported_for_target,"properties":properties});
     if !schema.allowed_positioned_children.is_empty() {
         v["allowed_positioned_children"] = json!(schema.allowed_positioned_children);
     }

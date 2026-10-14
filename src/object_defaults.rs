@@ -6,8 +6,19 @@ use std::vec;
 
 use ag_iso_stack::{
     network_management::name::NAME,
-    object_pool::{object::*, object_attributes::*, NullableObjectId, ObjectId, ObjectType},
+    object_pool::{
+        object::*, object_attributes::*, vt_version::VtVersion, NullableObjectId, ObjectId,
+        ObjectType,
+    },
 };
+
+/// Build the normal default object only when its object type exists in the
+/// selected target VT. Existing projects still use `default_object` when they
+/// need a placeholder for repair or migration.
+pub fn default_object_for_version(obj_type: ObjectType, version: VtVersion) -> Option<Object> {
+    crate::vt_compatibility::supported_object_type(obj_type, version)
+        .then(|| default_object(obj_type))
+}
 
 pub fn default_object(obj_type: ObjectType) -> Object {
     match obj_type {
@@ -179,9 +190,9 @@ fn default_input_boolean() -> InputBoolean {
         id: ObjectId::new(0).unwrap(),
         background_colour: 0,
         width: 0,
-        foreground_colour: ObjectId::new(0).unwrap(),
+        foreground_colour: ObjectId::new(0).unwrap().into(),
         variable_reference: NullableObjectId::NULL,
-        value: false,
+        value: 0,
         enabled: true,
         macro_refs: vec![],
     }
@@ -193,7 +204,7 @@ fn default_input_string() -> InputString {
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: ObjectId::new(0).unwrap().into(),
         input_attributes: NullableObjectId::NULL,
         options: InputStringOptions {
             transparent: false,
@@ -217,7 +228,7 @@ fn default_input_number() -> InputNumber {
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: ObjectId::new(0).unwrap().into(),
         options: NumberOptions {
             transparent: false,
             display_leading_zeros: false,
@@ -266,7 +277,7 @@ fn default_output_string() -> OutputString {
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: ObjectId::new(0).unwrap().into(),
         options: OutputStringOptions {
             transparent: false,
             auto_wrap: false,
@@ -288,7 +299,7 @@ fn default_output_number() -> OutputNumber {
         width: 0,
         height: 0,
         background_colour: 0,
-        font_attributes: ObjectId::new(0).unwrap(),
+        font_attributes: ObjectId::new(0).unwrap().into(),
         options: NumberOptions {
             transparent: false,
             display_leading_zeros: false,
@@ -312,7 +323,7 @@ fn default_output_number() -> OutputNumber {
 fn default_output_line() -> OutputLine {
     OutputLine {
         id: ObjectId::new(0).unwrap(),
-        line_attributes: ObjectId::new(0).unwrap(),
+        line_attributes: ObjectId::new(0).unwrap().into(),
         width: 0,
         height: 0,
         line_direction: LineDirection::TopLeftToBottomRight,
@@ -323,7 +334,7 @@ fn default_output_line() -> OutputLine {
 fn default_output_rectangle() -> OutputRectangle {
     OutputRectangle {
         id: ObjectId::new(0).unwrap(),
-        line_attributes: ObjectId::new(0).unwrap(),
+        line_attributes: ObjectId::new(0).unwrap().into(),
         width: 0,
         height: 0,
         line_suppression: 0,
@@ -335,7 +346,7 @@ fn default_output_rectangle() -> OutputRectangle {
 fn default_output_ellipse() -> OutputEllipse {
     OutputEllipse {
         id: ObjectId::new(0).unwrap(),
-        line_attributes: ObjectId::new(0).unwrap(),
+        line_attributes: ObjectId::new(0).unwrap().into(),
         width: 0,
         height: 0,
         ellipse_type: 0,
@@ -351,7 +362,7 @@ fn default_output_polygon() -> OutputPolygon {
         id: ObjectId::new(0).unwrap(),
         width: 0,
         height: 0,
-        line_attributes: ObjectId::new(0).unwrap(),
+        line_attributes: ObjectId::new(0).unwrap().into(),
         fill_attributes: NullableObjectId::NULL,
         polygon_type: 0,
         points: vec![

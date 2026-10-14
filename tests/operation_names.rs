@@ -297,7 +297,7 @@ fn name_based_lists_macros_and_rename_round_trip() {
     tx.add_operation(Operation::SetMacroReferences {
         object: name("Button"),
         macro_refs: vec![MacroReferenceTarget {
-            event_id: Event::OnActivate,
+            event_id: Event::OnKeyPress,
             macro_object: name("Activate Macro"),
         }],
     });

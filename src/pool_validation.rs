@@ -30,6 +30,35 @@ pub struct ValidationDiagnostic {
     pub code: String,                       // e.g., "E001_CIRCULAR_REF"
 }
 
+/// Format diagnostic object identities using the editor's selected radix.
+pub fn format_validation_diagnostic(
+    diagnostic: &ValidationDiagnostic,
+    format: crate::ObjectIdFormat,
+) -> String {
+    let Some(objects) = diagnostic
+        .affected_objects
+        .as_ref()
+        .filter(|ids| !ids.is_empty())
+    else {
+        return diagnostic.message.clone();
+    };
+    let objects = objects
+        .iter()
+        .map(|id| format.format(*id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let subject = if diagnostic
+        .affected_objects
+        .as_ref()
+        .is_some_and(|ids| ids.len() > 1)
+    {
+        "Objects"
+    } else {
+        "Object"
+    };
+    format!("{subject} {objects}: {}", diagnostic.message)
+}
+
 /// Check if adding a reference from parent_id to child_id would create a circular dependency
 /// Performs breadth-first search to detect cycles
 pub fn would_create_circular_reference(
@@ -41,7 +70,7 @@ pub fn would_create_circular_reference(
     if parent_id == child_id {
         return Err(ValidationDiagnostic {
             severity: ValidationSeverity::Error,
-            message: format!("Object {} cannot reference itself", parent_id.value()),
+            message: "Cannot reference an object to itself".to_owned(),
             affected_objects: Some(vec![parent_id.value()]),
             code: "E001_SELF_REFERENCE".to_string(),
         });
@@ -64,11 +93,7 @@ pub fn would_create_circular_reference(
             let cycle_path = build_cycle_path(pool, parent_id, child_id);
             return Err(ValidationDiagnostic {
                 severity: ValidationSeverity::Error,
-                message: format!(
-                    "Adding reference {} → {} would create a circular dependency",
-                    parent_id.value(),
-                    child_id.value()
-                ),
+                message: "Adding this reference would create a circular dependency".to_owned(),
                 affected_objects: Some(cycle_path),
                 code: "E002_CIRCULAR_REFERENCE".to_string(),
             });
@@ -108,7 +133,7 @@ pub fn validate_parent_child_relationship_for_version(
         .object_by_id(parent_id)
         .ok_or_else(|| ValidationDiagnostic {
             severity: ValidationSeverity::Error,
-            message: format!("Parent object {} not found", parent_id.value()),
+            message: "Parent object not found".to_owned(),
             affected_objects: Some(vec![parent_id.value()]),
             code: "E003_PARENT_NOT_FOUND".to_string(),
         })?;
@@ -117,7 +142,7 @@ pub fn validate_parent_child_relationship_for_version(
         .object_by_id(child_id)
         .ok_or_else(|| ValidationDiagnostic {
             severity: ValidationSeverity::Error,
-            message: format!("Child object {} not found", child_id.value()),
+            message: "Child object not found".to_owned(),
             affected_objects: Some(vec![child_id.value()]),
             code: "E004_CHILD_NOT_FOUND".to_string(),
         })?;
@@ -148,15 +173,15 @@ pub fn validate_object_id(id: u16) -> Result<ObjectId, ValidationDiagnostic> {
     if id == 0 || id == u16::MAX {
         return Err(ValidationDiagnostic {
             severity: ValidationSeverity::Error,
-            message: format!("Object ID {} is invalid (must be 1-65534)", id),
-            affected_objects: None,
+            message: "Object ID is invalid (must be 1-65534)".to_owned(),
+            affected_objects: Some(vec![id]),
             code: "E006_INVALID_OBJECT_ID".to_string(),
         });
     }
     ObjectId::new(id).map_err(|_| ValidationDiagnostic {
         severity: ValidationSeverity::Error,
-        message: format!("Object ID {} is invalid (must be 1-65534)", id),
-        affected_objects: None,
+        message: "Object ID is invalid (must be 1-65534)".to_owned(),
+        affected_objects: Some(vec![id]),
         code: "E006_INVALID_OBJECT_ID".to_string(),
     })
 }
@@ -165,7 +190,7 @@ pub fn validate_object_id(id: u16) -> Result<ObjectId, ValidationDiagnostic> {
 pub fn validate_object_exists(pool: &ObjectPool, id: ObjectId) -> Result<(), ValidationDiagnostic> {
     pool.object_by_id(id).ok_or_else(|| ValidationDiagnostic {
         severity: ValidationSeverity::Error,
-        message: format!("Object {} not found in pool", id.value()),
+        message: "Object not found in pool".to_owned(),
         affected_objects: Some(vec![id.value()]),
         code: "E007_OBJECT_NOT_FOUND".to_string(),
     })?;
@@ -217,23 +242,34 @@ pub fn validate_pool_state_for_version(
     // Check all object references for validity
     for obj in pool.objects() {
         use ag_iso_stack::object_pool::object::Object;
-        let string = match obj {
-            Object::InputString(s) => Some((&s.value, u8::MAX as usize)),
-            Object::OutputString(s) => Some((&s.value, u16::MAX as usize)),
-            Object::StringVariable(s) => Some((&s.value, u16::MAX as usize)),
-            _ => None,
+        // String encoding and target byte limits are checked together by
+        // vt_strings. Check other record counts without encoding a draft's
+        // Unicode text through the historical UTF-16 codec on legacy targets.
+        let mut wire_object = matches!(
+            obj,
+            Object::InputString(_) | Object::OutputString(_) | Object::StringVariable(_)
+        )
+        .then(|| obj.clone());
+        let empty = ag_iso_stack::object_pool::object::VtString::Encoded {
+            encoded_bytes: vec![],
         };
-        if let Some((value, maximum)) = string {
-            if value.wire_bytes().len() > maximum {
-                diagnostics.push(ValidationDiagnostic {
-                    severity: ValidationSeverity::Error,
-                    message: format!(
-                        "String value exceeds its {maximum}-byte encoded length limit"
-                    ),
-                    affected_objects: Some(vec![obj.id().value()]),
-                    code: "STRING_TOO_LONG".to_owned(),
-                });
-            }
+        match &mut wire_object {
+            Some(Object::InputString(s)) => s.value = empty,
+            Some(Object::OutputString(s)) => s.value = empty,
+            Some(Object::StringVariable(s)) => s.value = empty,
+            _ => {}
+        }
+        if let Err(message) = wire_object
+            .as_ref()
+            .unwrap_or(obj)
+            .validate_wire_for_version(vt_version)
+        {
+            diagnostics.push(ValidationDiagnostic {
+                severity: ValidationSeverity::Error,
+                message,
+                affected_objects: Some(vec![obj.id().value()]),
+                code: "VT_WIRE_INVALID".into(),
+            });
         }
         for referenced_id in obj.referenced_objects() {
             // Default editor objects use ObjectId(0) as an unresolved required
@@ -253,7 +289,66 @@ pub fn validate_pool_state_for_version(
         }
     }
 
+    diagnostics.extend(crate::vt_compatibility::validate_pool_compatibility(
+        pool, vt_version,
+    ));
+
     diagnostics
+}
+
+/// Return compatibility diagnostics whose violation is new or has worsened
+/// relative to an existing repair draft. Matching includes the diagnostic text
+/// so replacing one invalid value with another remains a rejected change.
+pub(crate) fn new_or_worsened_compatibility_diagnostics(
+    baseline: &[ValidationDiagnostic],
+    candidate: &[ValidationDiagnostic],
+) -> Vec<ValidationDiagnostic> {
+    use std::collections::HashMap;
+    fn is_compatibility(diagnostic: &ValidationDiagnostic) -> bool {
+        diagnostic.code.starts_with("VT_")
+    }
+    fn key(diagnostic: &ValidationDiagnostic) -> (String, String, Vec<u16>) {
+        (
+            diagnostic.code.clone(),
+            diagnostic.message.clone(),
+            diagnostic.affected_objects.clone().unwrap_or_default(),
+        )
+    }
+    let mut remaining = HashMap::new();
+    for diagnostic in baseline.iter().filter(|d| is_compatibility(d)) {
+        *remaining.entry(key(diagnostic)).or_insert(0usize) += 1;
+    }
+    candidate
+        .iter()
+        .filter(|diagnostic| is_compatibility(diagnostic))
+        .filter_map(|diagnostic| {
+            let count = remaining.entry(key(diagnostic)).or_insert(0);
+            if *count > 0 {
+                *count -= 1;
+                None
+            } else {
+                Some(diagnostic.clone())
+            }
+        })
+        .collect()
+}
+
+/// Preserve the identity of existing violations during object renumbering.
+pub(crate) fn remap_compatibility_diagnostic_ids(
+    diagnostics: &mut [ValidationDiagnostic],
+    id_changes: &[(u16, u16)],
+) {
+    for diagnostic in diagnostics {
+        for &(old_id, new_id) in id_changes {
+            if let Some(ids) = &mut diagnostic.affected_objects {
+                for id in ids {
+                    if *id == old_id {
+                        *id = new_id;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Build the cycle path for diagnostic reporting
@@ -299,5 +394,24 @@ mod tests {
     fn test_validate_object_id_invalid() {
         assert!(validate_object_id(0).is_err());
         assert!(validate_object_id(65535).is_err());
+    }
+
+    #[test]
+    fn diagnostic_object_ids_follow_selected_format() {
+        let diagnostic = ValidationDiagnostic {
+            severity: ValidationSeverity::Error,
+            message: "Property value is invalid".into(),
+            affected_objects: Some(vec![175]),
+            code: "TEST".into(),
+        };
+
+        assert_eq!(
+            format_validation_diagnostic(&diagnostic, crate::ObjectIdFormat::Decimal),
+            "Object 175: Property value is invalid"
+        );
+        assert_eq!(
+            format_validation_diagnostic(&diagnostic, crate::ObjectIdFormat::Hexadecimal),
+            "Object 0x00AF: Property value is invalid"
+        );
     }
 }

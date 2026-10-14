@@ -18,7 +18,6 @@ use ag_iso_stack::object_pool::ObjectType;
 use ag_iso_terminal_designer::ai::automation_bridge::EditorAutomationBridge;
 use ag_iso_terminal_designer::canvas::CanvasState;
 use ag_iso_terminal_designer::render_property_editor;
-use ag_iso_terminal_designer::RenderableObject;
 use ag_iso_terminal_designer::{EditorProject, Operation};
 #[cfg(not(target_arch = "wasm32"))]
 use app_persistence::RecentProject;
@@ -86,6 +85,11 @@ pub struct DesignerApp {
     file_channel: (Sender<FileEvent>, Receiver<FileEvent>),
     show_development_popup: bool,
     new_object_dialog: Option<(ObjectType, String)>,
+    pending_iop_import: Option<(
+        Vec<u8>,
+        String,
+        ag_iso_stack::object_pool::vt_version::VtVersion,
+    )>,
     apply_smart_naming_on_import: bool,
     #[cfg(not(target_arch = "wasm32"))]
     project_path: Option<PathBuf>,
@@ -124,6 +128,85 @@ pub struct DesignerApp {
 }
 
 impl DesignerApp {
+    fn show_iop_import(&mut self, ctx: &egui::Context) {
+        let Some((_, name, version)) = self.pending_iop_import.as_mut() else {
+            return;
+        };
+        let mut open = true;
+        let mut import = false;
+        let mut cancel = false;
+        egui::Window::new("Import ISOBUS Object Pool")
+            .open(&mut open)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label(name.as_str());
+                ui.label("Select the target VT version used to encode this pool.");
+                egui::ComboBox::from_id_salt("import_vt_version")
+                    .selected_text(format!("VT{}", u8::from(*version)))
+                    .show_ui(ui, |ui| {
+                        for number in 2..=6 {
+                            ui.selectable_value(
+                                version,
+                                ag_iso_stack::object_pool::vt_version::VtVersion::try_from(number)
+                                    .unwrap(),
+                                format!("VT{number}"),
+                            );
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    import = ui.button("Import").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if import {
+            let (content, name, version) = self.pending_iop_import.take().unwrap();
+            self.open_in_progress = false;
+            match EditorProject::import_iop_with_id_format(
+                content,
+                version,
+                self.preferences.object_id_format,
+            ) {
+                Ok(project) => {
+                    if self.apply_smart_naming_on_import {
+                        project.apply_smart_naming_to_all_objects();
+                    }
+                    project.mark_saved();
+                    let diagnostics = project.compatibility_diagnostics();
+                    self.close_project_settings();
+                    self.canvas = CanvasState::default();
+                    self.project = Some(project);
+                    self.project_display_name = name;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        self.project_path = None;
+                        self.invalidate_automation_proposal();
+                    }
+                    if self.discard_on_replace {
+                        self.clear_recovery();
+                    }
+                    self.discard_on_replace = false;
+                    match diagnostics {
+                        Ok(diagnostics) if !diagnostics.is_empty() => {
+                            self.error_message = Some(format!("Imported for repair. Resolve compatibility issues before IOP export:\n{}",
+                                diagnostics.iter().map(|diagnostic| ag_iso_terminal_designer::pool_validation::format_validation_diagnostic(diagnostic, self.preferences.object_id_format)).collect::<Vec<_>>().join("\n")));
+                        }
+                        Err(error) => {
+                            self.error_message = Some(error.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                Err(error) => {
+                    self.error_message = Some(error);
+                    self.discard_on_replace = false;
+                }
+            }
+        } else if cancel || !open {
+            self.pending_iop_import = None;
+            self.open_in_progress = false;
+            self.discard_on_replace = false;
+        }
+    }
     fn close_project_settings(&mut self) {
         self.project_settings_open = false;
         self.dimensions_draft = None;
@@ -263,6 +346,7 @@ impl DesignerApp {
             file_channel: std::sync::mpsc::channel(),
             show_development_popup: true,
             new_object_dialog: None,
+            pending_iop_import: None,
             apply_smart_naming_on_import: true, // Default to true for better UX
             #[cfg(not(target_arch = "wasm32"))]
             project_path: None,
@@ -378,30 +462,25 @@ impl DesignerApp {
                     path,
                 } => match reason {
                     FileDialogReason::LoadPool => {
-                        self.open_in_progress = false;
-                        #[cfg(not(target_arch = "wasm32"))]
-                        self.invalidate_automation_proposal();
-                        let project = EditorProject::from(ObjectPool::from_iop(content));
-                        // Apply smart naming to all objects that don't have custom names (if enabled)
-                        if self.apply_smart_naming_on_import {
-                            project.apply_smart_naming_to_all_objects();
-                        }
-                        project.mark_saved();
-                        self.close_project_settings();
-                        self.canvas = CanvasState::default();
-                        self.project = Some(project);
-                        self.project_display_name = file_name;
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            self.project_path = None;
-                        }
-                        if self.discard_on_replace {
-                            self.clear_recovery();
-                            self.discard_on_replace = false;
-                        }
+                        let version = self
+                            .project
+                            .as_ref()
+                            .map(EditorProject::vt_version)
+                            .unwrap_or(ag_iso_stack::object_pool::vt_version::VtVersion::Version6);
+                        self.pending_iop_import = Some((content, file_name, version));
                     }
                     FileDialogReason::LoadProject => match EditorProject::load_project(content) {
                         Ok(project) => {
+                            match project.compatibility_diagnostics() {
+                                Ok(diagnostics) if !diagnostics.is_empty() => {
+                                    self.error_message = Some(format!("Opened for repair. Resolve compatibility issues before IOP export:\n{}",
+                                        diagnostics.iter().map(|diagnostic| ag_iso_terminal_designer::pool_validation::format_validation_diagnostic(diagnostic, self.preferences.object_id_format)).collect::<Vec<_>>().join("\n")));
+                                }
+                                Err(error) => {
+                                    self.error_message = Some(error.to_string());
+                                }
+                                _ => {}
+                            }
                             self.open_in_progress = false;
                             #[cfg(not(target_arch = "wasm32"))]
                             self.invalidate_automation_proposal();
@@ -1270,6 +1349,7 @@ impl eframe::App for DesignerApp {
 
         // Handle file dialogs and deferred writes first.
         self.handle_file_loaded(ctx);
+        self.show_iop_import(ctx);
         if let Some(project) = &mut self.project {
             project.set_object_id_format(self.preferences.object_id_format);
         }
@@ -1561,6 +1641,9 @@ impl eframe::App for DesignerApp {
                                 .max_height(400.0)
                                 .show(ui, |ui| {
                                     for object_type in ObjectType::values() {
+                                        if !ag_iso_terminal_designer::vt_compatibility::supported_object_type(
+                                            object_type, self.project.as_ref().unwrap().vt_version(),
+                                        ) { continue; }
                                         if ui.button(format!("{:?}", object_type)).clicked() {
                                             let default_name = self
                                                 .project
@@ -1997,7 +2080,13 @@ impl DesignerApp {
                             ui.separator();
                             let desired_size = egui::Vec2::new(width as f32, height as f32);
                             ui.allocate_ui(desired_size, |ui| {
-                                rendered.render(ui, effective, Point::default());
+                                ag_iso_terminal_designer::render_object_with_version(
+                                    ui,
+                                    effective,
+                                    rendered,
+                                    Point::default(),
+                                    pool.vt_version(),
+                                );
                             });
                         });
                     } else {

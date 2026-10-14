@@ -1066,6 +1066,17 @@ pub fn set_property(
         .object_mut_by_id(object_id)
         .ok_or(PropertyError::ObjectNotFound(object_id))?;
 
+    // Older authoring data represented Boolean values as JSON booleans.
+    // Accept that form while retaining the full VT4+ byte value range.
+    let value = if matches!(obj, Object::InputBoolean(_)) && property == "value" {
+        value
+            .as_bool()
+            .map(|value| Value::from(u8::from(value)))
+            .unwrap_or(value)
+    } else {
+        value
+    };
+
     dispatch_property!(obj, set_property, property, value).map_err(|e| match e {
         PropertyAccessError::PropertyNotFound(p) => PropertyError::PropertyNotFound {
             object_id,

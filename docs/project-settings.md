@@ -16,7 +16,42 @@ overflow. Softkey dimensions are saved metadata; their canvas preview is pending
 New projects use a 500 × 500 mask, 60 × 60 softkeys, and VT6. Existing projects
 retain their mask and VT version. If softkey dimensions are missing, the editor
 infers each axis independently from Key contents, with a 60 × 60 baseline.
-The saved VT version is read-only until version switching has compatibility checks.
+Project Settings selects VT2 through VT6. Apply checks compatibility before
+changing the version and dimensions together as one undo action. Cancel discards
+the draft. Incompatible changes report the affected objects and attributes;
+objects are never silently converted or deleted.
+
+Object creation, attribute choices, references, macro events, and previews use
+the selected target. Checks cover the designer's existing objects, including
+version-specific flags, fonts, encodings, macro commands, and containment rules.
+Optional hardware capabilities remain separate from specification compatibility.
+Missing object renderers are not implemented by choosing a newer VT version.
+
+Raw IOP import asks for the encoding's target version because the file does not
+contain that information. Malformed or truncated input is rejected without
+replacing the open project. Structurally valid incompatible content opens for
+repair, as do existing incompatible projects. Edits can retain existing violations
+but cannot introduce or change them; fixing one issue at a time is supported.
+IOP export requires a compatible materialized pool, including live components.
+
+New saves use `.aitp` format v2 with version-independent authoring objects. This
+retains Unicode text, local fallback values, and incompatible repair drafts.
+Format v1 remains readable using its historical codec rather than its saved target
+version. Unknown formats or targets are reported explicitly. Older applications
+that only support format v1 cannot open v2 saves.
+
+VT2/VT3 exports encode edited strings with their consumers' 8-bit font character
+sets. Unrepresentable text and conflicting encodings for a shared String Variable
+are reported. Unreferenced edited variables use ISO-8859-1. Imported bytes remain
+unchanged; unused local strings of variable-backed fields are omitted from legacy
+IOP exports. VT4 and later support UTF-16LE. String lengths are checked in encoded
+bytes, including the 255-byte limit of variables consumed by Input String fields.
+VT5 and later support extended macro IDs; earlier targets limit macros to 255.
+
+Preview uses VT4+ button and Boolean rules and pixel-based text justification.
+VT2/VT3 previews use character-cell justification with top alignment; where the
+older standard leaves presentation undefined, the editor uses its deterministic
+control-character handling. The preview is an authoring aid, not runtime VT emulation.
 
 The editor shows advisories rather than rejecting designs below terminal minima.
 ISO 11783-6:2018 §4.5.2 requires a square terminal data-mask area of at least
@@ -65,7 +100,7 @@ They do not have serialized configuration or affect the object pool yet.
 
 | Section | Planned settings | Required capability |
 | --- | --- | --- |
-| Compatibility | VT version selection, colour capability, supported fonts/styles, input capabilities, supported object types | Version-aware compatibility checks and terminal capability profiles |
+| Compatibility | Colour capability, supported fonts/styles, input capabilities, terminal object support | Terminal capability profiles |
 | Softkey layout | Physical key count, navigation-key count, key arrangement | Softkey canvas preview and terminal layout profiles |
 | Languages | Supported/default languages, translation resources | Language resource management and variant generation |
 | Authoring | ID allocation ranges, naming conventions | Configurable allocation and naming policies |
