@@ -264,7 +264,9 @@ impl CanvasState {
             self.cancel_interaction();
             self.pair_layout.clone_from(&pairs);
         }
-        self.switch_mask(view.focused.filter(|id| view.visible.contains(id)));
+        let focused_mask = view.focused.filter(|id| view.visible.contains(id));
+        let navigating_mask = focused_mask.is_some() && self.mask != focused_mask;
+        self.switch_mask(focused_mask);
         if let Some(root) = self.mask {
             let (linked, page) = self.pages[&root];
             if self.softkey_mask != linked || self.softkey_page != page {
@@ -368,6 +370,7 @@ impl CanvasState {
             .find(|(id, _, _)| *id == root)
             .map(|(_, offset, _)| *offset)
             .unwrap_or(Vec2::ZERO);
+        let explicit_fit = self.fit_all || self.fit.is_some();
         if captions && !self.initially_fitted && !pairs.is_empty() {
             self.fit_all = true;
             self.initially_fitted = true;
@@ -382,7 +385,7 @@ impl CanvasState {
                 rect
             })
             .reduce(|a, b| a.union(b));
-        if self.fit_all || self.fit.is_some() {
+        if self.fit_all || self.fit.is_some() || navigating_mask {
             let fit_rect = if self.fit_all {
                 all_bounds
             } else if self.fit == Some(true) {
@@ -396,9 +399,14 @@ impl CanvasState {
             self.fit_all = false;
             self.fit = None;
             if let Some(fit_rect) = fit_rect {
-                self.zoom = ((viewport.width() - 48.0) / fit_rect.width().max(1.0))
+                let fit_zoom = ((viewport.width() - 48.0) / fit_rect.width().max(1.0))
                     .min((viewport.height() - 48.0) / fit_rect.height().max(1.0))
                     .clamp(0.1, 8.0);
+                self.zoom = if explicit_fit {
+                    fit_zoom
+                } else {
+                    self.zoom.min(fit_zoom)
+                };
                 self.pan = viewport.size() * 0.5 - fit_rect.center().to_vec2() * self.zoom;
             }
         }

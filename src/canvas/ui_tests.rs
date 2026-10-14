@@ -813,6 +813,8 @@ fn multiple_mask_pairs_keep_edits_local_and_softkey_pages_independent() {
     h.frame(vec![], Modifiers::NONE);
 
     // Both owners render the shared key, but changing one owner's page is local.
+    h.state.fit_all = true;
+    h.frame(vec![], Modifiers::NONE);
     let key_fill = crate::effective_colour::colour(h.project.get_pool(), 2).convert();
     for offset in [egui::vec2(0.0, 24.0), second] {
         let rect = Rect::from_min_size(h.screen(slot.min + offset), slot.size() * h.state.zoom);
@@ -838,4 +840,74 @@ fn multiple_mask_pairs_keep_edits_local_and_softkey_pages_independent() {
     h.key(Key::Delete, Modifiers::NONE);
     assert_eq!(h.project.revision(), revision);
     assert!(h.state.selected.is_empty());
+}
+
+#[test]
+fn mask_navigation_centers_the_pair_and_only_zooms_out() {
+    let mut h = Harness::new(false);
+    let mut pool = h.project.get_pool().clone();
+    let mut alarm = default_object(ObjectType::AlarmMask);
+    alarm.mut_id().set_value(20).unwrap();
+    if let Object::AlarmMask(mask) = &mut alarm {
+        mask.soft_key_mask = NullableObjectId::new(10);
+    }
+    let mut softmask = default_object(ObjectType::SoftKeyMask);
+    softmask.mut_id().set_value(10).unwrap();
+    pool.add(alarm);
+    pool.add(softmask);
+    h.project = EditorProject::from(pool);
+    h.project.mask_size = 500;
+    h.state = CanvasState::default();
+    let mut masks = MaskViewState::default();
+    masks.reconcile(&h.project);
+    h.masks = Some(masks);
+    h.frame(vec![], Modifiers::NONE);
+    assert_eq!(h.state.zoom, 1.0, "initial fitting must not zoom in");
+
+    for zoom in [0.5, 2.0] {
+        h.masks.as_mut().unwrap().focus(1);
+        h.frame(vec![], Modifiers::NONE);
+        h.state.zoom = zoom;
+        h.state.pan = egui::vec2(-2000.0, 300.0);
+        assert_eq!(h.masks.as_mut().unwrap().navigate(&h.project, 20), Some(20));
+        h.frame(vec![], Modifiers::NONE);
+
+        let keys = super::super::softkeys::build(&h.project, h.project.get_pool(), 20, 0);
+        let pair = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 500.0))
+            .union(keys.rect)
+            .translate(egui::vec2(532.0, 24.0));
+        assert!((h.screen(pair.center()) - h.state.viewport.center()).length() < 0.01);
+        let screen_pair = Rect::from_min_max(h.screen(pair.min), h.screen(pair.max));
+        assert!(h.state.viewport.shrink(23.9).contains_rect(screen_pair));
+        if zoom == 0.5 {
+            assert_eq!(h.state.zoom, zoom);
+        } else {
+            assert!(h.state.zoom < zoom);
+        }
+
+        // Same-mask navigation and later frames leave manual view changes intact.
+        h.state.pan += egui::vec2(17.0, -9.0);
+        let pan = h.state.pan;
+        let zoom = h.state.zoom;
+        h.masks.as_mut().unwrap().navigate(&h.project, 20);
+        h.frame(vec![], Modifiers::NONE);
+        h.frame(vec![], Modifiers::NONE);
+        assert_eq!(h.state.pan, pan);
+        assert_eq!(h.state.zoom, zoom);
+    }
+
+    // Explicit fitting can still zoom in, and clicking another mask stays stable.
+    h.state.zoom = 0.1;
+    h.state.fit_all = true;
+    h.frame(vec![], Modifiers::NONE);
+    assert!(h.state.zoom > 0.1);
+    let pan = h.state.pan;
+    let zoom = h.state.zoom;
+    let first = h.screen(egui::pos2(25.0, 49.0));
+    h.pointer(first, Some(true), Modifiers::NONE);
+    h.pointer(first, Some(false), Modifiers::NONE);
+    h.frame(vec![], Modifiers::NONE);
+    assert_eq!(h.masks.as_ref().unwrap().focused, Some(1));
+    assert_eq!(h.state.pan, pan);
+    assert_eq!(h.state.zoom, zoom);
 }
