@@ -4,8 +4,12 @@ pub mod automation_bridge;
 pub mod automation_service;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod automation_trace;
+pub mod commands;
 pub mod design_analysis;
 pub mod design_inspection;
+pub mod draft;
+pub(crate) mod draft_actions;
+pub mod export;
 pub mod preview;
 pub mod proposal;
 pub mod schema;

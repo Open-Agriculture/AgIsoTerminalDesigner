@@ -14,6 +14,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
@@ -75,7 +76,7 @@ pub struct WireError {
 }
 
 /// One provider-neutral action sent through the authenticated editor bridge.
-/// Status is the sole bootstrap action and may omit project identity/revision.
+/// Status and historical draft/submission queries may omit project identity/revision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomationRequest {
     #[serde(default)]
@@ -147,6 +148,7 @@ struct DomainJob {
     incoming: Incoming,
     state: crate::ai::AiDesignState,
     pending: Option<AiProposal>,
+    draft: Option<crate::ai::draft::Draft>,
     editor_instance_id: String,
     proposal_epoch: u64,
 }
@@ -155,7 +157,29 @@ struct DomainCompletion {
     incoming: Incoming,
     editor_instance_id: String,
     proposal_epoch: u64,
-    result: Result<automation_service::DomainResult, automation_service::DomainError>,
+    result: Result<DomainOutput, automation_service::DomainError>,
+}
+
+struct DomainOutput {
+    result: automation_service::DomainResult,
+    draft: Option<crate::ai::draft::Draft>,
+}
+
+/// A submission receipt remains queryable after review and project switches.
+#[derive(Debug, Clone, Serialize)]
+struct ProposalOutcome {
+    proposal_id: String,
+    draft_id: Option<String>,
+    generation: Option<u64>,
+    project_instance: String,
+    base_revision: u64,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    applied_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// Native editor side of the automation connection. Construct it on the UI thread and call
@@ -164,7 +188,14 @@ pub struct EditorAutomationBridge {
     editor_instance_id: String,
     project_instance_id: String,
     observed_revision: Option<ProjectRevision>,
+    current_project_path: Option<PathBuf>,
+    original_source_path: Option<PathBuf>,
+    display_name: String,
+    observed_dirty: Option<bool>,
     pending_proposal: Option<AiProposal>,
+    active_draft: Option<crate::ai::draft::Draft>,
+    draft_records: HashMap<String, Value>,
+    outcomes: HashMap<String, ProposalOutcome>,
     runtime_path: PathBuf,
     incoming: Receiver<Incoming>,
     domain_jobs: SyncSender<DomainJob>,
@@ -233,7 +264,14 @@ impl EditorAutomationBridge {
             editor_instance_id,
             project_instance_id,
             observed_revision: None,
+            current_project_path: None,
+            original_source_path: None,
+            display_name: String::new(),
+            observed_dirty: None,
             pending_proposal: None,
+            active_draft: None,
+            draft_records: HashMap::new(),
+            outcomes: HashMap::new(),
             runtime_path,
             incoming,
             domain_jobs: jobs_tx,
@@ -251,8 +289,17 @@ impl EditorAutomationBridge {
 
     /// Process network requests and publish project identity/revision changes.
     pub fn poll(&mut self, project: Option<&EditorProject>) {
+        self.observed_dirty = project.map(EditorProject::is_dirty);
         let revision = project.map(EditorProject::revision);
         if revision != self.observed_revision {
+            if self
+                .active_draft
+                .as_ref()
+                .is_some_and(|d| Some(d.base_revision) != revision)
+            {
+                self.close_draft("invalidated");
+                self.proposal_epoch = self.proposal_epoch.wrapping_add(1);
+            }
             if self
                 .pending_proposal
                 .as_ref()
@@ -287,8 +334,20 @@ impl EditorAutomationBridge {
                 )
             } else {
                 match completion.result {
-                    Ok(result) => {
+                    Ok(output) => {
+                        if let Some(draft) = output.draft {
+                            self.active_draft = Some(draft);
+                            self.remember_draft("editing", None);
+                            self.proposal_epoch = self.proposal_epoch.wrapping_add(1);
+                        }
+                        let result = output.result;
                         if let Some(proposal) = result.proposal {
+                            if let Some(previous) = self.pending_proposal.as_ref() {
+                                if let Some(outcome) = self.outcomes.get_mut(&previous.proposal_id)
+                                {
+                                    outcome.status = "superseded".into();
+                                }
+                            }
                             if self.pending_proposal.is_some() {
                                 self.proposal_metrics.refinement_rounds += 1;
                             } else {
@@ -296,18 +355,27 @@ impl EditorAutomationBridge {
                                     Some(proposal.proposal_id.clone());
                             }
                             self.proposal_metrics.proposal_id = Some(proposal.proposal_id.clone());
+                            self.outcomes.insert(
+                                proposal.proposal_id.clone(),
+                                ProposalOutcome {
+                                    proposal_id: proposal.proposal_id.clone(),
+                                    draft_id: self.active_draft.as_ref().map(|d| d.id.clone()),
+                                    generation: self.active_draft.as_ref().map(|d| d.generation),
+                                    project_instance: self.project_instance_id.clone(),
+                                    base_revision: proposal.base_revision,
+                                    status: "pending".into(),
+                                    applied_revision: None,
+                                    transaction_id: None,
+                                    error: None,
+                                },
+                            );
+                            self.remember_draft("submitted", Some(&proposal.proposal_id));
                             self.pending_proposal = Some(proposal);
+                            self.proposal_epoch = self.proposal_epoch.wrapping_add(1);
                             self.status = "A proposal is ready for review".into();
                         }
                         self.last_error = None;
-                        WireResponse {
-                            success: true,
-                            editor_instance_id: self.editor_instance_id.clone(),
-                            project_instance_id: self.project_instance_id.clone(),
-                            revision,
-                            result: Some(result.value),
-                            error: None,
-                        }
+                        self.success_response(revision, result.value)
                     }
                     Err(error) => self.error_response(
                         error.code,
@@ -334,16 +402,17 @@ impl EditorAutomationBridge {
                 if !incoming.claim() {
                     continue;
                 }
-                let response = if incoming.request.action == "get_project_status" {
-                    self.status_response(None)
-                } else {
-                    self.error_response(
-                        "PROJECT_NOT_OPEN",
-                        "Open a project in the editor before using automation.",
-                        incoming.request.revision,
-                        None,
-                    )
-                };
+                let response =
+                    if let Some(response) = self.bootstrap_response(&incoming.request, None) {
+                        response
+                    } else {
+                        self.error_response(
+                            "PROJECT_NOT_OPEN",
+                            "Open a project in the editor before using automation.",
+                            incoming.request.revision,
+                            None,
+                        )
+                    };
                 self.note_call(response.success);
                 let _ = incoming.reply.try_send(response);
             }
@@ -359,12 +428,15 @@ impl EditorAutomationBridge {
                 continue;
             }
             let request = &incoming.request;
-            if request.action == "get_project_status" {
+            if matches!(
+                request.action.as_str(),
+                "get_project_status" | "proposal_outcome" | "draft_status"
+            ) {
                 if !incoming.claim() {
                     continue;
                 }
-                let response = self.status_response(revision);
-                self.note_call(true);
+                let response = self.bootstrap_response(request, revision).unwrap();
+                self.note_call(response.success);
                 let _ = incoming.reply.try_send(response);
                 continue;
             }
@@ -393,6 +465,46 @@ impl EditorAutomationBridge {
                 );
                 let _ = incoming.reply.try_send(response);
                 continue;
+            }
+            if matches!(
+                request.action.as_str(),
+                "begin_draft" | "reopen_draft" | "discard_draft"
+            ) {
+                if !incoming.claim() {
+                    continue;
+                }
+                let response = self.draft_lifecycle(request, project);
+                self.note_call(response.success);
+                let _ = incoming.reply.try_send(response);
+                continue;
+            }
+            if matches!(request.action.as_str(), "edit_draft" | "submit_draft") {
+                if let Err(message) = self.guard_draft(&request.args, true) {
+                    if !incoming.claim() {
+                        continue;
+                    }
+                    let response =
+                        self.error_response("DRAFT_CONFLICT", message, request.revision, revision);
+                    let _ = incoming.reply.try_send(response);
+                    continue;
+                }
+            }
+            if request.action == "export_artifacts" {
+                if let Some(id) = request.args["proposal_id"].as_str() {
+                    let valid = self.outcomes.get(id).is_some_and(|outcome| {
+                        outcome.status == "applied"
+                            && outcome.project_instance == self.project_instance_id
+                            && outcome.applied_revision == revision
+                    });
+                    if !valid {
+                        if !incoming.claim() {
+                            continue;
+                        }
+                        let response = self.error_response("EXPORT_REVISION_CONFLICT", "Export requires this proposal's applied project and revision. Later edits or undo require a live export.", request.revision, revision);
+                        let _ = incoming.reply.try_send(response);
+                        continue;
+                    }
+                }
             }
             if request.action == "reject_proposal" {
                 if !incoming.claim() {
@@ -431,10 +543,27 @@ impl EditorAutomationBridge {
                 }
                 continue;
             }
+            let state = match self.read_state(project, &request.args) {
+                Ok(state) => state,
+                Err(message) => {
+                    if !incoming.claim() {
+                        continue;
+                    }
+                    let response = self.error_response(
+                        "VIEW_UNAVAILABLE",
+                        message,
+                        request.revision,
+                        revision,
+                    );
+                    let _ = incoming.reply.try_send(response);
+                    continue;
+                }
+            };
             let job = DomainJob {
                 incoming,
-                state: project.ai_design_state(),
+                state,
                 pending: self.pending_proposal.clone(),
+                draft: self.active_draft.clone(),
                 editor_instance_id: self.editor_instance_id.clone(),
                 proposal_epoch: self.proposal_epoch,
             };
@@ -477,6 +606,191 @@ impl EditorAutomationBridge {
     pub fn proposal(&self) -> Option<&AiProposal> {
         self.pending_proposal.as_ref()
     }
+
+    fn success_response(&self, revision: Option<u64>, value: Value) -> WireResponse {
+        WireResponse {
+            success: true,
+            editor_instance_id: self.editor_instance_id.clone(),
+            project_instance_id: self.project_instance_id.clone(),
+            revision,
+            result: Some(value),
+            error: None,
+        }
+    }
+
+    fn remember_draft(&mut self, status: &str, proposal_id: Option<&str>) {
+        if let Some(draft) = &self.active_draft {
+            let previous = self.draft_records.get(&draft.id);
+            let latest = proposal_id.map(str::to_owned).or_else(|| {
+                previous
+                    .and_then(|r| r["proposal_id"].as_str())
+                    .map(str::to_owned)
+            });
+            self.draft_records.insert(draft.id.clone(), serde_json::json!({
+                "draft_id":draft.id,"generation":draft.generation,"base_revision":draft.base_revision,
+                "name":draft.name,"status":status,"project_instance":self.project_instance_id,
+                "proposal_id":latest,"volatile":true,
+            }));
+        }
+    }
+
+    fn close_draft(&mut self, status: &str) {
+        self.remember_draft(status, None);
+        self.active_draft = None;
+    }
+
+    fn bootstrap_response(
+        &mut self,
+        request: &WireRequest,
+        revision: Option<u64>,
+    ) -> Option<WireResponse> {
+        let response = match request.action.as_str() {
+            "get_project_status" => self.status_response(revision),
+            "proposal_outcome" => {
+                match request.args["proposal_id"]
+                    .as_str()
+                    .and_then(|id| self.outcomes.get(id))
+                    .cloned()
+                {
+                    Some(outcome) => {
+                        self.success_response(revision, serde_json::json!({"outcome":outcome}))
+                    }
+                    None => self.error_response(
+                        "PROPOSAL_UNKNOWN",
+                        "No submission receipt matches this ID in this editor session.",
+                        None,
+                        revision,
+                    ),
+                }
+            }
+            "draft_status" => {
+                let id = request.args["draft_id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| self.active_draft.as_ref().map(|d| d.id.clone()));
+                match id.and_then(|id|self.draft_records.get(&id)).cloned() {
+                    Some(mut draft) => {
+                        if let Some(outcome) = draft["proposal_id"].as_str().and_then(|id|self.outcomes.get(id)) {
+                            draft["outcome"] = serde_json::to_value(outcome).unwrap();
+                        }
+                        self.success_response(revision, serde_json::json!({"draft":draft}))
+                    }
+                    None => self.error_response("DRAFT_UNKNOWN", "No draft matches this ID. Begin a draft, or select its original editor instance.", None, revision),
+                }
+            }
+            _ => return None,
+        };
+        Some(response)
+    }
+
+    fn guard_draft(&self, args: &Value, require_editing: bool) -> Result<(), String> {
+        let draft = self
+            .active_draft
+            .as_ref()
+            .ok_or("No active draft; begin one first")?;
+        if args["draft_id"].as_str() != Some(draft.id.as_str())
+            || args["generation"].as_u64() != Some(draft.generation)
+        {
+            return Err("Draft ID or generation changed; inspect the draft before retrying".into());
+        }
+        if require_editing && self.pending_proposal.is_some() {
+            return Err("Draft is submitted for review; reopen it before editing".into());
+        }
+        Ok(())
+    }
+
+    fn draft_lifecycle(&mut self, request: &WireRequest, project: &EditorProject) -> WireResponse {
+        let revision = Some(project.revision());
+        if request.action == "begin_draft" {
+            if request.args["name"]
+                .as_str()
+                .is_some_and(|name| name.len() > crate::operations::MAX_DESCRIPTION_LENGTH)
+            {
+                return self.error_response(
+                    "VALIDATION_FAILED",
+                    "Draft name exceeds the transaction description limit",
+                    request.revision,
+                    revision,
+                );
+            }
+            if self.active_draft.is_some() || self.pending_proposal.is_some() {
+                return self.error_response("DRAFT_CONFLICT", "An active draft or proposal already exists; inspect, reopen, reject, or discard it first.", request.revision, revision);
+            }
+            self.active_draft = Some(crate::ai::draft::begin(
+                &project.ai_design_state(),
+                request.args["name"].as_str().map(str::to_owned),
+            ));
+            self.remember_draft("editing", None);
+        } else {
+            if let Err(message) = self.guard_draft(&request.args, false) {
+                return self.error_response("DRAFT_CONFLICT", message, request.revision, revision);
+            }
+            if request.action == "reopen_draft" {
+                if self.pending_proposal.is_none() {
+                    return self.error_response(
+                        "DRAFT_CONFLICT",
+                        "Draft is already editable",
+                        request.revision,
+                        revision,
+                    );
+                }
+                self.finish_proposal("superseded");
+                self.pending_proposal = None;
+                self.active_draft.as_mut().unwrap().generation += 1;
+                self.remember_draft("editing", None);
+            } else {
+                if self.pending_proposal.is_some() {
+                    self.finish_proposal("rejected");
+                }
+                self.pending_proposal = None;
+                self.close_draft("discarded");
+                self.proposal_epoch = self.proposal_epoch.wrapping_add(1);
+                return self.success_response(
+                    revision,
+                    serde_json::json!({"discarded":true,"draft_id":request.args["draft_id"]}),
+                );
+            }
+        }
+        self.proposal_epoch = self.proposal_epoch.wrapping_add(1);
+        let draft = self.active_draft.as_ref().unwrap();
+        self.success_response(
+            revision,
+            serde_json::json!({"draft":self.draft_records[&draft.id]}),
+        )
+    }
+
+    fn read_state(
+        &self,
+        project: &EditorProject,
+        args: &Value,
+    ) -> Result<crate::ai::AiDesignState, String> {
+        let live = project.ai_design_state();
+        match args["view"].as_str().unwrap_or("live") {
+            "live" => Ok(live),
+            "draft" => {
+                let draft = self.active_draft.as_ref().ok_or("No active draft")?;
+                if let Some(id) = args["draft_id"].as_str() {
+                    if id != draft.id {
+                        return Err("Draft ID does not match the active draft".into());
+                    }
+                }
+                Ok(live)
+            }
+            "proposal" => {
+                let proposal = self
+                    .pending_proposal
+                    .as_ref()
+                    .ok_or("No pending proposal")?;
+                if let Some(id) = args["proposal_id"].as_str() {
+                    if id != proposal.proposal_id {
+                        return Err("Proposal ID does not match the pending review".into());
+                    }
+                }
+                Ok(live)
+            }
+            _ => Err("view must be live, draft, or proposal".into()),
+        }
+    }
     pub fn take_proposal(&mut self) -> Option<AiProposal> {
         self.proposal_epoch = self.proposal_epoch.wrapping_add(1);
         self.pending_proposal.take()
@@ -487,6 +801,7 @@ impl EditorAutomationBridge {
         }
         self.proposal_epoch = self.proposal_epoch.wrapping_add(1);
         self.pending_proposal = None;
+        self.close_draft("rejected");
         self.status = "Proposal rejected".into();
     }
     pub fn invalidate_proposal(&mut self) {
@@ -497,6 +812,7 @@ impl EditorAutomationBridge {
         }
         self.proposal_epoch = self.proposal_epoch.wrapping_add(1);
         self.pending_proposal = None;
+        self.close_draft("invalidated");
         self.project_instance_id = uuid::Uuid::new_v4().to_string();
         self.status = "Project identity changed; staged proposal cleared".into();
     }
@@ -512,17 +828,44 @@ impl EditorAutomationBridge {
     pub fn editor_instance_id(&self) -> &str {
         &self.editor_instance_id
     }
+
+    /// Publish native file identity from the application, without changing pool content.
+    /// Paths are absolute; the original source is retained through Save As.
+    /// An unsaved or recovered project may have no known path.
+    pub fn set_project_location(
+        &mut self,
+        current: Option<&std::path::Path>,
+        original: Option<&std::path::Path>,
+        display_name: &str,
+    ) {
+        self.current_project_path = current.map(std::path::Path::to_path_buf);
+        self.original_source_path = original.map(std::path::Path::to_path_buf);
+        self.display_name = display_name.to_owned();
+    }
     pub fn trace_path(&self) -> Option<&std::path::Path> {
         self.trace.as_ref().map(|trace| trace.path())
     }
 
-    pub fn record_applied(&mut self, proposal_id: &str) {
+    /// Record a successful GUI commit, including its exact resulting revision.
+    pub fn record_applied(&mut self, proposal_id: &str, revision: u64, transaction_id: &str) {
+        if let Some(outcome) = self.outcomes.get_mut(proposal_id) {
+            outcome.status = "applied".into();
+            outcome.applied_revision = Some(revision);
+            outcome.transaction_id = Some(transaction_id.into());
+        }
+        self.close_draft("applied");
         if self.proposal_metrics.proposal_id.as_deref() == Some(proposal_id) {
             self.finish_proposal("applied");
         }
     }
 
-    pub fn record_apply_failed(&mut self, proposal_id: &str) {
+    /// Record a failed GUI commit without reporting the submission as applied.
+    pub fn record_apply_failed(&mut self, proposal_id: &str, error: String) {
+        if let Some(outcome) = self.outcomes.get_mut(proposal_id) {
+            outcome.status = "apply_failed".into();
+            outcome.error = Some(error);
+        }
+        self.close_draft("apply_failed");
         if self.proposal_metrics.proposal_id.as_deref() == Some(proposal_id) {
             self.finish_proposal("apply_failed");
         }
@@ -536,6 +879,11 @@ impl EditorAutomationBridge {
     }
 
     fn finish_proposal(&mut self, outcome: &str) {
+        if let Some(id) = &self.proposal_metrics.proposal_id {
+            if let Some(record) = self.outcomes.get_mut(id) {
+                record.status = outcome.into();
+            }
+        }
         if let (Some(trace), Some(first), Some(id)) = (
             &self.trace,
             &self.proposal_metrics.first_proposal_id,
@@ -591,12 +939,17 @@ impl EditorAutomationBridge {
             revision,
             result: Some(serde_json::json!({
                 "project_open": revision.is_some(),
+                "current_project_path": if revision.is_some() {self.current_project_path.as_deref().and_then(std::path::Path::to_str)} else {None},
+                "original_source_path": if revision.is_some() {self.original_source_path.as_deref().and_then(std::path::Path::to_str)} else {None},
+                "display_name": revision.map(|_|self.display_name.as_str()),
+                "dirty": self.observed_dirty,
                 "revision": revision,
                 "proposal": self.pending_proposal.as_ref().map(|p| serde_json::json!({
                     "proposal_id": p.proposal_id,
                     "base_revision": p.base_revision,
                     "operation_count": p.summary.operation_count,
                 })),
+                "draft": self.active_draft.as_ref().and_then(|d|self.draft_records.get(&d.id)),
             })),
             error: None,
         }
@@ -827,12 +1180,15 @@ fn start_domain_worker(
         .name("aitp-automation-domain".into())
         .spawn(move || {
             while let Ok(job) = jobs.recv() {
-                let result = automation_service::execute(
-                    &job.state,
-                    job.pending.as_ref(),
-                    &job.incoming.request.action,
-                    job.incoming.request.args.clone(),
-                );
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute_domain_job(&job)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(automation_service::DomainError {
+                        code: "AUTOMATION_FAILED",
+                        message: "Could not prepare the command; the draft is unchanged.".into(),
+                    })
+                });
                 let completion = DomainCompletion {
                     incoming: job.incoming,
                     editor_instance_id: job.editor_instance_id,
@@ -846,6 +1202,172 @@ fn start_domain_worker(
             }
         })
         .expect("could not spawn automation domain worker");
+}
+
+fn proposal_state(
+    live: &crate::ai::AiDesignState,
+    proposal: &AiProposal,
+) -> crate::ai::AiDesignState {
+    let mut state = live.clone();
+    state.pool = proposal.prepared.pool.clone();
+    state.object_info = proposal.prepared.object_info.clone();
+    state.canonical_pool = Some(proposal.canonical_pool.clone());
+    state.components = proposal.components.clone();
+    state.graphics = proposal.graphics.clone();
+    state.soft_key_layout = proposal.soft_key_layout;
+    if let Some(content) = &proposal.candidate_content {
+        state.mask_size = content.mask_size;
+        state.soft_key_size = content.soft_key_size;
+        state.soft_key_layout = content.soft_key_layout;
+        state.vt_version = content.vt_version;
+        state.object_id_ranges = content.object_id_ranges.clone();
+    }
+    state
+}
+
+fn execute_domain_job(job: &DomainJob) -> Result<DomainOutput, automation_service::DomainError> {
+    let request = &job.incoming.request;
+    let failure = |message: String| automation_service::DomainError {
+        code: "VALIDATION_FAILED",
+        message,
+    };
+    let value = |value| DomainOutput {
+        result: automation_service::DomainResult {
+            value,
+            proposal: None,
+        },
+        draft: None,
+    };
+    match request.action.as_str() {
+        "edit_draft" => {
+            let draft = job
+                .draft
+                .as_ref()
+                .ok_or_else(|| failure("No active draft".into()))?;
+            let actions = request.args["actions"]
+                .as_array()
+                .cloned()
+                .ok_or_else(|| failure("Provide an actions array".into()))?;
+            let next = crate::ai::draft::edit(&job.state, draft, actions).map_err(failure)?;
+            let result = serde_json::json!({"draft":{"draft_id":next.id,"generation":next.generation,
+                "base_revision":next.base_revision,"name":next.name,"status":"editing","volatile":true}});
+            Ok(DomainOutput {
+                result: automation_service::DomainResult {
+                    value: result,
+                    proposal: None,
+                },
+                draft: Some(next),
+            })
+        }
+        "submit_draft" => {
+            let draft = job
+                .draft
+                .as_ref()
+                .ok_or_else(|| failure("No active draft".into()))?;
+            let proposal = crate::ai::draft::submit(&job.state, draft).map_err(failure)?;
+            let result = serde_json::json!({"proposal_id":proposal.proposal_id,"draft_id":draft.id,
+                "generation":draft.generation,"base_revision":draft.base_revision,"status":"pending"});
+            Ok(DomainOutput {
+                result: automation_service::DomainResult {
+                    value: result,
+                    proposal: Some(proposal),
+                },
+                draft: None,
+            })
+        }
+        "draft_diff" => {
+            let draft = job
+                .draft
+                .as_ref()
+                .ok_or_else(|| failure("No active draft".into()))?;
+            if request.args["draft_id"].as_str() != Some(draft.id.as_str()) {
+                return Err(failure("Draft does not match the active candidate".into()));
+            }
+            Ok(value(
+                serde_json::json!({"diff":automation_service::diff_states(&job.state,&draft.design_state(&job.state)),
+                "draft_id":draft.id,"generation":draft.generation}),
+            ))
+        }
+        "proposal_diff" => {
+            let proposal = job
+                .pending
+                .as_ref()
+                .ok_or_else(|| failure("No pending proposal".into()))?;
+            if request.args["proposal_id"]
+                .as_str()
+                .is_some_and(|id| id != proposal.proposal_id)
+            {
+                return Err(failure("Proposal does not match the pending review".into()));
+            }
+            Ok(value(
+                serde_json::json!({"diff":automation_service::diff_states(&job.state,&proposal_state(&job.state,proposal)),"proposal_id":proposal.proposal_id}),
+            ))
+        }
+        "export_artifacts" => {
+            if request.args["view"]
+                .as_str()
+                .is_some_and(|view| view != "live")
+            {
+                return Err(failure(
+                    "Production exports require the live project".into(),
+                ));
+            }
+            let mut artifacts = crate::ai::export::artifacts(
+                &job.state,
+                request.args["format"].as_str().unwrap_or("bundle"),
+            )
+            .map_err(failure)?;
+            artifacts["proposal_id"] = request.args["proposal_id"].clone();
+            Ok(value(artifacts))
+        }
+        _ => {
+            // New inspection requests select their state explicitly in the bridge.
+            // Legacy proposal endpoints retain their pending-candidate contract.
+            let pending = if request.args.get("view").is_some()
+                && !matches!(
+                    request.action.as_str(),
+                    "preview_proposal" | "proposal_status"
+                ) {
+                None
+            } else {
+                job.pending.as_ref()
+            };
+            let selected_state = match request.args["view"].as_str().unwrap_or("live") {
+                "draft" => job
+                    .draft
+                    .as_ref()
+                    .map(|draft| draft.design_state(&job.state)),
+                "proposal" => job
+                    .pending
+                    .as_ref()
+                    .map(|proposal| proposal_state(&job.state, proposal)),
+                _ => None,
+            };
+            let mut result = automation_service::execute(
+                selected_state.as_ref().unwrap_or(&job.state),
+                pending,
+                &request.action,
+                request.args.clone(),
+            )?;
+            if let Some(view) = request.args["view"].as_str() {
+                result.value["view"] = serde_json::json!(view);
+                if view == "draft" {
+                    if let Some(draft) = &job.draft {
+                        result.value["draft_id"] = serde_json::json!(draft.id);
+                        result.value["generation"] = serde_json::json!(draft.generation);
+                    }
+                } else if view == "proposal" {
+                    if let Some(proposal) = &job.pending {
+                        result.value["proposal_id"] = serde_json::json!(proposal.proposal_id);
+                    }
+                }
+            }
+            Ok(DomainOutput {
+                result,
+                draft: None,
+            })
+        }
+    }
 }
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
@@ -952,6 +1474,20 @@ fn write_runtime(path: &std::path::Path, runtime: &RuntimeRecord) -> Result<(), 
 
 /// Locate the editor runtime file. Multiple open editor instances require explicit selection.
 pub fn select_runtime(instance_id: Option<&str>) -> Result<(PathBuf, RuntimeRecord), String> {
+    choose_runtime(runtime_records()?, instance_id)
+}
+
+/// List reachable editor identities without exposing their authentication tokens.
+pub fn list_runtime_instances() -> Result<Vec<String>, String> {
+    let mut identities: Vec<_> = runtime_records()?
+        .into_iter()
+        .map(|(_, record)| record.instance_id)
+        .collect();
+    identities.sort();
+    Ok(identities)
+}
+
+fn runtime_records() -> Result<Vec<(PathBuf, RuntimeRecord)>, String> {
     let directory = runtime_dir()?;
     let mut records = Vec::new();
     for entry in fs::read_dir(&directory).map_err(|e| e.to_string())? {
@@ -979,7 +1515,7 @@ pub fn select_runtime(instance_id: Option<&str>) -> Result<(PathBuf, RuntimeReco
         }
         records.push((path, record));
     }
-    choose_runtime(records, instance_id)
+    Ok(records)
 }
 
 fn choose_runtime(
@@ -1298,6 +1834,110 @@ mod tests {
     }
 
     #[test]
+    fn draft_review_receipts_and_guarded_exports_roundtrip() {
+        let mut bridge = EditorAutomationBridge::start(eframe::egui::Context::default()).unwrap();
+        let mut project = EditorProject::new_pool();
+        let begin = call_tool(
+            &mut bridge,
+            &project,
+            "begin_draft",
+            serde_json::json!({"name":"CLI smoke"}),
+        )
+        .unwrap();
+        assert_eq!(begin["success"], true, "{begin}");
+        let id = begin["result"]["draft"]["draft_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let edit = call_tool(&mut bridge, &project, "edit_draft", serde_json::json!({"draft_id":id,"generation":0,"actions":[
+            {"kind":"operation","operation":{"type":"CreateObject","data":{"object_type":"NumberVariable","object_id":null,"name":"CLI value"}}}
+        ]})).unwrap();
+        assert_eq!(edit["success"], true, "{edit}");
+        assert_eq!(edit["result"]["draft"]["generation"], 1);
+        let conflict = call_tool(
+            &mut bridge,
+            &project,
+            "edit_draft",
+            serde_json::json!({"draft_id":id,"generation":0,"actions":[]}),
+        )
+        .unwrap_err();
+        assert!(conflict.starts_with("DRAFT_CONFLICT:"), "{conflict}");
+        let view = call_tool(
+            &mut bridge,
+            &project,
+            "list_objects",
+            serde_json::json!({"view":"draft","draft_id":id,"query":"CLI value"}),
+        )
+        .unwrap();
+        assert_eq!(view["result"]["objects"].as_array().unwrap().len(), 1);
+        let submitted = call_tool(
+            &mut bridge,
+            &project,
+            "submit_draft",
+            serde_json::json!({"draft_id":id,"generation":1}),
+        )
+        .unwrap();
+        assert_eq!(submitted["success"], true, "{submitted}");
+        let proposal_id = submitted["result"]["proposal_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let pending = call_tool(
+            &mut bridge,
+            &project,
+            "proposal_outcome",
+            serde_json::json!({"proposal_id":proposal_id}),
+        )
+        .unwrap();
+        assert_eq!(pending["result"]["outcome"]["status"], "pending");
+        let applied = project
+            .apply_ai_proposal(bridge.take_proposal().unwrap())
+            .unwrap();
+        let applied_revision = project.revision();
+        bridge.record_applied(&proposal_id, applied_revision, &applied.transaction_id);
+        let receipt = call_tool(
+            &mut bridge,
+            &project,
+            "proposal_outcome",
+            serde_json::json!({"proposal_id":proposal_id}),
+        )
+        .unwrap();
+        assert_eq!(receipt["result"]["outcome"]["status"], "applied");
+        assert_eq!(
+            receipt["result"]["outcome"]["applied_revision"],
+            applied_revision
+        );
+        let exported = call_tool(
+            &mut bridge,
+            &project,
+            "export_artifacts",
+            serde_json::json!({"format":"bundle","proposal_id":proposal_id}),
+        )
+        .unwrap();
+        assert_eq!(exported["success"], true, "{exported}");
+        assert!(exported["result"]["artifacts"]["iop"].is_string());
+        assert!(exported["result"]["artifacts"]["header"].is_string());
+        assert!(project.undo_operation());
+        let stale = call_tool(
+            &mut bridge,
+            &project,
+            "export_artifacts",
+            serde_json::json!({"format":"bundle","proposal_id":proposal_id}),
+        )
+        .unwrap_err();
+        assert!(stale.starts_with("EXPORT_REVISION_CONFLICT:"), "{stale}");
+        bridge.invalidate_proposal();
+        let receipt = call_tool(
+            &mut bridge,
+            &project,
+            "proposal_outcome",
+            serde_json::json!({"proposal_id":proposal_id}),
+        )
+        .unwrap();
+        assert_eq!(receipt["result"]["outcome"]["status"], "applied");
+    }
+
+    #[test]
     fn live_roundtrip_stages_rejects_applies_and_undoes() {
         let trace_path = std::env::temp_dir().join(format!(
             "agiso-automation-cycle-test-{}.jsonl",
@@ -1389,8 +2029,8 @@ mod tests {
         let before = project.get_pool().objects().len();
         let proposal = bridge.take_proposal().unwrap();
         let applied_id = proposal.proposal_id.clone();
-        project.apply_ai_proposal(proposal).unwrap();
-        bridge.record_applied(&applied_id);
+        let applied = project.apply_ai_proposal(proposal).unwrap();
+        bridge.record_applied(&applied_id, project.revision(), &applied.transaction_id);
         assert_eq!(project.get_pool().objects().len(), before + 1);
         assert!(project.undo_operation());
         assert_eq!(project.get_pool().objects().len(), before);

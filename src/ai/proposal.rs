@@ -20,6 +20,9 @@ pub struct AiProposal {
     /// Number of visual-review corrections included in this staged proposal.
     pub refinement_round: u8,
     pub soft_key_layout: crate::SoftKeyLayout,
+    /// Complete content selected by the staged draft workflow. Legacy proposals
+    /// continue to use `transaction` and the existing component intent path.
+    pub candidate_content: Option<super::draft::ProjectContent>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct AiProposalSummary {
@@ -99,6 +102,7 @@ pub fn propose_transaction(
         summary,
         refinement_round: 0,
         soft_key_layout: state.soft_key_layout,
+        candidate_content: None,
     })
 }
 

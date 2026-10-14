@@ -14,6 +14,7 @@ use ag_iso_stack::object_pool::{
     object::Object, vt_version::VtVersion, NullableObjectId, ObjectId, ObjectPool, ObjectType,
 };
 
+use crate::ai::draft::ProjectContent;
 use crate::ai::snapshot::{DesignContextRequest, DesignSnapshot, SnapshotError};
 use crate::ai::{AiDesignState, AiProposal, ProjectRevision};
 use crate::operations::{
@@ -113,6 +114,15 @@ pub struct EditorProject {
     graphics: crate::graphics::GraphicLibrary,
     component_history: HashMap<String, (ComponentCheckpoint, ComponentCheckpoint)>,
     dimension_history: HashMap<String, (DesignDimensions, DesignDimensions)>,
+    draft_history: HashMap<
+        String,
+        (
+            ComponentCheckpoint,
+            DesignDimensions,
+            ComponentCheckpoint,
+            DesignDimensions,
+        ),
+    >,
     selected_object: NullableObjectId,
     component_selection: Cell<Option<(ComponentInstanceId, ComponentNodeId)>>,
     pending_selected_object: Cell<NullableObjectId>,
@@ -156,6 +166,10 @@ pub struct EditorProject {
     /// Operations queued by UI widgets that only hold a shared project reference.
     queued_operations: RefCell<Vec<Operation>>,
     last_operation_error: RefCell<Option<String>>,
+    /// Candidate-only switch used by atomic draft batches to defer global
+    /// compatibility and containment checks until the final combined state.
+    defer_candidate_validation: Cell<bool>,
+    reserved_draft_ids: RefCell<HashSet<u16>>,
 
     /// Last project content that was opened or successfully saved.
     saved_content: RefCell<Option<ProjectContentCheckpoint>>,
@@ -194,6 +208,7 @@ impl From<ObjectPool> for EditorProject {
             graphics: Default::default(),
             component_history: Default::default(),
             dimension_history: Default::default(),
+            draft_history: Default::default(),
             selected_object: NullableObjectId::default(),
             component_selection: Cell::new(None),
             pending_selected_object: Cell::new(NullableObjectId::default()),
@@ -218,6 +233,8 @@ impl From<ObjectPool> for EditorProject {
             rename_request: RefCell::new(None),
             queued_operations: RefCell::new(Vec::new()),
             last_operation_error: RefCell::new(None),
+            defer_candidate_validation: Cell::new(false),
+            reserved_draft_ids: RefCell::new(HashSet::new()),
             saved_content: RefCell::new(None),
             dirty: Cell::new(false),
             revision: Cell::new(0),
@@ -556,6 +573,43 @@ impl EditorProject {
         self.refresh_dirty();
         self.bump_revision();
     }
+
+    fn restore_draft_checkpoint(
+        &mut self,
+        state: ComponentCheckpoint,
+        dimensions: DesignDimensions,
+    ) {
+        let selected_unique_id = self.selected_object.0.and_then(|id| {
+            self.object_info
+                .borrow()
+                .get(&id)
+                .map(ObjectInfo::get_unique_id)
+        });
+        let selected_after = selected_unique_id.and_then(|unique_id| {
+            state
+                .info
+                .iter()
+                .find_map(|(id, info)| (info.get_unique_id() == unique_id).then_some(*id))
+        });
+        self.pool = state.pool;
+        self.components = state.source;
+        self.graphics = state.graphics;
+        self.object_info.replace(state.info.clone());
+        self.mut_object_info.replace(state.info);
+        self.mask_size = dimensions.mask_size;
+        self.soft_key_size = dimensions.soft_key_size;
+        self.vt_version = dimensions.vt_version;
+        self.soft_key_layout = dimensions.soft_key_layout;
+        self.object_id_ranges = dimensions.object_id_ranges;
+        self.selected_object = NullableObjectId(selected_after);
+        self.pending_selected_object
+            .set(NullableObjectId(selected_after));
+        self.default_object_names.borrow_mut().clear();
+        self.cache.borrow_mut().materialized = None;
+        self.sync_component_selection();
+        self.refresh_dirty();
+        self.bump_revision();
+    }
     pub(crate) fn edit_components(
         &mut self,
         description: &str,
@@ -573,6 +627,7 @@ impl EditorProject {
             &mut HashMap<ObjectId, ObjectInfo>,
         ) -> ComponentResult<()>,
     ) -> ComponentResult<()> {
+        let validate = !self.defer_candidate_validation.get();
         let before = self.component_checkpoint();
         let mut after = before.clone();
         edit(
@@ -590,41 +645,43 @@ impl EditorProject {
             &after.graphics,
             &self.object_id_ranges,
         )?;
-        let baseline_materialized = self.materialize_shared().ok();
-        let baseline = baseline_materialized
-            .as_ref()
-            .map(|m| &m.pool)
-            .unwrap_or(&before.pool);
-        let baseline_diagnostics = self.compatibility_diagnostics_from_pool(baseline)?;
-        let mut candidate_project = self.canvas_preview_copy();
-        candidate_project.pool = after.pool.clone();
-        candidate_project.components = after.source.clone();
-        candidate_project.graphics = after.graphics.clone();
-        candidate_project.object_info.replace(after.info.clone());
-        let candidate_diagnostics =
-            candidate_project.compatibility_diagnostics_from_pool(&candidate.pool)?;
-        let new_errors = crate::pool_validation::new_or_worsened_compatibility_diagnostics(
-            &baseline_diagnostics,
-            &candidate_diagnostics,
-        );
-        if let Some(error) = new_errors
-            .iter()
-            .find(|d| d.severity == crate::ValidationSeverity::Error)
-        {
-            return Err(ComponentError::new(
-                "VT_COMPONENT_INCOMPATIBLE",
-                error.message.clone(),
-            ));
+        if validate {
+            let baseline_materialized = self.materialize_shared().ok();
+            let baseline = baseline_materialized
+                .as_ref()
+                .map(|m| &m.pool)
+                .unwrap_or(&before.pool);
+            let baseline_diagnostics = self.compatibility_diagnostics_from_pool(baseline)?;
+            let mut candidate_project = self.canvas_preview_copy();
+            candidate_project.pool = after.pool.clone();
+            candidate_project.components = after.source.clone();
+            candidate_project.graphics = after.graphics.clone();
+            candidate_project.object_info.replace(after.info.clone());
+            let candidate_diagnostics =
+                candidate_project.compatibility_diagnostics_from_pool(&candidate.pool)?;
+            let new_errors = crate::pool_validation::new_or_worsened_compatibility_diagnostics(
+                &baseline_diagnostics,
+                &candidate_diagnostics,
+            );
+            if let Some(error) = new_errors
+                .iter()
+                .find(|d| d.severity == crate::ValidationSeverity::Error)
+            {
+                return Err(ComponentError::new(
+                    "VT_COMPONENT_INCOMPATIBLE",
+                    error.message.clone(),
+                ));
+            }
+            crate::layout_containment::validate_change_with_soft_key_size(
+                baseline,
+                &candidate.pool,
+                self.mask_size,
+                self.mask_size,
+                self.soft_key_size,
+                self.soft_key_size,
+            )
+            .map_err(containment_component_error)?;
         }
-        crate::layout_containment::validate_change_with_soft_key_size(
-            baseline,
-            &candidate.pool,
-            self.mask_size,
-            self.mask_size,
-            self.soft_key_size,
-            self.soft_key_size,
-        )
-        .map_err(containment_component_error)?;
         after
             .info
             .retain(|id, _| after.pool.object_by_id(*id).is_some());
@@ -647,6 +704,14 @@ impl EditorProject {
         self.prune_checkpoint_history();
         self.restore_component_checkpoint(after);
         Ok(())
+    }
+
+    pub(crate) fn set_defer_candidate_validation(&self, defer: bool) {
+        self.defer_candidate_validation.set(defer);
+    }
+
+    pub(crate) fn set_ai_draft_reserved_ids(&self, ids: HashSet<u16>) {
+        self.reserved_draft_ids.replace(ids);
     }
 
     /// Start an empty, unsaved pool with a usable editing canvas.
@@ -996,6 +1061,7 @@ impl EditorProject {
         let history = self.operation_history.borrow();
         self.component_history.retain(|id, _| history.contains(id));
         self.dimension_history.retain(|id, _| history.contains(id));
+        self.draft_history.retain(|id, _| history.contains(id));
     }
 
     /// Atomically apply positive mask and softkey dimensions as one undo action.
@@ -2250,6 +2316,13 @@ impl EditorProject {
         let mut history = self.operation_history.borrow_mut();
 
         if let Some(applied_tx) = history.undo() {
+            if let Some((before, dimensions, _, _)) =
+                self.draft_history.get(&applied_tx.transaction_id).cloned()
+            {
+                drop(history);
+                self.restore_draft_checkpoint(before, dimensions);
+                return true;
+            }
             if let Some((before, _)) = self
                 .dimension_history
                 .get(&applied_tx.transaction_id)
@@ -2311,6 +2384,13 @@ impl EditorProject {
         let mut history = self.operation_history.borrow_mut();
 
         if let Some(applied_tx) = history.redo() {
+            if let Some((_, _, after, dimensions)) =
+                self.draft_history.get(&applied_tx.transaction_id).cloned()
+            {
+                drop(history);
+                self.restore_draft_checkpoint(after, dimensions);
+                return true;
+            }
             if let Some((_, after)) = self
                 .dimension_history
                 .get(&applied_tx.transaction_id)
@@ -2391,15 +2471,23 @@ impl EditorProject {
     /// Create a snapshot for AI context
     /// Owned, UI-free input for automation domain operations.
     pub fn ai_design_state(&self) -> AiDesignState {
+        let mut state = self.ai_draft_state();
+        state.pool = self
+            .materialize()
+            .expect("Committed source must materialize")
+            .pool;
+        state
+    }
+
+    /// Canonical candidate input without materializing an intermediate draft.
+    /// Draft batches may temporarily have unresolved component references.
+    pub(crate) fn ai_draft_state(&self) -> AiDesignState {
         AiDesignState {
             revision: self.revision(),
             canonical_pool: Some(self.pool.clone()),
             components: self.components.clone(),
             graphics: self.graphics.clone(),
-            pool: self
-                .materialize()
-                .expect("Committed source must materialize")
-                .pool,
+            pool: self.pool.clone(),
             object_info: self.object_info.borrow().clone(),
             vt_version: self.vt_version,
             mask_size: self.mask_size,
@@ -2427,6 +2515,13 @@ impl EditorProject {
                 "Project changed since this proposal was prepared",
             )));
         }
+        if let Some(content) = proposal.candidate_content {
+            return self
+                .apply_ai_draft_content(content, "Apply AI draft")
+                .map_err(|error| {
+                    component_transaction_error(ComponentError::new("DRAFT_APPLY_FAILED", error))
+                });
+        }
         if !proposal.component_intents.is_empty() {
             ComponentService::apply_intents(self, &proposal.component_intents)
                 .map_err(component_transaction_error)?;
@@ -2445,6 +2540,273 @@ impl EditorProject {
             ))
         })
     }
+
+    /// Commit a fully materialized draft as one undoable project action.
+    pub(crate) fn apply_ai_draft_content(
+        &mut self,
+        content: ProjectContent,
+        description: &str,
+    ) -> Result<AppliedTransaction, String> {
+        let before = self.component_checkpoint();
+        let before_dimensions = self.dimensions();
+        let mut candidate = content.into_editor_project(self.object_id_format);
+        candidate.revision.set(self.revision());
+        self.validate_ai_draft_candidate(&candidate)?;
+        candidate
+            .object_info
+            .borrow_mut()
+            .retain(|id, _| candidate.pool.object_by_id(*id).is_some());
+        let after = candidate.component_checkpoint();
+        let after_dimensions = candidate.dimensions();
+        if before.content_eq(&after) && before_dimensions == after_dimensions {
+            return Err("Draft contains no changes".into());
+        }
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        self.draft_history.insert(
+            transaction_id.clone(),
+            (
+                before,
+                before_dimensions,
+                after.clone(),
+                after_dimensions.clone(),
+            ),
+        );
+        let applied = AppliedTransaction {
+            transaction_id: transaction_id.clone(),
+            description: Some(description.into()),
+            forward_operations: vec![],
+            inverse_operations: vec![],
+            affected_objects: vec![],
+            execution_time_ms: 0,
+        };
+        self.operation_history.borrow_mut().push(applied.clone());
+        self.prune_checkpoint_history();
+        self.restore_draft_checkpoint(after, after_dimensions);
+        Ok(applied)
+    }
+
+    fn validate_ai_draft_candidate(&self, candidate: &EditorProject) -> Result<(), String> {
+        if !(2..=6).contains(&u8::from(candidate.vt_version)) {
+            return Err("Choose VT2 through VT6".into());
+        }
+        if candidate.mask_size == 0
+            || candidate.soft_key_size.0 == 0
+            || candidate.soft_key_size.1 == 0
+        {
+            return Err("Design dimensions must be greater than zero".into());
+        }
+        candidate.soft_key_layout.validate()?;
+        candidate.object_id_ranges.validate(candidate.vt_version)?;
+        let materialized = candidate.materialize_shared().map_err(|e| e.to_string())?;
+        let diagnostics = candidate
+            .compatibility_diagnostics_from_pool(&materialized.pool)
+            .map_err(|e| e.to_string())?;
+        let baseline_materialized = self.materialize_shared().map_err(|e| e.to_string())?;
+        let mut baseline_diagnostics = self
+            .compatibility_diagnostics_from_pool(&baseline_materialized.pool)
+            .map_err(|e| e.to_string())?;
+        let mut id_changes = Vec::new();
+        let current_info = self.object_info.borrow();
+        let candidate_info = candidate.object_info.borrow();
+        for (old_id, info) in current_info.iter() {
+            if let Some((new_id, _)) = candidate_info
+                .iter()
+                .find(|(_, next)| next.get_unique_id() == info.get_unique_id())
+            {
+                if old_id != new_id {
+                    id_changes.push((old_id.value(), new_id.value()));
+                }
+            }
+        }
+        for old_instance in &self.components.instances {
+            if let Some(new_instance) = candidate
+                .components
+                .instances
+                .iter()
+                .find(|item| item.id == old_instance.id)
+            {
+                for (node, old_id) in &old_instance.compiled_ids {
+                    if let Some(new_id) = new_instance.compiled_ids.get(node) {
+                        if old_id != new_id {
+                            id_changes.push((*old_id, *new_id));
+                        }
+                    }
+                }
+            }
+        }
+        crate::pool_validation::remap_compatibility_diagnostic_ids(
+            &mut baseline_diagnostics,
+            &id_changes,
+        );
+        if let Some(error) = new_or_worsened_project_errors(&baseline_diagnostics, &diagnostics)
+            .into_iter()
+            .next()
+        {
+            return Err(error.message);
+        }
+        crate::layout_containment::validate_change_with_id_changes_and_soft_key_size(
+            &baseline_materialized.pool,
+            &materialized.pool,
+            self.mask_size,
+            candidate.mask_size,
+            &id_changes,
+            Some((self.soft_key_size, candidate.soft_key_size)),
+        )
+        .map_err(|error| error.message)?;
+        Ok(())
+    }
+
+    pub(crate) fn apply_ai_draft_operation(&mut self, operation: &Operation) -> Result<(), String> {
+        let name = match operation {
+            Operation::CreateObject { name, .. } | Operation::RenameObject { name, .. } => {
+                Some(name.as_str())
+            }
+            Operation::RestoreObject {
+                info: Some(info), ..
+            } => info.name.as_deref(),
+            _ => None,
+        };
+        if name.is_some_and(|name| name.len() > crate::operations::MAX_NAME_LENGTH) {
+            return Err(format!(
+                "Object names may contain at most {} bytes",
+                crate::operations::MAX_NAME_LENGTH
+            ));
+        }
+        let mut operation = operation.clone();
+        let mut auto_created = false;
+        if let Operation::CreateObject {
+            object_id,
+            object_type,
+            ..
+        } = &mut operation
+        {
+            auto_created = object_id.is_none();
+            if object_id.is_none() {
+                let range = self.object_id_ranges.range_for(*object_type);
+                let reserved: HashSet<_> = self
+                    .components
+                    .instances
+                    .iter()
+                    .flat_map(|instance| instance.compiled_ids.values().copied())
+                    .collect();
+                let reserved = reserved
+                    .union(&self.reserved_draft_ids.borrow())
+                    .copied()
+                    .collect::<HashSet<_>>();
+                let id = (range.start..=range.end)
+                    .find(|id| {
+                        !reserved.contains(id)
+                            && ObjectId::new(*id)
+                                .ok()
+                                .is_some_and(|id| self.pool.object_by_id(id).is_none())
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "No free {:?} object ID remains in configured range {range}",
+                            object_type
+                        )
+                    })?;
+                *object_id = Some(id);
+            }
+        }
+        let id_mappings = match &operation {
+            Operation::ChangeObjectId { old_id, new_id }
+            | Operation::SetObjectIdAssignment {
+                object_id: old_id,
+                new_id,
+                ..
+            } => vec![(*old_id, *new_id)],
+            Operation::RemapObjectIds { mappings, .. } => mappings.clone(),
+            _ => Vec::new(),
+        };
+        let deleted_picture = if let Operation::DeleteObject { object_id } = &operation {
+            self.pool
+                .object_by_id(ObjectId::new(*object_id).map_err(|e| format!("{e:?}"))?)
+                .and_then(|object| match object {
+                    Object::PictureGraphic(picture)
+                        if picture.actual_width > 0 && picture.actual_height > 0 =>
+                    {
+                        Some((
+                            picture.clone(),
+                            self.object_info.borrow().get(&object.id()).cloned(),
+                            self.pool.clone(),
+                        ))
+                    }
+                    _ => None,
+                })
+        } else {
+            None
+        };
+        let mut pool = self.pool.clone();
+        let mut info = self.mut_object_info.borrow().clone();
+        let mut context = crate::operations::OperationContext {
+            vt_version: self.vt_version,
+            object_id_ranges: self.object_id_ranges.clone(),
+            ..Default::default()
+        };
+        operation
+            .apply(&mut pool, &mut info, &mut context)
+            .map_err(|e| e.to_string())?;
+        if let Operation::CreateObject {
+            object_id: Some(id),
+            ..
+        } = operation
+        {
+            if let Some(info) = info.get_mut(&ObjectId::new(id).map_err(|e| format!("{e:?}"))?) {
+                info.id_overridden = !auto_created;
+            }
+        }
+        self.pool = pool;
+        self.object_info.replace(info.clone());
+        self.mut_object_info.replace(info);
+        self.default_object_names.borrow_mut().clear();
+        self.cache.borrow_mut().materialized = None;
+        if !id_mappings.is_empty() {
+            crate::id_reassignment::remap_component_source(
+                &mut self.components,
+                &id_mappings,
+                &self.pool,
+                self.vt_version,
+            )
+            .map_err(|e| e.to_string())?;
+            let mapping: HashMap<_, _> = id_mappings.iter().copied().collect();
+            let bindings = std::mem::take(&mut self.graphics.legacy_bindings);
+            self.graphics.legacy_bindings = bindings
+                .into_iter()
+                .map(|(id, binding)| (mapping.get(&id).copied().unwrap_or(id), binding))
+                .collect();
+        }
+        if let Some((picture, info, before_pool)) = deleted_picture {
+            let asset = crate::graphics::integration::recover_picture_graphic(
+                &picture,
+                &before_pool,
+                info.as_ref(),
+            )?;
+            self.graphics.assets.insert(asset.id, asset);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_ai_draft_settings_unchecked(
+        &mut self,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+        vt_version: VtVersion,
+        soft_key_layout: SoftKeyLayout,
+        object_id_ranges: crate::ObjectIdRanges,
+    ) {
+        self.mask_size = mask_size;
+        self.soft_key_size = soft_key_size;
+        self.vt_version = vt_version;
+        self.soft_key_layout = soft_key_layout;
+        self.object_id_ranges = object_id_ranges;
+        self.cache.borrow_mut().materialized = None;
+    }
+
+    pub(crate) fn validate_ai_draft_content(&self, content: ProjectContent) -> Result<(), String> {
+        let candidate = content.into_editor_project(self.object_id_format);
+        self.validate_ai_draft_candidate(&candidate)
+    }
 }
 
 fn containment_component_error(
@@ -2453,6 +2815,42 @@ fn containment_component_error(
     let mut diagnostic = ComponentError::new(error.code(), error.message);
     diagnostic.object_id = Some(error.child_id);
     diagnostic
+}
+
+fn new_or_worsened_project_errors(
+    baseline: &[crate::ValidationDiagnostic],
+    candidate: &[crate::ValidationDiagnostic],
+) -> Vec<crate::ValidationDiagnostic> {
+    let mut remaining: HashMap<(String, String, Vec<u16>), usize> = HashMap::new();
+    for diagnostic in baseline
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == crate::ValidationSeverity::Error)
+    {
+        let key = (
+            diagnostic.code.clone(),
+            diagnostic.message.clone(),
+            diagnostic.affected_objects.clone().unwrap_or_default(),
+        );
+        *remaining.entry(key).or_default() += 1;
+    }
+    candidate
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == crate::ValidationSeverity::Error)
+        .filter_map(|diagnostic| {
+            let key = (
+                diagnostic.code.clone(),
+                diagnostic.message.clone(),
+                diagnostic.affected_objects.clone().unwrap_or_default(),
+            );
+            let count = remaining.entry(key).or_default();
+            if *count > 0 {
+                *count -= 1;
+                None
+            } else {
+                Some(diagnostic.clone())
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn component_transaction_error(error: ComponentError) -> TransactionDiagnostics {

@@ -5,6 +5,107 @@ use ag_iso_stack::object_pool::ObjectId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Describe authoring changes between two selected project states.
+/// Object entries include their serialized before/after values; larger project
+/// domains are summarized to keep bridge responses bounded.
+pub fn diff_states(before: &AiDesignState, after: &AiDesignState) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+
+    fn objects(state: &AiDesignState) -> HashMap<u16, Value> {
+        state
+            .pool
+            .objects()
+            .iter()
+            .map(|object| {
+                let id = object.id().value();
+                let name = state
+                    .object_info
+                    .get(&object.id())
+                    .map(|info| info.get_name(object));
+                let mut value = serde_json::to_value(object).unwrap_or(Value::Null);
+                if let Value::Object(fields) = &mut value {
+                    if let Some(name) = name {
+                        fields.insert("editor_name".into(), json!(name));
+                    }
+                    if let Some(info) = state.object_info.get(&object.id()) {
+                        fields.insert("editor_description".into(), json!(info.description));
+                        fields.insert("editor_tags".into(), json!(info.tags));
+                        fields.insert("allowed_references".into(), json!(info.allowed_references));
+                        fields.insert("id_overridden".into(), json!(info.id_overridden));
+                    }
+                }
+                (id, value)
+            })
+            .collect()
+    }
+
+    let before_objects = objects(before);
+    let after_objects = objects(after);
+    let ids: std::collections::BTreeSet<_> = before_objects
+        .keys()
+        .chain(after_objects.keys())
+        .copied()
+        .collect();
+    let mut object_changes = Vec::new();
+    for id in ids {
+        let old = before_objects.get(&id);
+        let new = after_objects.get(&id);
+        if old != new {
+            object_changes.push(json!({
+                "id": id,
+                "change": match (old, new) { (None, Some(_)) => "added", (Some(_), None) => "removed", _ => "updated" },
+                "before": old,
+                "after": new,
+            }));
+        }
+    }
+
+    fn component_summary(state: &AiDesignState) -> Value {
+        json!({
+            "definitions": state.components.definitions.iter().map(|(id, component)| json!({"id":id,"name":component.name,"revision":component.revision,"nodes":component.nodes,"parameters":component.parameters})).collect::<Vec<_>>(),
+            "instances": state.components.instances,
+        })
+    }
+    fn graphics_summary(state: &AiDesignState) -> Value {
+        use std::hash::{Hash, Hasher};
+        json!(state.graphics.assets.iter().map(|(id, asset)| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            asset.original_bytes.hash(&mut hasher);
+            json!({"id":id,"name":asset.name,"format":asset.format,"size":asset.original_bytes.len(),"content_hash":format!("{:016x}",hasher.finish())})
+        }).collect::<Vec<_>>())
+    }
+    fn settings(state: &AiDesignState) -> Value {
+        json!({
+            "vt_version": u8::from(state.vt_version),
+            "mask_size": state.mask_size,
+            "soft_key_size": state.soft_key_size,
+            "soft_key_layout": state.soft_key_layout,
+            "object_id_ranges": state.object_id_ranges,
+        })
+    }
+    fn change(before: Value, after: Value) -> Value {
+        if before == after {
+            Value::Null
+        } else {
+            json!({"before":before,"after":after})
+        }
+    }
+
+    let components = change(component_summary(before), component_summary(after));
+    let graphics = change(graphics_summary(before), graphics_summary(after));
+    let settings = change(settings(before), settings(after));
+    let changed = !object_changes.is_empty()
+        || !components.is_null()
+        || !graphics.is_null()
+        || !settings.is_null();
+    let mut changes = Map::new();
+    changes.insert("objects".into(), json!(object_changes));
+    changes.insert("components".into(), components);
+    changes.insert("graphics".into(), graphics);
+    changes.insert("settings".into(), settings);
+    json!({"changes":changes,"changed":changed})
+}
+
 pub const ALIGNMENT_TOLERANCE: i32 = 4;
 pub const SPACING_TOLERANCE: i32 = 4;
 pub const MIN_TOUCH_TARGET: u16 = 20;

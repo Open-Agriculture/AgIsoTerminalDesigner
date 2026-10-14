@@ -30,6 +30,23 @@ pub struct PropertySchemaSnapshot {
     pub semantic: PropertySemanticSnapshot,
     pub default_value: Value,
     pub valid_range: Option<(Value, Value)>,
+    /// Exact serialized choices supplied by the shared property metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_choices: Vec<Value>,
+    /// Named keys when the property is a structured set of boolean flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flag_choices: Vec<String>,
+    /// Fields for structured record-valued properties, derived from their default.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_fields: Vec<NestedFieldSchemaSnapshot>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestedFieldSchemaSnapshot {
+    pub name: String,
+    pub value_type: String,
+    pub default_value: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<NestedFieldSchemaSnapshot>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PropertySemanticSnapshot {
@@ -94,11 +111,24 @@ pub fn get_object_schema(
                             },
                         ),
                     ))
-                } else if matches!(d.semantic, PropertySemantic::Colour) {
+                } else if matches!(&d.semantic, PropertySemantic::Colour) {
                     Some((Value::from(0), Value::from(255)))
                 } else {
                     d.valid_range
                 },
+                enum_choices: d.enum_choices,
+                flag_choices: if matches!(&d.semantic, PropertySemantic::Bitflags) {
+                    get_object_property(&object, d.name)
+                        .ok()
+                        .and_then(|value| value.as_object().cloned())
+                        .map(|object| object.keys().cloned().collect::<Vec<String>>())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                },
+                nested_fields: nested_fields(
+                    &get_object_property(&object, d.name).unwrap_or(Value::Null),
+                ),
             }
         })
         .collect();
@@ -127,4 +157,31 @@ pub fn get_object_schema(
         possible_events: events.into_iter().map(|e| format!("{:?}", e)).collect(),
         supports_object_labels: matches!(object_type, ObjectType::ObjectLabelReferenceList),
     })
+}
+
+fn nested_fields(value: &Value) -> Vec<NestedFieldSchemaSnapshot> {
+    let Some(fields) = value.as_object() else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .map(|(name, value)| NestedFieldSchemaSnapshot {
+            name: name.clone(),
+            value_type: value_type(value).to_owned(),
+            default_value: value.clone(),
+            fields: nested_fields(value),
+        })
+        .collect()
+}
+
+fn value_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }

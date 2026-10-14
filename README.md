@@ -185,34 +185,19 @@ cargo build --release
 cargo run --release
 ```
 
-The CLI is at `target/release/aitd`. Add that directory to `PATH`, or invoke it by its full path. Codex CLI, Claude Code, and scripts can use ordinary shell commands:
+The CLI is at `target/release/aitd`. Add that directory to `PATH`, or invoke it by its full path. `aitd` uses commands for input and supports readable text or structured JSON output. Start with `aitd --help` or see the [CLI guide](docs/cli.md):
 
 ```bash
-aitd status --json
-aitd context --json
-aitd components list --json
-aitd graphics list --json
-aitd capabilities --json
-aitd proposal stage --input actions.json --json
+aitd status
+aitd object list --type Button
+aitd draft begin --name "Improve controls"
+aitd object set 10 width=120
+aitd draft submit
+aitd proposal wait
+aitd export bundle --iop build/object_pool.iop --header build/object_pool.h
 ```
 
-For example, after inspecting the project, an agent can write `actions.json` with the `project_instance` and `project_revision` returned by `aitd status --json`, plus a transaction:
-
-```json
-{
-  "project_instance": "<inspected project instance>",
-  "project_revision": 42,
-  "transaction": {
-    "operations": [
-      {"type": "SetProperty", "data": {"object": {"id": 10}, "property": "width", "value": 120}}
-    ]
-  }
-}
-```
-
-Use an actual object ID and revision from inspection. Staging requires both identity fields and fails if the project changed. The same JSON can be piped through `aitd proposal stage --input - --json`. Component actions use the existing `actions` array instead of `transaction`; `proposal_id` refines a pending proposal. Run `aitd --help` and subcommand help for arguments. JSON output includes project identity and revision; errors use JSON and a nonzero exit code. Only one proposal can await review per editor instance.
-
-The CLI reads the live editor project, including unsaved changes. Staging materializes and validates a candidate for the **Proposal** panel. The user reviews the preview and presses **Apply** or **Reject** in the editor. The CLI cannot Apply or save a `.aitp` file. The browser editor remains manual-only.
+The CLI reads and edits the project open in the desktop editor. Edits are collected in an editor-owned draft and submitted to the **Proposal** panel. The user reviews and applies or rejects the proposal in the editor. The CLI can query the review outcome and export IOP or C object-ID headers after the proposal is applied. Apply and `.aitp` project saving remain editor actions; drafts and proposal receipts are kept only for the lifetime of the editor process. The browser editor remains manual-only. See [the CLI guide](docs/cli.md) for command files, available edit commands, project guards, shell completion, and exit codes.
 
 If multiple editors are running, use `--instance <editor-instance-id>` or set `AG_ISO_EDITOR_INSTANCE_ID`. Connection details are in owner-only runtime files under the system temporary directory in `ag-iso-terminal-designer-<user>/`. The authenticated loopback bridge currently requires Unix owner-only file permissions.
 

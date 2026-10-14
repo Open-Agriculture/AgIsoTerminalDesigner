@@ -80,6 +80,19 @@ enum FileEvent {
     },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn absolute_project_path(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
 pub struct DesignerApp {
     project: Option<EditorProject>,
     canvas: CanvasState,
@@ -95,6 +108,10 @@ pub struct DesignerApp {
     apply_smart_naming_on_import: bool,
     #[cfg(not(target_arch = "wasm32"))]
     project_path: Option<PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
+    original_source_path: Option<PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_iop_source_path: Option<PathBuf>,
     project_display_name: String,
     preferences: AppPreferences,
     workspace: Workspace,
@@ -166,6 +183,8 @@ impl DesignerApp {
             });
         if import {
             let (content, name, version) = self.pending_iop_import.take().unwrap();
+            #[cfg(not(target_arch = "wasm32"))]
+            let source_path = self.pending_iop_source_path.take();
             self.open_in_progress = false;
             match EditorProject::import_iop_with_id_format(
                 content,
@@ -186,6 +205,7 @@ impl DesignerApp {
                     #[cfg(not(target_arch = "wasm32"))]
                     {
                         self.project_path = None;
+                        self.original_source_path = source_path;
                         self.invalidate_automation_proposal();
                     }
                     if self.discard_on_replace {
@@ -210,6 +230,10 @@ impl DesignerApp {
             }
         } else if cancel || !open {
             self.pending_iop_import = None;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.pending_iop_source_path = None;
+            }
             self.open_in_progress = false;
             self.discard_on_replace = false;
         }
@@ -430,6 +454,10 @@ impl DesignerApp {
             apply_smart_naming_on_import: true, // Default to true for better UX
             #[cfg(not(target_arch = "wasm32"))]
             project_path: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            original_source_path: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_iop_source_path: None,
             project_display_name: "Untitled project".to_owned(),
             preferences,
             workspace,
@@ -551,6 +579,10 @@ impl DesignerApp {
                             .map(EditorProject::vt_version)
                             .unwrap_or(ag_iso_stack::object_pool::vt_version::VtVersion::Version6);
                         self.pending_iop_import = Some((content, file_name, version));
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            self.pending_iop_source_path = Some(absolute_project_path(&path));
+                        }
                     }
                     FileDialogReason::LoadProject => match EditorProject::load_project(content) {
                         Ok(project) => {
@@ -574,7 +606,8 @@ impl DesignerApp {
                             self.project_display_name = file_name;
                             #[cfg(not(target_arch = "wasm32"))]
                             {
-                                self.project_path = Some(path.clone());
+                                self.project_path = Some(absolute_project_path(&path));
+                                self.original_source_path = self.project_path.clone();
                                 self.touch_recent(path);
                             }
                             if self.discard_on_replace {
@@ -624,7 +657,7 @@ impl DesignerApp {
                     self.project_display_name = file_name;
                     #[cfg(not(target_arch = "wasm32"))]
                     {
-                        self.project_path = Some(path.clone());
+                        self.project_path = Some(absolute_project_path(&path));
                         self.touch_recent(path);
                     }
                     self.clear_recovery();
@@ -805,6 +838,7 @@ impl DesignerApp {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     self.project_path = None;
+                    self.original_source_path = None;
                 }
                 if self.discard_on_replace {
                     self.clear_recovery();
@@ -854,6 +888,7 @@ impl DesignerApp {
                             #[cfg(not(target_arch = "wasm32"))]
                             {
                                 self.project_path = None;
+                                self.original_source_path = None;
                             }
                         }
                         Err(error) => {
@@ -918,47 +953,17 @@ impl DesignerApp {
         }
     }
 
-    /// Convert a string to a valid C identifier
-    fn to_c_identifier(name: &str) -> String {
-        name.chars()
-            .map(|c| match c {
-                'a'..='z' | 'A'..='Z' | '0'..='9' => c.to_ascii_uppercase(),
-                _ => '_',
-            })
-            .collect()
-    }
-
     /// Open a file dialog to save a C header file with object IDs
     fn save_header(&mut self) {
         if let Some(project) = &self.project {
-            let pool = project.get_pool();
-
-            // Start with the header
-            let mut header = String::from("// Object IDs for the objects in the object pool.\n\n");
-            header.push_str("#pragma once\n");
-            header.push_str("#define UNDEFINED 65535\n");
-
-            // Collect all objects with their names and IDs
-            let mut objects: Vec<(String, u16)> = pool
-                .objects()
-                .iter()
-                .map(|obj| {
-                    let name = project.get_object_info(obj).get_name(obj);
-                    let c_name = Self::to_c_identifier(&name);
-                    let id = u16::from(obj.id());
-                    (c_name, id)
-                })
-                .collect();
-
-            // Sort by ID for consistent output
-            objects.sort_by_key(|&(_, id)| id);
-
-            // Add defines for each object
-            for (name, id) in objects {
-                header.push_str(&format!("#define {} {}\n", name, id));
-            }
-
-            let contents = header.into_bytes();
+            let contents = match ag_iso_terminal_designer::ai::export::header_for_project(project) {
+                Ok(contents) => contents,
+                Err(error) => {
+                    self.error_message =
+                        Some(format!("Could not generate object ID header: {error}"));
+                    return;
+                }
+            };
             let task = rfd::AsyncFileDialog::new()
                 .set_file_name("object_pool.h")
                 .add_filter("C Header", &["h"])
@@ -1846,6 +1851,11 @@ impl eframe::App for DesignerApp {
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(bridge) = &mut self.automation_bridge {
+            bridge.set_project_location(
+                self.project_path.as_deref(),
+                self.original_source_path.as_deref(),
+                &self.project_display_name,
+            );
             bridge.poll(self.project.as_ref());
         }
 
@@ -2242,7 +2252,10 @@ impl eframe::App for DesignerApp {
             None => {}
         }
         if let Some(project) = self.project.as_mut() {
-            if self.shared_attributes.show(ctx, project, &mut self.error_message) {
+            if self
+                .shared_attributes
+                .show(ctx, project, &mut self.error_message)
+            {
                 self.workspace.open(Pane::Properties);
             }
         }
@@ -2828,9 +2841,13 @@ impl DesignerApp {
                 } else if let Some(proposal) = bridge.take_proposal() {
                     let proposal_id = proposal.proposal_id.clone();
                     match project.apply_ai_proposal(proposal) {
-                        Ok(_) => bridge.record_applied(&proposal_id),
+                        Ok(applied) => bridge.record_applied(
+                            &proposal_id,
+                            project.revision(),
+                            &applied.transaction_id,
+                        ),
                         Err(diagnostics) => {
-                            bridge.record_apply_failed(&proposal_id);
+                            bridge.record_apply_failed(&proposal_id, format!("{diagnostics:?}"));
                             self.error_message =
                                 Some(format!("Could not apply proposal: {diagnostics:?}"));
                         }

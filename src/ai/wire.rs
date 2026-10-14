@@ -111,6 +111,15 @@ pub fn schema(schema: super::schema::ObjectSchemaSnapshot) -> Value {
             if !p.writable {
                 v["writable"] = json!(false);
             }
+            if !p.enum_choices.is_empty() {
+                v["enum_choices"] = json!(p.enum_choices);
+            }
+            if !p.flag_choices.is_empty() {
+                v["flag_choices"] = json!(p.flag_choices);
+            }
+            if !p.nested_fields.is_empty() {
+                v["fields"] = json!(p.nested_fields);
+            }
             match p.semantic {
                 PropertySemanticSnapshot::ObjectReference {
                     allowed_object_types,
