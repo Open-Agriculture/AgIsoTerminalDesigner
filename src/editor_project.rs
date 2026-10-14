@@ -7,6 +7,7 @@ use crate::components::*;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
+    sync::Arc,
 };
 
 use ag_iso_stack::object_pool::{
@@ -53,6 +54,20 @@ struct DesignDimensions {
     soft_key_layout: SoftKeyLayout,
 }
 
+/// Derived state belongs to one authoritative project state, never to its copies.
+#[derive(Default)]
+struct ProjectCache {
+    state: Option<(ProjectRevision, DesignDimensions)>,
+    materialized: Option<ComponentResult<Arc<MaterializedProject>>>,
+    property_choices: HashMap<(ObjectId, String, String), bool>,
+}
+
+impl Clone for ProjectCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
 impl ComponentCheckpoint {
     fn content_eq(&self, other: &Self) -> bool {
         self.pool == other.pool
@@ -70,6 +85,7 @@ impl ComponentCheckpoint {
 
 #[derive(Clone)]
 pub struct EditorProject {
+    cache: RefCell<ProjectCache>,
     pool: ObjectPool,
     components: ComponentSource,
     graphics: crate::graphics::GraphicLibrary,
@@ -158,6 +174,7 @@ impl From<ObjectPool> for EditorProject {
             .unwrap_or(0);
 
         let project = EditorProject {
+            cache: RefCell::default(),
             pool,
             components: Default::default(),
             graphics: Default::default(),
@@ -296,13 +313,65 @@ impl EditorProject {
     pub(crate) fn component_object_info(&self) -> HashMap<ObjectId, ObjectInfo> {
         self.object_info.borrow().clone()
     }
+    /// Return an independently mutable materialized pool and source map.
     pub fn materialize(&self) -> ComponentResult<MaterializedProject> {
-        materialize_project(self)
+        self.materialize_shared().map(|result| (*result).clone())
+    }
+
+    /// Share a read-only materialized snapshot until authoritative content or
+    /// settings change. Errors are retained for the same project state too.
+    /// The snapshot remains valid after subsequent edits to the project.
+    pub fn materialize_shared(&self) -> ComponentResult<Arc<MaterializedProject>> {
+        self.reconcile_cache();
+        if let Some(result) = &self.cache.borrow().materialized {
+            return result.clone();
+        }
+        let result = materialize_project(self).map(Arc::new);
+        self.cache.borrow_mut().materialized = Some(result.clone());
+        result
+    }
+
+    fn reconcile_cache(&self) {
+        let state = (self.revision(), self.dimensions());
+        let mut cache = self.cache.borrow_mut();
+        if cache.state != Some(state) {
+            *cache = ProjectCache {
+                state: Some(state),
+                ..Default::default()
+            };
+        }
+    }
+
+    fn invalidate_cache(&self) {
+        self.cache.replace(ProjectCache::default());
+    }
+
+    /// Reuse UI choice validation without bypassing validation of committed edits.
+    pub(crate) fn property_choice_is_valid(
+        &self,
+        id: ObjectId,
+        property: &str,
+        value: serde_json::Value,
+    ) -> bool {
+        self.reconcile_cache();
+        let key = (id, property.to_owned(), value.to_string());
+        if let Some(valid) = self.cache.borrow().property_choices.get(&key) {
+            return *valid;
+        }
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(id.value()),
+            property: property.to_owned(),
+            value,
+        });
+        let valid = self.validate_transaction(&transaction).is_ok();
+        self.cache.borrow_mut().property_choices.insert(key, valid);
+        valid
     }
     /// Export the materialized pool, rejecting strings whose encoded byte
     /// length exceeds the ISO field limit.
     pub fn export_iop(&self) -> ComponentResult<Vec<u8>> {
-        let materialized = self.materialize()?;
+        let materialized = self.materialize_shared()?;
         let diagnostics = self.compatibility_diagnostics_from_pool(&materialized.pool)?;
         let errors: Vec<_> = diagnostics
             .iter()
@@ -328,7 +397,13 @@ impl EditorProject {
             });
         }
         let id = self.get_selected().0?.value();
-        match self.materialize().ok()?.source_map.by_object_id.get(&id)? {
+        match self
+            .materialize_shared()
+            .ok()?
+            .source_map
+            .by_object_id
+            .get(&id)?
+        {
             MaterializedSource::Primitive { object_id } => {
                 Some(EditorSelection::PrimitiveObject(*object_id))
             }
@@ -412,11 +487,12 @@ impl EditorProject {
             &after.info,
             &after.graphics,
         )?;
-        let baseline = self
-            .materialize()
-            .map(|m| m.pool)
-            .unwrap_or_else(|_| before.pool.clone());
-        let baseline_diagnostics = self.compatibility_diagnostics_from_pool(&baseline)?;
+        let baseline_materialized = self.materialize_shared().ok();
+        let baseline = baseline_materialized
+            .as_ref()
+            .map(|m| &m.pool)
+            .unwrap_or(&before.pool);
+        let baseline_diagnostics = self.compatibility_diagnostics_from_pool(baseline)?;
         let mut candidate_project = self.canvas_preview_copy();
         candidate_project.pool = after.pool.clone();
         candidate_project.components = after.source.clone();
@@ -438,7 +514,7 @@ impl EditorProject {
             ));
         }
         crate::layout_containment::validate_change_with_soft_key_size(
-            &baseline,
+            baseline,
             &candidate.pool,
             self.mask_size,
             self.mask_size,
@@ -490,6 +566,7 @@ impl EditorProject {
     }
 
     fn bump_revision(&self) {
+        self.invalidate_cache();
         self.revision.set(self.revision.get().wrapping_add(1));
     }
 
@@ -621,7 +698,7 @@ impl EditorProject {
 
     /// Compatibility diagnostics for the materialized project, including components.
     pub fn compatibility_diagnostics(&self) -> ComponentResult<Vec<crate::ValidationDiagnostic>> {
-        self.compatibility_diagnostics_from_pool(&self.materialize()?.pool)
+        self.compatibility_diagnostics_from_pool(&self.materialize_shared()?.pool)
     }
 
     fn compatibility_diagnostics_from_pool(
@@ -756,7 +833,7 @@ impl EditorProject {
         if self.vt_version != vt_version {
             let mut candidate = self.canvas_preview_copy();
             candidate.vt_version = vt_version;
-            let materialized = candidate.materialize()?;
+            let materialized = candidate.materialize_shared()?;
             let diagnostics = candidate.compatibility_diagnostics_from_pool(&materialized.pool)?;
             let errors: Vec<_> = diagnostics
                 .iter()
@@ -779,7 +856,7 @@ impl EditorProject {
                 .map_err(|message| ComponentError::new("VT_VERSION_INCOMPATIBLE", message))?;
         }
         if self.mask_size != mask_size || self.soft_key_size != soft_key_size {
-            let materialized = self.materialize()?;
+            let materialized = self.materialize_shared()?;
             crate::layout_containment::validate_change_with_soft_key_size(
                 &materialized.pool,
                 &materialized.pool,
@@ -1198,15 +1275,25 @@ impl EditorProject {
             }
         }
 
-        // Generate names for remaining objects
+        let mut type_counts = [0usize; 256];
+        for object_type in existing_names.values() {
+            type_counts[u8::from(*object_type) as usize] += 1;
+        }
+
+        // Generate names for remaining objects without recounting the whole map.
         for object in self.pool.objects() {
-            let new_name =
-                smart_naming::generate_smart_default_name(object.object_type(), &existing_names);
+            let object_type = object.object_type();
+            let new_name = smart_naming::generate_smart_name_from_count(
+                object_type,
+                &existing_names,
+                type_counts[u8::from(object_type) as usize],
+            );
 
             // Update the count for the new name to ensure uniqueness
             existing_names
                 .entry(new_name.clone())
-                .or_insert(object.object_type());
+                .or_insert(object_type);
+            type_counts[u8::from(object_type) as usize] += 1;
 
             let info = object_info
                 .entry(object.id())
@@ -1216,6 +1303,7 @@ impl EditorProject {
         drop(object_info);
         self.object_info
             .replace(self.mut_object_info.borrow().clone());
+        self.invalidate_cache();
     }
 
     /// Apply smart naming to an existing object if it doesn't have a custom name
@@ -1262,6 +1350,7 @@ impl EditorProject {
         drop(object_info);
         self.object_info
             .replace(self.mut_object_info.borrow().clone());
+        self.invalidate_cache();
     }
 
     /// Save the project to a file
@@ -1551,10 +1640,11 @@ impl EditorProject {
             &self.graphics,
         )
         .map_err(component_transaction_error)?;
-        let baseline = self
-            .materialize()
-            .map(|m| m.pool)
-            .unwrap_or_else(|_| self.pool.clone());
+        let baseline_materialized = self.materialize_shared().ok();
+        let baseline = baseline_materialized
+            .as_ref()
+            .map(|m| &m.pool)
+            .unwrap_or(&self.pool);
         let id_changes: Vec<_> = transaction
             .operations
             .iter()
@@ -1564,7 +1654,7 @@ impl EditorProject {
             })
             .collect();
         let mut baseline_diagnostics = self
-            .compatibility_diagnostics_from_pool(&baseline)
+            .compatibility_diagnostics_from_pool(baseline)
             .map_err(component_transaction_error)?;
         crate::pool_validation::remap_compatibility_diagnostic_ids(
             &mut baseline_diagnostics,
@@ -1592,7 +1682,7 @@ impl EditorProject {
             )));
         }
         crate::layout_containment::validate_change_with_id_changes_and_soft_key_size(
-            &baseline,
+            baseline,
             &candidate.pool,
             self.mask_size,
             self.mask_size,
@@ -1828,6 +1918,94 @@ pub(crate) fn component_transaction_error(error: ComponentError) -> TransactionD
 mod tests {
     use super::*;
     use crate::{default_object, ChildPlacement, MacroReferenceTarget};
+
+    #[test]
+    fn materialized_snapshots_follow_edits_and_history_without_changing_old_snapshots() {
+        let mut pool = ObjectPool::default();
+        pool.add(object_with_id(ObjectType::NumberVariable, 1));
+        let mut project = EditorProject::from(pool);
+        let before = project.materialize_shared().unwrap();
+        assert!(Arc::ptr_eq(&before, &project.materialize_shared().unwrap()));
+
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(1),
+            property: "value".into(),
+            value: 42.into(),
+        });
+        project.execute_transaction(transaction).unwrap();
+        let value = |snapshot: &MaterializedProject| match snapshot
+            .pool
+            .object_by_id(ObjectId::new(1).unwrap())
+            .unwrap()
+        {
+            Object::NumberVariable(number) => number.value,
+            _ => unreachable!(),
+        };
+        assert_eq!(value(&project.materialize_shared().unwrap()), 42);
+        assert_eq!(value(&before), 0);
+        assert!(project.undo_operation());
+        assert_eq!(value(&project.materialize_shared().unwrap()), 0);
+        assert!(project.redo_operation());
+        assert_eq!(value(&project.materialize_shared().unwrap()), 42);
+
+        let mut owned = project.materialize().unwrap();
+        owned.pool.remove(ObjectId::new(1).unwrap());
+        assert_eq!(value(&project.materialize_shared().unwrap()), 42);
+
+        let mut preview = project.canvas_preview_copy();
+        preview.pool.remove(ObjectId::new(1).unwrap());
+        assert_eq!(preview.materialize_shared().unwrap().pool.size(), 0);
+        assert_eq!(value(&project.materialize_shared().unwrap()), 42);
+        let mut copied = project.clone();
+        copied.pool.remove(ObjectId::new(1).unwrap());
+        assert_eq!(copied.materialize_shared().unwrap().pool.size(), 0);
+    }
+
+    #[test]
+    fn property_choices_revalidate_when_dimensions_change_without_a_revision() {
+        use ag_iso_stack::object_pool::{object_attributes::Point, ObjectRef};
+        let mut mask = object_with_id(ObjectType::DataMask, 1);
+        if let Object::DataMask(mask) = &mut mask {
+            mask.object_refs.push(ObjectRef {
+                id: ObjectId::new(2).unwrap(),
+                offset: Point { x: 20, y: 20 },
+            });
+        }
+        let mut shape = object_with_id(ObjectType::OutputRectangle, 2);
+        if let Object::OutputRectangle(shape) = &mut shape {
+            shape.width = 40;
+            shape.height = 30;
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(mask);
+        pool.add(shape);
+        let mut project = EditorProject::from(pool);
+        project.mask_size = 200;
+        let id = ObjectId::new(2).unwrap();
+        assert!(project.property_choice_is_valid(id, "width", 150.into()));
+        assert!(project.property_choice_is_valid(id, "width", 150.into()));
+        let revision = project.revision();
+        project.mask_size = 100;
+        assert_eq!(project.revision(), revision);
+        assert!(!project.property_choice_is_valid(id, "width", 150.into()));
+        assert!(project.property_choice_is_valid(id, "width", 50.into()));
+    }
+
+    #[test]
+    fn cached_materialization_errors_do_not_survive_a_repair() {
+        let mut pointer = object_with_id(ObjectType::ObjectPointer, 1);
+        if let Object::ObjectPointer(pointer) = &mut pointer {
+            pointer.value = NullableObjectId::new(99);
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(pointer);
+        let mut project = EditorProject::from(pool);
+        assert!(project.materialize_shared().is_err());
+        assert!(project.materialize_shared().is_err());
+        assert!(project.delete_object(ObjectId::new(1).unwrap()));
+        assert_eq!(project.materialize_shared().unwrap().pool.size(), 0);
+    }
 
     #[test]
     fn content_changes_and_undo_update_dirty_state() {

@@ -74,6 +74,14 @@ pub fn generate_smart_default_name(
         .filter(|&&t| t == object_type)
         .count();
 
+    generate_smart_name_from_count(object_type, existing_names, same_type_count)
+}
+
+pub(crate) fn generate_smart_name_from_count(
+    object_type: ObjectType,
+    existing_names: &HashMap<String, ObjectType>,
+    same_type_count: usize,
+) -> String {
     // Generate numbered name
     let mut counter = same_type_count + 1;
     loop {

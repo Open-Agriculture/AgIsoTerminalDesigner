@@ -286,6 +286,176 @@ fn picture_cache_tracks_format_and_effective_palette() {
 }
 
 #[test]
+fn picture_decode_discards_packed_row_padding_and_compares_transparency_by_rgb() {
+    use ag_iso_stack::object_pool::object_attributes::{DataCodeType, PictureGraphicFormat};
+    use ag_iso_terminal_designer::{effective_colour, graphics::preview};
+
+    let pool = ObjectPool::default();
+    let Object::PictureGraphic(mut picture) = default_object(ObjectType::PictureGraphic) else {
+        panic!()
+    };
+    picture.actual_width = 3;
+    picture.actual_height = 2;
+    picture.options.data_code_type = DataCodeType::Raw;
+    picture.format = PictureGraphicFormat::FourBit;
+    picture.data = vec![0x12, 0x30, 0x45, 0x60];
+    let image = preview::decode_picture(&picture, &pool);
+    let expected: Vec<_> = [1, 2, 3, 4, 5, 6]
+        .map(|index| effective_colour::colour(&pool, index).as_rgba())
+        .into_iter()
+        .collect();
+    let actual: Vec<_> = image.pixels.iter().map(|color| color.to_array()).collect();
+    assert_eq!(actual, expected);
+
+    picture.format = PictureGraphicFormat::Monochrome;
+    picture.data = vec![0b1011_0000, 0b0101_0000];
+    let image = preview::decode_picture(&picture, &pool);
+    let expected: Vec<_> = [1, 0, 1, 0, 1, 0]
+        .map(|index| effective_colour::colour(&pool, index).as_rgba())
+        .into_iter()
+        .collect();
+    let actual: Vec<_> = image.pixels.iter().map(|color| color.to_array()).collect();
+    assert_eq!(actual, expected);
+
+    use ag_iso_stack::object_pool::{Colour, NullableObjectId};
+    let mut duplicate_rgb_pool = ObjectPool::default();
+    let mut palette = default_object(ObjectType::ColourPalette);
+    palette.mut_id().set_value(10).unwrap();
+    if let Object::ColourPalette(palette) = &mut palette {
+        palette.colours = vec![Colour::RED; 256];
+    }
+    duplicate_rgb_pool.add(palette);
+    let mut controls = default_object(ObjectType::WorkingSetSpecialControls);
+    controls.mut_id().set_value(11).unwrap();
+    if let Object::WorkingSetSpecialControls(controls) = &mut controls {
+        controls.id_of_colour_palette = NullableObjectId(Some(ObjectId::new(10).unwrap()));
+    }
+    duplicate_rgb_pool.add(controls);
+
+    picture.actual_width = 2;
+    picture.actual_height = 1;
+    picture.format = PictureGraphicFormat::FourBit;
+    picture.data = vec![0x01];
+    picture.options.transparent = true;
+    picture.transparency_colour = 0;
+    let image = preview::decode_picture(&picture, &duplicate_rgb_pool);
+    assert_eq!(image.pixels[0].a(), 0);
+    assert_eq!(image.pixels[1].a(), 0);
+}
+
+#[test]
+fn picture_texture_cache_separates_pools_with_same_picture_id() {
+    use ag_iso_stack::object_pool::{object_attributes::DataCodeType, Colour, NullableObjectId};
+    use ag_iso_terminal_designer::graphics::preview;
+
+    fn pool_with_palette(colour: Colour) -> ObjectPool {
+        let mut pool = ObjectPool::default();
+        let mut palette = default_object(ObjectType::ColourPalette);
+        palette.mut_id().set_value(10).unwrap();
+        if let Object::ColourPalette(palette) = &mut palette {
+            palette.colours = vec![colour; 256];
+        }
+        pool.add(palette);
+        let mut controls = default_object(ObjectType::WorkingSetSpecialControls);
+        controls.mut_id().set_value(11).unwrap();
+        if let Object::WorkingSetSpecialControls(controls) = &mut controls {
+            controls.id_of_colour_palette = NullableObjectId(Some(ObjectId::new(10).unwrap()));
+        }
+        pool.add(controls);
+        pool
+    }
+
+    let first_pool = pool_with_palette(Colour::RED);
+    let second_pool = pool_with_palette(Colour::BLUE);
+    let Object::PictureGraphic(mut first_picture) = default_object(ObjectType::PictureGraphic)
+    else {
+        panic!()
+    };
+    first_picture.actual_width = 1;
+    first_picture.actual_height = 1;
+    first_picture.data = vec![3];
+    first_picture.options.data_code_type = DataCodeType::Raw;
+    let mut second_picture = first_picture.clone();
+    second_picture.data = vec![4];
+
+    let ctx = egui::Context::default();
+    let first = preview::picture_texture(&ctx, &first_picture, &first_pool).unwrap();
+    let second = preview::picture_texture(&ctx, &second_picture, &second_pool).unwrap();
+    assert_ne!(first.id(), second.id());
+    assert_eq!(
+        preview::decode_picture(&first_picture, &first_pool).pixels[0].to_array(),
+        [255, 0, 0, 255]
+    );
+    assert_eq!(
+        preview::decode_picture(&second_picture, &second_pool).pixels[0].to_array(),
+        [0, 0, 255, 255]
+    );
+}
+
+#[test]
+fn effective_colour_uses_lowest_controls_and_falls_back_for_missing_references() {
+    use ag_iso_stack::object_pool::{Colour, NullableObjectId};
+    use ag_iso_terminal_designer::effective_colour;
+
+    let mut pool = ObjectPool::default();
+    let mut selected_palette = default_object(ObjectType::ColourPalette);
+    selected_palette.mut_id().set_value(10).unwrap();
+    if let Object::ColourPalette(palette) = &mut selected_palette {
+        palette.colours = vec![Colour::BLUE, Colour::RED];
+    }
+    pool.add(selected_palette);
+    let mut other_palette = default_object(ObjectType::ColourPalette);
+    other_palette.mut_id().set_value(20).unwrap();
+    if let Object::ColourPalette(palette) = &mut other_palette {
+        palette.colours = vec![Colour::GREEN; 256];
+    }
+    pool.add(other_palette);
+    let mut map = default_object(ObjectType::ColourMap);
+    map.mut_id().set_value(30).unwrap();
+    if let Object::ColourMap(map) = &mut map {
+        map.colour_map = vec![5]; // Index 1 falls back to index 1.
+    }
+    pool.add(map);
+
+    let mut selected = default_object(ObjectType::WorkingSetSpecialControls);
+    selected.mut_id().set_value(11).unwrap();
+    if let Object::WorkingSetSpecialControls(controls) = &mut selected {
+        controls.id_of_colour_map = NullableObjectId(Some(ObjectId::new(30).unwrap()));
+        controls.id_of_colour_palette = NullableObjectId(Some(ObjectId::new(10).unwrap()));
+    }
+    pool.add(selected);
+    let mut higher_id = default_object(ObjectType::WorkingSetSpecialControls);
+    higher_id.mut_id().set_value(12).unwrap();
+    if let Object::WorkingSetSpecialControls(controls) = &mut higher_id {
+        controls.id_of_colour_palette = NullableObjectId(Some(ObjectId::new(20).unwrap()));
+    }
+    pool.add(higher_id);
+
+    assert_eq!(
+        effective_colour::colour(&pool, 1).as_rgb(),
+        Colour::RED.as_rgb()
+    );
+    if let Some(Object::WorkingSetSpecialControls(controls)) =
+        pool.object_mut_by_id(ObjectId::new(11).unwrap())
+    {
+        controls.id_of_colour_map = NullableObjectId(Some(ObjectId::new(99).unwrap()));
+    }
+    assert_eq!(
+        effective_colour::colour(&pool, 1).as_rgb(),
+        Colour::RED.as_rgb()
+    );
+    if let Some(Object::WorkingSetSpecialControls(controls)) =
+        pool.object_mut_by_id(ObjectId::new(11).unwrap())
+    {
+        controls.id_of_colour_palette = NullableObjectId(Some(ObjectId::new(99).unwrap()));
+    }
+    assert_eq!(
+        effective_colour::colour(&pool, 1).as_rgb(),
+        pool.color_by_index(1).as_rgb()
+    );
+}
+
+#[test]
 fn create_preserves_uploaded_semantic_metadata() {
     let mut project = fixture();
     let asset = upload(&mut project, "Warning.png");

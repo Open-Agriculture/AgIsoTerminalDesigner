@@ -2230,7 +2230,7 @@ impl eframe::App for DesignerApp {
             {
                 if let Some(selected) = pool.get_selected().0 {
                     if let Some(root) = self.mask_view.navigate(pool, selected.value()) {
-                        if let Ok(materialized) = pool.materialize() {
+                        if let Ok(materialized) = pool.materialize_shared() {
                             self.canvas.navigate_to_object(
                                 pool,
                                 &materialized,
@@ -2462,7 +2462,7 @@ impl DesignerApp {
                 });
             }
             Pane::Properties => {
-                let materialized = pool.materialize();
+                let materialized = pool.materialize_shared();
                 if let Some(
                     ag_iso_terminal_designer::components::EditorSelection::ComponentNode {
                         instance_id,
@@ -2538,7 +2538,7 @@ impl DesignerApp {
             }
             Pane::Canvas => {
                 self.canvas_visible = true;
-                let materialized = pool.materialize();
+                let materialized = pool.materialize_shared();
                 match &materialized {
                     Ok(materialized) => {
                         self.mask_view.reconcile(pool);

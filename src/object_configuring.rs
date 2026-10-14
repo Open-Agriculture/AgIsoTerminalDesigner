@@ -1520,13 +1520,7 @@ fn property_choice_is_valid(
     property: &str,
     value: serde_json::Value,
 ) -> bool {
-    let mut transaction = OperationTransaction::new(None);
-    transaction.add_operation(Operation::SetProperty {
-        object: ObjectTarget::id(id.value()),
-        property: property.to_owned(),
-        value,
-    });
-    design.validate_transaction(&transaction).is_ok()
+    design.property_choice_is_valid(id, property, value)
 }
 
 /// Preserve the JSON number kind exposed by the property's Rust type. In
