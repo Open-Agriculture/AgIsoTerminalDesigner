@@ -89,7 +89,9 @@ pub fn plan_component_capture(
                     continue;
                 }
                 if subtree.contains(&id) {
-                    return Err(fail("An outside object references the selected subtree; detach that reference first"));
+                    return Err(fail(
+                        "An outside object references the selected subtree; detach that reference first",
+                    ));
                 }
                 remove.remove(&id);
                 changed = true;
@@ -153,15 +155,19 @@ pub fn plan_component_capture(
                     if let Some(node) = node_ids.get(&target) {
                         ComponentReference::Internal(*node)
                     } else {
-                        external_references.push((node_ids[id], descriptor.name.into(), target));
+                        external_references.push((
+                            node_ids[id],
+                            descriptor.name.to_string(),
+                            target,
+                        ));
                         ComponentReference::ExternalObject(ObjectTarget::id(target))
                     }
                 } else {
                     ComponentReference::Null
                 };
-                references.insert(descriptor.name.into(), reference);
+                references.insert(descriptor.name, reference);
             } else {
-                properties.insert(descriptor.name.into(), value);
+                properties.insert(descriptor.name, value);
             }
         }
         let macro_references = macro_refs(object)

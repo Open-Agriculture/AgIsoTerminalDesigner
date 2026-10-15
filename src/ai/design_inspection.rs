@@ -1,6 +1,6 @@
 //! Focused display-tree inspection using the existing path-aware layout iterator.
 use super::{AiDesignState, AiToolError};
-use crate::object_properties::get_object_property;
+use crate::object_properties::{get_object_property, PropertyKey};
 use ag_iso_stack::object_pool::ObjectId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -30,7 +30,6 @@ pub struct InspectDesignRegionRequest {
     pub root_id: u16,
     pub region: Region,
     pub types: Vec<String>,
-    pub purpose: String,
     pub max_results: usize,
 }
 impl Default for InspectDesignRegionRequest {
@@ -39,7 +38,6 @@ impl Default for InspectDesignRegionRequest {
             root_id: 0,
             region: Region::All,
             types: vec![],
-            purpose: "style_match".into(),
             max_results: DEFAULT_REGION_RESULTS,
         }
     }
@@ -54,13 +52,16 @@ pub fn inspect_design_region(
         .pool
         .object_by_id(root)
         .ok_or(AiToolError::ObjectNotFound(request.root_id))?;
-    let dimension = |name| {
+    let dimension = |name: PropertyKey| {
         get_object_property(object, name)
             .ok()
             .and_then(|v| v.as_f64())
             .unwrap_or(state.mask_size as f64)
     };
-    let (width, height) = (dimension("width"), dimension("height"));
+    let (width, height) = (
+        dimension(PropertyKey::Width),
+        dimension(PropertyKey::Height),
+    );
     let (x0, y0, x1, y1) = match request.region {
         Region::Top => (0., 0., width, height / 2.),
         Region::Bottom => (0., height / 2., width, height),
@@ -110,51 +111,37 @@ pub fn inspect_design_region(
             continue;
         }
         let mut style = json!({});
-        for name in [
-            "background_colour",
-            "border_colour",
-            "transparency_colour",
-            "justification",
-            "options",
-            "horizontal_justification",
-            "vertical_justification",
+        for property in [
+            PropertyKey::BackgroundColour,
+            PropertyKey::BorderColour,
+            PropertyKey::TransparencyColour,
+            PropertyKey::Justification,
+            PropertyKey::Options,
         ] {
-            if let Ok(v) = get_object_property(object, name) {
+            let name = property.as_str();
+            if let Ok(v) = get_object_property(object, property) {
                 style[name] =
-                    super::visual_intent::enrich(&state.pool, object.object_type(), name, v);
+                    super::visual_intent::enrich(&state.pool, object.object_type(), property, v);
             }
         }
         let mut refs = json!({});
-        for name in [
-            "font_attributes",
-            "fill_attributes",
-            "line_attributes",
-            "variable_reference",
+        for property in [
+            PropertyKey::FontAttributes,
+            PropertyKey::FillAttributes,
+            PropertyKey::LineAttributes,
+            PropertyKey::VariableReference,
         ] {
-            if let Ok(v) = get_object_property(object, name) {
-                if let Ok(id) =
-                    serde_json::from_value::<ag_iso_stack::object_pool::NullableObjectId>(v)
-                {
-                    refs[name] = json!(id.0.map(|id| id.value()));
-                    if name != "variable_reference" {
-                        if let Some(attribute) = id.0.and_then(|id| state.pool.object_by_id(id)) {
-                            let mut resolved = json!({});
-                            for d in crate::object_properties::get_property_descriptors(
-                                attribute.object_type(),
-                            ) {
-                                if let Ok(v) = get_object_property(attribute, d.name) {
-                                    if v.to_string().len() <= 256 {
-                                        resolved[d.name] = super::visual_intent::enrich(
-                                            &state.pool,
-                                            attribute.object_type(),
-                                            d.name,
-                                            v,
-                                        );
-                                    }
-                                }
-                            }
-                            style[name] = resolved;
-                        }
+            let name = property.as_str();
+            let Ok(v) = get_object_property(object, property) else {
+                continue;
+            };
+            if let Ok(id) = serde_json::from_value::<ag_iso_stack::object_pool::NullableObjectId>(v)
+            {
+                refs[name] = json!(id.0.map(|id| id.value()));
+                if property != PropertyKey::VariableReference {
+                    if let Some(attribute) = id.0.and_then(|id| state.pool.object_by_id(id)) {
+                        style[name] =
+                            super::visual_intent::property_style(&state.pool, attribute, Some(256));
                     }
                 }
             }

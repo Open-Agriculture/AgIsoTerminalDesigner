@@ -31,7 +31,7 @@ pub enum ComponentIntent {
     SetComponentMasterProperty {
         component_id: ComponentId,
         node_id: ComponentNodeId,
-        property: String,
+        property: crate::object_properties::PropertyKey,
         value: Value,
         scope: ComponentMasterScope,
     },
@@ -93,11 +93,10 @@ impl ComponentService {
                                 ComponentError::new("COMPONENT_NODE_INVALID", "Unknown master node")
                             })?;
                         node.properties.insert(property.clone(), value.clone());
-                        for parameter in definition
-                            .parameters
-                            .iter_mut()
-                            .filter(|p| p.target_node == *node_id && p.property == *property)
-                        {
+                        for parameter in definition.parameters.iter_mut().filter(|p| {
+                            p.target_node == *node_id
+                                && p.property == ComponentParameterTarget::Property(*property)
+                        }) {
                             parameter.default_value = value.clone();
                         }
                         definition.revision += 1;

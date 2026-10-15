@@ -4,9 +4,9 @@ use ag_iso_stack::object_pool::object::Object;
 use ag_iso_stack::object_pool::object_attributes::Event;
 use ag_iso_stack::object_pool::{ObjectId, ObjectPool, ObjectType};
 use ag_iso_terminal_designer::{
-    default_object, ChildPlacement, MacroReferenceTarget, ObjectInfo, ObjectTarget,
-    ObjectTargetList, Operation, OperationError, OperationExecutor, OperationTransaction,
-    CURRENT_OPERATION_SCHEMA_VERSION,
+    default_object, object_properties::PropertyKey, ChildPlacement, MacroReferenceTarget,
+    ObjectInfo, ObjectTarget, ObjectTargetList, Operation, OperationError, OperationExecutor,
+    OperationTransaction, CURRENT_OPERATION_SCHEMA_VERSION,
 };
 use serde_json::json;
 
@@ -57,6 +57,10 @@ fn schema_v2_json_uses_only_object_shaped_targets() {
             ..
         }
     ));
+    assert_eq!(
+        serde_json::to_value(&transaction.operations[1]).unwrap()["data"]["property"],
+        "value"
+    );
     assert!(serde_json::from_value::<Operation>(json!({
         "type": "RestoreObject",
         "data": { "object": {}, "info": null }
@@ -80,17 +84,17 @@ fn same_transaction_creation_resolves_names_and_builds_layout() {
         },
         Operation::SetProperty {
             object: name("Actual Rate"),
-            property: "width".into(),
+            property: PropertyKey::Width,
             value: json!(120),
         },
         Operation::SetProperty {
             object: name("Actual Rate"),
-            property: "height".into(),
+            property: PropertyKey::Height,
             value: json!(40),
         },
         Operation::SetObjectReference {
             object: name("Actual Rate"),
-            property: "variable_reference".into(),
+            property: PropertyKey::VariableReference,
             reference: Some(name("Rate Variable")),
         },
         Operation::AddChild {
@@ -115,15 +119,19 @@ fn same_transaction_creation_resolves_names_and_builds_layout() {
         .find_map(|(id, info)| (info.name.as_deref() == Some("Actual Rate")).then_some(*id))
         .unwrap();
     assert_eq!(
-        ag_iso_terminal_designer::object_properties::get_property(&changed, output_id, "width")
-            .unwrap(),
+        ag_iso_terminal_designer::object_properties::get_property(
+            &changed,
+            output_id,
+            PropertyKey::Width
+        )
+        .unwrap(),
         json!(120)
     );
     assert_eq!(
         ag_iso_terminal_designer::object_properties::get_property(
             &changed,
             output_id,
-            "variable_reference"
+            PropertyKey::VariableReference
         )
         .unwrap(),
         serde_json::to_value(rate_id).unwrap()
@@ -160,7 +168,7 @@ fn unknown_and_ambiguous_names_fail_atomically() {
     let mut tx = OperationTransaction::new(None);
     tx.add_operation(Operation::SetProperty {
         object: name("Future Object"),
-        property: "width".into(),
+        property: PropertyKey::Width,
         value: json!(100),
     });
     tx.add_operation(Operation::CreateObject {
@@ -180,7 +188,7 @@ fn unknown_and_ambiguous_names_fail_atomically() {
     let mut tx = OperationTransaction::new(None);
     tx.add_operation(Operation::SetProperty {
         object: name("Existing"),
-        property: "width".into(),
+        property: PropertyKey::Width,
         value: json!(1),
     });
     assert!(
@@ -223,22 +231,22 @@ fn reference_operations_enforce_property_semantics_and_target_type() {
     let cases = [
         Operation::SetProperty {
             object: name("Output"),
-            property: "variable_reference".into(),
+            property: PropertyKey::VariableReference,
             value: json!(11),
         },
         Operation::SetObjectReference {
             object: name("Output"),
-            property: "width".into(),
+            property: PropertyKey::Width,
             reference: Some(name("Number")),
         },
         Operation::SetObjectReference {
             object: name("Output"),
-            property: "variable_reference".into(),
+            property: PropertyKey::VariableReference,
             reference: Some(name("String")),
         },
         Operation::SetObjectReference {
             object: name("Output"),
-            property: "variable_reference".into(),
+            property: PropertyKey::VariableReference,
             reference: Some(name("Missing")),
         },
     ];
@@ -251,7 +259,7 @@ fn reference_operations_enforce_property_semantics_and_target_type() {
     let mut valid = OperationTransaction::new(None);
     valid.add_operation(Operation::SetObjectReference {
         object: ObjectTarget::id(10),
-        property: "variable_reference".into(),
+        property: PropertyKey::VariableReference,
         reference: Some(name("Number")),
     });
     let (changed, changed_infos, applied) = OperationExecutor::new()
@@ -260,7 +268,7 @@ fn reference_operations_enforce_property_semantics_and_target_type() {
     let mut clear = OperationTransaction::new(None);
     clear.add_operation(Operation::SetObjectReference {
         object: name("Output"),
-        property: "variable_reference".into(),
+        property: PropertyKey::VariableReference,
         reference: None,
     });
     assert!(OperationExecutor::new()

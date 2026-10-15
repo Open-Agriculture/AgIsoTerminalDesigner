@@ -11,13 +11,194 @@
 //! use Object::serialize/deserialize directly via Serde.
 
 use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool, ObjectType};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// A recognized property name shared by editing, validation, and serialization.
+///
+/// This single registry defines the enum, stable JSON spellings, parser, and
+/// lexical ordering used by property maps and pagination.
+macro_rules! property_keys {
+    ($( $variant:ident => $spelling:literal ),* $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum PropertyKey {
+            $(#[serde(rename = $spelling)] $variant,)*
+        }
+
+        impl PropertyKey {
+            /// Return the stable JSON spelling of this property.
+            pub const fn as_str(self) -> &'static str {
+                match self { $(Self::$variant => $spelling,)* }
+            }
+
+            /// Parse an existing serialized property spelling.
+            pub fn parse(value: &str) -> Option<Self> {
+                match value { $($spelling => Some(Self::$variant),)* _ => None }
+            }
+        }
+
+        impl std::fmt::Display for PropertyKey {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for PropertyKey {
+            type Err = UnknownPropertyKey;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::parse(value).ok_or_else(|| UnknownPropertyKey(value.to_owned()))
+            }
+        }
+
+        impl PartialOrd for PropertyKey {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl Ord for PropertyKey {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.as_str().cmp(other.as_str())
+            }
+        }
+    };
+}
+
+property_keys! {
+    AcousticSignal => "acoustic_signal",
+    ActiveMask => "active_mask",
+    ActualHeight => "actual_height",
+    ActualWidth => "actual_width",
+    ArcAndTickColour => "arc_and_tick_colour",
+    AuxiliaryObjectId => "auxiliary_object_id",
+    BackgroundColour => "background_colour",
+    BarGraphWidth => "bar_graph_width",
+    BorderColour => "border_colour",
+    CanvasHeight => "canvas_height",
+    CanvasWidth => "canvas_width",
+    CellFormat => "cell_format",
+    CodePlanes => "code_planes",
+    Colour => "colour",
+    ColourMap => "colour_map",
+    Colours => "colours",
+    Commands => "commands",
+    Data => "data",
+    DefaultChildIndex => "default_child_index",
+    DefaultObjectId => "default_object_id",
+    EllipseType => "ellipse_type",
+    Enabled => "enabled",
+    EndAngle => "end_angle",
+    ExternalObjectId => "external_object_id",
+    ExternalReferenceNameId => "external_reference_name_id",
+    FillAttributes => "fill_attributes",
+    FillAttributesObject => "fill_attributes_object",
+    FillColour => "fill_colour",
+    FillPattern => "fill_pattern",
+    FillType => "fill_type",
+    FirstChildIndex => "first_child_index",
+    FontAttributes => "font_attributes",
+    FontAttributesObject => "font_attributes_object",
+    FontColour => "font_colour",
+    FontSize => "font_size",
+    FontStyle => "font_style",
+    FontType => "font_type",
+    ForegroundColour => "foreground_colour",
+    Format => "format",
+    FunctionAttributes => "function_attributes",
+    FunctionType => "function_type",
+    GraphicsCursorX => "graphics_cursor_x",
+    GraphicsCursorY => "graphics_cursor_y",
+    Height => "height",
+    Hidden => "hidden",
+    IdOfColourMap => "id_of_colour_map",
+    IdOfColourPalette => "id_of_colour_palette",
+    InputAttributes => "input_attributes",
+    InputId => "input_id",
+    Justification => "justification",
+    KeyCode => "key_code",
+    KeyGroupIcon => "key_group_icon",
+    LanguageCodes => "language_codes",
+    LanguagePairs => "language_pairs",
+    LastChildIndex => "last_child_index",
+    LineArt => "line_art",
+    LineAttributes => "line_attributes",
+    LineAttributesObject => "line_attributes_object",
+    LineColour => "line_colour",
+    LineDirection => "line_direction",
+    LineSuppression => "line_suppression",
+    LineWidth => "line_width",
+    MaxValue => "max_value",
+    MinValue => "min_value",
+    Mode => "mode",
+    Name => "name",
+    NeedleColour => "needle_colour",
+    NrOfDecimals => "nr_of_decimals",
+    NrOfTicks => "nr_of_ticks",
+    Offset => "offset",
+    Options => "options",
+    Options2 => "options2",
+    PointerType => "pointer_type",
+    Points => "points",
+    PolygonType => "polygon_type",
+    Priority => "priority",
+    RefreshInterval => "refresh_interval",
+    Scale => "scale",
+    ScaleType => "scale_type",
+    Selectable => "selectable",
+    SoftKeyMask => "soft_key_mask",
+    StartAngle => "start_angle",
+    TargetLineColour => "target_line_colour",
+    TargetValue => "target_value",
+    TargetValueVariableReference => "target_value_variable_reference",
+    TransparencyColour => "transparency_colour",
+    ValidationString => "validation_string",
+    ValidationType => "validation_type",
+    Value => "value",
+    VariableReference => "variable_reference",
+    ViewportHeight => "viewport_height",
+    ViewportWidth => "viewport_width",
+    ViewportX => "viewport_x",
+    ViewportY => "viewport_y",
+    ViewportZoom => "viewport_zoom",
+    Width => "width",
+    WindowIcon => "window_icon",
+    WindowTitle => "window_title",
+    WindowType => "window_type",
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownPropertyKey(pub String);
+
+impl std::fmt::Display for UnknownPropertyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Unknown property key: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownPropertyKey {}
+
+/// An editor control target. Structural controls are not ordinary properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorTarget {
+    Property(PropertyKey),
+    MacroRefs,
+}
+
+impl EditorTarget {
+    pub const fn property(self) -> Option<PropertyKey> {
+        match self {
+            Self::Property(key) => Some(key),
+            Self::MacroRefs => None,
+        }
+    }
+}
+
 /// Property metadata for UI and validation
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PropertyDescriptor {
-    pub name: &'static str,
+    pub name: PropertyKey,
     pub writable: bool,
     pub semantic: PropertySemantic,
     pub valid_range: Option<(Value, Value)>,
@@ -32,7 +213,7 @@ pub struct PropertyDescriptor {
 /// declared only for object types that use the generic renderer.
 #[derive(Debug, Clone, Copy)]
 pub struct PropertyEditorDescriptor {
-    pub property: &'static str,
+    pub property: EditorTarget,
     pub editor: EditorKind,
 }
 
@@ -58,14 +239,14 @@ pub fn property_editor_descriptors(object_type: ObjectType) -> Vec<PropertyEdito
         .into_iter()
         .filter(|descriptor| descriptor.writable)
         .map(|descriptor| PropertyEditorDescriptor {
-            property: descriptor.name,
+            property: EditorTarget::Property(descriptor.name),
             editor: editor_override(object_type, descriptor.name)
                 .unwrap_or_else(|| default_editor(&descriptor.semantic)),
         })
         .collect();
     if supports_macro_references(object_type) {
         descriptors.push(PropertyEditorDescriptor {
-            property: "macro_refs",
+            property: EditorTarget::MacroRefs,
             editor: EditorKind::MacroReferences,
         });
     }
@@ -84,18 +265,21 @@ fn default_editor(semantic: &PropertySemantic) -> EditorKind {
 }
 
 /// Widgets whose presentation cannot be determined from their semantic alone.
-fn editor_override(object_type: ObjectType, property: &str) -> Option<EditorKind> {
+fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<EditorKind> {
     match (object_type, property) {
         // These upstream fields are raw bytes, not Rust enums. Keep their numeric
         // editor explicit until the stack exposes typed variants.
-        (ObjectType::AuxiliaryFunctionType1 | ObjectType::AuxiliaryInputType1, "function_type")
-        | (ObjectType::AuxiliaryControlDesignatorType2, "pointer_type")
-        | (ObjectType::OutputEllipse, "ellipse_type")
-        | (ObjectType::OutputPolygon, "polygon_type")
-        | (ObjectType::FillAttributes, "fill_type")
-        | (ObjectType::GraphicData, "format")
-        | (ObjectType::ScaledGraphic, "scale_type") => Some(EditorKind::Auto),
-        (_, "justification") => Some(EditorKind::Justification),
+        (
+            ObjectType::AuxiliaryFunctionType1 | ObjectType::AuxiliaryInputType1,
+            PropertyKey::FunctionType,
+        )
+        | (ObjectType::AuxiliaryControlDesignatorType2, PropertyKey::PointerType)
+        | (ObjectType::OutputEllipse, PropertyKey::EllipseType)
+        | (ObjectType::OutputPolygon, PropertyKey::PolygonType)
+        | (ObjectType::FillAttributes, PropertyKey::FillType)
+        | (ObjectType::GraphicData, PropertyKey::Format)
+        | (ObjectType::ScaledGraphic, PropertyKey::ScaleType) => Some(EditorKind::Auto),
+        (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }
 }
@@ -137,7 +321,7 @@ fn supports_macro_references(object_type: ObjectType) -> bool {
 }
 
 /// Meaning that cannot be recovered reliably from a property's JSON value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum PropertySemantic {
     Normal,
     Colour,
@@ -150,10 +334,10 @@ pub enum PropertySemantic {
 /// Pool-level dispatcher converts this to PropertyError with object_id
 #[derive(Debug, Clone)]
 pub enum PropertyAccessError {
-    PropertyNotFound(String),
+    PropertyNotFound(PropertyKey),
     UnsupportedObjectType,
     InvalidValue {
-        property: &'static str,
+        property: PropertyKey,
         reason: String,
     },
 }
@@ -179,7 +363,7 @@ pub enum PropertyError {
     ObjectNotFound(ObjectId),
     PropertyNotFound {
         object_id: ObjectId,
-        property: String,
+        property: PropertyKey,
     },
     UnsupportedObjectType {
         object_id: ObjectId,
@@ -187,11 +371,11 @@ pub enum PropertyError {
     },
     InvalidValue {
         object_id: ObjectId,
-        property: String,
+        property: PropertyKey,
         reason: String,
     },
     OutOfRange {
-        property: String,
+        property: PropertyKey,
         value: String,
         min: String,
         max: String,
@@ -209,7 +393,7 @@ impl std::fmt::Display for PropertyError {
             Self::PropertyNotFound { property, .. } => write!(
                 f,
                 "The {} property does not exist on this object.",
-                property.replace('_', " ")
+                property.as_str().replace('_', " ")
             ),
             Self::UnsupportedObjectType { object_type, .. } => write!(
                 f,
@@ -218,13 +402,18 @@ impl std::fmt::Display for PropertyError {
             Self::InvalidValue {
                 property, reason, ..
             } => {
-                if property == "active_mask" && reason == "invalid type: null, expected u16" {
+                if *property == PropertyKey::ActiveMask
+                    && reason == "invalid type: null, expected u16"
+                {
                     write!(
                         f,
                         "An active mask is required. Select a mask instead of clearing this value."
                     )
                 } else if reason == "invalid type: null, expected u16" {
-                    write!(f, "A value is required. Enter a whole number between 0 and 65535, or select an object if this is a reference.")
+                    write!(
+                        f,
+                        "A value is required. Enter a whole number between 0 and 65535, or select an object if this is a reference."
+                    )
                 } else {
                     write!(f, "Invalid value: {reason}")
                 }
@@ -245,30 +434,19 @@ impl std::fmt::Display for PropertyError {
 /// Implementations are generated via impl_properties! macro
 pub trait PropertyAccess {
     /// Get a property value as JSON
-    fn get_property(&self, property: &str) -> Result<Value, PropertyAccessError>;
+    fn get_property(&self, property: PropertyKey) -> Result<Value, PropertyAccessError>;
 
     /// Set a property to a new value, returning the old value
-    fn set_property(&mut self, property: &str, value: Value) -> Result<Value, PropertyAccessError>;
+    fn set_property(
+        &mut self,
+        property: PropertyKey,
+        value: Value,
+    ) -> Result<Value, PropertyAccessError>;
 
     /// Get all property descriptors for this object
     fn property_descriptors() -> Vec<PropertyDescriptor>;
 }
 
-/// Macro to generate PropertyAccess implementations for object types.
-/// Takes field names plus optional semantic metadata; Serde handles Rust types.
-///
-/// Example:
-/// ```ignore
-/// impl_properties! {
-///     Button {
-///         width,
-///         height,
-///         background_colour => PropertySemantic::Colour,
-///         border_colour => PropertySemantic::Colour,
-///         key_code,
-///     }
-/// }
-/// ```
 macro_rules! property_semantic {
     () => {
         PropertySemantic::Normal
@@ -367,49 +545,64 @@ fn enum_unit_choices<T: serde::de::DeserializeOwned>() -> Vec<Value> {
         .collect()
 }
 
+/// Macro to generate PropertyAccess implementations for object types.
+/// Maps typed keys to upstream fields with optional semantic metadata; Serde handles Rust types.
+///
+/// Example:
+/// ```ignore
+/// impl_properties! {
+///     Button {
+///         Width: width,
+///         Height: height,
+///         BackgroundColour: background_colour => PropertySemantic::Colour,
+///         BorderColour: border_colour => PropertySemantic::Colour,
+///         KeyCode: key_code,
+///     }
+/// }
+/// ```
 macro_rules! impl_properties {
     (
         $type:ty {
-            $( $field:ident $(=> $semantic:expr)? ),* $(,)?
+            $( $key:ident : $field:ident $(=> $semantic:expr)? ),* $(,)?
         }
     ) => {
         impl PropertyAccess for $type {
-            fn get_property(&self, property: &str) -> Result<Value, PropertyAccessError> {
+            fn get_property(&self, property: PropertyKey) -> Result<Value, PropertyAccessError> {
                 match property {
                     $(
-                        stringify!($field) => {
+                        PropertyKey::$key => {
                             serde_json::to_value(&self.$field)
                                 .map_err(|e| PropertyAccessError::InvalidValue {
-                                    property: stringify!($field),
+                                    property: PropertyKey::$key,
                                     reason: e.to_string(),
                                 })
                         }
                     )*
-                    _ => Err(PropertyAccessError::PropertyNotFound(property.to_string())),
+                    _ => Err(PropertyAccessError::PropertyNotFound(property)),
                 }
             }
 
             #[allow(unused_variables)]
-            fn set_property(&mut self, property: &str, value: Value) -> Result<Value, PropertyAccessError> {
+            fn set_property(&mut self, property: PropertyKey, value: Value) -> Result<Value, PropertyAccessError> {
                 match property {
                     $(
-                        stringify!($field) => {
+                        PropertyKey::$key => {
                             let old = serde_json::to_value(&self.$field)
                                 .map_err(|e| PropertyAccessError::InvalidValue {
-                                    property: stringify!($field),
+                                    property: PropertyKey::$key,
                                     reason: e.to_string(),
                                 })?;
 
                             self.$field = serde_json::from_value(value)
                                 .map_err(|e| PropertyAccessError::InvalidValue {
-                                    property: stringify!($field),
+                                    property: PropertyKey::$key,
                                     reason: e.to_string(),
                                 })?;
 
                             Ok(old)
                         }
                     )*
-                    _ => Err(PropertyAccessError::PropertyNotFound(property.to_string())),
+                    _ => Err(PropertyAccessError::PropertyNotFound(property)),
                 }
             }
 
@@ -425,7 +618,7 @@ macro_rules! impl_properties {
                                 semantic
                             };
                             PropertyDescriptor {
-                                name: stringify!($field),
+                                name: PropertyKey::$key,
                                 writable: true,
                                 semantic,
                                 valid_range: None,
@@ -442,475 +635,426 @@ macro_rules! impl_properties {
 // Identity, child placement/reference collections, and macro references are
 // deliberately managed by their dedicated operations rather than SetProperty.
 impl_properties! {
-    ag_iso_stack::object_pool::object::WorkingSet {
-        background_colour => PropertySemantic::Colour,
-        selectable,
-        active_mask => object_reference!(DataMask, AlarmMask),
-        language_codes
-    }
-}
+ag_iso_stack::object_pool::object::WorkingSet {
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    Selectable: selectable,
+    ActiveMask: active_mask => object_reference!(DataMask, AlarmMask),
+    LanguageCodes: language_codes
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::DataMask {
-        background_colour => PropertySemantic::Colour,
-        soft_key_mask => object_reference!(SoftKeyMask)
-    }
-}
+ag_iso_stack::object_pool::object::DataMask {
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    SoftKeyMask: soft_key_mask => object_reference!(SoftKeyMask)
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::AlarmMask {
-        background_colour => PropertySemantic::Colour,
-        soft_key_mask => object_reference!(SoftKeyMask),
-        priority,
-        acoustic_signal
-    }
-}
+ag_iso_stack::object_pool::object::AlarmMask {
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    SoftKeyMask: soft_key_mask => object_reference!(SoftKeyMask),
+    Priority: priority,
+    AcousticSignal: acoustic_signal
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::Container {
-        width,
-        height,
-        hidden
-    }
-}
+ag_iso_stack::object_pool::object::Container {
+    Width: width,
+    Height: height,
+    Hidden: hidden
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::SoftKeyMask {
-        background_colour => PropertySemantic::Colour
-    }
-}
+ag_iso_stack::object_pool::object::SoftKeyMask {
+    BackgroundColour: background_colour => PropertySemantic::Colour
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::Key {
-        background_colour => PropertySemantic::Colour,
-        key_code
-    }
-}
+ag_iso_stack::object_pool::object::Key {
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    KeyCode: key_code
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::Button {
-        width,
-        height,
-        background_colour => PropertySemantic::Colour,
-        border_colour => PropertySemantic::Colour,
-        key_code,
-        options => PropertySemantic::Bitflags
-    }
-}
+ag_iso_stack::object_pool::object::Button {
+    Width: width,
+    Height: height,
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    BorderColour: border_colour => PropertySemantic::Colour,
+    KeyCode: key_code,
+    Options: options => PropertySemantic::Bitflags
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::InputBoolean {
-        background_colour => PropertySemantic::Colour,
-        width,
-        foreground_colour => object_reference!(FontAttributes),
-        variable_reference => object_reference!(NumberVariable),
-        value,
-        enabled
-    }
-}
+ag_iso_stack::object_pool::object::InputBoolean {
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    Width: width,
+    ForegroundColour: foreground_colour => object_reference!(FontAttributes),
+    VariableReference: variable_reference => object_reference!(NumberVariable),
+    Value: value,
+    Enabled: enabled
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::InputString {
-        width,
-        height,
-        background_colour => PropertySemantic::Colour,
-        font_attributes => object_reference!(FontAttributes),
-        input_attributes => object_reference!(InputAttributes),
-        options => PropertySemantic::Bitflags,
-        variable_reference => object_reference!(StringVariable),
-        value,
-        justification,
-        enabled
-    }
-}
+ag_iso_stack::object_pool::object::InputString {
+    Width: width,
+    Height: height,
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    FontAttributes: font_attributes => object_reference!(FontAttributes),
+    InputAttributes: input_attributes => object_reference!(InputAttributes),
+    Options: options => PropertySemantic::Bitflags,
+    VariableReference: variable_reference => object_reference!(StringVariable),
+    Value: value,
+    Justification: justification,
+    Enabled: enabled
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::InputNumber {
-        width,
-        height,
-        background_colour => PropertySemantic::Colour,
-        font_attributes => object_reference!(FontAttributes),
-        options => PropertySemantic::Bitflags,
-        variable_reference => object_reference!(NumberVariable),
-        value,
-        min_value,
-        max_value,
-        offset,
-        scale,
-        nr_of_decimals,
-        format => PropertySemantic::Enum,
-        justification,
-        options2 => PropertySemantic::Bitflags
-    }
-}
+ag_iso_stack::object_pool::object::InputNumber {
+    Width: width,
+    Height: height,
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    FontAttributes: font_attributes => object_reference!(FontAttributes),
+    Options: options => PropertySemantic::Bitflags,
+    VariableReference: variable_reference => object_reference!(NumberVariable),
+    Value: value,
+    MinValue: min_value,
+    MaxValue: max_value,
+    Offset: offset,
+    Scale: scale,
+    NrOfDecimals: nr_of_decimals,
+    Format: format => PropertySemantic::Enum,
+    Justification: justification,
+    Options2: options2 => PropertySemantic::Bitflags
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::InputList {
-        width,
-        height,
-        variable_reference => object_reference!(NumberVariable),
-        value,
-        options => PropertySemantic::Bitflags
-    }
-}
+ag_iso_stack::object_pool::object::InputList {
+    Width: width,
+    Height: height,
+    VariableReference: variable_reference => object_reference!(NumberVariable),
+    Value: value,
+    Options: options => PropertySemantic::Bitflags
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::OutputString {
-        width,
-        height,
-        background_colour => PropertySemantic::Colour,
-        font_attributes => object_reference!(FontAttributes),
-        options => PropertySemantic::Bitflags,
-        variable_reference => object_reference!(StringVariable),
-        justification,
-        value
-    }
-}
+ag_iso_stack::object_pool::object::OutputString {
+    Width: width,
+    Height: height,
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    FontAttributes: font_attributes => object_reference!(FontAttributes),
+    Options: options => PropertySemantic::Bitflags,
+    VariableReference: variable_reference => object_reference!(StringVariable),
+    Justification: justification,
+    Value: value
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::OutputNumber {
-        width,
-        height,
-        background_colour => PropertySemantic::Colour,
-        font_attributes => object_reference!(FontAttributes),
-        options => PropertySemantic::Bitflags,
-        variable_reference => object_reference!(NumberVariable),
-        value,
-        offset,
-        scale,
-        nr_of_decimals,
-        format => PropertySemantic::Enum,
-        justification
-    }
-}
+ag_iso_stack::object_pool::object::OutputNumber {
+    Width: width,
+    Height: height,
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    FontAttributes: font_attributes => object_reference!(FontAttributes),
+    Options: options => PropertySemantic::Bitflags,
+    VariableReference: variable_reference => object_reference!(NumberVariable),
+    Value: value,
+    Offset: offset,
+    Scale: scale,
+    NrOfDecimals: nr_of_decimals,
+    Format: format => PropertySemantic::Enum,
+    Justification: justification
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::OutputList {
-        width,
-        height,
-        variable_reference => object_reference!(NumberVariable),
-        value
-    }
-}
+ag_iso_stack::object_pool::object::OutputList {
+    Width: width,
+    Height: height,
+    VariableReference: variable_reference => object_reference!(NumberVariable),
+    Value: value
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::OutputLine {
-        line_attributes => object_reference!(LineAttributes),
-        width,
-        height,
-        line_direction => PropertySemantic::Enum
-    }
-}
+ag_iso_stack::object_pool::object::OutputLine {
+    LineAttributes: line_attributes => object_reference!(LineAttributes),
+    Width: width,
+    Height: height,
+    LineDirection: line_direction => PropertySemantic::Enum
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::OutputRectangle {
-        line_attributes => object_reference!(LineAttributes),
-        width,
-        height,
-        line_suppression => PropertySemantic::Bitflags,
-        fill_attributes => object_reference!(FillAttributes)
-    }
-}
+ag_iso_stack::object_pool::object::OutputRectangle {
+    LineAttributes: line_attributes => object_reference!(LineAttributes),
+    Width: width,
+    Height: height,
+    LineSuppression: line_suppression => PropertySemantic::Bitflags,
+    FillAttributes: fill_attributes => object_reference!(FillAttributes)
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::OutputEllipse {
-        line_attributes => object_reference!(LineAttributes),
-        width,
-        height,
-        ellipse_type => PropertySemantic::Enum,
-        start_angle,
-        end_angle,
-        fill_attributes => object_reference!(FillAttributes)
-    }
-}
+ag_iso_stack::object_pool::object::OutputEllipse {
+    LineAttributes: line_attributes => object_reference!(LineAttributes),
+    Width: width,
+    Height: height,
+    EllipseType: ellipse_type => PropertySemantic::Enum,
+    StartAngle: start_angle,
+    EndAngle: end_angle,
+    FillAttributes: fill_attributes => object_reference!(FillAttributes)
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::OutputPolygon {
-        width,
-        height,
-        line_attributes => object_reference!(LineAttributes),
-        fill_attributes => object_reference!(FillAttributes),
-        polygon_type => PropertySemantic::Enum,
-        points
-    }
-}
+ag_iso_stack::object_pool::object::OutputPolygon {
+    Width: width,
+    Height: height,
+    LineAttributes: line_attributes => object_reference!(LineAttributes),
+    FillAttributes: fill_attributes => object_reference!(FillAttributes),
+    PolygonType: polygon_type => PropertySemantic::Enum,
+    Points: points
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::OutputMeter {
-        width,
-        needle_colour => PropertySemantic::Colour,
-        border_colour => PropertySemantic::Colour,
-        arc_and_tick_colour => PropertySemantic::Colour,
-        options => PropertySemantic::Bitflags,
-        nr_of_ticks,
-        start_angle,
-        end_angle,
-        min_value,
-        max_value,
-        variable_reference => object_reference!(NumberVariable),
-        value
-    }
-}
+ag_iso_stack::object_pool::object::OutputMeter {
+    Width: width,
+    NeedleColour: needle_colour => PropertySemantic::Colour,
+    BorderColour: border_colour => PropertySemantic::Colour,
+    ArcAndTickColour: arc_and_tick_colour => PropertySemantic::Colour,
+    Options: options => PropertySemantic::Bitflags,
+    NrOfTicks: nr_of_ticks,
+    StartAngle: start_angle,
+    EndAngle: end_angle,
+    MinValue: min_value,
+    MaxValue: max_value,
+    VariableReference: variable_reference => object_reference!(NumberVariable),
+    Value: value
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::OutputLinearBarGraph {
-        width,
-        height,
-        colour => PropertySemantic::Colour,
-        target_line_colour => PropertySemantic::Colour,
-        options => PropertySemantic::Bitflags,
-        nr_of_ticks,
-        min_value,
-        max_value,
-        variable_reference => object_reference!(NumberVariable),
-        value,
-        target_value_variable_reference => object_reference!(NumberVariable),
-        target_value
-    }
-}
+ag_iso_stack::object_pool::object::OutputLinearBarGraph {
+    Width: width,
+    Height: height,
+    Colour: colour => PropertySemantic::Colour,
+    TargetLineColour: target_line_colour => PropertySemantic::Colour,
+    Options: options => PropertySemantic::Bitflags,
+    NrOfTicks: nr_of_ticks,
+    MinValue: min_value,
+    MaxValue: max_value,
+    VariableReference: variable_reference => object_reference!(NumberVariable),
+    Value: value,
+    TargetValueVariableReference: target_value_variable_reference => object_reference!(NumberVariable),
+    TargetValue: target_value
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::OutputArchedBarGraph {
-        width,
-        height,
-        colour => PropertySemantic::Colour,
-        target_line_colour => PropertySemantic::Colour,
-        options => PropertySemantic::Bitflags,
-        start_angle,
-        end_angle,
-        bar_graph_width,
-        min_value,
-        max_value,
-        variable_reference => object_reference!(NumberVariable),
-        value,
-        target_value_variable_reference => object_reference!(NumberVariable),
-        target_value
-    }
-}
+ag_iso_stack::object_pool::object::OutputArchedBarGraph {
+    Width: width,
+    Height: height,
+    Colour: colour => PropertySemantic::Colour,
+    TargetLineColour: target_line_colour => PropertySemantic::Colour,
+    Options: options => PropertySemantic::Bitflags,
+    StartAngle: start_angle,
+    EndAngle: end_angle,
+    BarGraphWidth: bar_graph_width,
+    MinValue: min_value,
+    MaxValue: max_value,
+    VariableReference: variable_reference => object_reference!(NumberVariable),
+    Value: value,
+    TargetValueVariableReference: target_value_variable_reference => object_reference!(NumberVariable),
+    TargetValue: target_value
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::PictureGraphic {
-        width,
-        actual_width,
-        actual_height,
-        format => PropertySemantic::Enum,
-        options => PropertySemantic::Bitflags,
-        transparency_colour => PropertySemantic::Colour,
-        data
-    }
-}
+ag_iso_stack::object_pool::object::PictureGraphic {
+    Width: width,
+    ActualWidth: actual_width,
+    ActualHeight: actual_height,
+    Format: format => PropertySemantic::Enum,
+    Options: options => PropertySemantic::Bitflags,
+    TransparencyColour: transparency_colour => PropertySemantic::Colour,
+    Data: data
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::NumberVariable { value }
-}
+ag_iso_stack::object_pool::object::NumberVariable { Value: value }}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::StringVariable { value }
-}
+ag_iso_stack::object_pool::object::StringVariable { Value: value }}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::FontAttributes {
-        font_colour => PropertySemantic::Colour,
-        font_size => PropertySemantic::Enum,
-        font_type => PropertySemantic::Enum,
-        font_style => PropertySemantic::Bitflags
-    }
-}
+ag_iso_stack::object_pool::object::FontAttributes {
+    FontColour: font_colour => PropertySemantic::Colour,
+    FontSize: font_size => PropertySemantic::Enum,
+    FontType: font_type => PropertySemantic::Enum,
+    FontStyle: font_style => PropertySemantic::Bitflags
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::LineAttributes {
-        line_colour => PropertySemantic::Colour,
-        line_width,
-        line_art => PropertySemantic::Bitflags
-    }
-}
+ag_iso_stack::object_pool::object::LineAttributes {
+    LineColour: line_colour => PropertySemantic::Colour,
+    LineWidth: line_width,
+    LineArt: line_art => PropertySemantic::Bitflags
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::FillAttributes {
-        fill_type => PropertySemantic::Enum,
-        fill_colour => PropertySemantic::Colour,
-        fill_pattern => object_reference!(PictureGraphic)
-    }
-}
+ag_iso_stack::object_pool::object::FillAttributes {
+    FillType: fill_type => PropertySemantic::Enum,
+    FillColour: fill_colour => PropertySemantic::Colour,
+    FillPattern: fill_pattern => object_reference!(PictureGraphic)
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::InputAttributes {
-        validation_type => PropertySemantic::Enum,
-        validation_string
-    }
-}
+ag_iso_stack::object_pool::object::InputAttributes {
+    ValidationType: validation_type => PropertySemantic::Enum,
+    ValidationString: validation_string
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::ObjectPointer {
-        value => object_reference!()
-    }
-}
+ag_iso_stack::object_pool::object::ObjectPointer {
+    Value: value => object_reference!()
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::Macro { commands }
-}
+ag_iso_stack::object_pool::object::Macro { Commands: commands }}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::AuxiliaryFunctionType1 {
-        background_colour => PropertySemantic::Colour,
-        function_type => PropertySemantic::Enum
-    }
-}
+ag_iso_stack::object_pool::object::AuxiliaryFunctionType1 {
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    FunctionType: function_type => PropertySemantic::Enum
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::AuxiliaryInputType1 {
-        background_colour => PropertySemantic::Colour,
-        function_type => PropertySemantic::Enum,
-        input_id
-    }
-}
+ag_iso_stack::object_pool::object::AuxiliaryInputType1 {
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    FunctionType: function_type => PropertySemantic::Enum,
+    InputId: input_id
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::AuxiliaryFunctionType2 {
-        background_colour => PropertySemantic::Colour,
-        function_attributes => PropertySemantic::Bitflags
-    }
-}
+ag_iso_stack::object_pool::object::AuxiliaryFunctionType2 {
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    FunctionAttributes: function_attributes => PropertySemantic::Bitflags
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::AuxiliaryInputType2 {
-        background_colour => PropertySemantic::Colour,
-        function_attributes => PropertySemantic::Bitflags
-    }
-}
+ag_iso_stack::object_pool::object::AuxiliaryInputType2 {
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    FunctionAttributes: function_attributes => PropertySemantic::Bitflags
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::AuxiliaryControlDesignatorType2 {
-        pointer_type => PropertySemantic::Enum,
-        auxiliary_object_id => object_reference!(AuxiliaryFunctionType2, AuxiliaryInputType2)
-    }
-}
+ag_iso_stack::object_pool::object::AuxiliaryControlDesignatorType2 {
+    PointerType: pointer_type => PropertySemantic::Enum,
+    AuxiliaryObjectId: auxiliary_object_id => object_reference!(AuxiliaryFunctionType2, AuxiliaryInputType2)
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::WindowMask {
-        cell_format => PropertySemantic::Enum,
-        window_type => PropertySemantic::Enum,
-        background_colour => PropertySemantic::Colour,
-        options => PropertySemantic::Bitflags,
-        name => object_reference!(OutputString),
-        window_title => object_reference!(OutputString),
-        window_icon => object_reference!(PictureGraphic)
-    }
-}
+ag_iso_stack::object_pool::object::WindowMask {
+    CellFormat: cell_format => PropertySemantic::Enum,
+    WindowType: window_type => PropertySemantic::Enum,
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    Options: options => PropertySemantic::Bitflags,
+    Name: name => object_reference!(OutputString),
+    WindowTitle: window_title => object_reference!(OutputString),
+    WindowIcon: window_icon => object_reference!(PictureGraphic)
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::KeyGroup {
-        options => PropertySemantic::Bitflags,
-        name => object_reference!(OutputString),
-        key_group_icon => object_reference!(PictureGraphic)
-    }
-}
+ag_iso_stack::object_pool::object::KeyGroup {
+    Options: options => PropertySemantic::Bitflags,
+    Name: name => object_reference!(OutputString),
+    KeyGroupIcon: key_group_icon => object_reference!(PictureGraphic)
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::GraphicsContext {
-        viewport_width,
-        viewport_height,
-        viewport_x,
-        viewport_y,
-        canvas_width,
-        canvas_height,
-        viewport_zoom,
-        graphics_cursor_x,
-        graphics_cursor_y,
-        foreground_colour => PropertySemantic::Colour,
-        background_colour => PropertySemantic::Colour,
-        font_attributes_object => object_reference!(FontAttributes),
-        line_attributes_object => object_reference!(LineAttributes),
-        fill_attributes_object => object_reference!(FillAttributes),
-        format => PropertySemantic::Enum,
-        options => PropertySemantic::Bitflags,
-        transparency_colour => PropertySemantic::Colour
-    }
-}
+ag_iso_stack::object_pool::object::GraphicsContext {
+    ViewportWidth: viewport_width,
+    ViewportHeight: viewport_height,
+    ViewportX: viewport_x,
+    ViewportY: viewport_y,
+    CanvasWidth: canvas_width,
+    CanvasHeight: canvas_height,
+    ViewportZoom: viewport_zoom,
+    GraphicsCursorX: graphics_cursor_x,
+    GraphicsCursorY: graphics_cursor_y,
+    ForegroundColour: foreground_colour => PropertySemantic::Colour,
+    BackgroundColour: background_colour => PropertySemantic::Colour,
+    FontAttributesObject: font_attributes_object => object_reference!(FontAttributes),
+    LineAttributesObject: line_attributes_object => object_reference!(LineAttributes),
+    FillAttributesObject: fill_attributes_object => object_reference!(FillAttributes),
+    Format: format => PropertySemantic::Enum,
+    Options: options => PropertySemantic::Bitflags,
+    TransparencyColour: transparency_colour => PropertySemantic::Colour
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::ExtendedInputAttributes {
-        validation_type => PropertySemantic::Enum,
-        code_planes
-    }
-}
+ag_iso_stack::object_pool::object::ExtendedInputAttributes {
+    ValidationType: validation_type => PropertySemantic::Enum,
+    CodePlanes: code_planes
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::ColourMap { colour_map }
-}
+ag_iso_stack::object_pool::object::ColourMap { ColourMap: colour_map }}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::ObjectLabelReferenceList {}
-}
+ag_iso_stack::object_pool::object::ObjectLabelReferenceList {}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::ExternalObjectDefinition {
-        options => PropertySemantic::Bitflags,
-        name
-    }
-}
+ag_iso_stack::object_pool::object::ExternalObjectDefinition {
+    Options: options => PropertySemantic::Bitflags,
+    Name: name
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::ExternalReferenceName {
-        options => PropertySemantic::Bitflags,
-        name
-    }
-}
+ag_iso_stack::object_pool::object::ExternalReferenceName {
+    Options: options => PropertySemantic::Bitflags,
+    Name: name
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::ExternalObjectPointer {
-        default_object_id => object_reference!(),
-        external_reference_name_id => object_reference!(ExternalReferenceName),
-        // Numeric identity in the external ECU's pool, not a local picker target.
-        external_object_id
-    }
-}
+ag_iso_stack::object_pool::object::ExternalObjectPointer {
+    DefaultObjectId: default_object_id => object_reference!(),
+    ExternalReferenceNameId: external_reference_name_id => object_reference!(ExternalReferenceName),
+    // Numeric identity in the external ECU's pool, not a local picker target.
+    ExternalObjectId: external_object_id
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::Animation {
-        width,
-        height,
-        refresh_interval,
-        value,
-        enabled,
-        first_child_index,
-        last_child_index,
-        default_child_index,
-        options => PropertySemantic::Bitflags
-    }
-}
+ag_iso_stack::object_pool::object::Animation {
+    Width: width,
+    Height: height,
+    RefreshInterval: refresh_interval,
+    Value: value,
+    Enabled: enabled,
+    FirstChildIndex: first_child_index,
+    LastChildIndex: last_child_index,
+    DefaultChildIndex: default_child_index,
+    Options: options => PropertySemantic::Bitflags
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::ColourPalette {
-        options => PropertySemantic::Bitflags,
-        colours
-    }
-}
+ag_iso_stack::object_pool::object::ColourPalette {
+    Options: options => PropertySemantic::Bitflags,
+    Colours: colours
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::GraphicData {
-        format => PropertySemantic::Enum,
-        data
-    }
-}
+ag_iso_stack::object_pool::object::GraphicData {
+    Format: format => PropertySemantic::Enum,
+    Data: data
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::WorkingSetSpecialControls {
-        id_of_colour_map => object_reference!(ColourMap),
-        id_of_colour_palette => object_reference!(ColourPalette),
-        language_pairs
-    }
-}
+ag_iso_stack::object_pool::object::WorkingSetSpecialControls {
+    IdOfColourMap: id_of_colour_map => object_reference!(ColourMap),
+    IdOfColourPalette: id_of_colour_palette => object_reference!(ColourPalette),
+    LanguagePairs: language_pairs
+}}
 
 impl_properties! {
-    ag_iso_stack::object_pool::object::ScaledGraphic {
-        width,
-        height,
-        scale_type => PropertySemantic::Enum,
-        options => PropertySemantic::Bitflags,
-        value => object_reference!(PictureGraphic, GraphicData)
-    }
-}
+ag_iso_stack::object_pool::object::ScaledGraphic {
+    Width: width,
+    Height: height,
+    ScaleType: scale_type => PropertySemantic::Enum,
+    Options: options => PropertySemantic::Bitflags,
+    Value: value => object_reference!(PictureGraphic, GraphicData)
+}}
 
 // Master list used to generate every match over property-enabled objects.
 macro_rules! supported_property_objects {
@@ -1019,11 +1163,15 @@ macro_rules! supported_object_types_impl {
     };
 }
 
-/// Get a property from an object in the pool
+/// Get a recognized property from an object in the pool.
+///
+/// A recognized key can still be unsupported for the object's type; that
+/// returns [`PropertyError::PropertyNotFound`]. Existing upstream values are
+/// serialized as stored so callers can inspect and repair legacy values.
 pub fn get_property(
     pool: &ObjectPool,
     object_id: ObjectId,
-    property: &str,
+    property: PropertyKey,
 ) -> Result<Value, PropertyError> {
     let obj = pool
         .object_by_id(object_id)
@@ -1040,27 +1188,38 @@ pub fn get_property(
         },
         PropertyAccessError::InvalidValue { property, reason } => PropertyError::InvalidValue {
             object_id,
-            property: property.to_string(),
+            property,
             reason,
         },
     })
 }
 
-/// Get one declared property from an object without requiring a pool lookup.
-pub fn get_object_property(object: &Object, property: &str) -> Result<Value, PropertyAccessError> {
+/// Get a recognized, declared property without requiring a pool lookup.
+///
+/// A recognized key unsupported by this object's type returns
+/// [`PropertyAccessError::PropertyNotFound`]. Values are read as stored, even
+/// when they need repair by the editor.
+pub fn get_object_property(
+    object: &Object,
+    property: PropertyKey,
+) -> Result<Value, PropertyAccessError> {
     dispatch_property!(object, get_property, property)
 }
 
 /// Query the field's existing deserializer without changing the object.
-pub(crate) fn property_accepts_null(object: &Object, property: &str) -> bool {
+pub(crate) fn property_accepts_null(object: &Object, property: PropertyKey) -> bool {
     dispatch_property!(&mut object.clone(), set_property, property, Value::Null).is_ok()
 }
 
-/// Set a property on an object in the pool
+/// Set a recognized property on an object in the pool.
+///
+/// The key must be supported by the object's type and the value must deserialize
+/// to the upstream field type. Editor-level constraints are checked separately
+/// by [`validate_property`], allowing existing recognized values to be repaired.
 pub fn set_property(
     pool: &mut ObjectPool,
     object_id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     value: Value,
 ) -> Result<Value, PropertyError> {
     let obj = pool
@@ -1069,7 +1228,7 @@ pub fn set_property(
 
     // Older authoring data represented Boolean values as JSON booleans.
     // Accept that form while retaining the full VT4+ byte value range.
-    let value = if matches!(obj, Object::InputBoolean(_)) && property == "value" {
+    let value = if matches!(obj, Object::InputBoolean(_)) && property == PropertyKey::Value {
         value
             .as_bool()
             .map(|value| Value::from(u8::from(value)))
@@ -1089,7 +1248,7 @@ pub fn set_property(
         },
         PropertyAccessError::InvalidValue { property, reason } => PropertyError::InvalidValue {
             object_id,
-            property: property.to_string(),
+            property,
             reason,
         },
     })
@@ -1097,49 +1256,6 @@ pub fn set_property(
 
 pub fn get_property_descriptors(object_type: ObjectType) -> Vec<PropertyDescriptor> {
     supported_property_objects!(property_descriptors_impl, object_type)
-}
-
-/// Rewrite property-backed references after an object's identity changes.
-/// Structural reference collections are handled by the operations layer.
-pub(crate) fn replace_object_reference(
-    object: &mut Object,
-    old_id: ObjectId,
-    new_id: ObjectId,
-) -> Result<bool, PropertyAccessError> {
-    let mut changed = false;
-    for descriptor in get_property_descriptors(object.object_type()) {
-        if !matches!(
-            &descriptor.semantic,
-            PropertySemantic::ObjectReference { .. }
-        ) {
-            continue;
-        }
-        let value = dispatch_property!(object, get_property, descriptor.name)?;
-        if value.is_null() {
-            continue;
-        }
-        let reference_id = serde_json::from_value::<ObjectId>(value).map_err(|error| {
-            PropertyAccessError::InvalidValue {
-                property: descriptor.name,
-                reason: error.to_string(),
-            }
-        })?;
-        if reference_id == old_id {
-            dispatch_property!(
-                object,
-                set_property,
-                descriptor.name,
-                serde_json::to_value(new_id).map_err(|error| {
-                    PropertyAccessError::InvalidValue {
-                        property: descriptor.name,
-                        reason: error.to_string(),
-                    }
-                })?
-            )?;
-            changed = true;
-        }
-    }
-    Ok(changed)
 }
 
 /// Remap all property-backed object references simultaneously. Structural
@@ -1185,18 +1301,20 @@ pub(crate) fn remap_object_references(
 }
 
 /// Get every non-identity, non-placement property exposed by an object.
+/// Get every non-identity, non-placement property exposed by an object.
+///
+/// Returned keys use their typed property identity.
 pub fn get_properties(
     pool: &ObjectPool,
     object_id: ObjectId,
-) -> Result<HashMap<String, Value>, PropertyError> {
+) -> Result<HashMap<PropertyKey, Value>, PropertyError> {
     let object = pool
         .object_by_id(object_id)
         .ok_or(PropertyError::ObjectNotFound(object_id))?;
     get_property_descriptors(object.object_type())
         .into_iter()
         .map(|descriptor| {
-            get_property(pool, object_id, descriptor.name)
-                .map(|value| (descriptor.name.to_owned(), value))
+            get_property(pool, object_id, descriptor.name).map(|value| (descriptor.name, value))
         })
         .collect()
 }
@@ -1205,10 +1323,15 @@ fn property_access_supported(object_type: ObjectType) -> bool {
     supported_property_objects!(property_access_supported_impl, object_type)
 }
 
+/// Validate a proposed value for a recognized property without mutating the pool.
+///
+/// A recognized key unsupported by the object's type returns
+/// [`PropertyError::PropertyNotFound`]. This checks a candidate edit; it does not
+/// discard or rewrite an existing value that needs repair.
 pub fn validate_property(
     pool: &ObjectPool,
     object_id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     value: &Value,
 ) -> Result<(), PropertyError> {
     let object = pool
@@ -1227,13 +1350,13 @@ pub fn validate_property(
         .find(|descriptor| descriptor.name == property)
         .ok_or_else(|| PropertyError::PropertyNotFound {
             object_id,
-            property: property.to_string(),
+            property,
         })?;
 
     if !descriptor.writable {
         return Err(PropertyError::InvalidValue {
             object_id,
-            property: property.to_string(),
+            property,
             reason: "property is read-only".to_string(),
         });
     }
@@ -1245,7 +1368,7 @@ pub fn validate_property(
         if !matches!((number, minimum, maximum), (Some(value), Some(min), Some(max)) if value >= min && value <= max)
         {
             return Err(PropertyError::OutOfRange {
-                property: property.to_string(),
+                property,
                 value: value.to_string(),
                 min: min.to_string(),
                 max: max.to_string(),
@@ -1258,7 +1381,7 @@ pub fn validate_property(
             if !matches!(value.as_u64(), Some(0..=255)) {
                 return Err(PropertyError::InvalidValue {
                     object_id,
-                    property: property.to_string(),
+                    property,
                     reason: "colour must be an integer from 0 through 255".to_string(),
                 });
             }
@@ -1273,7 +1396,7 @@ pub fn validate_property(
                 serde_json::from_value::<ObjectId>(value.clone()).map_err(|error| {
                     PropertyError::InvalidValue {
                         object_id,
-                        property: property.to_string(),
+                        property,
                         reason: error.to_string(),
                     }
                 })?;
@@ -1304,26 +1427,18 @@ mod tests {
     }
 
     #[test]
-    fn typed_enum_fields_are_discovered_without_manual_semantics_or_choices() {
-        #[derive(serde::Serialize, serde::Deserialize)]
-        enum Mode {
-            First,
-            NewlyAdded,
-        }
-        struct Example {
-            mode: Mode,
-        }
-        impl_properties! { Example { mode } }
-        let descriptor = Example::property_descriptors().remove(0);
-        assert_eq!(descriptor.semantic, PropertySemantic::Enum);
-        assert!(matches!(
-            default_editor(&descriptor.semantic),
-            EditorKind::Enum
-        ));
+    fn property_keys_keep_serialized_names_and_lexical_order() {
+        assert_eq!(PropertyKey::ForegroundColour.as_str(), "foreground_colour");
         assert_eq!(
-            descriptor.enum_choices,
-            vec![json!("First"), json!("NewlyAdded")]
+            serde_json::to_string(&PropertyKey::ForegroundColour).unwrap(),
+            "\"foreground_colour\""
         );
+        assert_eq!(
+            serde_json::from_str::<PropertyKey>("\"foreground_colour\"").unwrap(),
+            PropertyKey::ForegroundColour
+        );
+        assert_eq!(PropertyKey::parse("unknown_property"), None);
+        assert!(PropertyKey::ForegroundColour < PropertyKey::Width);
     }
 
     #[test]
@@ -1337,7 +1452,7 @@ mod tests {
                 }
                 let editor = editors
                     .iter()
-                    .find(|editor| editor.property == descriptor.name)
+                    .find(|editor| editor.property == EditorTarget::Property(descriptor.name))
                     .unwrap();
                 let current = get_object_property(&object, descriptor.name).unwrap();
                 if matches!(editor.editor, EditorKind::Auto) {
@@ -1371,7 +1486,7 @@ mod tests {
         let descriptors = get_property_descriptors(ObjectType::FontAttributes);
         let sizes = &descriptors
             .iter()
-            .find(|d| d.name == "font_size")
+            .find(|d| d.name == PropertyKey::FontSize)
             .unwrap()
             .enum_choices;
         assert_eq!(sizes.len(), 15 + 185);
@@ -1381,7 +1496,7 @@ mod tests {
         assert!(sizes.contains(&json!({"Proportional": 192})));
         let fonts = &descriptors
             .iter()
-            .find(|d| d.name == "font_type")
+            .find(|d| d.name == PropertyKey::FontType)
             .unwrap()
             .enum_choices;
         assert_eq!(fonts.len(), 6 + 16);
@@ -1398,12 +1513,28 @@ mod tests {
         let descriptors = get_property_descriptors(ObjectType::Button);
 
         assert!(descriptors.iter().any(|descriptor| {
-            descriptor.name == "width" && descriptor.semantic == PropertySemantic::Normal
+            descriptor.name == PropertyKey::Width && descriptor.semantic == PropertySemantic::Normal
         }));
         assert!(descriptors.iter().any(|descriptor| {
-            descriptor.name == "background_colour"
+            descriptor.name == PropertyKey::BackgroundColour
                 && descriptor.semantic == PropertySemantic::Colour
         }));
+    }
+
+    #[test]
+    fn recognized_property_unsupported_by_object_returns_typed_not_found() {
+        let mut pool = ObjectPool::default();
+        let working_set = default_object(ObjectType::WorkingSet);
+        let working_set_id = working_set.id();
+        pool.add(working_set);
+
+        assert!(matches!(
+            get_property(&pool, working_set_id, PropertyKey::Width),
+            Err(PropertyError::PropertyNotFound {
+                property: PropertyKey::Width,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1413,11 +1544,16 @@ mod tests {
         let button_id = button.id();
         pool.add(button);
 
-        let result = set_property(&mut pool, button_id, "width", json!("not a number"));
+        let result = set_property(
+            &mut pool,
+            button_id,
+            PropertyKey::Width,
+            json!("not a number"),
+        );
 
         assert!(matches!(result, Err(PropertyError::InvalidValue { .. })));
         assert!(matches!(
-            get_property(&pool, button_id, "width"),
+            get_property(&pool, button_id, PropertyKey::Width),
             Ok(value) if value == json!(0)
         ));
     }
@@ -1429,7 +1565,8 @@ mod tests {
         let button_id = button.id();
         pool.add(button);
 
-        let result = validate_property(&pool, button_id, "background_colour", &json!(256));
+        let result =
+            validate_property(&pool, button_id, PropertyKey::BackgroundColour, &json!(256));
 
         assert!(matches!(result, Err(PropertyError::InvalidValue { .. })));
     }
@@ -1451,12 +1588,18 @@ mod tests {
         *number.mut_id() = ObjectId::new(3).unwrap();
         pool.add(number);
 
-        assert!(validate_property(&pool, input_id, "font_attributes", &json!(2)).is_ok());
+        assert!(validate_property(&pool, input_id, PropertyKey::FontAttributes, &json!(2)).is_ok());
         assert!(matches!(
-            validate_property(&pool, input_id, "font_attributes", &json!(3)),
+            validate_property(&pool, input_id, PropertyKey::FontAttributes, &json!(3)),
             Err(PropertyError::InvalidObjectReference { .. })
         ));
-        assert!(validate_property(&pool, input_id, "variable_reference", &Value::Null).is_ok());
+        assert!(validate_property(
+            &pool,
+            input_id,
+            PropertyKey::VariableReference,
+            &Value::Null
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1473,11 +1616,6 @@ mod tests {
             let object = default_object(object_type);
             let object_id = object.id();
             pool.add(object);
-
-            assert!(matches!(
-                get_property(&pool, object_id, "__unknown_property__"),
-                Err(PropertyError::PropertyNotFound { .. })
-            ));
 
             for descriptor in get_property_descriptors(object_type) {
                 let value =
@@ -1509,8 +1647,55 @@ mod tests {
             for property in properties.into_iter().filter(|property| property.writable) {
                 assert!(editors
                     .iter()
-                    .any(|editor| editor.property == property.name));
+                    .any(|editor| editor.property == EditorTarget::Property(property.name)));
             }
         }
     }
+}
+
+/// Array element prototypes shared by command insertion and schema discovery.
+/// The empty path denotes the property itself; `*` denotes an array index.
+/// Record prototypes list required scalar fields while nested arrays start empty.
+pub fn property_array_element_schemas(
+    property: PropertyKey,
+) -> std::collections::BTreeMap<&'static str, Value> {
+    let mut schemas = std::collections::BTreeMap::new();
+    let element = match property {
+        PropertyKey::Points => serde_json::json!({"x":0,"y":0}),
+        PropertyKey::ColourMap | PropertyKey::Data => serde_json::json!(0u8),
+        PropertyKey::Colours => serde_json::to_value(ag_iso_stack::object_pool::Colour::BLACK)
+            .expect("colours serialize"),
+        PropertyKey::CodePlanes => {
+            schemas.insert(
+                "*.character_ranges",
+                serde_json::json!({"first_character":0u16,"last_character":0u16}),
+            );
+            serde_json::json!({"number":0u8,"character_ranges":[]})
+        }
+        PropertyKey::LanguagePairs => serde_json::json!(["", ""]),
+        _ => return schemas,
+    };
+    schemas.insert("", element);
+    schemas
+}
+
+/// Return the typed element prototype for a top-level array property.
+pub fn property_array_element_schema(property: PropertyKey) -> Option<Value> {
+    property_array_element_schema_at(property, "")
+}
+
+/// Return the element prototype of a nested array, using zero-based indices.
+pub fn property_array_element_schema_at(property: PropertyKey, path: &str) -> Option<Value> {
+    let normalized = path
+        .split('.')
+        .map(|part| {
+            if part.parse::<usize>().is_ok() {
+                "*"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    property_array_element_schemas(property).remove(normalized.as_str())
 }

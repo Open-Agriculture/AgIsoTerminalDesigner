@@ -1,5 +1,7 @@
 //! Deterministic, semantic snapshots used by automation requests.
-use crate::object_properties::{get_object_property, get_property_descriptors, PropertySemantic};
+use crate::object_properties::{
+    get_object_property, get_property_descriptors, PropertyKey, PropertySemantic,
+};
 use crate::operations::{macro_refs, object_list, object_refs, ObjectReferenceList};
 use crate::{ObjectInfo, ProjectRevision};
 use ag_iso_stack::object_pool::{object::Object, NullableObjectId, ObjectId, ObjectPool};
@@ -49,9 +51,9 @@ pub struct ObjectSnapshot {
     pub name: String,
     pub object_type: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub properties: BTreeMap<String, Value>,
+    pub properties: BTreeMap<PropertyKey, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub references: BTreeMap<String, ObjectReferenceSnapshot>,
+    pub references: BTreeMap<PropertyKey, ObjectReferenceSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub positioned_children: Vec<PositionedChildSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,14 +170,6 @@ fn reference(
         object_type: found.map(|v| v.object_type),
     }
 }
-#[cfg(test)]
-pub(crate) fn object_snapshot(
-    pool: &ObjectPool,
-    info: &HashMap<ObjectId, ObjectInfo>,
-    id: ObjectId,
-) -> Option<ObjectSnapshot> {
-    object_snapshot_sections(pool, info, id, true)
-}
 pub(crate) fn object_snapshot_sections(
     pool: &ObjectPool,
     info: &HashMap<ObjectId, ObjectInfo>,
@@ -194,10 +188,10 @@ pub(crate) fn object_snapshot_sections(
             descriptor.semantic,
             PropertySemantic::ObjectReference { .. }
         ) {
-            references.insert(descriptor.name.to_owned(), reference(pool, info, value));
+            references.insert(descriptor.name, reference(pool, info, value));
         } else {
             properties.insert(
-                descriptor.name.to_owned(),
+                descriptor.name,
                 sanitize_binary(
                     descriptor.name,
                     super::visual_intent::enrich(
@@ -271,8 +265,8 @@ pub(crate) fn object_snapshot_sections(
         parents,
     })
 }
-fn sanitize_binary(name: &str, value: Value) -> Value {
-    if name == "data" {
+fn sanitize_binary(name: PropertyKey, value: Value) -> Value {
+    if name == PropertyKey::Data {
         if let Value::Array(bytes) = &value {
             return serde_json::json!({ "byte_length": bytes.len() });
         }
@@ -283,7 +277,7 @@ pub(crate) fn active_mask(pool: &ObjectPool) -> Option<ObjectId> {
     pool.objects()
         .iter()
         .find(|o| matches!(o, Object::WorkingSet(_)))
-        .and_then(|o| get_object_property(o, "active_mask").ok())
+        .and_then(|o| get_object_property(o, PropertyKey::ActiveMask).ok())
         .and_then(|v| serde_json::from_value::<NullableObjectId>(v).ok())
         .and_then(|id| id.0)
 }
@@ -325,11 +319,11 @@ pub(crate) fn layout_instances(
             let Some(child_object) = pool.object_by_id(placement.id) else {
                 continue;
             };
-            let width = get_object_property(child_object, "width")
+            let width = get_object_property(child_object, PropertyKey::Width)
                 .ok()
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u16::try_from(v).ok());
-            let height = get_object_property(child_object, "height")
+            let height = get_object_property(child_object, PropertyKey::Height)
                 .ok()
                 .and_then(|v| v.as_u64())
                 .and_then(|v| u16::try_from(v).ok());
@@ -399,7 +393,7 @@ pub(crate) fn context_layout<'a>(
                 continue;
             };
             let child_object = pool.object_by_id(child_id).unwrap();
-            let dimension = |name| {
+            let dimension = |name: PropertyKey| {
                 get_object_property(child_object, name)
                     .ok()
                     .and_then(|v| v.as_u64())
@@ -412,8 +406,8 @@ pub(crate) fn context_layout<'a>(
                 parent: summary(pool, info, id).unwrap(),
                 x,
                 y,
-                width: dimension("width"),
-                height: dimension("height"),
+                width: dimension(PropertyKey::Width),
+                height: dimension(PropertyKey::Height),
                 depth: depth + 1,
                 path: child_path.clone(),
             });

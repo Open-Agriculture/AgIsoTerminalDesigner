@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use ag_iso_stack::object_pool::{ObjectId, ObjectPool, ObjectType};
 use ag_iso_terminal_designer::{
-    default_object, ObjectInfo, ObjectTarget, Operation, OperationExecutor, OperationTransaction,
-    ValidationContext,
+    default_object, object_properties::PropertyKey, ObjectInfo, ObjectTarget, Operation,
+    OperationExecutor, OperationTransaction, ValidationContext,
 };
 use serde_json::json;
 
@@ -27,7 +27,7 @@ fn preparation_is_non_mutating_and_matches_execution() {
         object: ObjectTarget::Name {
             name: "Button".into(),
         },
-        property: "width".into(),
+        property: PropertyKey::Width,
         value: json!(123),
     });
     let executor = OperationExecutor::new();
@@ -49,14 +49,14 @@ fn diagnostics_are_indexed_and_validation_is_preparation() {
     let mut tx = OperationTransaction::new(None);
     tx.add_operation(Operation::SetProperty {
         object: ObjectTarget::id(10),
-        property: "width".into(),
+        property: PropertyKey::Width,
         value: json!(123),
     });
     tx.add_operation(Operation::SetProperty {
         object: ObjectTarget::Name {
             name: "Missing".into(),
         },
-        property: "width".into(),
+        property: PropertyKey::Width,
         value: json!(123),
     });
     let executor = OperationExecutor::new();

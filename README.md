@@ -190,18 +190,15 @@ The CLI is at `target/release/aitd`. Add that directory to `PATH`, or invoke it 
 ```bash
 aitd status
 aitd object list --type Button
-aitd draft begin --name "Improve controls"
 aitd object set 10 width=120
-aitd draft submit
-aitd proposal wait
+aitd --check run --file changes.aitd
+aitd run --file changes.aitd
 aitd export bundle --iop build/object_pool.iop --header build/object_pool.h
 ```
 
-The CLI reads and edits the project open in the desktop editor. Edits are collected in an editor-owned draft and submitted to the **Proposal** panel. The user reviews and applies or rejects the proposal in the editor. The CLI can query the review outcome and export IOP or C object-ID headers after the proposal is applied. Apply and `.aitp` project saving remain editor actions; drafts and proposal receipts are kept only for the lifetime of the editor process. The browser editor remains manual-only. See [the CLI guide](docs/cli.md) for command files, available edit commands, project guards, shell completion, and exit codes.
+The CLI edits the project open in the desktop editor immediately, through the same validated editing APIs used by the UI. Each edit, or an entire command file, is one undoable action. A failed command file leaves the project unchanged; `--check` validates without applying. Inputs are shell commands and plain command files, including field assignments for structured properties; JSON is supported only for output. Project saving remains an editor action. The browser editor remains manual-only. See the [CLI guide](docs/cli.md) for edit syntax, project guards, validation, exports, completion, and exit codes.
 
 If multiple editors are running, use `--instance <editor-instance-id>` or set `AG_ISO_EDITOR_INSTANCE_ID`. Connection details are in owner-only runtime files under the system temporary directory in `ag-iso-terminal-designer-<user>/`. The authenticated loopback bridge currently requires Unix owner-only file permissions.
-
-For optional local request diagnostics, start the editor with `AG_ISO_AUTOMATION_TRACE=1 cargo run --release`. The Proposal panel shows the owner-only trace path.
 
 ### Running the Web Application
 

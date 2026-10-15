@@ -233,7 +233,10 @@ fn resize_object(
             format!("Object {object_id} is not an editable primitive object"),
         ));
     }
-    for (property, value) in [("width", width), ("height", height)] {
+    for (property, value) in [
+        (crate::object_properties::PropertyKey::Width, width),
+        (crate::object_properties::PropertyKey::Height, height),
+    ] {
         if let Some(value) = value {
             crate::object_properties::set_property(pool, id, property, json!(value))
                 .map_err(|e| ComponentError::new("CANVAS_EDIT_INVALID", e.to_string()))?;

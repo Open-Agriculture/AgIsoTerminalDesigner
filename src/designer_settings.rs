@@ -20,8 +20,6 @@ pub struct AppPreferences {
     pub show_ancestry: bool,
     /// Show numeric IDs alongside object names in authoring labels.
     pub show_object_ids: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    pub show_proposal: bool,
     pub object_id_format: ObjectIdFormat,
 }
 
@@ -35,8 +33,6 @@ impl Default for AppPreferences {
             show_properties: true,
             show_ancestry: true,
             show_object_ids: false,
-            #[cfg(not(target_arch = "wasm32"))]
-            show_proposal: true,
             object_id_format: ObjectIdFormat::Decimal,
         }
     }

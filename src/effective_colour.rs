@@ -115,6 +115,28 @@ pub fn distance(a: [u8; 3], b: [u8; 3]) -> u32 {
 pub fn resolve_name(pool: &ObjectPool, name: &str) -> Option<ResolvedColour> {
     named_rgb(name).map(|rgb| nearest(pool, rgb))
 }
+/// Resolve command text as an exact palette index, a colour name, or #RRGGBB.
+/// Names and RGB values choose the nearest effective palette entry; explicit
+/// indices retain their identity. Invalid text returns an actionable error.
+pub fn resolve(pool: &ObjectPool, raw: &str) -> Result<ResolvedColour, String> {
+    if let Ok(index) = raw.parse::<u8>() {
+        return Ok(resolve_index(pool, index));
+    }
+    if raw.starts_with('#') {
+        if raw.len() != 7 || !raw.is_ascii() {
+            return Err("Colour must use #RRGGBB".into());
+        }
+        let channel = |start| {
+            u8::from_str_radix(&raw[start..start + 2], 16)
+                .map_err(|_| "Colour must use #RRGGBB".to_owned())
+        };
+        return Ok(nearest(pool, [channel(1)?, channel(3)?, channel(5)?]));
+    }
+    resolve_name(pool, raw).ok_or_else(|| {
+        format!("Unknown colour '{raw}'; use a palette index, basic colour name, or #RRGGBB")
+    })
+}
+
 pub fn palette(pool: &ObjectPool) -> Vec<ResolvedColour> {
     let resolved = colours(pool);
     (0..=255u8)

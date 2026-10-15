@@ -119,7 +119,7 @@ fn with_object(object_type: ObjectType, id: u16) -> ObjectPool {
 fn set_property(object: u16, property: &str, value: Value) -> Operation {
     Operation::SetProperty {
         object: ObjectTarget::id(object),
-        property: property.to_owned(),
+        property: property.parse().unwrap(),
         value,
     }
 }

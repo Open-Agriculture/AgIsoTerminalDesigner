@@ -4,7 +4,6 @@ use crate::ai::snapshot::{
     SnapshotScope, MAX_SNAPSHOT_OBJECTS,
 };
 use ag_iso_stack::object_pool::ObjectId;
-use ag_iso_stack::object_pool::ObjectType;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[derive(Debug, Clone, Serialize)]
@@ -71,39 +70,6 @@ pub struct ObjectDetails {
     pub next_parent_offset: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nearby_style: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetObjectSchemaRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub object_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub object_types: Vec<String>,
-}
-pub const MAX_SCHEMA_TYPES_PER_CALL: usize = 10;
-impl GetObjectSchemaRequest {
-    pub fn types(self) -> Result<Vec<String>, String> {
-        let mut types = self.object_types;
-        if let Some(ty) = self.object_type {
-            types.push(ty);
-        }
-        if types.is_empty() {
-            return Err(format!(
-                "Request 1–{MAX_SCHEMA_TYPES_PER_CALL} object types"
-            ));
-        }
-        types.sort();
-        types.dedup();
-        for name in &types {
-            if !ObjectType::values()
-                .iter()
-                .any(|v| format!("{v:?}") == *name)
-            {
-                return Err(format!("unknown object type: {name}"));
-            }
-        }
-        Ok(types)
-    }
 }
 
 pub fn get_design_context(
@@ -362,37 +328,34 @@ fn nearby_style(state: &AiDesignState, root: ObjectId, offset: usize) -> Value {
             .unwrap();
         let mut example = json!({"id":placement.object.id,"type":placement.object.object_type,
             "x":placement.x,"y":placement.y,"path":placement.path});
-        for name in [
-            "width",
-            "height",
-            "background_colour",
-            "border_colour",
-            "justification",
+        for property in [
+            crate::object_properties::PropertyKey::Width,
+            crate::object_properties::PropertyKey::Height,
+            crate::object_properties::PropertyKey::BackgroundColour,
+            crate::object_properties::PropertyKey::BorderColour,
+            crate::object_properties::PropertyKey::Justification,
         ] {
-            if let Ok(value) = get_object_property(object, name) {
-                example[name] =
-                    super::visual_intent::enrich(&state.pool, object.object_type(), name, value);
-            }
+            let name = property.as_str();
+            let Ok(value) = get_object_property(object, property) else {
+                continue;
+            };
+            example[name] =
+                super::visual_intent::enrich(&state.pool, object.object_type(), property, value);
         }
-        for name in ["font_attributes", "line_attributes", "fill_attributes"] {
-            if let Ok(value) = get_object_property(object, name) {
+        for property in [
+            crate::object_properties::PropertyKey::FontAttributes,
+            crate::object_properties::PropertyKey::LineAttributes,
+            crate::object_properties::PropertyKey::FillAttributes,
+        ] {
+            let name = property.as_str();
+            if let Ok(value) = get_object_property(object, property) {
                 if let Ok(id) =
                     serde_json::from_value::<ag_iso_stack::object_pool::NullableObjectId>(value)
                 {
                     if let Some(style) = id.0.and_then(|id| state.pool.object_by_id(id)) {
-                        let mut resolved = json!({"id":style.id().value()});
-                        for descriptor in
-                            crate::object_properties::get_property_descriptors(style.object_type())
-                        {
-                            if let Ok(v) = get_object_property(style, descriptor.name) {
-                                resolved[descriptor.name] = super::visual_intent::enrich(
-                                    &state.pool,
-                                    style.object_type(),
-                                    descriptor.name,
-                                    v,
-                                );
-                            }
-                        }
+                        let mut resolved =
+                            super::visual_intent::property_style(&state.pool, style, None);
+                        resolved["id"] = json!(style.id().value());
                         example[name] = resolved;
                     }
                 }
@@ -404,8 +367,8 @@ fn nearby_style(state: &AiDesignState, root: ObjectId, offset: usize) -> Value {
 }
 
 /// Long scalar strings and arrays remain accessible without unbounded tool payloads.
-fn page_properties(
-    properties: &mut std::collections::BTreeMap<String, Value>,
+fn page_properties<K: Ord>(
+    properties: &mut std::collections::BTreeMap<K, Value>,
     offset: usize,
     limit: usize,
 ) -> bool {
@@ -460,7 +423,7 @@ pub fn component_design_context(
     state: &AiDesignState,
     snapshot: crate::ai::snapshot::DesignSnapshot,
 ) -> Value {
-    let mut context = super::wire::context(snapshot);
+    let mut context = serde_json::to_value(snapshot).expect("snapshot serializes");
     let map = crate::components::source_map(&state.components);
     if let Some(objects) = context["objects"].as_array_mut() {
         objects.retain(|object| {
@@ -471,7 +434,7 @@ pub fn component_design_context(
     }
     if let Some(layout) = context["layout"].as_array_mut() {
         layout.retain(|item| {
-            !item["id"]
+            !item["object"]["id"]
                 .as_u64()
                 .is_some_and(|id| map.by_object_id.contains_key(&(id as u16)))
         });
@@ -484,64 +447,4 @@ pub fn component_design_context(
     context["components"] = component_catalog(state);
     context["component_instances"] = component_instances(state);
     context
-}
-
-/// Accept human parameter names at the wire boundary, while source state uses stable IDs.
-pub fn parse_component_actions(
-    source: &crate::components::ComponentSource,
-    mut value: Value,
-) -> Result<Vec<crate::components::ComponentIntent>, String> {
-    let actions = value
-        .as_array_mut()
-        .ok_or("Expected component actions array")?;
-    for action in actions {
-        if let Some(id) = action["parent"]["id"].as_u64() {
-            action["parent"] = json!(id);
-        }
-        let component_id = action
-            .get("component_id")
-            .and_then(|id| {
-                serde_json::from_value::<crate::components::ComponentId>(id.clone()).ok()
-            })
-            .or_else(|| {
-                let instance_id = serde_json::from_value::<crate::components::ComponentInstanceId>(
-                    action["instance_id"].clone(),
-                )
-                .ok()?;
-                source
-                    .instances
-                    .iter()
-                    .find(|i| i.id == instance_id)
-                    .map(|i| i.component_id)
-            })
-            .ok_or("Unknown component or instance identity")?;
-        let definition = source
-            .definitions
-            .get(&component_id)
-            .ok_or("Unknown component")?;
-        let resolve = |name: &str| -> Result<String, String> {
-            if let Some(parameter) = definition
-                .parameters
-                .iter()
-                .find(|p| p.name == name || p.id.to_string() == name)
-            {
-                Ok(parameter.id.to_string())
-            } else {
-                Err(format!("Unknown declared parameter: {name}"))
-            }
-        };
-        if let Some(name) = action["parameter"].as_str() {
-            action["parameter"] = json!(resolve(name)?);
-        }
-        if let Some(overrides) = action.get_mut("overrides").and_then(Value::as_object_mut) {
-            let mut normalized = serde_json::Map::new();
-            for (name, value) in std::mem::take(overrides) {
-                if normalized.insert(resolve(&name)?, value).is_some() {
-                    return Err("Duplicate override parameter".into());
-                }
-            }
-            *overrides = normalized;
-        }
-    }
-    serde_json::from_value(value).map_err(|e| e.to_string())
 }

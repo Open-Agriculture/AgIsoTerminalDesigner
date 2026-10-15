@@ -1,4 +1,5 @@
 //! Project-local source identities. None of these are ISO object types.
+use crate::object_properties::PropertyKey;
 use crate::ObjectTarget;
 use ag_iso_stack::object_pool::ObjectType;
 use serde::{Deserialize, Serialize};
@@ -47,9 +48,9 @@ pub struct ComponentNode {
     pub id: ComponentNodeId,
     pub name: String,
     pub object_type: ObjectType,
-    pub properties: BTreeMap<String, Value>,
+    pub properties: BTreeMap<PropertyKey, Value>,
     pub children: Vec<ComponentChild>,
-    pub references: BTreeMap<String, ComponentReference>,
+    pub references: BTreeMap<PropertyKey, ComponentReference>,
     #[serde(default)]
     pub macro_references: Vec<ComponentMacroReference>,
     #[serde(default)]
@@ -78,13 +79,50 @@ pub enum ComponentParameterKind {
     Enum,
     Graphic,
 }
+/// A parameter targets an ordinary writable object property or a picture graphic.
+/// The graphic target is structural and is not an ISO object property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ComponentParameterTarget {
+    Property(PropertyKey),
+    Graphic,
+}
+impl ComponentParameterTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Property(property) => property.as_str(),
+            Self::Graphic => "graphic",
+        }
+    }
+}
+impl Serialize for ComponentParameterTarget {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+impl<'de> Deserialize<'de> for ComponentParameterTarget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let name = String::deserialize(deserializer)?;
+        if name == "graphic" {
+            return Ok(Self::Graphic);
+        }
+        PropertyKey::parse(&name)
+            .map(Self::Property)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown component property '{name}'")))
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComponentParameter {
     pub id: ComponentParameterId,
     pub name: String,
     pub description: Option<String>,
     pub target_node: ComponentNodeId,
-    pub property: String,
+    pub property: ComponentParameterTarget,
     pub kind: ComponentParameterKind,
     pub default_value: Value,
 }

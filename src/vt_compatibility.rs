@@ -137,23 +137,23 @@ pub fn supported_property(_object_type: ObjectType, property: &str, version: VtV
 /// This covers version-defined flag introductions, not negotiated VT capabilities.
 pub fn supported_property_flag(
     object_type: ObjectType,
-    property: &str,
+    property: crate::PropertyKey,
     flag: &str,
     version: VtVersion,
 ) -> bool {
     let introduced_in_v4 = match (object_type, property, flag) {
         (
             ObjectType::Button,
-            "options",
+            crate::PropertyKey::Options,
             "suppress_border" | "transparent_background" | "disabled" | "no_border",
         ) => true,
-        (ObjectType::InputString, "options", "wrap_on_hyphen")
-        | (ObjectType::OutputString, "options", "wrap_on_hyphen")
-        | (ObjectType::FontAttributes, "font_style", "proportional")
-        | (ObjectType::InputNumber, "options", "truncate")
-        | (ObjectType::OutputNumber, "options", "truncate")
-        | (ObjectType::InputNumber, "options2", "real_time_editing")
-        | (ObjectType::InputList, "options", "real_time_editing") => true,
+        (ObjectType::InputString, crate::PropertyKey::Options, "wrap_on_hyphen")
+        | (ObjectType::OutputString, crate::PropertyKey::Options, "wrap_on_hyphen")
+        | (ObjectType::FontAttributes, crate::PropertyKey::FontStyle, "proportional")
+        | (ObjectType::InputNumber, crate::PropertyKey::Options, "truncate")
+        | (ObjectType::OutputNumber, crate::PropertyKey::Options, "truncate")
+        | (ObjectType::InputNumber, crate::PropertyKey::Options2, "real_time_editing")
+        | (ObjectType::InputList, crate::PropertyKey::Options, "real_time_editing") => true,
         _ => false,
     };
     !introduced_in_v4 || version >= VtVersion::Version4
@@ -382,7 +382,12 @@ pub fn validate_pool_compatibility(
                         ("no_border", value.options.no_border),
                     ] {
                         if enabled
-                            && !supported_property_flag(object_type, "options", flag, version)
+                            && !supported_property_flag(
+                                object_type,
+                                crate::PropertyKey::Options,
+                                flag,
+                                version,
+                            )
                         {
                             push(
                                 id,

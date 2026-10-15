@@ -5,7 +5,7 @@
 
 use crate::object_properties::{
     get_object_property, get_property_descriptors, property_editor_descriptors, EditorKind,
-    PropertySemantic,
+    EditorTarget, PropertyKey, PropertySemantic,
 };
 use crate::operations::{
     ChildPlacement, MacroReferenceTarget, ObjectReferenceList, ObjectTarget, ObjectTargetList,
@@ -95,8 +95,8 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                     let mut converted = picture.clone();
                     crate::graphics::convert_picture_graphic_format(&mut converted, format);
                     let value = serde_json::to_value(converted).unwrap();
-                    for property in ["format", "options", "data"] {
-                        queue(design, id, property, value[property].clone());
+                    for property in [PropertyKey::Format, PropertyKey::Options, PropertyKey::Data] {
+                        queue(design, id, property, value[property.as_str()].clone());
                     }
                 }
             }
@@ -127,10 +127,15 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             queue(
                 design,
                 id,
-                "options",
+                PropertyKey::Options,
                 serde_json::to_value(options).unwrap(),
             );
-            queue(design, id, "transparency_colour", serde_json::json!(colour));
+            queue(
+                design,
+                id,
+                PropertyKey::TransparencyColour,
+                serde_json::json!(colour),
+            );
         }
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -151,35 +156,38 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
         });
     }
     for editor in property_editor_descriptors(object_type) {
+        let EditorTarget::Property(property_key) = editor.property else {
+            continue;
+        };
+        let property_name = property_key.as_str();
         if object_type == ObjectType::PictureGraphic
             && matches!(
-                editor.property,
-                "format" | "options" | "transparency_colour"
+                property_key,
+                PropertyKey::Format | PropertyKey::Options | PropertyKey::TransparencyColour
             )
         {
             continue;
         }
 
         if object_type == ObjectType::PictureGraphic
-            && matches!(editor.property, "data" | "actual_width" | "actual_height")
+            && matches!(
+                property_key,
+                PropertyKey::Data | PropertyKey::ActualWidth | PropertyKey::ActualHeight
+            )
         {
             continue;
         }
-        // Structural collections are rendered below and never use SetProperty.
-        if matches!(editor.editor, EditorKind::MacroReferences) {
-            continue;
-        }
-        let Some(property) = properties.iter().find(|item| item.name == editor.property) else {
+        let Some(property) = properties.iter().find(|item| item.name == property_key) else {
             continue;
         };
-        let Ok(value) = get_object_property(object, editor.property) else {
+        let Ok(value) = get_object_property(object, property_key) else {
             continue;
         };
-        let label = human_readable_property_name(editor.property);
+        let label = human_readable_property_name(property_name);
         if object_type == ObjectType::ExternalObjectPointer
-            && editor.property == "external_object_id"
+            && property_key == PropertyKey::ExternalObjectId
         {
-            let key = ui.make_persistent_id((id.value(), editor.property));
+            let key = ui.make_persistent_id((id.value(), property_name));
             let mut foreign_id = ui
                 .data(|data| data.get_temp::<u16>(key))
                 .unwrap_or_else(|| value.as_u64().map_or(u16::MAX, |value| value as u16));
@@ -201,7 +209,7 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                     } else {
                         foreign_id.into()
                     };
-                    queue(design, id, editor.property, value);
+                    queue(design, id, property_key, value);
                     ui.data_mut(|data| data.remove::<u16>(key));
                 }
             });
@@ -210,23 +218,23 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
         }
         if !crate::vt_compatibility::supported_property(
             object_type,
-            editor.property,
+            property_name,
             design.vt_version,
         ) {
             let default = crate::default_object(object_type);
-            if get_object_property(&default, editor.property).ok().as_ref() == Some(&value) {
+            if get_object_property(&default, property_key).ok().as_ref() == Some(&value) {
                 continue;
             }
             repair_warning(ui, &label, design.vt_version, |version| {
-                crate::vt_compatibility::supported_property(object_type, editor.property, version)
+                crate::vt_compatibility::supported_property(object_type, property_name, version)
             });
         }
-        if editor.property == "value" {
+        if property_key == PropertyKey::Value {
             if let Some(decoded) = decoded_string_value(object, design.get_pool()) {
                 match decoded {
                     Ok(text) => {
-                        ui.push_id(editor.property, |ui| {
-                            render_text(ui, &label, &text, id, editor.property, design)
+                        ui.push_id(property_name, |ui| {
+                            render_text(ui, &label, &text, id, property_key, design)
                         });
                     }
                     Err(message) => {
@@ -236,7 +244,7 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                 continue;
             }
         }
-        if object_type == ObjectType::InputBoolean && editor.property == "value" {
+        if object_type == ObjectType::InputBoolean && property_key == PropertyKey::Value {
             if value.as_u64().is_some_and(|value| value > 1)
                 && design.vt_version < VtVersion::Version4
             {
@@ -249,15 +257,7 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             } else {
                 u8::MAX as f64
             };
-            render_number(
-                ui,
-                &label,
-                &value,
-                0.0..=maximum,
-                id,
-                editor.property,
-                design,
-            );
+            render_number(ui, &label, &value, 0.0..=maximum, id, property_key, design);
             continue;
         }
         if matches!(editor.editor, EditorKind::ObjectReference) {
@@ -279,32 +279,32 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                 }
             }
         }
-        ui.push_id(editor.property, |ui| match editor.editor {
-            EditorKind::Colour => render_colour(ui, &label, &value, id, editor.property, design),
+        ui.push_id(property_name, |ui| match editor.editor {
+            EditorKind::Colour => render_colour(ui, &label, &value, id, property_key, design),
             EditorKind::ObjectReference => {
-                if object_type == ObjectType::ObjectPointer && editor.property == "value" {
+                if object_type == ObjectType::ObjectPointer && property_key == PropertyKey::Value {
                     render_pointer_reference(
                         ui,
                         &label,
                         &value,
                         property,
                         id,
-                        editor.property,
+                        property_key,
                         design,
                     );
                 } else {
-                    render_reference(ui, &label, &value, property, id, editor.property, design)
+                    render_reference(ui, &label, &value, property, id, property_key, design)
                 }
             }
             EditorKind::Enum => {
-                if !enum_value_supported(object_type, editor.property, &value, design.vt_version) {
+                if !enum_value_supported(object_type, property_key, &value, design.vt_version) {
                     repair_warning(ui, &label, design.vt_version, |version| {
-                        enum_value_supported(object_type, editor.property, &value, version)
+                        enum_value_supported(object_type, property_key, &value, version)
                     });
                 }
                 ui.horizontal(|ui| {
                     let label_response = ui.label(&label);
-                    egui::ComboBox::from_id_salt(editor.property)
+                    egui::ComboBox::from_id_salt(property_name)
                         .icon(crate::ui_style::combo_box_icon)
                         .selected_text(enum_choice_label(&value))
                         .show_ui(ui, |ui| {
@@ -312,7 +312,7 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                                 if choice != &value
                                     && !enum_value_supported(
                                         object_type,
-                                        editor.property,
+                                        property_key,
                                         choice,
                                         design.vt_version,
                                     )
@@ -322,13 +322,13 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                                 let valid = choice == &value
                                     || (enum_value_supported(
                                         object_type,
-                                        editor.property,
+                                        property_key,
                                         choice,
                                         design.vt_version,
                                     ) && property_choice_is_valid(
                                         design,
                                         id,
-                                        editor.property,
+                                        property_key,
                                         choice.clone(),
                                     ));
                                 let response = ui.add_enabled(
@@ -339,7 +339,7 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                                     ),
                                 );
                                 if response.clicked() && choice != &value {
-                                    queue(design, id, editor.property, choice.clone());
+                                    queue(design, id, property_key, choice.clone());
                                 }
                             }
                         })
@@ -348,12 +348,12 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                 });
             }
             EditorKind::FlagSet => {
-                render_flag_set(ui, &label, &value, id, object_type, editor.property, design)
+                render_flag_set(ui, &label, &value, id, object_type, property_key, design)
             }
             EditorKind::Justification => {
-                render_justification(ui, &label, &value, id, editor.property, design)
+                render_justification(ui, &label, &value, id, property_key, design)
             }
-            EditorKind::Auto => render_auto(ui, &label, &value, id, editor.property, design),
+            EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
     }
@@ -440,7 +440,7 @@ fn render_colour(
     label: &str,
     value: &serde_json::Value,
     id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     design: &EditorProject,
 ) {
     use crate::isobus_colour::{self, FIRST_PROPRIETARY};
@@ -1396,7 +1396,7 @@ fn render_identity(
     }
 }
 
-fn queue(design: &EditorProject, id: ObjectId, property: &str, value: serde_json::Value) {
+fn queue(design: &EditorProject, id: ObjectId, property: PropertyKey, value: serde_json::Value) {
     let is_reference = design.get_pool().object_by_id(id).is_some_and(|object| {
         get_property_descriptors(object.object_type())
             .into_iter()
@@ -1418,13 +1418,13 @@ fn queue(design: &EditorProject, id: ObjectId, property: &str, value: serde_json
         };
         design.queue_operation(Operation::SetObjectReference {
             object: ObjectTarget::id(id.value()),
-            property: property.to_owned(),
+            property,
             reference,
         });
     } else {
         design.queue_operation(Operation::SetProperty {
             object: ObjectTarget::id(id.value()),
-            property: property.to_owned(),
+            property,
             value,
         });
     }
@@ -1432,22 +1432,26 @@ fn queue(design: &EditorProject, id: ObjectId, property: &str, value: serde_json
 
 fn enum_value_supported(
     object_type: ObjectType,
-    property: &str,
+    property: PropertyKey,
     value: &serde_json::Value,
     version: VtVersion,
 ) -> bool {
     match property {
-        "font_size" => serde_json::from_value(value.clone())
-            .ok()
-            .is_some_and(|font_size| {
-                crate::vt_compatibility::supported_font_size(font_size, version)
-            }),
-        "font_type" => serde_json::from_value(value.clone())
-            .ok()
-            .is_some_and(|font_type| {
-                crate::vt_compatibility::supported_font_type(font_type, version)
-            }),
-        _ => crate::vt_compatibility::supported_property(object_type, property, version),
+        PropertyKey::FontSize => {
+            serde_json::from_value(value.clone())
+                .ok()
+                .is_some_and(|font_size| {
+                    crate::vt_compatibility::supported_font_size(font_size, version)
+                })
+        }
+        PropertyKey::FontType => {
+            serde_json::from_value(value.clone())
+                .ok()
+                .is_some_and(|font_type| {
+                    crate::vt_compatibility::supported_font_type(font_type, version)
+                })
+        }
+        _ => crate::vt_compatibility::supported_property(object_type, property.as_str(), version),
     }
 }
 
@@ -1484,20 +1488,23 @@ fn unavailable_features(object: &Object, version: VtVersion) -> Vec<String> {
     });
     let descriptors = get_property_descriptors(object_type);
     for editor in property_editor_descriptors(object_type) {
-        let label = human_readable_property_name(editor.property);
+        let EditorTarget::Property(property_key) = editor.property else {
+            continue;
+        };
+        let property_name = property_key.as_str();
+        let label = human_readable_property_name(property_name);
         add(label.clone(), &|v| {
-            compatibility::supported_property(object_type, editor.property, v)
+            compatibility::supported_property(object_type, property_name, v)
         });
-        let Ok(value) = get_object_property(object, editor.property) else {
+        let Ok(value) = get_object_property(object, property_key) else {
             continue;
         };
         match editor.editor {
             EditorKind::Enum => {
-                if let Some(descriptor) =
-                    descriptors.iter().find(|item| item.name == editor.property)
+                if let Some(descriptor) = descriptors.iter().find(|item| item.name == property_key)
                 {
                     for choice in &descriptor.enum_choices {
-                        let choice_label = if editor.property == "font_size"
+                        let choice_label = if property_key == PropertyKey::FontSize
                             && choice.get("Proportional").is_some()
                         {
                             "Proportional font sizes".to_owned()
@@ -1505,7 +1512,7 @@ fn unavailable_features(object: &Object, version: VtVersion) -> Vec<String> {
                             format!("{label}: {}", enum_choice_label(choice))
                         };
                         add(choice_label, &|v| {
-                            enum_value_supported(object_type, editor.property, choice, v)
+                            enum_value_supported(object_type, property_key, choice, v)
                         });
                     }
                 }
@@ -1514,14 +1521,14 @@ fn unavailable_features(object: &Object, version: VtVersion) -> Vec<String> {
                 if let Some(fields) = value.as_object() {
                     for (field, value) in fields {
                         if value.is_boolean()
-                            && !(editor.property == "font_style" && field == "proportional")
+                            && !(property_key == PropertyKey::FontStyle && field == "proportional")
                         {
                             add(
                                 format!("{label}: {}", human_readable_property_name(field)),
                                 &|v| {
                                     compatibility::supported_property_flag(
                                         object_type,
-                                        editor.property,
+                                        property_key,
                                         field,
                                         v,
                                     )
@@ -1541,7 +1548,7 @@ fn unavailable_features(object: &Object, version: VtVersion) -> Vec<String> {
             }
             _ => {}
         }
-        if let Some(descriptor) = descriptors.iter().find(|item| item.name == editor.property) {
+        if let Some(descriptor) = descriptors.iter().find(|item| item.name == property_key) {
             if let PropertySemantic::ObjectReference { allowed_types } = &descriptor.semantic {
                 for target_type in allowed_types {
                     add(format!("{label}: {target_type:?} references"), &|v| {
@@ -1577,7 +1584,7 @@ fn unavailable_features(object: &Object, version: VtVersion) -> Vec<String> {
 fn property_choice_is_valid(
     design: &EditorProject,
     id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     value: serde_json::Value,
 ) -> bool {
     design.property_choice_is_valid(id, property, value)
@@ -1617,7 +1624,7 @@ fn render_auto(
     label: &str,
     value: &serde_json::Value,
     id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     design: &EditorProject,
 ) {
     match value {
@@ -1646,7 +1653,7 @@ fn render_text(
     label: &str,
     current: &str,
     id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     design: &EditorProject,
 ) {
     let key = ui.make_persistent_id((id.value(), property));
@@ -1670,7 +1677,7 @@ fn render_number(
     value: &serde_json::Value,
     range: std::ops::RangeInclusive<f64>,
     id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     design: &EditorProject,
 ) {
     let Some(current) = value.as_f64() else {
@@ -1857,7 +1864,7 @@ fn render_flag_field(
     fields: &serde_json::Map<String, serde_json::Value>,
     id: ObjectId,
     object_type: ObjectType,
-    property: &str,
+    property: PropertyKey,
     design: &EditorProject,
 ) -> Option<serde_json::Value> {
     let label = human_readable_property_name(field);
@@ -1955,11 +1962,15 @@ fn render_flag_set(
     value: &serde_json::Value,
     id: ObjectId,
     object_type: ObjectType,
-    property: &str,
+    property: PropertyKey,
     design: &EditorProject,
 ) {
     if let Some(current) = value.as_u64() {
-        let bits = if property == "line_art" { 16 } else { 8 };
+        let bits = if property == PropertyKey::LineArt {
+            16
+        } else {
+            8
+        };
         ui.label(label);
         ui.horizontal_wrapped(|ui| {
             for bit in (0..bits).rev() {
@@ -1990,7 +2001,7 @@ fn render_flag_set(
         ui.label(label);
         for (field, value) in fields {
             // The font-size selector already chooses fixed/proportional mode.
-            if property == "font_style" && field == "proportional" {
+            if property == PropertyKey::FontStyle && field == "proportional" {
                 continue;
             }
             let edited = ui
@@ -2016,7 +2027,7 @@ fn render_reference(
     value: &serde_json::Value,
     descriptor: &crate::object_properties::PropertyDescriptor,
     id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     design: &EditorProject,
 ) {
     let PropertySemantic::ObjectReference { allowed_types } = &descriptor.semantic else {
@@ -2108,7 +2119,7 @@ fn render_pointer_reference(
     value: &serde_json::Value,
     descriptor: &crate::object_properties::PropertyDescriptor,
     id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     design: &EditorProject,
 ) {
     let PropertySemantic::ObjectReference { allowed_types } = &descriptor.semantic else {
@@ -2256,13 +2267,13 @@ fn render_pointer_reference(
 fn validate_pointer_target(
     design: &EditorProject,
     pointer: ObjectId,
-    property: &str,
+    property: PropertyKey,
     target: ObjectId,
 ) -> Result<(), String> {
     let mut transaction = OperationTransaction::new(None);
     transaction.add_operation(Operation::SetObjectReference {
         object: ObjectTarget::id(pointer.value()),
-        property: property.to_owned(),
+        property,
         reference: Some(ObjectTarget::id(target.value())),
     });
     design
@@ -2288,7 +2299,7 @@ fn render_justification(
     label: &str,
     value: &serde_json::Value,
     id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     design: &EditorProject,
 ) {
     let Some(fields) = value.as_object() else {
@@ -2383,7 +2394,7 @@ fn render_json(
     label: &str,
     value: &serde_json::Value,
     id: ObjectId,
-    property: &str,
+    property: PropertyKey,
     design: &EditorProject,
 ) {
     let key = ui.make_persistent_id((id.value(), property));
@@ -2886,11 +2897,9 @@ mod tests {
         let mut project = project_at_version(font, 3);
         let ctx = egui::Context::default();
         let text = editor_frame(&ctx, &project, vec![]);
-        assert!(
-            text.iter()
-                .any(|(text, _)| text
-                    .contains("Font Type: incompatible with VT3. Available from VT4"))
-        );
+        assert!(text.iter().any(|(text, _)| {
+            text.contains("Font Type: incompatible with VT3. Available from VT4")
+        }));
         click_editor_text(&ctx, &project, "Greek");
         click_editor_text(&ctx, &project, "Latin1");
         assert!(project.commit_queued("Repair font encoding"));
@@ -2930,17 +2939,17 @@ mod tests {
         for (source_type, property, target_type) in [
             (
                 ObjectType::ObjectPointer,
-                "value",
+                PropertyKey::Value,
                 ObjectType::ObjectPointer,
             ),
             (
                 ObjectType::OutputNumber,
-                "variable_reference",
+                PropertyKey::VariableReference,
                 ObjectType::NumberVariable,
             ),
             (
                 ObjectType::OutputString,
-                "font_attributes",
+                PropertyKey::FontAttributes,
                 ObjectType::FontAttributes,
             ),
         ] {
@@ -2986,7 +2995,7 @@ mod tests {
                         egui::CentralPanel::default().show(ctx, |ui| {
                             render_reference(
                                 ui,
-                                property,
+                                property.as_str(),
                                 &serde_json::json!(2),
                                 &descriptor,
                                 source,
@@ -3025,7 +3034,7 @@ mod tests {
         let project = EditorProject::from(pool);
         let descriptor = get_property_descriptors(ObjectType::ObjectPointer)
             .into_iter()
-            .find(|descriptor| descriptor.name == "value")
+            .find(|descriptor| descriptor.name == PropertyKey::Value)
             .unwrap();
         for (value, expected) in [
             (serde_json::Value::Null, "None"),
@@ -3040,7 +3049,7 @@ mod tests {
                         &value,
                         &descriptor,
                         ObjectId::new(1).unwrap(),
-                        "value",
+                        PropertyKey::Value,
                         &project,
                     );
                 });
@@ -3069,7 +3078,10 @@ mod tests {
                 if !matches!(editor.editor, EditorKind::FlagSet) {
                     continue;
                 }
-                let value = get_object_property(&object, editor.property).unwrap();
+                let EditorTarget::Property(property_key) = editor.property else {
+                    continue;
+                };
+                let value = get_object_property(&object, property_key).unwrap();
                 if value.is_u64() {
                     continue;
                 }
@@ -3084,7 +3096,7 @@ mod tests {
                     assert!(
                         choices.contains(current),
                         "{object_type:?}.{}.{field}: {current}",
-                        editor.property
+                        property_key
                     );
                     for choice in choices {
                         let mut updated = fields.clone();
@@ -3092,7 +3104,7 @@ mod tests {
                         crate::object_properties::validate_property(
                             &pool,
                             id,
-                            editor.property,
+                            property_key,
                             &serde_json::Value::Object(updated),
                         )
                         .unwrap();
@@ -3115,7 +3127,7 @@ mod tests {
         assert!(crate::object_properties::validate_property(
             &pool,
             button_id,
-            "background_colour",
+            PropertyKey::BackgroundColour,
             &serde_json::Value::Number(integer),
         )
         .is_ok());

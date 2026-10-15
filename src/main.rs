@@ -116,17 +116,11 @@ pub struct DesignerApp {
     preferences: AppPreferences,
     workspace: Workspace,
     canvas_visible: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    proposal_apply: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    proposal_reject: bool,
     project_settings_open: bool,
     shared_attributes: shared_attributes::SharedAttributes,
     reassign_ids_open: bool,
     reassign_include_overrides: bool,
     dimensions_draft: Option<DimensionsDraft>,
-    #[cfg(not(target_arch = "wasm32"))]
-    last_proposal_id: Option<String>,
     pending_action: Option<PendingAction>,
     confirm_discard_recovery: Option<PendingAction>,
     save_then_continue: Option<PendingAction>,
@@ -145,8 +139,6 @@ pub struct DesignerApp {
     _before_unload: Option<Closure<dyn FnMut(web_sys::BeforeUnloadEvent)>>,
     #[cfg(not(target_arch = "wasm32"))]
     automation_bridge: Option<EditorAutomationBridge>,
-    #[cfg(not(target_arch = "wasm32"))]
-    automation_bridge_error: Option<String>,
 }
 
 impl DesignerApp {
@@ -206,7 +198,7 @@ impl DesignerApp {
                     {
                         self.project_path = None;
                         self.original_source_path = source_path;
-                        self.invalidate_automation_proposal();
+                        self.invalidate_automation_identity();
                     }
                     if self.discard_on_replace {
                         self.clear_recovery();
@@ -412,11 +404,13 @@ impl DesignerApp {
         };
 
         #[cfg(not(target_arch = "wasm32"))]
-        let (automation_bridge, automation_bridge_error) =
-            match EditorAutomationBridge::start(_cc.egui_ctx.clone()) {
-                Ok(bridge) => (Some(bridge), None),
-                Err(error) => (None, Some(error)),
-            };
+        let automation_bridge = match EditorAutomationBridge::start(_cc.egui_ctx.clone()) {
+            Ok(bridge) => Some(bridge),
+            Err(error) => {
+                error_message = Some(error);
+                None
+            }
+        };
 
         #[cfg(target_arch = "wasm32")]
         let browser_dirty = Rc::new(Cell::new(false));
@@ -462,17 +456,11 @@ impl DesignerApp {
             preferences,
             workspace,
             canvas_visible: false,
-            #[cfg(not(target_arch = "wasm32"))]
-            proposal_apply: false,
-            #[cfg(not(target_arch = "wasm32"))]
-            proposal_reject: false,
             project_settings_open: false,
             shared_attributes: shared_attributes::SharedAttributes::default(),
             reassign_ids_open: false,
             reassign_include_overrides: false,
             dimensions_draft: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            last_proposal_id: None,
             pending_action: None,
             confirm_discard_recovery: None,
             save_then_continue: None,
@@ -491,17 +479,15 @@ impl DesignerApp {
             _before_unload: before_unload,
             #[cfg(not(target_arch = "wasm32"))]
             automation_bridge,
-            #[cfg(not(target_arch = "wasm32"))]
-            automation_bridge_error,
         }
     }
 }
 
 impl DesignerApp {
     #[cfg(not(target_arch = "wasm32"))]
-    fn invalidate_automation_proposal(&mut self) {
+    fn invalidate_automation_identity(&mut self) {
         if let Some(bridge) = &mut self.automation_bridge {
-            bridge.invalidate_proposal();
+            bridge.project_changed();
         }
     }
     /// Open a file dialog
@@ -598,7 +584,7 @@ impl DesignerApp {
                             }
                             self.open_in_progress = false;
                             #[cfg(not(target_arch = "wasm32"))]
-                            self.invalidate_automation_proposal();
+                            self.invalidate_automation_identity();
                             self.close_project_settings();
                             self.canvas = CanvasState::default();
                             self.mask_view = MaskViewState::default();
@@ -632,10 +618,10 @@ impl DesignerApp {
                                 match ag_iso_terminal_designer::graphics::apply_image_bytes_to_picture_graphic(&mut picture, &content) {
                                     Ok(()) => {
                                         let value = serde_json::to_value(&picture).unwrap();
-                                        for property in ["actual_width", "actual_height", "width", "format", "transparency_colour", "options", "data"] {
+                                        for property in [ag_iso_terminal_designer::PropertyKey::ActualWidth, ag_iso_terminal_designer::PropertyKey::ActualHeight, ag_iso_terminal_designer::PropertyKey::Width, ag_iso_terminal_designer::PropertyKey::Format, ag_iso_terminal_designer::PropertyKey::TransparencyColour, ag_iso_terminal_designer::PropertyKey::Options, ag_iso_terminal_designer::PropertyKey::Data] {
                                             pool.queue_operation(Operation::SetProperty {
                                                 object: ag_iso_terminal_designer::ObjectTarget::id(id.value()),
-                                                property: property.into(), value: value[property].clone(),
+                                                property, value: value[property.as_str()].clone(),
                                             });
                                         }
                                     }
@@ -828,7 +814,7 @@ impl DesignerApp {
         match action {
             PendingAction::NewPool => {
                 #[cfg(not(target_arch = "wasm32"))]
-                self.invalidate_automation_proposal();
+                self.invalidate_automation_identity();
                 self.close_project_settings();
                 self.canvas = CanvasState::default();
                 self.mask_view = MaskViewState::default();
@@ -879,7 +865,7 @@ impl DesignerApp {
                         Ok(project) => {
                             project.mark_recovered();
                             #[cfg(not(target_arch = "wasm32"))]
-                            self.invalidate_automation_proposal();
+                            self.invalidate_automation_identity();
                             self.close_project_settings();
                             self.canvas = CanvasState::default();
                             self.mask_view = MaskViewState::default();
@@ -1856,7 +1842,7 @@ impl eframe::App for DesignerApp {
                 self.original_source_path.as_deref(),
                 &self.project_display_name,
             );
-            bridge.poll(self.project.as_ref());
+            bridge.poll(self.project.as_mut());
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -1999,19 +1985,6 @@ impl eframe::App for DesignerApp {
                     });
                 });
             return;
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let proposal_id = self
-                .automation_bridge
-                .as_ref()
-                .and_then(|bridge| bridge.proposal())
-                .map(|proposal| proposal.proposal_id.clone());
-            if proposal_id.is_some() && proposal_id != self.last_proposal_id {
-                self.workspace.open(Pane::Proposal);
-            }
-            self.last_proposal_id = proposal_id;
         }
 
         // Show new object name dialog
@@ -2336,9 +2309,6 @@ impl eframe::App for DesignerApp {
             }
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
-        self.finish_proposal_actions();
-
         #[cfg(target_arch = "wasm32")]
         self.browser_dirty
             .set(self.project.as_ref().is_some_and(EditorProject::is_dirty));
@@ -2449,11 +2419,6 @@ fn execute<F: Future<Output = ()> + 'static>(f: F) {
 impl DesignerApp {
     fn render_pane(&mut self, ui: &mut egui::Ui, pane: Pane) {
         let ctx = ui.ctx().clone();
-        #[cfg(not(target_arch = "wasm32"))]
-        if pane == Pane::Proposal {
-            self.render_proposal(ui);
-            return;
-        }
         let Some(pool) = self.project.as_mut() else {
             ui.label("Open a project to use this pane.");
             return;
@@ -2674,189 +2639,8 @@ impl DesignerApp {
                         .show(ui, |ui| render_selected_ancestry_panel(ui, pool));
                 }
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            Pane::Proposal => unreachable!(),
         }
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    fn render_proposal(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if let Some(error) = &self.automation_bridge_error {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!("Automation bridge unavailable: {error}"),
-                );
-            } else if let Some(bridge) = &self.automation_bridge {
-                ui.label(bridge.status());
-                if let Some(path) = bridge.trace_path() {
-                    ui.small(format!("Automation trace: {}", path.display()));
-                }
-                if let Some(error) = bridge.last_error() {
-                    ui.colored_label(ui.visuals().error_fg_color, error);
-                }
-                if let Some(proposal) = bridge.proposal() {
-                    ui.separator();
-                    ui.heading("Proposed change");
-                    ui.label(
-                        proposal
-                            .transaction
-                            .description
-                            .as_deref()
-                            .unwrap_or("Untitled change"),
-                    );
-                    if proposal.component_intents.is_empty() {
-                        ui.label(format!(
-                            "{} operations, {} affected objects",
-                            proposal.summary.operation_count,
-                            proposal.summary.affected_objects.len()
-                        ));
-                    } else {
-                        ui.label(format!(
-                            "{} component actions",
-                            proposal.component_intents.len()
-                        ));
-                    }
-                    for action in &proposal.component_intents {
-                        use ag_iso_terminal_designer::components::ComponentIntent;
-                        match action {
-                            ComponentIntent::InstantiateComponent {
-                                component_id,
-                                x,
-                                y,
-                                overrides,
-                                ..
-                            } => {
-                                let definition = &proposal.components.definitions[component_id];
-                                ui.label(format!("Add {} at ({x}, {y})", definition.name));
-                                for (id, value) in overrides {
-                                    if let Some(parameter) =
-                                        definition.parameters.iter().find(|p| p.id == *id)
-                                    {
-                                        ui.label(format!("{}: {value}", parameter.name));
-                                    }
-                                }
-                            }
-                            ComponentIntent::SetComponentOverride {
-                                parameter, value, ..
-                            } => {
-                                ui.label(format!("Set declared parameter {parameter}: {value}"));
-                            }
-                            ComponentIntent::ResetComponentOverride { parameter, .. } => {
-                                ui.label(format!("Reset declared parameter {parameter}"));
-                            }
-                            ComponentIntent::SetComponentMasterProperty {
-                                component_id,
-                                property,
-                                value,
-                                ..
-                            } => {
-                                ui.label(format!(
-                                    "All {} instances: {property} = {value}",
-                                    proposal.components.definitions[component_id].name
-                                ));
-                            }
-                        }
-                    }
-                    ui.label("Validation passed");
-                    if let Some(project) = self.project.as_ref() {
-                        let design = project.ai_design_state();
-                        if let Ok(preview) =
-                            ag_iso_terminal_designer::ai::render_proposal_preview(&design, proposal)
-                        {
-                            ui.label(format!(
-                                "Proposed mask preview: {} × {}",
-                                preview.width, preview.height
-                            ));
-                            if preview.diagnostics.is_empty() {
-                                ui.label("Design checks: no deterministic issues found");
-                            } else {
-                                ui.label(format!(
-                                    "Design checks: {} issue(s)",
-                                    preview.diagnostics.len()
-                                ));
-                                for diagnostic in preview.diagnostics.iter().take(4) {
-                                    ui.label(format!(
-                                        "{:?}: {}",
-                                        diagnostic.severity, diagnostic.message
-                                    ));
-                                }
-                            }
-                            let _ = ag_iso_terminal_designer::ai::render_preview_ui(
-                                ui, &design, proposal,
-                            );
-                        } else {
-                            ui.colored_label(
-                                ui.visuals().error_fg_color,
-                                "Could not render proposal preview.",
-                            );
-                        }
-                    } else {
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            "The project was closed; this proposal cannot be applied.",
-                        );
-                    }
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(self.project.is_some(), egui::Button::new("Apply"))
-                            .clicked()
-                        {
-                            self.proposal_apply = true;
-                        }
-                        if ui.button("Reject").clicked() {
-                            self.proposal_reject = true;
-                        }
-                    });
-                } else {
-                    ui.separator();
-                    ui.label("No proposal is waiting for review.");
-                    ui.label("Use aitd while this editor has a project open to stage a proposal.");
-                }
-            } else {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    "Automation bridge did not start.",
-                );
-            }
-        });
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    fn finish_proposal_actions(&mut self) {
-        if std::mem::take(&mut self.proposal_reject) {
-            if let Some(bridge) = &mut self.automation_bridge {
-                bridge.reject_proposal();
-            }
-        }
-        if std::mem::take(&mut self.proposal_apply) {
-            if let (Some(project), Some(bridge)) = (&mut self.project, &mut self.automation_bridge)
-            {
-                if bridge
-                    .proposal()
-                    .is_some_and(|proposal| proposal.base_revision != project.revision())
-                {
-                    bridge.invalidate_proposal();
-                    self.error_message = Some(
-                            "The project changed after this proposal was staged. Request a new proposal.".into(),
-                        );
-                } else if let Some(proposal) = bridge.take_proposal() {
-                    let proposal_id = proposal.proposal_id.clone();
-                    match project.apply_ai_proposal(proposal) {
-                        Ok(applied) => bridge.record_applied(
-                            &proposal_id,
-                            project.revision(),
-                            &applied.transaction_id,
-                        ),
-                        Err(diagnostics) => {
-                            bridge.record_apply_failed(&proposal_id, format!("{diagnostics:?}"));
-                            self.error_message =
-                                Some(format!("Could not apply proposal: {diagnostics:?}"));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     fn render_workspace(&mut self, ctx: &egui::Context) {
         let mut dock =
             std::mem::replace(&mut self.workspace.dock, egui_dock::DockState::new(vec![]));

@@ -197,7 +197,10 @@ pub fn materialize_source_with_graphics(
                 .iter()
                 .any(|n| !instance.compiled_ids.contains_key(&n.id))
         {
-            return Err(ComponentError::new("COMPONENT_NODE_INVALID", "Compiled ID reservations must match current definition nodes; prepare source state first"));
+            return Err(ComponentError::new(
+                "COMPONENT_NODE_INVALID",
+                "Compiled ID reservations must match current definition nodes; prepare source state first",
+            ));
         }
         for (node, id) in &instance.compiled_ids {
             if *id == u16::MAX || !reserved.insert(*id) {
@@ -449,11 +452,11 @@ fn compile_nodes(
                 version,
                 Operation::SetProperty {
                     object: ObjectTarget::id(id),
-                    property: property.clone(),
+                    property: *property,
                     value: value.clone(),
                 },
             )
-            .map_err(|e| locate(e, definition, instance, node.id, Some(property)))?;
+            .map_err(|e| locate(e, definition, instance, node.id, Some(property.as_str())))?;
         }
         for (property, reference) in &node.references {
             let target = match reference {
@@ -476,7 +479,7 @@ fn compile_nodes(
                                 definition,
                                 instance,
                                 node.id,
-                                Some(property),
+                                Some(property.as_str()),
                             )
                         })?
                         .value(),
@@ -508,11 +511,11 @@ fn compile_nodes(
                 version,
                 Operation::SetObjectReference {
                     object: ObjectTarget::id(id),
-                    property: property.clone(),
+                    property: *property,
                     reference: target.map(ObjectTarget::id),
                 },
             )
-            .map_err(|e| locate(e, definition, instance, node.id, Some(property)))?;
+            .map_err(|e| locate(e, definition, instance, node.id, Some(property.as_str())))?;
         }
         for parameter in definition
             .parameters
@@ -526,25 +529,41 @@ fn compile_nodes(
             if parameter.kind == ComponentParameterKind::Graphic {
                 continue;
             }
+            let ComponentParameterTarget::Property(property) = parameter.property else {
+                unreachable!("graphic parameters are skipped above");
+            };
             let op = if parameter.kind == ComponentParameterKind::ObjectReference {
                 Operation::SetObjectReference {
                     object: ObjectTarget::id(id),
-                    property: parameter.property.clone(),
+                    property: property,
                     reference: external_value(value, canonical, info)
                         .map_err(|e| {
-                            locate(e, definition, instance, node.id, Some(&parameter.property))
+                            locate(
+                                e,
+                                definition,
+                                instance,
+                                node.id,
+                                Some(parameter.property.as_str()),
+                            )
                         })?
                         .map(ObjectTarget::id),
                 }
             } else {
                 Operation::SetProperty {
                     object: ObjectTarget::id(id),
-                    property: parameter.property.clone(),
+                    property: property,
                     value: value.clone(),
                 }
             };
-            apply(pool, version, op)
-                .map_err(|e| locate(e, definition, instance, node.id, Some(&parameter.property)))?;
+            apply(pool, version, op).map_err(|e| {
+                locate(
+                    e,
+                    definition,
+                    instance,
+                    node.id,
+                    Some(parameter.property.as_str()),
+                )
+            })?;
         }
         if let Some(list) = &node.object_list {
             let resolve = |target: &ObjectTarget| -> ComponentResult<ObjectTarget> {
@@ -665,7 +684,7 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
         if !parameters.insert(p.id)
             || !names.insert(&p.name)
             || p.name.trim().is_empty()
-            || !targets.insert((p.target_node, &p.property))
+            || !targets.insert((p.target_node, p.property))
         {
             return Err(ComponentError::new(
                 "COMPONENT_PARAMETER_INVALID",
@@ -679,7 +698,7 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
             .ok_or_else(|| invalid("Parameter node missing"))?;
         if p.kind == ComponentParameterKind::Graphic {
             if node.object_type != ag_iso_stack::object_pool::ObjectType::PictureGraphic
-                || p.property != "graphic"
+                || p.property != ComponentParameterTarget::Graphic
             {
                 return Err(ComponentError::new(
                     "COMPONENT_PARAMETER_INVALID",
@@ -689,9 +708,15 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
             validate_value(p, &p.default_value)?;
             continue;
         }
+        let ComponentParameterTarget::Property(property) = p.property else {
+            return Err(ComponentError::new(
+                "COMPONENT_PARAMETER_INVALID",
+                "Ordinary parameters must target an object property",
+            ));
+        };
         let descriptor = get_property_descriptors(node.object_type)
             .into_iter()
-            .find(|d| d.name == p.property && d.writable)
+            .find(|d| d.name == property && d.writable)
             .ok_or_else(|| {
                 ComponentError::new(
                     "COMPONENT_PARAMETER_INVALID",
@@ -705,9 +730,8 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
             PropertySemantic::Colour => p.kind == ComponentParameterKind::Colour,
             PropertySemantic::Enum => p.kind == ComponentParameterKind::Enum,
             _ => {
-                let value =
-                    get_object_property(&crate::default_object(node.object_type), &p.property)
-                        .map_err(|_| invalid("Unsupported property"))?;
+                let value = get_object_property(&crate::default_object(node.object_type), property)
+                    .map_err(|_| invalid("Unsupported property"))?;
                 match p.kind {
                     ComponentParameterKind::Graphic => {
                         serde_json::from_value::<crate::graphics::GraphicAssetId>(value.clone())
@@ -719,7 +743,7 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
                         value.is_boolean()
                             || (node.object_type
                                 == ag_iso_stack::object_pool::ObjectType::InputBoolean
-                                && p.property == "value")
+                                && property.as_str() == "value")
                     }
                     _ => false,
                 }
@@ -745,14 +769,14 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
             }
             match reference {
                 ComponentReference::Internal(id) if !ids.contains(id) => {
-                    return Err(invalid("Internal reference node missing"))
+                    return Err(invalid("Internal reference node missing"));
                 }
                 ComponentReference::Parameter(id) => {
                     if !definition.parameters.iter().any(|p| {
                         p.id == *id
                             && p.kind == ComponentParameterKind::ObjectReference
                             && p.target_node == node.id
-                            && p.property == *property
+                            && p.property == ComponentParameterTarget::Property(*property)
                     }) {
                         return Err(invalid("Reference parameter must target this property"));
                     }
@@ -870,9 +894,11 @@ pub fn component_bounds(definition: &ComponentDefinition) -> Option<(u16, u16)> 
         .nodes
         .iter()
         .find(|n| n.id == definition.root_node)?;
+    let width = crate::object_properties::PropertyKey::parse("width")?;
+    let height = crate::object_properties::PropertyKey::parse("height")?;
     Some((
-        u16::try_from(root.properties.get("width")?.as_u64()?).ok()?,
-        u16::try_from(root.properties.get("height")?.as_u64()?).ok()?,
+        u16::try_from(root.properties.get(&width)?.as_u64()?).ok()?,
+        u16::try_from(root.properties.get(&height)?.as_u64()?).ok()?,
     ))
 }
 

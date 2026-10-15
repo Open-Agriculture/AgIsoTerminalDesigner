@@ -104,7 +104,7 @@ impl ObjectIdRanges {
                     entry.object_type
                 ));
             }
-            if range.end >= u16::MAX {
+            if range.end == u16::MAX {
                 return Err(format!(
                     "{:?} ID range must stay within 0–65534",
                     entry.object_type

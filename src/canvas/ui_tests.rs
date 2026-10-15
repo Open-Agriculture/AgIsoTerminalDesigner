@@ -331,7 +331,7 @@ fn numeric_dimension_drag_is_one_edit_and_updates_shared_object() {
                 .get_pool()
                 .object_by_id(ObjectId::new(2).unwrap())
                 .unwrap(),
-            "width",
+            crate::object_properties::PropertyKey::Width,
         )
         .unwrap()
         .as_u64()
@@ -375,11 +375,19 @@ fn resize_from_center_preserves_ratio_and_undoes_as_one_action() {
         .object_by_id(ObjectId::new(2).unwrap())
         .unwrap();
     assert_eq!(
-        crate::object_properties::get_object_property(object, "width").unwrap(),
+        crate::object_properties::get_object_property(
+            object,
+            crate::object_properties::PropertyKey::Width
+        )
+        .unwrap(),
         serde_json::json!(80)
     );
     assert_eq!(
-        crate::object_properties::get_object_property(object, "height").unwrap(),
+        crate::object_properties::get_object_property(
+            object,
+            crate::object_properties::PropertyKey::Height
+        )
+        .unwrap(),
         serde_json::json!(60)
     );
     assert_eq!(h.offset(1), (220, 100));
@@ -519,7 +527,7 @@ fn editing_x_does_not_change_existing_zero_dimensions() {
     let mut transaction = OperationTransaction::new(Some("Zero-sized object".into()));
     transaction.operations.push(Operation::SetProperty {
         object: ObjectTarget::id(2),
-        property: "width".into(),
+        property: crate::object_properties::PropertyKey::Width,
         value: serde_json::json!(0),
     });
     h.project.execute_transaction(transaction).unwrap();
@@ -554,11 +562,19 @@ fn editing_x_does_not_change_existing_zero_dimensions() {
         .object_by_id(ObjectId::new(2).unwrap())
         .unwrap();
     assert_eq!(
-        crate::object_properties::get_object_property(object, "width").unwrap(),
+        crate::object_properties::get_object_property(
+            object,
+            crate::object_properties::PropertyKey::Width
+        )
+        .unwrap(),
         serde_json::json!(0)
     );
     assert_eq!(
-        crate::object_properties::get_object_property(object, "height").unwrap(),
+        crate::object_properties::get_object_property(
+            object,
+            crate::object_properties::PropertyKey::Height
+        )
+        .unwrap(),
         serde_json::json!(30)
     );
 }
@@ -569,12 +585,12 @@ fn resize_keeps_zero_dimensions_when_no_larger_size_fits() {
     let mut transaction = OperationTransaction::new(Some("Zero viewport".into()));
     transaction.operations.push(Operation::SetProperty {
         object: ObjectTarget::id(2),
-        property: "width".into(),
+        property: crate::object_properties::PropertyKey::Width,
         value: serde_json::json!(0),
     });
     transaction.operations.push(Operation::SetProperty {
         object: ObjectTarget::id(2),
-        property: "height".into(),
+        property: crate::object_properties::PropertyKey::Height,
         value: serde_json::json!(0),
     });
     transaction.operations.push(Operation::SetChildren {

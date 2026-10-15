@@ -88,18 +88,6 @@ pub trait RenderableObject {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>);
 }
 
-/// Render one mask through the same object-rendering implementation used by
-/// the editor.  This deliberately accepts a supplied pool so staged AI
-/// candidates never need to be installed in `EditorProject`.
-pub fn render_mask_with_version(
-    ui: &mut egui::Ui,
-    pool: &ObjectPool,
-    mask: &Object,
-    version: VtVersion,
-) {
-    render_object_with_version(ui, pool, mask, Point::default(), version);
-}
-
 impl RenderableObject for Object {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
         let Some(_ancestry_guard) = RenderAncestryGuard::enter(self.id().value()) else {

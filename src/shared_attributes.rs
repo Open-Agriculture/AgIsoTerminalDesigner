@@ -333,13 +333,13 @@ mod tests {
                     name: "Label".into(),
                     object_type: ObjectType::OutputString,
                     properties: BTreeMap::from([
-                        ("width".into(), json!(80)),
-                        ("height".into(), json!(20)),
-                        ("value".into(), json!("Text")),
+                        (ag_iso_terminal_designer::PropertyKey::Width, json!(80)),
+                        (ag_iso_terminal_designer::PropertyKey::Height, json!(20)),
+                        (ag_iso_terminal_designer::PropertyKey::Value, json!("Text")),
                     ]),
                     children: vec![],
                     references: BTreeMap::from([(
-                        "font_attributes".into(),
+                        ag_iso_terminal_designer::PropertyKey::FontAttributes,
                         ComponentReference::ExternalObject(ObjectTarget::id(23000)),
                     )]),
                     macro_references: vec![],

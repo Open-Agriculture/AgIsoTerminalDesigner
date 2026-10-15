@@ -1,26 +1,32 @@
 //! Shared export generation for the CLI and editor.
-use crate::{ai::AiDesignState, EditorProject};
+use crate::EditorProject;
 use ag_iso_stack::object_pool::{object::Object, ObjectPool};
-use serde_json::{json, Value};
 use std::collections::HashMap;
 
+/// Raw artifacts generated for one export request. Encoding belongs to the
+/// transport that serializes these bytes.
+#[derive(Debug, Default)]
+pub struct ExportArtifacts {
+    pub iop: Option<Vec<u8>>,
+    pub header: Option<Vec<u8>>,
+    pub vt_version: u8,
+}
+
 /// Generate requested project artifacts from one materialized project snapshot.
-///
-/// `format` is `iop`, `header`, or `bundle`. Artifact bytes are base64 encoded
-/// because the automation bridge transports JSON values.
-pub fn artifacts(state: &AiDesignState, format: &str) -> Result<Value, String> {
+/// `format` is `iop`, `header`, or `bundle`.
+pub fn artifacts(project: &EditorProject, format: &str) -> Result<ExportArtifacts, String> {
     if !matches!(format, "iop" | "header" | "bundle") {
         return Err(format!(
             "Unknown export format '{format}'. Choose iop, header, or bundle."
         ));
     }
-    let project = EditorProject::from_ai_source(state);
     let materialized = project
         .materialize_shared()
         .map_err(|error| error.to_string())?;
     let header = if matches!(format, "header" | "bundle") {
+        let info = project.component_object_info();
         Some(generate_header(&materialized.pool, |object| {
-            object_name(state, &materialized.source_map, object)
+            object_name(project, &info, &materialized.source_map, object)
         })?)
     } else {
         None
@@ -31,49 +37,28 @@ pub fn artifacts(state: &AiDesignState, format: &str) -> Result<Value, String> {
         None
     };
 
-    let mut generated = serde_json::Map::new();
-    match format {
-        "iop" => {
-            generated.insert("iop".into(), encode(iop.as_deref().unwrap()));
-        }
-        "header" => {
-            generated.insert(
-                "header".into(),
-                encode(header.as_deref().unwrap().as_bytes()),
-            );
-        }
-        "bundle" => {
-            generated.insert("iop".into(), encode(iop.as_deref().unwrap()));
-            generated.insert(
-                "header".into(),
-                encode(header.as_deref().unwrap().as_bytes()),
-            );
-        }
-        _ => unreachable!("validated format above"),
-    }
-    Ok(json!({
-        "artifacts": generated,
-        "vt_version": u8::from(project.vt_version),
-    }))
+    Ok(ExportArtifacts {
+        iop,
+        header: header.map(String::into_bytes),
+        vt_version: u8::from(project.vt_version),
+    })
 }
 
 /// Generate a C object ID header for the editor's current materialized project.
 pub fn header_for_project(project: &EditorProject) -> Result<Vec<u8>, String> {
-    let value = artifacts(&project.ai_design_state(), "header")?;
-    let encoded = value["artifacts"]["header"]
-        .as_str()
-        .ok_or_else(|| "Header export did not produce an artifact".to_owned())?;
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-        .map_err(|error| format!("Could not decode generated header: {error}"))
+    artifacts(project, "header")?
+        .header
+        .ok_or_else(|| "Header export did not produce an artifact".to_owned())
 }
 
 fn object_name(
-    state: &AiDesignState,
+    project: &EditorProject,
+    info: &HashMap<ag_iso_stack::object_pool::ObjectId, crate::ObjectInfo>,
     source_map: &crate::components::MaterializedSourceMap,
     object: &Object,
 ) -> String {
     let id = object.id();
-    if let Some(info) = state.object_info.get(&id) {
+    if let Some(info) = info.get(&id) {
         return info.get_name(object);
     }
     if let Some(crate::components::MaterializedSource::ComponentNode {
@@ -81,13 +66,17 @@ fn object_name(
         node_id,
     }) = source_map.by_object_id.get(&id.value())
     {
-        if let Some(instance) = state
-            .components
+        if let Some(instance) = project
+            .component_source()
             .instances
             .iter()
             .find(|i| i.id == *instance_id)
         {
-            if let Some(definition) = state.components.definitions.get(&instance.component_id) {
+            if let Some(definition) = project
+                .component_source()
+                .definitions
+                .get(&instance.component_id)
+            {
                 if let Some(node) = definition.nodes.iter().find(|n| n.id == *node_id) {
                     return format!("{}_{}_{}", definition.name, node.name, id.value());
                 }
@@ -95,13 +84,6 @@ fn object_name(
         }
     }
     crate::smart_naming::get_object_type_name(object.object_type()).to_owned()
-}
-
-fn encode(bytes: &[u8]) -> Value {
-    Value::String(base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        bytes,
-    ))
 }
 
 fn generate_header(

@@ -23,6 +23,7 @@ mod soft_key_layout;
 pub mod ai;
 pub mod canvas;
 pub mod components;
+pub mod editing;
 pub mod effective_colour;
 pub mod graphics;
 pub mod isobus_colour;
@@ -49,10 +50,10 @@ pub use soft_key_layout::{SoftKeyArrangement, SoftKeyLayout};
 
 // Operation system exports
 pub use ai::snapshot::{DesignSnapshot, PoolSnapshot};
-pub use ai::{AiDesignState, AiProposal, ProjectRevision};
+pub use ai::{AiDesignState, ProjectRevision};
 pub use object_properties::{
     get_properties, PropertyAccess, PropertyAccessError, PropertyDescriptor, PropertyError,
-    PropertySemantic,
+    PropertyKey, PropertySemantic,
 };
 pub use operations::{
     AppliedTransaction, ChildPlacement, DiagnosticSeverity, MacroReferenceTarget, ObjectTarget,

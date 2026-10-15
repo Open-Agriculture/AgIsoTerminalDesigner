@@ -411,8 +411,8 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                 ui.text_edit_singleline(&mut node.name);
                                 for (property, value) in &mut node.properties {
                                     ui.horizontal(|ui| {
-                                        ui.label(property);
-                                        let font_type = if property == "value"
+                                        ui.label(property.as_str());
+                                        let font_type = if property.as_str() == "value"
                                             && matches!(
                                                 node.object_type,
                                                 ObjectType::OutputString
@@ -430,20 +430,20 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                         value_editor_with_font(
                                             ui,
                                             node.id,
-                                            property,
+                                            property.as_str(),
                                             value,
                                             font_type,
                                         );
                                     });
                                 }
                                 for (property, reference) in &mut node.references {
-                                    ui.label(format!("Reference: {property}"));
+                                    ui.label(format!("Reference: {}", property.as_str()));
                                     if let Some(descriptor) =
                                         crate::object_properties::get_property_descriptors(
                                             node.object_type,
                                         )
                                         .into_iter()
-                                        .find(|d| d.name == property)
+                                        .find(|d| d.name == *property)
                                     {
                                         if let crate::PropertySemantic::ObjectReference {
                                             allowed_types,
@@ -451,9 +451,9 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                         {
                                             if let Some(selected) = crate::object_picker::button(
                                                 ui,
-                                                (node.id, property, "external_reference"),
+                                                (node.id, *property, "external_reference"),
                                                 "Choose external object…",
-                                                &format!("Change {property} reference on component node {}", node.name),
+                                                &format!("Change {} reference on component node {}", property.as_str(), node.name),
                                                 project,
                                                 None,
                                                 true,
@@ -483,7 +483,7 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                     }
 
                                     let mut value = serde_json::to_value(&*reference).unwrap();
-                                    value_editor(ui, node.id, property, &mut value);
+                                    value_editor(ui, node.id, property.as_str(), &mut value);
                                     if let Ok(updated) = serde_json::from_value(value) {
                                         *reference = updated;
                                     }
@@ -547,14 +547,14 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                     crate::PropertySemantic::ObjectReference { .. }
                                 ) {
                                     references
-                                        .insert(descriptor.name.into(), ComponentReference::Null);
+                                        .insert(descriptor.name, ComponentReference::Null);
                                 } else if let Ok(value) =
                                     crate::object_properties::get_object_property(
                                         &object,
                                         descriptor.name,
                                     )
                                 {
-                                    properties.insert(descriptor.name.into(), value);
+                                    properties.insert(descriptor.name, value);
                                 }
                             }
                             let id = ComponentNodeId::default();
@@ -600,7 +600,7 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                             ui.push_id(parameter.id, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.text_edit_singleline(&mut parameter.name);
-                                    ui.label(&parameter.property);
+                                    ui.label(parameter.property.as_str());
                                     if ui.button("Remove parameter").clicked() {
                                         remove_parameter = Some(parameter.id);
                                     }
@@ -620,7 +620,7 @@ fn edit_dialog(ctx: &egui::Context, project: &mut EditorProject) {
                                 } else {
                                     let font_type = (parameter.kind
                                         == ComponentParameterKind::Text
-                                        && parameter.property == "value")
+                                        && parameter.property.as_str() == "value")
                                         .then(|| {
                                             font_type_for_node(
                                                 &editor_font_context,
@@ -831,12 +831,12 @@ fn font_type_for_object(
 }
 fn declared_parameter_default(
     node: &ComponentNode,
-    property: &str,
+    property: crate::object_properties::PropertyKey,
     kind: ComponentParameterKind,
 ) -> serde_json::Value {
     let value = node
         .properties
-        .get(property)
+        .get(&property)
         .cloned()
         .or_else(|| {
             crate::object_properties::get_object_property(
@@ -849,7 +849,7 @@ fn declared_parameter_default(
 
     if kind == ComponentParameterKind::Boolean
         && node.object_type == ObjectType::InputBoolean
-        && property == "value"
+        && property.as_str() == "value"
     {
         if let Some(number) = value.as_i64() {
             return serde_json::Value::Bool(number != 0);
@@ -962,8 +962,8 @@ fn manual_parameter_form(
                     {
                         ui.selectable_value(
                             &mut draft.2,
-                            descriptor.name.to_owned(),
-                            descriptor.name,
+                            descriptor.name.to_string(),
+                            descriptor.name.as_str(),
                         );
                     }
                 });
@@ -1001,7 +1001,7 @@ fn manual_parameter_form(
                         name: draft.0.clone(),
                         description: None,
                         target_node: draft.1,
-                        property: draft.2.clone(),
+                        property: ComponentParameterTarget::Graphic,
                         kind: draft.3,
                         default_value: serde_json::json!(id),
                     });
@@ -1011,34 +1011,52 @@ fn manual_parameter_form(
                 ui.data_mut(|d| d.insert_temp(graphic_key, graphic.clone()));
             }
             if ui.button("Add declared parameter").clicked() {
-                let value = if draft.3 == ComponentParameterKind::Graphic {
-                    graphic
-                } else if draft.3 == ComponentParameterKind::ObjectReference {
-                    match node.references.get(&draft.2) {
-                        Some(ComponentReference::ExternalObject(target)) => {
-                            serde_json::to_value(target).unwrap()
+                let target = if draft.3 == ComponentParameterKind::Graphic {
+                    Some(ComponentParameterTarget::Graphic)
+                } else {
+                    crate::object_properties::PropertyKey::parse(&draft.2)
+                        .map(ComponentParameterTarget::Property)
+                };
+                if let Some(target) = target {
+                    let value = if draft.3 == ComponentParameterKind::Graphic {
+                        graphic
+                    } else if draft.3 == ComponentParameterKind::ObjectReference {
+                        match target {
+                            ComponentParameterTarget::Property(property) => {
+                                match node.references.get(&property) {
+                                    Some(ComponentReference::ExternalObject(target)) => {
+                                        serde_json::to_value(target).unwrap()
+                                    }
+                                    _ => serde_json::Value::Null,
+                                }
+                            }
+                            ComponentParameterTarget::Graphic => unreachable!(),
                         }
-                        _ => serde_json::Value::Null,
+                    } else if let ComponentParameterTarget::Property(property) = target {
+                        declared_parameter_default(node, property, draft.3)
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    let parameter = ComponentParameter {
+                        id: ComponentParameterId::default(),
+                        name: draft.0.clone(),
+                        description: None,
+                        target_node: draft.1,
+                        property: target,
+                        kind: draft.3,
+                        default_value: value,
+                    };
+                    let mut candidate = definition.clone();
+                    candidate.parameters.push(parameter);
+                    match validate_definition(&candidate) {
+                        Ok(()) => *definition = candidate,
+                        Err(e) => report_error(ui, e.to_string()),
                     }
                 } else {
-                    declared_parameter_default(node, &draft.2, draft.3)
-                };
-                let parameter = ComponentParameter {
-                    id: ComponentParameterId::default(),
-                    name: draft.0.clone(),
-                    description: None,
-                    target_node: draft.1,
-                    property: draft.2.clone(),
-                    kind: draft.3,
-                    default_value: value,
-                };
-                let mut candidate = definition.clone();
-                candidate.parameters.push(parameter);
-                match validate_definition(&candidate) {
-                    Ok(()) => *definition = candidate,
-                    Err(e) => {
-                        report_error(ui, e.to_string());
-                    }
+                    report_error(
+                        ui,
+                        "Choose a supported property before adding the parameter",
+                    );
                 }
             }
         }
@@ -1092,7 +1110,7 @@ pub fn inspector(
             .get(&parameter.id)
             .unwrap_or(&parameter.default_value);
         let font_type = (parameter.kind == ComponentParameterKind::Text
-            && parameter.property == "value")
+            && parameter.property.as_str() == "value")
             .then(|| font_type_for_instance_node(&materialized, id, parameter.target_node));
         let initial_text = if parameter.kind == ComponentParameterKind::Text {
             serde_json::from_value::<VtString>(value.clone())
@@ -1127,7 +1145,7 @@ pub fn inspector(
                 if let Some(descriptor) =
                     crate::object_properties::get_property_descriptors(node.object_type)
                         .into_iter()
-                        .find(|d| d.name == parameter.property)
+                        .find(|d| parameter.property == ComponentParameterTarget::Property(d.name))
                 {
                     if let crate::PropertySemantic::ObjectReference { allowed_types } =
                         descriptor.semantic
@@ -1136,7 +1154,10 @@ pub fn inspector(
                             ui,
                             (id, parameter.id, "override_reference"),
                             "Choose referenced object…",
-                            &format!("Choose the draft value for parameter '{}'. Use Set override to apply it.", parameter.name),
+                            &format!(
+                                "Choose the draft value for parameter '{}'. Use Set override to apply it.",
+                                parameter.name
+                            ),
                             project,
                             None,
                             true,
@@ -1146,10 +1167,25 @@ pub fn inspector(
                             },
                             |ui, selected| {
                                 ui.label("Preview after Set override:");
-                                crate::object_picker::impact::review_change(ui, project, |candidate| {
-                                    let value = serde_json::to_value(selected.0.map(|id| crate::ObjectTarget::id(id.value()))).unwrap();
-                                    ComponentService::set_component_override(candidate, id, parameter.id, value).map_err(|error| error.to_string())
-                                })
+                                crate::object_picker::impact::review_change(
+                                    ui,
+                                    project,
+                                    |candidate| {
+                                        let value = serde_json::to_value(
+                                            selected
+                                                .0
+                                                .map(|id| crate::ObjectTarget::id(id.value())),
+                                        )
+                                        .unwrap();
+                                        ComponentService::set_component_override(
+                                            candidate,
+                                            id,
+                                            parameter.id,
+                                            value,
+                                        )
+                                        .map_err(|error| error.to_string())
+                                    },
+                                )
                             },
                         ) {
                             draft = serde_json::to_string(
@@ -1244,7 +1280,10 @@ mod tests {
             id: ComponentNodeId::default(),
             name: "Boolean".into(),
             object_type: ObjectType::InputBoolean,
-            properties: BTreeMap::from([("value".into(), value)]),
+            properties: BTreeMap::from([(
+                crate::object_properties::PropertyKey::parse("value").unwrap(),
+                value,
+            )]),
             children: Vec::new(),
             references: BTreeMap::new(),
             macro_references: Vec::new(),
@@ -1257,7 +1296,7 @@ mod tests {
         assert_eq!(
             declared_parameter_default(
                 &input_boolean(serde_json::json!(0)),
-                "value",
+                crate::object_properties::PropertyKey::parse("value").unwrap(),
                 ComponentParameterKind::Boolean,
             ),
             serde_json::json!(false)
@@ -1265,7 +1304,7 @@ mod tests {
         assert_eq!(
             declared_parameter_default(
                 &input_boolean(serde_json::json!(3)),
-                "value",
+                crate::object_properties::PropertyKey::parse("value").unwrap(),
                 ComponentParameterKind::Boolean,
             ),
             serde_json::json!(true)

@@ -14,8 +14,6 @@ pub enum Pane {
     Canvas,
     Properties,
     Ancestry,
-    #[cfg(not(target_arch = "wasm32"))]
-    Proposal,
 }
 impl Pane {
     pub const ALL: &'static [Self] = &[
@@ -25,8 +23,6 @@ impl Pane {
         Self::Canvas,
         Self::Properties,
         Self::Ancestry,
-        #[cfg(not(target_arch = "wasm32"))]
-        Self::Proposal,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -36,8 +32,6 @@ impl Pane {
             Self::Canvas => "Canvas",
             Self::Properties => "Properties",
             Self::Ancestry => "Selection Ancestry",
-            #[cfg(not(target_arch = "wasm32"))]
-            Self::Proposal => "Proposal",
         }
     }
 }
@@ -57,28 +51,41 @@ fn deserialize_expanded_dock<'de, D>(deserializer: D) -> Result<DockState<Pane>,
 where
     D: serde::Deserializer<'de>,
 {
-    // Read directly from the persistence format first (eframe uses RON). Most
-    // workspaces need no normalization, so keep those layouts on the normal path.
-    let dock = DockState::<Pane>::deserialize(deserializer)?;
-    if !dock
-        .iter_surfaces()
-        .flat_map(|surface| surface.iter_nodes())
-        .any(egui_dock::Node::is_collapsed)
-    {
-        return Ok(dock);
+    // Accept the retired pane only while loading persisted layouts. Remove it
+    // through DockState so empty leaves/windows and focus are reconciled normally.
+    #[derive(Clone, PartialEq, Serialize, Deserialize)]
+    enum StoredPane {
+        Objects,
+        Graphics,
+        Components,
+        Canvas,
+        Properties,
+        Ancestry,
+        Proposal,
     }
-
-    // egui_dock exposes node collapse state, but the tree's aggregate collapse
-    // fields are private. Normalize those fields through a JSON value only when
-    // a saved node is actually collapsed.
-    let mut dock = dock;
+    let mut dock = DockState::<StoredPane>::deserialize(deserializer)?;
+    let metadata = serde_json::to_value(&dock).map_err(serde::de::Error::custom)?;
+    let focused = metadata["focused_surface"].as_u64().and_then(|surface| {
+        let surface = egui_dock::SurfaceIndex(usize::try_from(surface).ok()?);
+        let tree = dock.get_surface(surface)?.node_tree()?;
+        let node = tree.focused_leaf()?;
+        let leaf = tree.iter().nth(node.0)?.get_leaf()?;
+        leaf.tabs.get(leaf.active.0).cloned()
+    });
+    while let Some(location) = dock.find_tab(&StoredPane::Proposal) {
+        dock.remove_tab(location);
+    }
+    if let Some(location) = focused.and_then(|pane| dock.find_tab(&pane)) {
+        dock.set_active_tab(location);
+        dock.set_focused_node_and_surface((location.0, location.1));
+    }
     sanitize_nonfinite_dock_geometry(&mut dock);
     let mut value = serde_json::to_value(dock).map_err(serde::de::Error::custom)?;
     clear_dock_collapse_state(&mut value);
     DockState::<Pane>::deserialize(value).map_err(serde::de::Error::custom)
 }
 
-fn sanitize_nonfinite_dock_geometry(dock: &mut DockState<Pane>) {
+fn sanitize_nonfinite_dock_geometry<T>(dock: &mut DockState<T>) {
     for surface in dock.iter_surfaces_mut() {
         for node in surface.iter_nodes_mut() {
             if node.rect().is_some_and(|rect| !rect.is_finite()) {
@@ -136,14 +143,6 @@ impl Workspace {
         if preferences.show_ancestry {
             dock.main_surface_mut()
                 .split_below(center, 0.88, vec![Pane::Ancestry]);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        if preferences.show_proposal {
-            let surface = dock.add_window(vec![Pane::Proposal]);
-            if let Some(window) = dock.get_window_state_mut(surface) {
-                window.set_position(egui::pos2(70.0, 80.0));
-                window.set_size(egui::vec2(360.0, 420.0));
-            }
         }
         Self {
             dock,
@@ -257,18 +256,14 @@ mod tests {
     fn saved_collapsed_layout_restores_expanded_without_changing_other_state() {
         let preferences = AppPreferences {
             show_graphics: false,
-            #[cfg(not(target_arch = "wasm32"))]
-            show_proposal: true,
             ..Default::default()
         };
         let mut workspace = Workspace::new(&preferences);
         workspace.open(Pane::Properties);
         workspace.ancestry_expanded = true;
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(window) = workspace
-            .dock
-            .get_window_state_mut(egui_dock::SurfaceIndex(1))
-        {
+        workspace.close(Pane::Components);
+        let surface = workspace.dock.add_window(vec![Pane::Components]);
+        if let Some(window) = workspace.dock.get_window_state_mut(surface) {
             window.set_position(egui::pos2(123.0, 234.0));
             window.set_size(egui::vec2(456.0, 345.0));
         }
@@ -324,6 +319,46 @@ mod tests {
         let mut expected = serde_json::to_value(expected_dock).unwrap();
         clear_dock_collapse_state(&mut expected);
         assert_eq!(serde_json::to_value(&restored.dock).unwrap(), expected);
+    }
+
+    #[test]
+    fn retired_proposal_tabs_are_removed_from_saved_layouts() {
+        let mut workspace = Workspace::new(&AppPreferences::default());
+        workspace.close(Pane::Graphics);
+        let retired = workspace.dock.add_window(vec![Pane::Graphics]);
+        workspace.close(Pane::Components);
+        let retained = workspace.dock.add_window(vec![Pane::Components]);
+        workspace
+            .dock
+            .get_window_state_mut(retained)
+            .unwrap()
+            .set_position(egui::pos2(123.0, 234.0));
+        let (surface, node, tab) = workspace.dock.find_tab(&Pane::Components).unwrap();
+        workspace.dock.set_active_tab((surface, node, tab));
+        workspace.dock.set_focused_node_and_surface((surface, node));
+        let mut storage = Storage::default();
+        eframe::set_value(&mut storage, STORAGE_KEY, &workspace);
+        let saved = storage.0.get_mut(STORAGE_KEY).unwrap();
+        assert!(saved.contains("Graphics"));
+        *saved = saved.replace("Graphics", "Proposal");
+        let restored: Workspace = eframe::get_value(&storage, STORAGE_KEY).unwrap();
+        assert!(restored.valid());
+        assert!(!restored.contains(Pane::Graphics));
+        assert!(restored.contains(Pane::Canvas));
+        assert!(restored.contains(Pane::Components));
+        assert_eq!(
+            restored.dock.iter_all_tabs().count(),
+            workspace.dock.iter_all_tabs().count() - 1
+        );
+        assert_eq!(restored.dock.focused_leaf(), Some((surface, node)));
+        let mut actual = serde_json::to_value(&restored.dock).unwrap();
+        workspace.dock.remove_surface(retired);
+        workspace.dock.set_focused_node_and_surface((surface, node));
+        sanitize_nonfinite_dock_geometry(&mut workspace.dock);
+        let mut expected = serde_json::to_value(&workspace.dock).unwrap();
+        clear_dock_collapse_state(&mut actual);
+        clear_dock_collapse_state(&mut expected);
+        assert_eq!(actual, expected);
     }
 
     #[test]

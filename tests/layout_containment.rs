@@ -51,7 +51,7 @@ fn sized_container(id: u16, width: u16, height: u16) -> Object {
 fn property(object_id: u16, property: &str, value: serde_json::Value) -> Operation {
     Operation::SetProperty {
         object: ObjectTarget::id(object_id),
-        property: property.into(),
+        property: property.parse().unwrap(),
         value,
     }
 }
@@ -72,7 +72,7 @@ fn diagnostics_code(project: &EditorProject, transaction: &OperationTransaction)
 }
 
 #[test]
-fn property_resize_rejects_overflow_atomically_for_editor_and_proposal_preparation() {
+fn property_resize_rejects_overflow_atomically_during_execution_and_preparation() {
     let mut pool = ObjectPool::default();
     pool.add(object_with_id(ObjectType::DataMask, 1));
     pool.add(sized_container(2, 100, 60));

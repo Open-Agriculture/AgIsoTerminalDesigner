@@ -2,6 +2,7 @@
 //! Each operation is reversible: apply() returns its inverse
 
 use crate::object_info::ObjectInfo;
+use crate::object_properties::PropertyKey;
 use ag_iso_stack::object_pool::object::Object;
 use ag_iso_stack::object_pool::object_attributes::{MacroRef, ObjectLabel, Point};
 use ag_iso_stack::object_pool::{
@@ -39,14 +40,14 @@ pub enum Operation {
     /// Returns old value as inverse via JSON
     SetProperty {
         object: ObjectTarget,
-        property: String,
+        property: PropertyKey,
         value: Value,
     },
 
     /// Set a property whose declared semantic is an object reference.
     SetObjectReference {
         object: ObjectTarget,
-        property: String,
+        property: PropertyKey,
         reference: Option<ObjectTarget>,
     },
 
@@ -72,7 +73,7 @@ pub enum Operation {
     #[serde(skip)]
     RestoreObjectReference {
         object_id: u16,
-        property: String,
+        property: PropertyKey,
         value: Value,
     },
 
@@ -253,7 +254,12 @@ pub enum OperationError {
     },
     PropertyError {
         object_id: u16,
-        property: String,
+        property: PropertyKey,
+        reason: String,
+    },
+    OperationContextError {
+        object_id: u16,
+        context: String,
         reason: String,
     },
     DeleteReferencedObject(u16),
@@ -266,11 +272,11 @@ pub enum OperationError {
     },
     ReferencePropertyRequiresReferenceOperation {
         object_id: u16,
-        property: String,
+        property: PropertyKey,
     },
     PropertyIsNotObjectReference {
         object_id: u16,
-        property: String,
+        property: PropertyKey,
     },
     ObjectAlreadyExists(u16),
     InvalidObjectOrder,
@@ -286,11 +292,12 @@ impl std::fmt::Display for OperationError {
             Self::AmbiguousObjectName(name) => write!(f, "More than one object is named “{name}”. Use a unique name."),
             Self::CircularReference { parent, child } => write!(f, "Object {child} cannot be added to object {parent} because this would create a circular reference."),
             Self::InvalidReference { parent_type, child_type } => write!(f, "A {parent_type} cannot reference a {child_type}."),
-            Self::PropertyError { object_id, property, reason } => write!(f, "Could not change {} on object {object_id}.\n{reason}", property.replace('_', " ")),
+            Self::PropertyError { object_id, property, reason } => write!(f, "Could not change {} on object {object_id}.\n{reason}", property.as_str().replace('_', " ")),
+            Self::OperationContextError { object_id, context, reason } => write!(f, "Could not complete {context} for object {object_id}.\n{reason}"),
             Self::DeleteReferencedObject(id) => write!(f, "Object {id} is still referenced by other objects. Remove those references before deleting it."),
             Self::UnsupportedSchemaVersion { expected, actual } => write!(f, "Operation format version {actual} is not supported. Expected version {expected}."),
-            Self::ReferencePropertyRequiresReferenceOperation { object_id, property } => write!(f, "The {} property on object {object_id} must be changed using an object reference operation.", property.replace('_', " ")),
-            Self::PropertyIsNotObjectReference { object_id, property } => write!(f, "The {} property on object {object_id} is not an object reference.", property.replace('_', " ")),
+            Self::ReferencePropertyRequiresReferenceOperation { object_id, property } => write!(f, "The {} property on object {object_id} must be changed using an object reference operation.", property.as_str().replace('_', " ")),
+            Self::PropertyIsNotObjectReference { object_id, property } => write!(f, "The {} property on object {object_id} is not an object reference.", property.as_str().replace('_', " ")),
             Self::InvalidObjectOrder => write!(f, "The object order must include every object exactly once."),
         }
     }
@@ -346,7 +353,7 @@ fn ensure_unique_name(
 fn property_semantic(
     pool: &ObjectPool,
     id: ObjectId,
-    property: &str,
+    property: PropertyKey,
 ) -> Result<crate::object_properties::PropertySemantic, OperationError> {
     let object = pool
         .object_by_id(id)
@@ -357,7 +364,7 @@ fn property_semantic(
         .map(|descriptor| descriptor.semantic)
         .ok_or_else(|| OperationError::PropertyError {
             object_id: id.value(),
-            property: property.to_owned(),
+            property,
             reason: "Property not found".to_owned(),
         })
 }
@@ -434,9 +441,9 @@ impl Operation {
                         })
                     }
                     .and_then(|value| ObjectId::new(value).ok())
-                    .ok_or(OperationError::PropertyError {
+                    .ok_or(OperationError::OperationContextError {
                         object_id: 0,
-                        property: "CreateObject".to_string(),
+                        context: "CreateObject".to_string(),
                         reason: "No object IDs are available".to_string(),
                     })?
                 };
@@ -447,9 +454,9 @@ impl Operation {
                 ensure_unique_name(name, None, object_info)?;
 
                 let mut obj = crate::default_object_for_version(*object_type, context.vt_version)
-                    .ok_or_else(|| OperationError::PropertyError {
+                    .ok_or_else(|| OperationError::OperationContextError {
                     object_id: target_id.value(),
-                    property: "object_type".into(),
+                    context: "object_type".into(),
                     reason: format!(
                         "{:?} is unavailable in VT{}",
                         object_type,
@@ -457,9 +464,9 @@ impl Operation {
                     ),
                 })?;
                 obj.mut_id().set_value(target_id.value()).map_err(|_| {
-                    OperationError::PropertyError {
+                    OperationError::OperationContextError {
                         object_id: target_id.value(),
-                        property: "CreateObject".to_string(),
+                        context: "CreateObject".to_string(),
                         reason: "Invalid object ID".to_string(),
                     }
                 })?;
@@ -541,11 +548,11 @@ impl Operation {
                 // Validate object exists
                 validate_object_exists(pool, id).map_err(|diag| OperationError::PropertyError {
                     object_id,
-                    property: property.clone(),
+                    property: *property,
                     reason: diag.message,
                 })?;
 
-                let semantic = property_semantic(pool, id, property)?;
+                let semantic = property_semantic(pool, id, *property)?;
                 if matches!(
                     semantic,
                     crate::object_properties::PropertySemantic::ObjectReference { .. }
@@ -553,39 +560,38 @@ impl Operation {
                     return Err(
                         OperationError::ReferencePropertyRequiresReferenceOperation {
                             object_id,
-                            property: property.clone(),
+                            property: *property,
                         },
                     );
                 }
-                crate::object_properties::validate_property(pool, id, property, value).map_err(
+                crate::object_properties::validate_property(pool, id, *property, value).map_err(
                     |e| OperationError::PropertyError {
                         object_id,
-                        property: property.clone(),
+                        property: *property,
                         reason: e.to_string(),
                     },
                 )?;
 
                 // Get old value for inverse, then set new value.
-                let old_value = crate::object_properties::get_property(pool, id, property)
+                let old_value = crate::object_properties::get_property(pool, id, *property)
                     .map_err(|e| OperationError::PropertyError {
                         object_id,
-                        property: property.clone(),
+                        property: *property,
                         reason: e.to_string(),
                     })?;
 
-                crate::object_properties::set_property(pool, id, property, value.clone()).map_err(
-                    |e| OperationError::PropertyError {
+                crate::object_properties::set_property(pool, id, *property, value.clone())
+                    .map_err(|e| OperationError::PropertyError {
                         object_id,
-                        property: property.clone(),
+                        property: *property,
                         reason: e.to_string(),
-                    },
-                )?;
+                    })?;
                 context.affected_objects.insert(id);
 
                 // Inverse: SetProperty with old value
                 Ok(Operation::SetProperty {
                     object: ObjectTarget::id(object_id),
-                    property: property.clone(),
+                    property: *property,
                     value: old_value,
                 })
             }
@@ -597,20 +603,20 @@ impl Operation {
             } => {
                 let id = resolve_target(object, pool, object_info)?;
                 let object_id = id.value();
-                let semantic = property_semantic(pool, id, property)?;
+                let semantic = property_semantic(pool, id, *property)?;
                 if !matches!(
                     semantic,
                     crate::object_properties::PropertySemantic::ObjectReference { .. }
                 ) {
                     return Err(OperationError::PropertyIsNotObjectReference {
                         object_id,
-                        property: property.clone(),
+                        property: *property,
                     });
                 }
-                let old_value = crate::object_properties::get_property(pool, id, property)
+                let old_value = crate::object_properties::get_property(pool, id, *property)
                     .map_err(|e| OperationError::PropertyError {
                         object_id,
-                        property: property.clone(),
+                        property: *property,
                         reason: e.to_string(),
                     })?;
                 let value = match reference {
@@ -636,7 +642,7 @@ impl Operation {
                         {
                             return Err(OperationError::PropertyError {
                                 object_id,
-                                property: property.clone(),
+                                property: *property,
                                 reason: format!(
                                     "Object {} is not in this pointer's allowed references",
                                     reference_id.value()
@@ -648,24 +654,24 @@ impl Operation {
                     }
                     None => Value::Null,
                 };
-                crate::object_properties::validate_property(pool, id, property, &value).map_err(
+                crate::object_properties::validate_property(pool, id, *property, &value).map_err(
                     |e| OperationError::PropertyError {
                         object_id,
-                        property: property.clone(),
+                        property: *property,
                         reason: e.to_string(),
                     },
                 )?;
-                crate::object_properties::set_property(pool, id, property, value).map_err(|e| {
-                    OperationError::PropertyError {
+                crate::object_properties::set_property(pool, id, *property, value).map_err(
+                    |e| OperationError::PropertyError {
                         object_id,
-                        property: property.clone(),
+                        property: *property,
                         reason: e.to_string(),
-                    }
-                })?;
+                    },
+                )?;
                 context.affected_objects.insert(id);
                 Ok(Operation::RestoreObjectReference {
                     object_id,
-                    property: property.clone(),
+                    property: *property,
                     value: old_value,
                 })
             }
@@ -677,9 +683,9 @@ impl Operation {
                     .object_by_id(id)
                     .is_none_or(|object| object.object_type() != ObjectType::ObjectPointer)
                 {
-                    return Err(OperationError::PropertyError {
+                    return Err(OperationError::OperationContextError {
                         object_id,
-                        property: "allowed_references".to_owned(),
+                        context: "allowed_references".to_owned(),
                         reason: "Allowed references can only be assigned to an ObjectPointer"
                             .into(),
                     });
@@ -692,16 +698,16 @@ impl Operation {
                 for target in references {
                     let reference_id = resolve_target(target, pool, object_info)?;
                     if reference_id == id {
-                        return Err(OperationError::PropertyError {
+                        return Err(OperationError::OperationContextError {
                             object_id,
-                            property: "allowed_references".to_owned(),
+                            context: "allowed_references".to_owned(),
                             reason: "An ObjectPointer cannot allow itself as a reference".into(),
                         });
                     }
                     if resolved.contains(&reference_id) {
-                        return Err(OperationError::PropertyError {
+                        return Err(OperationError::OperationContextError {
                             object_id,
-                            property: "allowed_references".to_owned(),
+                            context: "allowed_references".to_owned(),
                             reason: format!(
                                 "Object {} is listed more than once",
                                 reference_id.value()
@@ -721,12 +727,14 @@ impl Operation {
                     }
                     resolved.push(reference_id);
                 }
-                let active_value = crate::object_properties::get_property(pool, id, "value")
-                    .map_err(|error| OperationError::PropertyError {
-                        object_id,
-                        property: "value".to_owned(),
-                        reason: error.to_string(),
-                    })?;
+                let active_value =
+                    crate::object_properties::get_property(pool, id, PropertyKey::Value).map_err(
+                        |error| OperationError::PropertyError {
+                            object_id,
+                            property: PropertyKey::Value,
+                            reason: error.to_string(),
+                        },
+                    )?;
                 let active_target = serde_json::from_value::<ObjectId>(active_value.clone()).ok();
                 let next_value = if !resolved.is_empty()
                     && active_target.is_some_and(|target| !resolved.contains(&target))
@@ -736,13 +744,17 @@ impl Operation {
                     active_value.clone()
                 };
                 if next_value != active_value {
-                    crate::object_properties::set_property(pool, id, "value", next_value).map_err(
-                        |error| OperationError::PropertyError {
-                            object_id,
-                            property: "value".to_owned(),
-                            reason: error.to_string(),
-                        },
-                    )?;
+                    crate::object_properties::set_property(
+                        pool,
+                        id,
+                        PropertyKey::Value,
+                        next_value,
+                    )
+                    .map_err(|error| OperationError::PropertyError {
+                        object_id,
+                        property: PropertyKey::Value,
+                        reason: error.to_string(),
+                    })?;
                 }
                 object_info
                     .entry(id)
@@ -772,9 +784,9 @@ impl Operation {
                     .object_by_id(id)
                     .ok_or(OperationError::ObjectNotFound(*object_id))?;
                 if object.object_type() != ObjectType::ObjectPointer {
-                    return Err(OperationError::PropertyError {
+                    return Err(OperationError::OperationContextError {
                         object_id: *object_id,
-                        property: "allowed_references".to_owned(),
+                        context: "allowed_references".to_owned(),
                         reason: "Allowed references can only be assigned to an ObjectPointer"
                             .into(),
                     });
@@ -784,20 +796,19 @@ impl Operation {
                     .map(|info| info.allowed_references.clone())
                     .unwrap_or_default();
                 let old_value =
-                    crate::object_properties::get_property(pool, id, "value").map_err(|error| {
-                        OperationError::PropertyError {
+                    crate::object_properties::get_property(pool, id, PropertyKey::Value).map_err(
+                        |error| OperationError::PropertyError {
                             object_id: *object_id,
-                            property: "value".to_owned(),
+                            property: PropertyKey::Value,
                             reason: error.to_string(),
-                        }
-                    })?;
-                crate::object_properties::set_property(pool, id, "value", value.clone()).map_err(
-                    |error| OperationError::PropertyError {
+                        },
+                    )?;
+                crate::object_properties::set_property(pool, id, PropertyKey::Value, value.clone())
+                    .map_err(|error| OperationError::PropertyError {
                         object_id: *object_id,
-                        property: "value".to_owned(),
+                        property: PropertyKey::Value,
                         reason: error.to_string(),
-                    },
-                )?;
+                    })?;
                 object_info
                     .entry(id)
                     .or_insert_with(|| {
@@ -826,33 +837,32 @@ impl Operation {
             } => {
                 let id = ObjectId::new(*object_id)
                     .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
-                let semantic = property_semantic(pool, id, property)?;
+                let semantic = property_semantic(pool, id, *property)?;
                 if !matches!(
                     semantic,
                     crate::object_properties::PropertySemantic::ObjectReference { .. }
                 ) {
                     return Err(OperationError::PropertyIsNotObjectReference {
                         object_id: *object_id,
-                        property: property.clone(),
+                        property: *property,
                     });
                 }
-                let old_value = crate::object_properties::get_property(pool, id, property)
+                let old_value = crate::object_properties::get_property(pool, id, *property)
                     .map_err(|e| OperationError::PropertyError {
                         object_id: *object_id,
-                        property: property.clone(),
+                        property: *property,
                         reason: e.to_string(),
                     })?;
-                crate::object_properties::set_property(pool, id, property, value.clone()).map_err(
-                    |e| OperationError::PropertyError {
+                crate::object_properties::set_property(pool, id, *property, value.clone())
+                    .map_err(|e| OperationError::PropertyError {
                         object_id: *object_id,
-                        property: property.clone(),
+                        property: *property,
                         reason: e.to_string(),
-                    },
-                )?;
+                    })?;
                 context.affected_objects.insert(id);
                 Ok(Operation::RestoreObjectReference {
                     object_id: *object_id,
-                    property: property.clone(),
+                    property: *property,
                     value: old_value,
                 })
             }
@@ -882,9 +892,9 @@ impl Operation {
                     }
                     if object.id() == old_id {
                         object.mut_id().set_value(new_id.value()).map_err(|error| {
-                            OperationError::PropertyError {
+                            OperationError::OperationContextError {
                                 object_id: old_id.value(),
-                                property: "id".to_owned(),
+                                context: "id".to_owned(),
                                 reason: format!("{error:?}"),
                             }
                         })?;
@@ -961,9 +971,9 @@ impl Operation {
                     }
                     if let Some(new_id) = remap.get(&old_object_id) {
                         object.mut_id().set_value(new_id.value()).map_err(|error| {
-                            OperationError::PropertyError {
+                            OperationError::OperationContextError {
                                 object_id: old_object_id.value(),
-                                property: "id".into(),
+                                context: "id".into(),
                                 reason: format!("{error:?}"),
                             }
                         })?;
@@ -1082,17 +1092,17 @@ impl Operation {
 
                 // Validate both objects exist
                 validate_object_exists(pool, parent_obj_id).map_err(|diag| {
-                    OperationError::PropertyError {
+                    OperationError::OperationContextError {
                         object_id: parent_id,
-                        property: "parent".to_string(),
+                        context: "parent".to_string(),
                         reason: diag.message,
                     }
                 })?;
 
                 validate_object_exists(pool, child_obj_id).map_err(|diag| {
-                    OperationError::PropertyError {
+                    OperationError::OperationContextError {
                         object_id: child_id,
-                        property: "child".to_string(),
+                        context: "child".to_string(),
                         reason: diag.message,
                     }
                 })?;
@@ -1139,17 +1149,17 @@ impl Operation {
 
                 // Verify both objects exist
                 validate_object_exists(pool, parent_obj_id).map_err(|diag| {
-                    OperationError::PropertyError {
+                    OperationError::OperationContextError {
                         object_id: *parent_id,
-                        property: "parent".to_string(),
+                        context: "parent".to_string(),
                         reason: diag.message,
                     }
                 })?;
 
                 validate_object_exists(pool, child_obj_id).map_err(|diag| {
-                    OperationError::PropertyError {
+                    OperationError::OperationContextError {
                         object_id: *child_id,
-                        property: "child".to_string(),
+                        context: "child".to_string(),
                         reason: diag.message,
                     }
                 })?;
@@ -1158,9 +1168,9 @@ impl Operation {
                 let index = refs
                     .iter()
                     .position(|reference| reference.id == child_obj_id)
-                    .ok_or_else(|| OperationError::PropertyError {
+                    .ok_or_else(|| OperationError::OperationContextError {
                         object_id: *parent_id,
-                        property: "RemoveChild".to_string(),
+                        context: "RemoveChild".to_string(),
                         reason: format!("Object {} is not a child", child_id),
                     })?;
                 let removed = refs.remove(index);
@@ -1187,17 +1197,17 @@ impl Operation {
 
                 // Verify both objects exist
                 validate_object_exists(pool, parent_obj_id).map_err(|diag| {
-                    OperationError::PropertyError {
+                    OperationError::OperationContextError {
                         object_id: *parent_id,
-                        property: "parent".to_string(),
+                        context: "parent".to_string(),
                         reason: diag.message,
                     }
                 })?;
 
                 validate_object_exists(pool, child_obj_id).map_err(|diag| {
-                    OperationError::PropertyError {
+                    OperationError::OperationContextError {
                         object_id: *child_id,
-                        property: "child".to_string(),
+                        context: "child".to_string(),
                         reason: diag.message,
                     }
                 })?;
@@ -1206,9 +1216,9 @@ impl Operation {
                 let reference = refs
                     .iter_mut()
                     .find(|reference| reference.id == child_obj_id)
-                    .ok_or_else(|| OperationError::PropertyError {
+                    .ok_or_else(|| OperationError::OperationContextError {
                         object_id: *parent_id,
-                        property: "SetChildPosition".to_string(),
+                        context: "SetChildPosition".to_string(),
                         reason: format!("Object {} is not a child", child_id),
                     })?;
                 let old = reference.offset;
@@ -1239,18 +1249,18 @@ impl Operation {
                     })
                     .collect::<Result<_, _>>()?;
                 validate_object_exists(pool, parent_obj_id).map_err(|diag| {
-                    OperationError::PropertyError {
+                    OperationError::OperationContextError {
                         object_id: parent_id,
-                        property: "children".to_owned(),
+                        context: "children".to_owned(),
                         reason: diag.message,
                     }
                 })?;
 
                 for child in &resolved {
                     validate_object_exists(pool, child.id).map_err(|diag| {
-                        OperationError::PropertyError {
+                        OperationError::OperationContextError {
                             object_id: parent_id,
-                            property: "children".to_owned(),
+                            context: "children".to_owned(),
                             reason: diag.message,
                         }
                     })?;
@@ -1297,18 +1307,18 @@ impl Operation {
                 let object_id = parent_id.value();
                 let resolved = resolve_object_list(objects, pool, object_info)?;
                 validate_object_exists(pool, parent_id).map_err(|diag| {
-                    OperationError::PropertyError {
+                    OperationError::OperationContextError {
                         object_id,
-                        property: "objects".to_owned(),
+                        context: "objects".to_owned(),
                         reason: diag.message,
                     }
                 })?;
 
                 for child_id in resolved.ids() {
                     validate_object_exists(pool, child_id).map_err(|diag| {
-                        OperationError::PropertyError {
+                        OperationError::OperationContextError {
                             object_id,
-                            property: "objects".to_owned(),
+                            context: "objects".to_owned(),
                             reason: diag.message,
                         }
                     })?;
@@ -1334,15 +1344,15 @@ impl Operation {
                     .object_mut_by_id(parent_id)
                     .ok_or(OperationError::ObjectNotFound(object_id))?;
                 let old_objects =
-                    object_list(parent).ok_or_else(|| OperationError::PropertyError {
+                    object_list(parent).ok_or_else(|| OperationError::OperationContextError {
                         object_id,
-                        property: "objects".to_owned(),
+                        context: "objects".to_owned(),
                         reason: "This object type does not support an object list".to_owned(),
                     })?;
                 if !set_object_list(parent, resolved.clone()) {
-                    return Err(OperationError::PropertyError {
+                    return Err(OperationError::OperationContextError {
                         object_id,
-                        property: "objects".to_owned(),
+                        context: "objects".to_owned(),
                         reason: "Object-list representation does not match object type".to_owned(),
                     });
                 }
@@ -1373,16 +1383,16 @@ impl Operation {
 
                 for macro_ref in &resolved {
                     let macro_id = ObjectId::new(u16::from(macro_ref.macro_id)).map_err(|_| {
-                        OperationError::PropertyError {
+                        OperationError::OperationContextError {
                             object_id,
-                            property: "macro_refs".to_owned(),
+                            context: "macro_refs".to_owned(),
                             reason: format!("Invalid macro object ID {}", macro_ref.macro_id),
                         }
                     })?;
                     let macro_object = pool.object_by_id(macro_id).ok_or_else(|| {
-                        OperationError::PropertyError {
+                        OperationError::OperationContextError {
                             object_id,
-                            property: "macro_refs".to_owned(),
+                            context: "macro_refs".to_owned(),
                             reason: format!("Macro object {} does not exist", macro_ref.macro_id),
                         }
                     })?;
@@ -1420,9 +1430,9 @@ impl Operation {
                     .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
                 for reference_id in labels.iter().flat_map(object_label_references) {
                     validate_object_exists(pool, reference_id).map_err(|diag| {
-                        OperationError::PropertyError {
+                        OperationError::OperationContextError {
                             object_id: *object_id,
-                            property: "object_labels".to_owned(),
+                            context: "object_labels".to_owned(),
                             reason: diag.message,
                         }
                     })?;
@@ -1448,9 +1458,9 @@ impl Operation {
                     .object_mut_by_id(id)
                     .ok_or(OperationError::ObjectNotFound(*object_id))?;
                 let Object::ObjectLabelReferenceList(object) = object else {
-                    return Err(OperationError::PropertyError {
+                    return Err(OperationError::OperationContextError {
                         object_id: *object_id,
-                        property: "object_labels".to_owned(),
+                        context: "object_labels".to_owned(),
                         reason: "This object type does not support object labels".to_owned(),
                     });
                 };
@@ -1573,9 +1583,9 @@ fn object_refs_mut<'a>(
     with_positioned_children!(
         object,
         object => Ok(&mut object.object_refs),
-        Err(OperationError::PropertyError {
+        Err(OperationError::OperationContextError {
             object_id: parent_id.value(),
-            property: operation.to_owned(),
+            context: operation.to_owned(),
             reason: "This object type does not support positioned children".to_owned(),
         })
     )
@@ -1584,17 +1594,6 @@ fn object_refs_mut<'a>(
 /// Read-only positioned children for descriptor-driven structural editors.
 pub fn object_refs(object: &Object) -> Option<&[ObjectRef]> {
     with_positioned_children!(object, object => Some(object.object_refs.as_slice()), None)
-}
-
-pub(super) fn set_object_refs(object: &mut Object, refs: Vec<ObjectRef>) -> bool {
-    with_positioned_children!(
-        object,
-        object => {
-            object.object_refs = refs;
-            true
-        },
-        false
-    )
 }
 
 /// Clone an object's ordered unpositioned reference list for structural edits.
@@ -1639,21 +1638,6 @@ pub(super) fn set_object_list(object: &mut Object, objects: ObjectReferenceList)
     true
 }
 
-pub(super) fn object_labels(object: &Object) -> Option<&[ObjectLabel]> {
-    match object {
-        Object::ObjectLabelReferenceList(object) => Some(&object.object_labels),
-        _ => None,
-    }
-}
-
-pub(super) fn set_object_labels(object: &mut Object, labels: Vec<ObjectLabel>) -> bool {
-    match object {
-        Object::ObjectLabelReferenceList(object) => object.object_labels = labels,
-        _ => return false,
-    }
-    true
-}
-
 fn replace_references(
     object: &mut Object,
     old_id: ObjectId,
@@ -1688,9 +1672,9 @@ fn remap_macro_commands(
             version,
             &object_types,
         )
-        .map_err(|reason| OperationError::PropertyError {
+        .map_err(|reason| OperationError::OperationContextError {
             object_id: object.id().value(),
-            property: "commands".into(),
+            context: "commands".into(),
             reason,
         })?;
         if remapped != macro_object.commands {
@@ -1711,9 +1695,9 @@ fn remap_references(
 ) -> Result<bool, OperationError> {
     let mut changed =
         crate::object_properties::remap_object_references(object, remap).map_err(|error| {
-            OperationError::PropertyError {
+            OperationError::OperationContextError {
                 object_id: object.id().value(),
-                property: "object reference".to_owned(),
+                context: "object reference".to_owned(),
                 reason: error.to_string(),
             }
         })?;
@@ -1814,17 +1798,6 @@ pub fn macro_refs(object: &Object) -> Option<&[MacroRef]> {
     )
 }
 
-pub(super) fn set_macro_refs(object: &mut Object, refs: Vec<MacroRef>) -> bool {
-    with_macro_references!(
-        object,
-        object => {
-            object.macro_refs = refs;
-            true
-        },
-        false
-    )
-}
-
 fn macro_refs_mut<'a>(
     pool: &'a mut ObjectPool,
     object_id: ObjectId,
@@ -1836,9 +1809,9 @@ fn macro_refs_mut<'a>(
     with_macro_references!(
         object,
         object => Ok(&mut object.macro_refs),
-        Err(OperationError::PropertyError {
+        Err(OperationError::OperationContextError {
             object_id: object_id.value(),
-            property: operation.to_owned(),
+            context: operation.to_owned(),
             reason: "This object type does not support macro references".to_owned(),
         })
     )

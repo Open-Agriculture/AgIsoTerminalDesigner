@@ -5,6 +5,10 @@ use ag_iso_terminal_designer::{components::*, *};
 use serde_json::json;
 use std::collections::BTreeMap;
 
+fn property(name: &str) -> object_properties::PropertyKey {
+    object_properties::PropertyKey::parse(name).unwrap()
+}
+
 fn fixture() -> EditorProject {
     let mut pool = ObjectPool::default();
     for (id, ty) in [
@@ -67,7 +71,7 @@ fn parameter(p: &mut EditorProject, component: ComponentId) -> ComponentParamete
             name: "Text".into(),
             description: Some("Caption".into()),
             target_node: node,
-            property: "value".into(),
+            property: ComponentParameterTarget::Property(property("value")),
             kind: ComponentParameterKind::Text,
             default_value: json!("Action"),
         },
@@ -112,13 +116,13 @@ fn master_update_preserves_overrides_and_ids_without_generated_source_mutation()
     let mut master = p.component_source().definitions[&component].clone();
     for node in &mut master.nodes {
         if node.object_type == ObjectType::Button {
-            node.properties.insert("height".into(), json!(48));
+            node.properties.insert(property("height"), json!(48));
             node.properties
-                .insert("background_colour".into(), json!(14));
+                .insert(property("background_colour"), json!(14));
         }
         if node.object_type == ObjectType::OutputString {
             node.properties.insert(
-                "justification".into(),
+                property("justification"),
                 json!({"horizontal":"Middle","vertical":"Middle"}),
             );
         }
@@ -185,6 +189,29 @@ fn save_load_detach_and_history_preserve_source_and_output() {
     assert_eq!(loaded.component_source(), p.component_source());
     assert!(loaded.redo_operation());
     assert_eq!(before, objects_by_id(&loaded.materialize().unwrap().pool));
+}
+
+#[test]
+fn unknown_saved_component_property_names_are_rejected() {
+    let (mut project, component, _) = captured();
+    parameter(&mut project, component);
+    let definition = &project.component_source().definitions[&component];
+    let mut value = serde_json::to_value(definition).unwrap();
+    value["nodes"][0]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .insert("not_a_property".into(), json!(1));
+    let error = serde_json::from_value::<ComponentDefinition>(value)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not_a_property"), "{error}");
+
+    let mut value = serde_json::to_value(definition).unwrap();
+    value["parameters"][0]["property"] = json!("not_a_property");
+    let error = serde_json::from_value::<ComponentDefinition>(value)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not_a_property"), "{error}");
 }
 #[test]
 fn invalid_override_collision_reverse_reference_and_delete_are_atomic() {
@@ -254,60 +281,6 @@ fn reset_default_add_remove_nodes_and_duplicate() {
     ComponentService::delete_component_instance(&mut p, b).unwrap();
     assert_eq!(p.materialize().unwrap().pool.objects().len(), n - 3);
 }
-#[test]
-fn ai_component_instantiation_and_override_are_single_source_actions() {
-    let (mut p, component, _) = captured();
-    let text = parameter(&mut p, component);
-    let state = p.ai_design_state();
-    let before = p.component_source().clone();
-    let proposal = ai::proposal::propose_component_intents(
-        &state,
-        vec![ComponentIntent::InstantiateComponent {
-            instance_id: None,
-            component_id: component,
-            parent: 2,
-            x: 170,
-            y: 20,
-            overrides: BTreeMap::from([(text, json!("Connect"))]),
-        }],
-    )
-    .unwrap();
-    assert_eq!(p.component_source(), &before);
-    assert!(proposal.prepared.pool.objects().len() > p.get_pool().objects().len());
-    p.apply_ai_proposal(proposal).unwrap();
-    assert_eq!(p.get_pool().objects().len(), 1);
-    assert_eq!(p.component_source().instances.len(), 2);
-    assert!(p.undo_operation());
-    assert_eq!(p.component_source(), &before);
-    assert!(p.redo_operation());
-    let id = p
-        .component_source()
-        .instances
-        .iter()
-        .find(|i| !before.instances.iter().any(|b| b.id == i.id))
-        .unwrap()
-        .id;
-    let master = p.component_source().definitions.clone();
-    let proposal = ai::proposal::propose_component_intents(
-        &p.ai_design_state(),
-        vec![ComponentIntent::SetComponentOverride {
-            instance_id: id,
-            parameter: text,
-            value: json!("Join"),
-        }],
-    )
-    .unwrap();
-    p.apply_ai_proposal(proposal).unwrap();
-    assert_eq!(p.component_source().definitions, master);
-    assert!(p
-        .materialize()
-        .unwrap()
-        .pool
-        .objects()
-        .iter()
-        .any(|o| matches!(o, Object::OutputString(s) if s.value.decode(FontType::Latin1).unwrap() == "Join")));
-}
-
 #[test]
 fn shared_visual_dependencies_are_copied_and_internal_sharing_is_preserved() {
     let mut pool = fixture().get_pool().clone();
@@ -430,16 +403,16 @@ fn explicit_object_reference_parameters_resolve_to_canonical_variables() {
         .unwrap();
     node.object_type = ObjectType::OutputNumber;
     node.properties.clear();
-    node.properties.insert("width".into(), json!(140));
-    node.properties.insert("height".into(), json!(20));
-    node.references.remove("variable_reference");
+    node.properties.insert(property("width"), json!(140));
+    node.properties.insert(property("height"), json!(20));
+    node.references.remove(&property("variable_reference"));
     let parameter = ComponentParameterId::default();
     master.parameters.push(ComponentParameter {
         id: parameter,
         name: "Value Source".into(),
         description: None,
         target_node: node.id,
-        property: "variable_reference".into(),
+        property: ComponentParameterTarget::Property(property("variable_reference")),
         kind: ComponentParameterKind::ObjectReference,
         default_value: json!(200),
     });
@@ -485,7 +458,9 @@ fn materialized_property_errors_map_back_to_component_instance_node_and_property
         .find(|n| n.id == root)
         .unwrap()
         .properties
-        .insert("height".into(), json!(-1));
+        .insert(property("height"), json!(-1));
+    let source: ComponentSource = serde_json::from_value(serde_json::to_value(source).unwrap())
+        .expect("invalid values on recognized properties remain loadable for repair");
     let error = materialize_source(
         p.get_pool(),
         &source,
@@ -544,117 +519,6 @@ fn legacy_project_and_empty_project_load_without_component_metadata() {
         .get_pool()
         .objects()
         .is_empty());
-}
-
-#[test]
-fn ai_preview_ids_match_apply_and_master_intent_keeps_instance_source_unchanged() {
-    let (mut p, component, _) = captured();
-    let text = parameter(&mut p, component);
-    let proposal = ai::proposal::propose_component_intents(
-        &p.ai_design_state(),
-        vec![ComponentIntent::InstantiateComponent {
-            instance_id: None,
-            component_id: component,
-            parent: 2,
-            x: 170,
-            y: 20,
-            overrides: BTreeMap::from([(text, json!("Save"))]),
-        }],
-    )
-    .unwrap();
-    let preview = objects_by_id(&proposal.prepared.pool);
-    let instances = proposal.components.instances.clone();
-    p.apply_ai_proposal(proposal).unwrap();
-    assert_eq!(p.component_source().instances, instances);
-    assert_eq!(objects_by_id(&p.materialize().unwrap().pool), preview);
-    let root = p.component_source().definitions[&component].root_node;
-    let proposal = ai::proposal::propose_component_intents(
-        &p.ai_design_state(),
-        vec![ComponentIntent::SetComponentMasterProperty {
-            component_id: component,
-            node_id: root,
-            property: "height".into(),
-            value: json!(48),
-            scope: ComponentMasterScope::AllInstances,
-        }],
-    )
-    .unwrap();
-    p.apply_ai_proposal(proposal).unwrap();
-    assert_eq!(p.component_source().instances, instances);
-}
-
-#[test]
-fn three_button_payload_benchmark() {
-    let (mut p, component, _) = captured();
-    let text = parameter(&mut p, component);
-    let actions: Vec<_> = ["Scan", "Connect", "Disconnect"]
-        .into_iter()
-        .enumerate()
-        .map(|(i, caption)| ComponentIntent::InstantiateComponent {
-            instance_id: None,
-            component_id: component,
-            parent: 2,
-            x: 10,
-            y: 80 + i as i32 * 50,
-            overrides: BTreeMap::from([(text, json!(caption))]),
-        })
-        .collect();
-    let component_bytes = serde_json::to_vec(&json!({"actions":actions}))
-        .unwrap()
-        .len();
-    let mut primitive = OperationTransaction::new(Some("Three styled action buttons".into()));
-    for (i, caption) in ["Scan", "Connect", "Disconnect"].into_iter().enumerate() {
-        let button = 400 + i as u16 * 3;
-        let label = button + 1;
-        let font = button + 2;
-        for (id, ty) in [
-            (button, ObjectType::Button),
-            (label, ObjectType::OutputString),
-            (font, ObjectType::FontAttributes),
-        ] {
-            primitive.add_operation(Operation::CreateObject {
-                object_id: Some(id),
-                object_type: ty,
-                name: format!("{caption} {ty:?}"),
-            });
-        }
-        for (id, property, value) in [
-            (button, "width", json!(148)),
-            (button, "height", json!(48)),
-            (button, "background_colour", json!(12)),
-            (label, "width", json!(140)),
-            (label, "height", json!(20)),
-            (label, "value", json!(caption)),
-        ] {
-            primitive.add_operation(Operation::SetProperty {
-                object: ObjectTarget::id(id),
-                property: property.into(),
-                value,
-            });
-        }
-        primitive.add_operation(Operation::SetObjectReference {
-            object: ObjectTarget::id(label),
-            property: "font_attributes".into(),
-            reference: Some(ObjectTarget::id(font)),
-        });
-        primitive.add_operation(Operation::AddChild {
-            parent: ObjectTarget::id(button),
-            child: ObjectTarget::id(label),
-            x: 0,
-            y: 8,
-        });
-        primitive.add_operation(Operation::AddChild {
-            parent: ObjectTarget::id(2),
-            child: ObjectTarget::id(button),
-            x: 10,
-            y: 80 + i as i16 * 50,
-        });
-    }
-    let primitive_bytes = serde_json::to_vec(&primitive).unwrap().len();
-    let state = p.ai_design_state();
-    assert!(ai::proposal::propose_component_intents(&state, actions.clone()).is_ok());
-    assert!(ai::propose_transaction(&state, primitive.clone()).is_ok());
-    eprintln!("Three-button benchmark: component payload={component_bytes} bytes, primitive payload={primitive_bytes} bytes; local validation failures=0/0.");
 }
 
 #[test]
@@ -747,7 +611,7 @@ fn detached_objects_are_independent_of_later_master_changes() {
         .find(|n| n.id == master.root_node)
         .unwrap()
         .properties
-        .insert("height".into(), json!(80));
+        .insert(property("height"), json!(80));
     ComponentService::edit_component_definition(&mut p, master).unwrap();
     assert_eq!(before, objects_by_id(&p.materialize().unwrap().pool));
 }

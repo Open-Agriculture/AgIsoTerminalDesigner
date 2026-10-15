@@ -69,7 +69,10 @@ pub(crate) fn remap_component_source(
     for definition in source.definitions.values_mut() {
         for node in &mut definition.nodes {
             if node.object_type == ObjectType::Macro {
-                if let Some(value) = node.properties.get_mut("commands") {
+                if let Some(value) = node
+                    .properties
+                    .get_mut(&crate::object_properties::PropertyKey::Commands)
+                {
                     let bytes: Vec<u8> =
                         serde_json::from_value(value.clone()).map_err(|error| {
                             format!("Invalid component Macro command stream: {error}")
@@ -86,7 +89,7 @@ pub(crate) fn remap_component_source(
             }
             for (property, reference) in &mut node.references {
                 if node.object_type == ObjectType::ExternalObjectPointer
-                    && property == "external_object_id"
+                    && *property == crate::object_properties::PropertyKey::ExternalObjectId
                 {
                     continue;
                 }
@@ -390,7 +393,7 @@ mod tests {
                 properties: BTreeMap::new(),
                 children: vec![],
                 references: BTreeMap::from([(
-                    "pointer".into(),
+                    crate::PropertyKey::Value,
                     ComponentReference::ExternalObject(ObjectTarget::id(10)),
                 )]),
                 macro_references: vec![ComponentMacroReference {
@@ -404,7 +407,9 @@ mod tests {
                 name: "Pointer".into(),
                 description: None,
                 target_node: node,
-                property: "value".into(),
+                property: crate::components::ComponentParameterTarget::Property(
+                    crate::PropertyKey::Value,
+                ),
                 kind: ComponentParameterKind::ObjectReference,
                 default_value: serde_json::json!(10),
             }],
@@ -435,7 +440,7 @@ mod tests {
         assert_eq!(instance.overrides[&parameter], serde_json::json!(11));
         let remapped_node = &source.definitions[&component].nodes[0];
         assert_eq!(
-            remapped_node.references["pointer"],
+            remapped_node.references[&crate::PropertyKey::Value],
             ComponentReference::ExternalObject(ObjectTarget::id(11))
         );
         assert_eq!(

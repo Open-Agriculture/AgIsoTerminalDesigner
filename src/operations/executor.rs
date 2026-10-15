@@ -32,7 +32,9 @@ pub struct TransactionDiagnostic {
     pub operation_type: Option<String>,
     pub object_id: Option<u16>,
     pub object_name: Option<String>,
-    pub property: Option<String>,
+    pub property: Option<crate::object_properties::PropertyKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     pub related_objects: Vec<u16>,
 }
 
@@ -45,57 +47,55 @@ impl TransactionDiagnostics {
     }
     /// Compatibility conversion for existing UI callers still using OperationError.
     pub fn legacy_operation_error(&self) -> OperationError {
-        let d = self.0.first();
-        match d.map(|d| d.code.as_str()) {
-            Some("UNSUPPORTED_SCHEMA_VERSION") => OperationError::UnsupportedSchemaVersion {
+        let Some(diagnostic) = self.0.first() else {
+            return OperationError::OperationContextError {
+                object_id: 0,
+                context: "transaction".into(),
+                reason: "Transaction preparation failed".into(),
+            };
+        };
+        let object_id = diagnostic.object_id.unwrap_or(0);
+        let name = || diagnostic.object_name.clone().unwrap_or_default();
+        match (diagnostic.code.as_str(), diagnostic.property) {
+            ("UNSUPPORTED_SCHEMA_VERSION", _) => OperationError::UnsupportedSchemaVersion {
                 expected: CURRENT_OPERATION_SCHEMA_VERSION,
-                actual: d.and_then(|d| d.object_id).unwrap_or(0) as u32,
+                actual: object_id as u32,
             },
-            Some("OBJECT_NAME_NOT_FOUND") => OperationError::ObjectNameNotFound(
-                d.and_then(|d| d.object_name.clone()).unwrap_or_default(),
-            ),
-            Some("DUPLICATE_OBJECT_NAME") => OperationError::DuplicateObjectName(
-                d.and_then(|d| d.object_name.clone()).unwrap_or_default(),
-            ),
-            Some("AMBIGUOUS_OBJECT_NAME") => OperationError::AmbiguousObjectName(
-                d.and_then(|d| d.object_name.clone()).unwrap_or_default(),
-            ),
-            Some("OBJECT_ALREADY_EXISTS") => {
-                OperationError::ObjectAlreadyExists(d.and_then(|d| d.object_id).unwrap_or(0))
-            }
-            Some("OBJECT_NOT_FOUND") => {
-                OperationError::ObjectNotFound(d.and_then(|d| d.object_id).unwrap_or(0))
-            }
-            Some("CIRCULAR_REFERENCE") => OperationError::CircularReference {
-                parent: d.and_then(|d| d.object_id).unwrap_or(0),
-                child: d
-                    .and_then(|d| d.related_objects.get(1).copied())
-                    .unwrap_or(0),
+            ("OBJECT_NAME_NOT_FOUND", _) => OperationError::ObjectNameNotFound(name()),
+            ("DUPLICATE_OBJECT_NAME", _) => OperationError::DuplicateObjectName(name()),
+            ("AMBIGUOUS_OBJECT_NAME", _) => OperationError::AmbiguousObjectName(name()),
+            ("OBJECT_ALREADY_EXISTS", _) => OperationError::ObjectAlreadyExists(object_id),
+            ("OBJECT_NOT_FOUND", _) => OperationError::ObjectNotFound(object_id),
+            ("CIRCULAR_REFERENCE", _) => OperationError::CircularReference {
+                parent: object_id,
+                child: diagnostic.related_objects.get(1).copied().unwrap_or(0),
             },
-            Some("DELETE_REFERENCED_OBJECT") => {
-                OperationError::DeleteReferencedObject(d.and_then(|d| d.object_id).unwrap_or(0))
-            }
-            Some("REFERENCE_PROPERTY_REQUIRES_REFERENCE_OPERATION") => {
+            ("DELETE_REFERENCED_OBJECT", _) => OperationError::DeleteReferencedObject(object_id),
+            ("REFERENCE_PROPERTY_REQUIRES_REFERENCE_OPERATION", Some(property)) => {
                 OperationError::ReferencePropertyRequiresReferenceOperation {
-                    object_id: d.and_then(|d| d.object_id).unwrap_or(0),
-                    property: d.and_then(|d| d.property.clone()).unwrap_or_default(),
+                    object_id,
+                    property,
                 }
             }
-            Some("PROPERTY_IS_NOT_OBJECT_REFERENCE") => {
+            ("PROPERTY_IS_NOT_OBJECT_REFERENCE", Some(property)) => {
                 OperationError::PropertyIsNotObjectReference {
-                    object_id: d.and_then(|d| d.object_id).unwrap_or(0),
-                    property: d.and_then(|d| d.property.clone()).unwrap_or_default(),
+                    object_id,
+                    property,
                 }
             }
-            Some("INVALID_OBJECT_ORDER") => OperationError::InvalidObjectOrder,
-            _ => OperationError::PropertyError {
-                object_id: d.and_then(|d| d.object_id).unwrap_or(0),
-                property: d
-                    .and_then(|d| d.property.clone())
+            ("INVALID_OBJECT_ORDER", _) => OperationError::InvalidObjectOrder,
+            ("INVALID_PROPERTY_VALUE", Some(property)) => OperationError::PropertyError {
+                object_id,
+                property,
+                reason: diagnostic.message.clone(),
+            },
+            _ => OperationError::OperationContextError {
+                object_id,
+                context: diagnostic
+                    .context
+                    .clone()
                     .unwrap_or_else(|| "transaction".into()),
-                reason: d
-                    .map(|d| d.message.clone())
-                    .unwrap_or_else(|| "Transaction preparation failed".into()),
+                reason: diagnostic.message.clone(),
             },
         }
     }
@@ -113,6 +113,7 @@ pub(crate) fn containment_transaction_error(
         object_id: Some(error.child_id),
         object_name: None,
         property: None,
+        context: None,
         related_objects: vec![error.parent_id, error.child_id],
     }])
 }
@@ -367,6 +368,7 @@ impl OperationExecutor {
                 object_id: Some(transaction.schema_version as u16),
                 object_name: None,
                 property: None,
+                context: None,
                 related_objects: vec![],
             }));
         }
@@ -388,6 +390,7 @@ impl OperationExecutor {
                 object_id: None,
                 object_name: None,
                 property: None,
+                context: None,
                 related_objects: vec![],
             }));
         }
@@ -509,6 +512,7 @@ impl OperationExecutor {
                 object_id: None,
                 object_name: None,
                 property: None,
+                context: None,
                 related_objects: d.affected_objects.unwrap_or_default(),
             })
             .collect();
@@ -648,17 +652,19 @@ fn operation_diagnostic(
     forced_code: &str,
     forced_message: &str,
 ) -> TransactionDiagnostic {
-    let (mut code, mut message, object_id, property, related) = match error {
+    let (mut code, mut message, object_id, property, context, related) = match error {
         OperationError::ObjectNotFound(id) => (
             "OBJECT_NOT_FOUND",
             format!("Object {} was not found", id),
             Some(id),
+            None,
             None,
             vec![],
         ),
         OperationError::ObjectNameNotFound(n) => (
             "OBJECT_NAME_NOT_FOUND",
             format!("Object named {n:?} was not found"),
+            None,
             None,
             None,
             vec![],
@@ -668,11 +674,13 @@ fn operation_diagnostic(
             format!("Object name {n:?} is already in use"),
             None,
             None,
+            None,
             vec![],
         ),
         OperationError::AmbiguousObjectName(n) => (
             "AMBIGUOUS_OBJECT_NAME",
             format!("Object name {n:?} is ambiguous"),
+            None,
             None,
             None,
             vec![],
@@ -681,6 +689,7 @@ fn operation_diagnostic(
             "OBJECT_ALREADY_EXISTS",
             format!("Object {} already exists", id),
             Some(id),
+            None,
             None,
             vec![],
         ),
@@ -692,6 +701,7 @@ fn operation_diagnostic(
             ),
             Some(parent),
             None,
+            None,
             vec![parent, child],
         ),
         OperationError::InvalidReference {
@@ -702,12 +712,14 @@ fn operation_diagnostic(
             format!("Invalid reference from {parent_type} to {child_type}"),
             None,
             None,
+            None,
             vec![],
         ),
         OperationError::DeleteReferencedObject(id) => (
             "DELETE_REFERENCED_OBJECT",
             format!("Object {} is still referenced", id),
             Some(id),
+            None,
             None,
             vec![],
         ),
@@ -719,6 +731,7 @@ fn operation_diagnostic(
             "Reference properties require SetObjectReference".into(),
             Some(object_id),
             Some(property),
+            None,
             vec![],
         ),
         OperationError::PropertyIsNotObjectReference {
@@ -729,11 +742,13 @@ fn operation_diagnostic(
             "Property is not an object reference".into(),
             Some(object_id),
             Some(property),
+            None,
             vec![],
         ),
         OperationError::InvalidObjectOrder => (
             "INVALID_OBJECT_ORDER",
             "Object order must contain every object exactly once".into(),
+            None,
             None,
             None,
             vec![],
@@ -747,12 +762,26 @@ fn operation_diagnostic(
             reason,
             Some(object_id),
             Some(property),
+            None,
+            vec![],
+        ),
+        OperationError::OperationContextError {
+            object_id,
+            context,
+            reason,
+        } => (
+            "OPERATION_CONTEXT_ERROR",
+            reason,
+            Some(object_id),
+            None,
+            Some(context),
             vec![],
         ),
         OperationError::UnsupportedSchemaVersion { expected, actual } => (
             "UNSUPPORTED_SCHEMA_VERSION",
             format!("Unsupported schema version {actual}; supported version is {expected}"),
             Some(actual as u16),
+            None,
             None,
             vec![],
         ),
@@ -776,6 +805,7 @@ fn operation_diagnostic(
         object_id,
         object_name,
         property,
+        context,
         related_objects: related,
     }
 }

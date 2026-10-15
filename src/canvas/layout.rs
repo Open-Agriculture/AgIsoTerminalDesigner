@@ -48,7 +48,10 @@ pub(super) fn dimensions(project: &EditorProject, item: &SceneItem) -> (Option<u
             .and_then(|v| v.as_u64())
             .and_then(|v| u16::try_from(v).ok())
     };
-    (get("width"), get("height"))
+    (
+        get(crate::object_properties::PropertyKey::Width),
+        get(crate::object_properties::PropertyKey::Height),
+    )
 }
 
 pub(super) fn bounds(items: &[SceneItem]) -> Option<Rect> {

@@ -1,23 +1,13 @@
 //! Domain operations exposed through the authenticated automation bridge.
-use crate::ai::{self, AiDesignState, AiProposal};
+use super::protocol::AutomationAction;
+use crate::ai;
 use ag_iso_stack::object_pool::ObjectType;
 use serde_json::{json, Value};
-
-pub struct DomainResult {
-    pub value: Value,
-    pub proposal: Option<AiProposal>,
-}
 
 #[derive(Debug)]
 pub struct DomainError {
     pub code: &'static str,
     pub message: String,
-}
-
-/// Compare two explicitly selected project states for the bridge's draft and
-/// proposal review responses.
-pub fn diff_states(before: &AiDesignState, after: &AiDesignState) -> Value {
-    ai::design_analysis::diff_states(before, after)
 }
 
 impl DomainError {
@@ -27,13 +17,6 @@ impl DomainError {
             message: message.into(),
         }
     }
-}
-
-fn result(value: Value) -> Result<DomainResult, DomainError> {
-    Ok(DomainResult {
-        value,
-        proposal: None,
-    })
 }
 
 fn inspection_error(error: ai::AiToolError) -> DomainError {
@@ -52,37 +35,14 @@ fn inspection_error(error: ai::AiToolError) -> DomainError {
 }
 
 pub fn execute(
-    state: &AiDesignState,
-    pending: Option<&AiProposal>,
-    tool: &str,
+    project: &crate::EditorProject,
+    tool: AutomationAction,
     args: Value,
-) -> Result<DomainResult, DomainError> {
+) -> Result<Value, DomainError> {
+    let state = &project.ai_design_state();
     let mut args = if args.is_null() { json!({}) } else { args };
-    // View selection belongs to the bridge, not the domain request DTOs.
-    if let Some(fields) = args.as_object_mut() {
-        fields.remove("view");
-        fields.remove("draft_id");
-        fields.remove("generation");
-        if !matches!(
-            tool,
-            "preview_proposal" | "propose_transaction" | "propose_component_actions"
-        ) {
-            fields.remove("proposal_id");
-        }
-    }
-    let selected = |id: &str| -> Result<&AiProposal, DomainError> {
-        let proposal = pending
-            .ok_or_else(|| DomainError::new("PROPOSAL_STALE", "No proposal is awaiting review"))?;
-        if args["proposal_id"].as_str() != Some(id) {
-            return Err(DomainError::new(
-                "PROPOSAL_STALE",
-                "Proposal ID does not match the staged proposal",
-            ));
-        }
-        Ok(proposal)
-    };
     match tool {
-        "export_object_bytes" => {
+        AutomationAction::ExportObjectBytes => {
             let target: crate::ObjectTarget = serde_json::from_value(args["object"].clone())
                 .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
             let id = crate::operations::resolve_target(&target, &state.pool, &state.object_info)
@@ -90,6 +50,9 @@ pub fn execute(
             let property = args["property"]
                 .as_str()
                 .ok_or_else(|| DomainError::new("INVALID_ARGUMENTS", "Provide a property name"))?;
+            let property = property
+                .parse::<crate::object_properties::PropertyKey>()
+                .map_err(|error| DomainError::new("INVALID_ARGUMENTS", error.to_string()))?;
             let value = crate::object_properties::get_object_property(
                 state.pool.object_by_id(id).unwrap(),
                 property,
@@ -113,16 +76,16 @@ pub fn execute(
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            result(
+            Ok(
                 json!({"object_id":id.value(),"property":property,"bytes_base64":base64::Engine::encode(&base64::engine::general_purpose::STANDARD,bytes)}),
             )
         }
-        "get_object_types" => result(
+        AutomationAction::GetObjectTypes => Ok(
             json!({"types":ObjectType::values().into_iter().map(|ty|json!({
             "type":format!("{ty:?}"),"supported_for_target":crate::vt_compatibility::supported_object_type(ty,state.vt_version)
         })).collect::<Vec<_>>()}),
         ),
-        "get_design_context" => {
+        AutomationAction::GetDesignContext => {
             if let Some(scope) = args["scope"].as_str() {
                 args["scope"] = json!(match scope {
                     "active_mask" => "ActiveMask",
@@ -134,9 +97,9 @@ pub fn execute(
             let request = serde_json::from_value(args)
                 .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
             let context = ai::get_design_context(state, request).map_err(inspection_error)?;
-            result(json!({"context": ai::tools::component_design_context(state, context)}))
+            Ok(json!({"context": ai::tools::component_design_context(state, context)}))
         }
-        "get_objects" => {
+        AutomationAction::GetObjects => {
             if let Some(targets) = args.get("targets").and_then(Value::as_array) {
                 let ids = targets
                     .iter()
@@ -162,36 +125,10 @@ pub fn execute(
                 .iter()
                 .filter_map(|o| ai::tools::source_context(&state.components, o.object.id))
                 .collect::<Vec<_>>();
-            let mut values = ai::wire::objects(objects);
-            for value in values.as_array_mut().unwrap() {
-                if let Some(object) = value["id"]
-                    .as_u64()
-                    .and_then(|id| u16::try_from(id).ok())
-                    .and_then(|id| ag_iso_stack::object_pool::ObjectId::new(id).ok())
-                    .and_then(|id| state.pool.object_by_id(id))
-                {
-                    if let ag_iso_stack::object_pool::object::Object::ObjectLabelReferenceList(
-                        labels,
-                    ) = object
-                    {
-                        value["labels"] = json!(labels.object_labels);
-                    }
-                    if object.object_type() == ObjectType::ObjectPointer {
-                        value["allowed_references"] = json!(state
-                            .object_info
-                            .get(&object.id())
-                            .map(|info| info
-                                .allowed_references
-                                .iter()
-                                .map(|id| id.value())
-                                .collect::<Vec<_>>())
-                            .unwrap_or_default());
-                    }
-                }
-            }
-            result(json!({"sources":sources,"objects":values}))
+            let values = serde_json::to_value(objects).unwrap();
+            Ok(json!({"sources":sources,"objects":values}))
         }
-        "list_objects" => {
+        AutomationAction::ListObjects => {
             let query = args["query"].as_str().unwrap_or("").to_lowercase();
             let type_filter = args
                 .get("object_type")
@@ -274,11 +211,11 @@ pub fn execute(
                 .take(limit)
                 .collect::<Vec<_>>();
             let has_more = offset.saturating_add(objects.len()) < total;
-            result(
+            Ok(
                 json!({"objects":objects,"total":total,"offset":offset,"limit":limit,"has_more":has_more}),
             )
         }
-        "get_object_schema" => {
+        AutomationAction::GetObjectSchema => {
             let names: Vec<&str> = match args.get("object_types").and_then(Value::as_array) {
                 Some(types) => types
                     .iter()
@@ -312,13 +249,17 @@ pub fn execute(
                             format!("Unknown object type: {name}"),
                         )
                     })?;
-                let schema = ai::get_object_schema(state, ty)
-                    .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
-                schemas.push(ai::wire::schema(schema));
+                let mut schema = ai::get_object_schema(state, ty);
+                if let Some(properties) = args["properties"].as_array().filter(|p| !p.is_empty()) {
+                    if let Some(fields) = schema["properties"].as_array_mut() {
+                        fields.retain(|field| properties.contains(&field["name"]));
+                    }
+                }
+                schemas.push(schema);
             }
-            result(json!({"schemas": schemas}))
+            Ok(json!({"schemas": schemas}))
         }
-        "list_components" => {
+        AutomationAction::ListComponents => {
             let query = args["query"].as_str().unwrap_or("").to_lowercase();
             let category = args["category"].as_str().unwrap_or("").to_lowercase();
             let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
@@ -342,11 +283,11 @@ pub fn execute(
                 })
                 .cloned()
                 .collect();
-            result(
+            Ok(
                 json!({"components":matching.iter().take(limit).collect::<Vec<_>>(),"total":matching.len()}),
             )
         }
-        "get_component" => {
+        AutomationAction::GetComponent => {
             let id = serde_json::from_value::<crate::components::ComponentId>(
                 args["component_id"].clone(),
             )
@@ -365,9 +306,9 @@ pub fn execute(
             if args["include_nodes"] == true {
                 metadata["nodes"] = json!(component.nodes);
             }
-            result(json!({"component":metadata}))
+            Ok(json!({"component":metadata}))
         }
-        "get_component_instances" => {
+        AutomationAction::GetComponentInstances => {
             let instances = &state.components.instances;
             let requested = args.get("instance_id").filter(|v| !v.is_null());
             let matches: Vec<_> = instances
@@ -380,17 +321,16 @@ pub fn execute(
                     "Component instance was not found",
                 ));
             }
-            result(json!({"instances":matches,"total":matches.len()}))
+            Ok(json!({"instances":matches,"total":matches.len()}))
         }
-        "project_settings" => result(json!({"settings":{
+        AutomationAction::ProjectSettings => Ok(json!({"settings":{
             "mask_size":state.mask_size,
             "soft_key_size":state.soft_key_size,
             "soft_key_layout":state.soft_key_layout,
             "vt_version":u8::from(state.vt_version),
             "object_id_ranges":state.object_id_ranges.iter().map(|(object_type, range)| json!({"object_type":format!("{object_type:?}"),"start":range.start,"end":range.end})).collect::<Vec<_>>(),
         }})),
-        "validate_design" => {
-            let project = crate::EditorProject::from_ai_source(state);
+        AutomationAction::ValidateDesign => {
             let materialized = project.materialize_shared();
             let mut diagnostics = match &materialized {
                 Ok(materialized) => crate::pool_validation::validate_pool_state_for_version(
@@ -429,9 +369,9 @@ pub fn execute(
             let valid = diagnostics.iter().all(|diagnostic| {
                 diagnostic.severity != crate::pool_validation::ValidationSeverity::Error
             });
-            result(json!({"valid":valid,"diagnostics":diagnostics}))
+            Ok(json!({"valid":valid,"diagnostics":diagnostics}))
         }
-        "preview_design" => {
+        AutomationAction::PreviewDesign => {
             let mask_id = args
                 .get("mask_id")
                 .and_then(Value::as_u64)
@@ -443,11 +383,11 @@ pub fn execute(
                 .transpose()?;
             let preview = ai::preview::render_design_preview(state, mask_id)
                 .map_err(|error| DomainError::new("INSPECTION_FAILED", format!("{error:?}")))?;
-            result(
-                json!({"width":preview.width,"height":preview.height,"mask_id":preview.mask_id,"diagnostics":preview.diagnostics,"colour_summary":preview.colour_summary,"png_base64":base64::Engine::encode(&base64::engine::general_purpose::STANDARD,&preview.image.bytes)}),
+            Ok(
+                json!({"width":preview.width,"height":preview.height,"mask_id":preview.mask_id,"png_base64":base64::Engine::encode(&base64::engine::general_purpose::STANDARD,&preview.image.bytes)}),
             )
         }
-        "get_graphic" => {
+        AutomationAction::GetGraphic => {
             let id = args["id"].as_str().ok_or_else(|| {
                 DomainError::new(
                     "INVALID_ARGUMENTS",
@@ -473,7 +413,7 @@ pub fn execute(
                         png.into_inner()
                     ));
                 }
-                result(json!({"graphic":value}))
+                Ok(json!({"graphic":value}))
             } else {
                 let object_id = id.parse::<u16>().map_err(|_| {
                     DomainError::new(
@@ -504,240 +444,42 @@ pub fn execute(
                         png
                     ));
                 }
-                result(json!({"graphic":value}))
+                Ok(json!({"graphic":value}))
             }
         }
-        "list_graphics" => result(json!({"graphics":crate::graphics::integration::catalog(
+        AutomationAction::ListGraphics => {
+            Ok(json!({"graphics":crate::graphics::integration::catalog(
             &state.pool,
             &state.graphics,
             &state.object_info,
             args["query"].as_str().unwrap_or(""), args["status"].as_str().unwrap_or("all"),
-            args["limit"].as_u64().unwrap_or(20).clamp(1,50) as usize)})),
-        "resolve_colours" => {
-            let queries = if let Some(queries) = args["queries"].as_array() {
-                queries.clone()
-            } else if let Some(indexes) = args["indexes"].as_array() {
-                indexes.clone()
-            } else {
+            args["limit"].as_u64().unwrap_or(20).clamp(1,50) as usize)}))
+        }
+        AutomationAction::ResolveColours => {
+            let colours: Vec<String> = serde_json::from_value(args["colours"].clone())
+                .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
+            if colours.is_empty() || colours.len() > 16 {
                 return Err(DomainError::new(
                     "INVALID_ARGUMENTS",
-                    "Provide 1..16 queries or indexes",
-                ));
-            };
-            if queries.is_empty() || queries.len() > 16 {
-                return Err(DomainError::new(
-                    "INVALID_ARGUMENTS",
-                    "Provide 1..16 queries or indexes",
+                    "Provide 1..16 colour indices, names, or #RRGGBB values",
                 ));
             }
-            let pool = &state.pool;
-            result(
-                json!({"results":queries.iter().map(|q| match ai::visual_intent::resolve(pool,q) {
-                Ok(c) => json!({"query":q,"resolved":c}), Err(e) => json!({"query":q,"diagnostic":e})
-            }).collect::<Vec<_>>(),"source":crate::effective_colour::source(pool)}),
+            Ok(
+                json!({"results":colours.iter().map(|query|match crate::effective_colour::resolve(&state.pool,query) {
+                Ok(colour)=>json!({"query":query,"resolved":colour}),Err(message)=>json!({"query":query,"error":message})
+            }).collect::<Vec<_>>(),"source":crate::effective_colour::source(&state.pool)}),
             )
         }
-        "inspect_design_region" => {
+        AutomationAction::InspectDesignRegion => {
             let request = serde_json::from_value(args)
                 .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
             let region = ai::design_inspection::inspect_design_region(state, request)
                 .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
-            result(json!({"region":region}))
+            Ok(json!({"region":region}))
         }
-        "analyze_design" => {
-            let scope = match args["scope"].as_str() {
-                Some("proposal") => ai::DesignAnalysisScope::Proposal,
-                Some("active_mask") | None => ai::DesignAnalysisScope::ActiveMask,
-                Some(_) => {
-                    return Err(DomainError::new(
-                        "INVALID_ARGUMENTS",
-                        "scope must be active_mask or proposal",
-                    ))
-                }
-            };
-            let analysis = ai::analyze_design(state, None, scope)
-                .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
-            result(json!({"analysis":analysis}))
-        }
-        "propose_transaction" => {
-            let base = match pending {
-                Some(p) => Some(selected(&p.proposal_id)?),
-                None if args.get("proposal_id").is_some() => {
-                    return Err(DomainError::new(
-                        "PROPOSAL_STALE",
-                        "No proposal matches this ID",
-                    ))
-                }
-                None => None,
-            };
-            let mut tx_value = args.get("transaction").cloned().unwrap_or(args);
-            if !tx_value.is_object() {
-                return Err(DomainError::new(
-                    "INVALID_ARGUMENTS",
-                    "transaction must be an object with an operations array",
-                ));
-            }
-            tx_value["schema_version"] = json!(crate::operations::CURRENT_OPERATION_SCHEMA_VERSION);
-            let candidate = base.map(|p| AiDesignState {
-                pool: p.prepared.pool.clone(),
-                object_info: p.prepared.object_info.clone(),
-                ..state.clone()
-            });
-            let (normalized, colours) =
-                ai::visual_intent::compile(candidate.as_ref().unwrap_or(state), tx_value)
-                    .map_err(|e| DomainError::new("VALIDATION_FAILED", format!("{e:?}")))?;
-            let tx = serde_json::from_value(normalized)
-                .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
-            let proposal = match base {
-                Some(p) => ai::propose_refinement(state, p, tx),
-                None => ai::propose_transaction(state, tx),
-            }
-            .map_err(|e| {
-                DomainError::new(
-                    "VALIDATION_FAILED",
-                    serde_json::to_string(&e).unwrap_or_else(|_| format!("{e:?}")),
-                )
-            })?;
-            let analysis =
-                ai::analyze_design(state, Some(&proposal), ai::DesignAnalysisScope::Proposal).ok();
-            let value = json!({"proposal_id":proposal.proposal_id,"base_revision":proposal.base_revision,"summary":{"operation_count":proposal.summary.operation_count,"affected_objects":proposal.summary.affected_objects},"refinement_round":proposal.refinement_round,"diagnostics":analysis.map(|a|a.diagnostics),"colour_resolutions":colours});
-            Ok(DomainResult {
-                value,
-                proposal: Some(proposal),
-            })
-        }
-        "propose_component_actions" => {
-            let base = match pending {
-                Some(p) => Some(selected(&p.proposal_id)?),
-                None if args.get("proposal_id").is_some() => {
-                    return Err(DomainError::new(
-                        "PROPOSAL_STALE",
-                        "No proposal matches this ID",
-                    ))
-                }
-                None => None,
-            };
-            if base.is_some_and(|p| !p.transaction.operations.is_empty()) {
-                return Err(DomainError::new(
-                    "VALIDATION_FAILED",
-                    "Apply the primitive proposal before staging component actions",
-                ));
-            }
-            let source = base.map(|p| &p.components).unwrap_or(&state.components);
-            let mut intents = base
-                .map(|p| p.component_intents.clone())
-                .unwrap_or_default();
-            intents.extend(
-                ai::tools::parse_component_actions(source, args["actions"].clone())
-                    .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e))?,
-            );
-            let proposal =
-                ai::proposal::propose_component_intents(state, intents).map_err(|e| {
-                    DomainError::new(
-                        "VALIDATION_FAILED",
-                        serde_json::to_string(&e).unwrap_or_else(|_| format!("{e:?}")),
-                    )
-                })?;
-            let value = json!({"proposal_id":proposal.proposal_id,"base_revision":proposal.base_revision,"summary":{"operation_count":proposal.summary.operation_count,"affected_objects":proposal.summary.affected_objects},"component_instances":proposal.components.instances});
-            Ok(DomainResult {
-                value,
-                proposal: Some(proposal),
-            })
-        }
-        "preview_proposal" => {
-            let proposal = selected(
-                pending
-                    .ok_or_else(|| {
-                        DomainError::new("PROPOSAL_STALE", "No proposal is awaiting review")
-                    })?
-                    .proposal_id
-                    .as_str(),
-            )?;
-            let preview = ai::render_proposal_preview(state, proposal)
-                .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
-            result(
-                json!({"proposal_id":preview.proposal_id,"width":preview.width,"height":preview.height,"mask_id":preview.mask_id,"diagnostics":preview.diagnostics,"colour_summary":preview.colour_summary,"png_base64":base64::Engine::encode(&base64::engine::general_purpose::STANDARD,&preview.image.bytes)}),
-            )
-        }
-        "proposal_status" => result(
-            json!({"proposal":pending.map(|p|json!({"proposal_id":p.proposal_id,"base_revision":p.base_revision,"summary":{"operation_count":p.summary.operation_count,"affected_objects":p.summary.affected_objects},"refinement_round":p.refinement_round}))}),
-        ),
         _ => Err(DomainError::new(
             "UNSUPPORTED_OPERATION",
             format!("Unsupported tool: {tool}"),
         )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{default_object, EditorProject};
-    use ag_iso_stack::object_pool::{ObjectPool, ObjectType};
-
-    fn project() -> EditorProject {
-        let mut pool = ObjectPool::default();
-        let mut button = default_object(ObjectType::Button);
-        button.mut_id().set_value(10).unwrap();
-        pool.add(button);
-        EditorProject::from(pool)
-    }
-
-    #[test]
-    fn proposal_requires_matching_id_and_does_not_mutate_live_project() {
-        let project = project();
-        let original = project.get_pool().as_iop();
-        let state = project.ai_design_state();
-        assert!(execute(
-            &state,
-            None,
-            "propose_transaction",
-            json!({"transaction": []})
-        )
-        .is_err());
-        let transaction = json!({"operations":[{"type":"SetProperty","data":{"object":{"id":10},"property":"width","value":120}}]});
-        let first = execute(&state, None, "propose_transaction", transaction.clone()).unwrap();
-        let proposal = first.proposal.unwrap();
-        assert_eq!(project.get_pool().as_iop(), original);
-        assert!(execute(
-            &state,
-            Some(&proposal),
-            "propose_transaction",
-            transaction.clone()
-        )
-        .is_err());
-        assert!(execute(
-            &state,
-            Some(&proposal),
-            "preview_proposal",
-            json!({"proposal_id":"wrong"})
-        )
-        .is_err());
-        let status = execute(&state, Some(&proposal), "proposal_status", json!({})).unwrap();
-        assert_eq!(
-            status.value["proposal"]["proposal_id"],
-            proposal.proposal_id
-        );
-    }
-
-    #[test]
-    fn selected_state_inspection_and_diff_are_consistent() {
-        let state = project().ai_design_state();
-        let listed = execute(
-            &state,
-            None,
-            "list_objects",
-            json!({"query":"button","object_type":"Button","offset":0,"limit":10}),
-        )
-        .unwrap();
-        assert_eq!(listed.value["total"], 1);
-        assert_eq!(listed.value["objects"][0]["id"], 10);
-
-        let settings = execute(&state, None, "project_settings", json!({})).unwrap();
-        assert_eq!(settings.value["settings"]["mask_size"], state.mask_size);
-        let instances = execute(&state, None, "get_component_instances", json!({})).unwrap();
-        assert_eq!(instances.value["total"], 0);
-
-        assert_eq!(diff_states(&state, &state)["changed"], false);
     }
 }

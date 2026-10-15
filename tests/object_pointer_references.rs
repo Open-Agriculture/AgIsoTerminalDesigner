@@ -108,7 +108,7 @@ fn excluding_active_target_clears_it_and_one_undo_restores_both() {
         &mut project,
         vec![Operation::SetObjectReference {
             object: ObjectTarget::id(pointer),
-            property: "value".into(),
+            property: ag_iso_terminal_designer::object_properties::PropertyKey::Value,
             reference: Some(ObjectTarget::id(active)),
         }],
     ));
@@ -149,7 +149,7 @@ fn disallowed_reference_assignment_is_rejected_without_mutation() {
         &mut project,
         vec![Operation::SetObjectReference {
             object: ObjectTarget::id(pointer),
-            property: "value".into(),
+            property: ag_iso_terminal_designer::object_properties::PropertyKey::Value,
             reference: Some(ObjectTarget::id(denied_target)),
         }],
     ));
@@ -169,7 +169,7 @@ fn allowed_target_and_none_switching_work_and_empty_list_preserves_active_target
             &mut project,
             vec![Operation::SetObjectReference {
                 object: ObjectTarget::id(pointer),
-                property: "value".into(),
+                property: ag_iso_terminal_designer::object_properties::PropertyKey::Value,
                 reference: reference.map(ObjectTarget::id),
             }],
         ));
@@ -193,7 +193,7 @@ fn allowed_target_and_none_switching_work_and_empty_list_preserves_active_target
         &mut project,
         vec![Operation::SetObjectReference {
             object: ObjectTarget::id(pointer),
-            property: "value".into(),
+            property: ag_iso_terminal_designer::object_properties::PropertyKey::Value,
             reference: Some(ObjectTarget::id(first)),
         }],
     ));
@@ -214,7 +214,7 @@ fn allowed_reference_lists_reject_duplicate_self_non_pointer_and_cycle_entries()
         &mut project,
         vec![Operation::SetObjectReference {
             object: ObjectTarget::id(40),
-            property: "value".into(),
+            property: ag_iso_terminal_designer::object_properties::PropertyKey::Value,
             reference: Some(ObjectTarget::id(pointer)),
         }],
     ));
@@ -233,14 +233,14 @@ fn narrowing_list_keeps_a_newly_circular_target_unselectable() {
         &mut project,
         vec![Operation::SetObjectReference {
             object: ObjectTarget::id(target_b),
-            property: "value".into(),
+            property: ag_iso_terminal_designer::object_properties::PropertyKey::Value,
             reference: Some(ObjectTarget::id(pointer_a)),
         }],
     ));
 
     let selection = Operation::SetObjectReference {
         object: ObjectTarget::id(pointer_a),
-        property: "value".into(),
+        property: ag_iso_terminal_designer::object_properties::PropertyKey::Value,
         reference: Some(ObjectTarget::id(target_b)),
     };
     assert!(!transact(&mut project, vec![selection.clone()]));
