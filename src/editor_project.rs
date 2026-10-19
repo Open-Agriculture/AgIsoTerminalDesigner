@@ -48,6 +48,7 @@ impl std::error::Error for ObjectIdAllocationError {}
 struct ProjectContentCheckpoint {
     pool: ObjectPool,
     object_names: Vec<(u16, String)>,
+    object_annotations: Vec<(u16, Option<String>, Option<String>, Vec<String>)>,
     allowed_references: Vec<(u16, Vec<ObjectId>)>,
     overridden_ids: Vec<u16>,
     mask_size: u16,
@@ -107,6 +108,8 @@ impl ComponentCheckpoint {
 
 #[derive(Clone)]
 pub struct EditorProject {
+    /// Transient identity used to invalidate UI drafts when a project is replaced.
+    ui_session_id: uuid::Uuid,
     cache: RefCell<ProjectCache>,
     pool: ObjectPool,
     components: ComponentSource,
@@ -196,6 +199,7 @@ impl From<ObjectPool> for EditorProject {
                 });
 
         let mut project = EditorProject {
+            ui_session_id: uuid::Uuid::new_v4(),
             cache: RefCell::default(),
             pool,
             components: Default::default(),
@@ -296,6 +300,11 @@ impl EditorProject {
         &self.graphics
     }
 
+    /// Stable identity for this in-memory project session; cloning preserves it.
+    pub fn ui_session_id(&self) -> uuid::Uuid {
+        self.ui_session_id
+    }
+
     /// Current application-level object-ID presentation preference.
     pub fn object_id_format(&self) -> ObjectIdFormat {
         self.object_id_format
@@ -304,6 +313,83 @@ impl EditorProject {
     /// Change ID presentation without changing content, revision or history.
     pub fn set_object_id_format(&mut self, format: ObjectIdFormat) {
         self.object_id_format = format;
+    }
+
+    /// Format a pool diagnostic with current authoring names and this project's ID format.
+    pub fn format_validation_diagnostic(&self, diagnostic: &crate::ValidationDiagnostic) -> String {
+        let ids = diagnostic.affected_objects.as_deref().unwrap_or_default();
+        let names = self.object_names_for_ids(ids);
+        crate::pool_validation::format_validation_diagnostic_with_names(
+            diagnostic,
+            self.object_id_format,
+            &names,
+        )
+    }
+
+    /// Format transaction diagnostics with current names, preserving the structured records.
+    pub fn format_transaction_diagnostics(&self, diagnostics: &TransactionDiagnostics) -> String {
+        diagnostics
+            .0
+            .iter()
+            .map(|diagnostic| {
+                let mut ids = diagnostic.related_objects.clone();
+                if let Some(id) = diagnostic.object_id {
+                    if !ids.contains(&id) {
+                        ids.insert(0, id);
+                    }
+                }
+                let mut names = self.object_names_for_ids(&ids);
+                if let (Some(id), Some(name)) =
+                    (diagnostic.object_id, diagnostic.object_name.as_ref())
+                {
+                    names.entry(id).or_insert_with(|| name.clone());
+                }
+                if ids.is_empty() {
+                    return diagnostic.message.clone();
+                }
+                let plural = ids.len() > 1;
+                let objects = ids
+                    .iter()
+                    .map(|id| {
+                        crate::pool_validation::format_object_identity(
+                            *id,
+                            self.object_id_format,
+                            names.get(id).map(String::as_str),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{} {objects}: {}",
+                    if plural { "Objects" } else { "Object" },
+                    diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn object_names_for_ids(&self, ids: &[u16]) -> HashMap<u16, String> {
+        let mut names = HashMap::new();
+        let authoritative = self.object_info.borrow();
+        let drafts = self.mut_object_info.borrow();
+        for id in ids {
+            let Some(object_id) = ObjectId::new(*id).ok() else {
+                continue;
+            };
+            if let Some(name) = drafts
+                .get(&object_id)
+                .and_then(|info| info.name.as_ref())
+                .or_else(|| {
+                    authoritative
+                        .get(&object_id)
+                        .and_then(|info| info.name.as_ref())
+                })
+            {
+                names.insert(*id, name.clone());
+            }
+        }
+        names
     }
 
     /// Configured inclusive automatic allocation ranges.
@@ -475,7 +561,7 @@ impl EditorProject {
         let errors: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.severity == crate::ValidationSeverity::Error)
-            .map(|d| crate::pool_validation::format_validation_diagnostic(d, self.object_id_format))
+            .map(|d| self.format_validation_diagnostic(d))
             .collect();
         if !errors.is_empty() {
             return Err(ComponentError::new(
@@ -890,6 +976,16 @@ impl EditorProject {
             .filter_map(|(id, info)| info.name.clone().map(|name| (id.value(), name)))
             .collect();
         object_names.sort_by_key(|(id, _)| *id);
+        let mut object_annotations: Vec<_> = object_info
+            .iter()
+            .filter(|(_, info)| {
+                info.description.is_some() || info.notes.is_some() || !info.tags.is_empty()
+            })
+            .map(|(id, info)| {
+                (id.value(), info.description.clone(), info.notes.clone(), info.tags.clone())
+            })
+            .collect();
+        object_annotations.sort_by_key(|(id, ..)| *id);
         let mut allowed_references: Vec<_> = object_info
             .iter()
             .filter(|(_, info)| !info.allowed_references.is_empty())
@@ -906,6 +1002,7 @@ impl EditorProject {
         ProjectContentCheckpoint {
             pool: self.pool.clone(),
             object_names,
+            object_annotations,
             allowed_references,
             overridden_ids,
             mask_size: self.mask_size,
@@ -1526,11 +1623,19 @@ impl EditorProject {
     }
 
     fn execute_ui_transaction(&mut self, transaction: OperationTransaction) -> bool {
-        match self.execute_transaction(transaction) {
-            Ok(_) => true,
-            Err(error) => {
-                log::error!("Failed to execute UI operation: {error:?}");
-                self.last_operation_error.replace(Some(error.to_string()));
+        match self.prepare_transaction(&transaction) {
+            Ok(prepared) => match self.commit_prepared_transaction(prepared) {
+                Ok(_) => true,
+                Err(error) => {
+                    log::error!("Failed to execute UI operation: {error:?}");
+                    self.last_operation_error.replace(Some(error.to_string()));
+                    false
+                }
+            },
+            Err(diagnostics) => {
+                let message = self.format_transaction_diagnostics(&diagnostics);
+                log::error!("Failed to execute UI operation: {message}");
+                self.last_operation_error.replace(Some(message));
                 false
             }
         }
@@ -1852,10 +1957,11 @@ impl EditorProject {
                 let info = object_info
                     .entry(object.id())
                     .or_insert_with(|| ObjectInfo::new(object));
-                if let Some(name) = &meta.name {
-                    info.set_name(name.clone());
-                }
+                // A persisted null name is an explicit unnamed object. Generate
+                // names only for objects without a metadata record.
+                info.name = meta.name.clone();
                 info.description = meta.description.clone();
+                info.notes = meta.notes.clone();
                 info.tags = meta.tags.clone();
                 info.allowed_references = meta.allowed_references.clone();
                 info.id_overridden = meta.id_overridden;
@@ -1868,7 +1974,9 @@ impl EditorProject {
 
         // Apply smart naming to objects without custom names
         for object in editor_project.pool.objects() {
-            editor_project.apply_smart_naming_to_object(object);
+            if !metadata.contains_key(&object.id().value()) {
+                editor_project.apply_smart_naming_to_object(object);
+            }
         }
 
         // Restore last selected
@@ -2244,10 +2352,21 @@ impl EditorProject {
             .iter()
             .find(|d| d.severity == crate::ValidationSeverity::Error)
         {
-            return Err(component_transaction_error(ComponentError::new(
-                "VT_PROJECT_INCOMPATIBLE",
+            let affected = error.affected_objects.clone().unwrap_or_default();
+            let mut diagnostics = component_transaction_error(ComponentError::new(
+                &error.code,
                 error.message.clone(),
-            )));
+            ));
+            if let Some(diagnostic) = diagnostics.0.first_mut() {
+                diagnostic.object_id = affected.first().copied();
+                diagnostic.object_name = affected
+                    .first()
+                    .and_then(|id| ObjectId::new(*id).ok())
+                    .and_then(|id| prepared.object_info.get(&id))
+                    .and_then(|info| info.name.clone());
+                diagnostic.related_objects = affected;
+            }
+            return Err(diagnostics);
         }
         crate::layout_containment::validate_change_with_id_changes_and_soft_key_size(
             baseline,
@@ -2257,7 +2376,9 @@ impl EditorProject {
             &id_changes,
             Some((self.soft_key_size, self.soft_key_size)),
         )
-        .map_err(crate::operations::executor::containment_transaction_error)?;
+        .map_err(|error| {
+            crate::operations::executor::containment_transaction_error(error, &prepared.object_info)
+        })?;
         Ok(prepared)
     }
 
@@ -2705,7 +2826,7 @@ pub(crate) fn component_transaction_error(error: ComponentError) -> TransactionD
         context: error
             .property
             .filter(|name| crate::PropertyKey::parse(name).is_none()),
-        related_objects: vec![],
+        related_objects: error.object_id.into_iter().collect(),
     }])
 }
 
@@ -2713,6 +2834,29 @@ pub(crate) fn component_transaction_error(error: ComponentError) -> TransactionD
 mod tests {
     use super::*;
     use crate::{default_object, ChildPlacement, MacroReferenceTarget};
+
+    #[test]
+    fn transaction_error_formatting_includes_names_and_all_affected_ids() {
+        let mut project = EditorProject::default();
+        project.set_object_id_format(ObjectIdFormat::Hexadecimal);
+        let diagnostics = TransactionDiagnostics(vec![crate::TransactionDiagnostic {
+            severity: crate::DiagnosticSeverity::Error,
+            code: "INVALID_CHILD_TYPE".into(),
+            message: "Invalid relationship".into(),
+            operation_index: None,
+            operation_type: None,
+            object_id: Some(175),
+            object_name: Some("Header".into()),
+            property: None,
+            context: None,
+            related_objects: vec![175, 176],
+        }]);
+
+        assert_eq!(
+            project.format_transaction_diagnostics(&diagnostics),
+            "Objects ‘Header’ (0x00AF), 0x00B0: Invalid relationship"
+        );
+    }
 
     #[test]
     fn edit_batch_reports_object_changes_and_reconciles_primitive_selection() {
@@ -3753,6 +3897,31 @@ mod tests {
             .is_some());
         assert!(!restored.object_id_is_overridden(ObjectId::new(10).unwrap()));
         assert!(!restored.is_dirty());
+    }
+
+    #[test]
+    fn object_notes_survive_project_round_trip() {
+        let object = object_with_id(ObjectType::Button, 27);
+        let mut pool = ObjectPool::default();
+        pool.add(object.clone());
+        let mut project = EditorProject::from(pool);
+        project.mark_saved();
+        let actions = crate::cli::commands::parse_commands(
+            "object metadata 27 --notes 'Review after field testing\nkeep the alarm label'",
+            std::path::Path::new("."),
+            &|_| unreachable!(),
+        )
+        .unwrap();
+        crate::cli::editing::execute_batch(&mut project, serde_json::json!({"actions":actions}))
+            .unwrap();
+        assert!(project.is_dirty());
+
+        let saved = project.save_project().unwrap();
+        let loaded = EditorProject::load_project(saved).unwrap();
+        assert_eq!(
+            loaded.get_object_info(&object).notes.as_deref(),
+            Some("Review after field testing\nkeep the alarm label")
+        );
     }
 
     #[test]

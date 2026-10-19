@@ -20,6 +20,9 @@ pub struct AppPreferences {
     pub show_ancestry: bool,
     /// Show numeric IDs alongside object names in authoring labels.
     pub show_object_ids: bool,
+    /// Show the automatically scaled canvas grid overlay.
+    #[serde(default)]
+    pub show_grid: bool,
     pub object_id_format: ObjectIdFormat,
 }
 
@@ -33,6 +36,7 @@ impl Default for AppPreferences {
             show_properties: true,
             show_ancestry: true,
             show_object_ids: false,
+            show_grid: false,
             object_id_format: ObjectIdFormat::Decimal,
         }
     }
@@ -172,10 +176,7 @@ pub fn show_project_settings(
                         for diagnostic in diagnostics {
                             ui.colored_label(
                                 ui.visuals().warn_fg_color,
-                                ag_iso_terminal_designer::pool_validation::format_validation_diagnostic(
-                                    &diagnostic,
-                                    project.object_id_format(),
-                                ),
+                                project.format_validation_diagnostic(&diagnostic),
                             );
                         }
                     }

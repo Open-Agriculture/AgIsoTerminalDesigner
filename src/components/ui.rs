@@ -8,6 +8,60 @@ use ag_iso_stack::object_pool::{
 };
 use eframe::egui;
 
+#[derive(Clone)]
+struct PendingInspectorEdit {
+    session: uuid::Uuid,
+    revision: u64,
+    frame: u64,
+    instance: ComponentInstanceId,
+    position: Option<(i32, i32)>,
+    overrides: std::collections::BTreeMap<ComponentParameterId, serde_json::Value>,
+}
+
+/// Finish valid drafts whose inspector disappeared during this frame's navigation.
+/// Call after rendering the editor panes, before committing queued primitive edits.
+pub fn finish_inspector_edits(ctx: &egui::Context, project: &mut EditorProject) {
+    let key = egui::Id::new("pending_component_inspectors");
+    let pending = ctx
+        .data_mut(|data| data.remove_temp::<Vec<PendingInspectorEdit>>(key))
+        .unwrap_or_default();
+    let mut retained = Vec::new();
+    let revision = project.revision();
+    for edit in pending {
+        if edit.session != project.ui_session_id() || edit.revision != revision {
+            continue;
+        }
+        if edit.frame == ctx.cumulative_frame_nr() {
+            retained.push(edit);
+            continue;
+        }
+        let result = project.edit_source("Edit component instance", |_, source, _, _| {
+            let instance = source
+                .instances
+                .iter_mut()
+                .find(|instance| instance.id == edit.instance)
+                .ok_or_else(|| {
+                    ComponentError::new(
+                        "COMPONENT_INSTANCE_NOT_FOUND",
+                        "Component instance no longer exists",
+                    )
+                })?;
+            if let Some((x, y)) = edit.position {
+                instance.x = x;
+                instance.y = y;
+            }
+            instance.overrides.extend(edit.overrides);
+            Ok(())
+        });
+        if let Err(error) = result {
+            ctx.data_mut(|data| {
+                data.insert_temp(egui::Id::new("component_error"), error.to_string())
+            });
+        }
+    }
+    ctx.data_mut(|data| data.insert_temp(key, retained));
+}
+
 /// UI drafts live in egui temporary state; saving invokes the same atomic service as AI.
 pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
@@ -1080,6 +1134,14 @@ pub fn inspector(
     };
     let definition = project.component_source().definitions[&instance.component_id].clone();
     let materialized = super::materialize::materialize_project(project);
+    let mut pending_edit = PendingInspectorEdit {
+        session: project.ui_session_id(),
+        revision: project.revision(),
+        frame: ui.ctx().cumulative_frame_nr(),
+        instance: id,
+        position: None,
+        overrides: Default::default(),
+    };
     ui.heading(&definition.name);
     ui.label(format!("Instance: {id}"));
     ui.label(format!(
@@ -1091,17 +1153,37 @@ pub fn inspector(
             .map(|n| n.name.as_str())
             .unwrap_or("?")
     ));
-    let mut x = instance.x;
-    let mut y = instance.y;
-    let mut moved = false;
+    let position_key = ui.id().with((
+        "instance_position",
+        project.ui_session_id(),
+        id,
+        project.revision(),
+    ));
+    let mut position = ui
+        .data(|data| data.get_temp::<(i32, i32)>(position_key))
+        .unwrap_or((instance.x, instance.y));
+    let mut finished = false;
+    let mut cancelled = false;
     ui.horizontal(|ui| {
         ui.label("Position");
-        moved |= ui.add(egui::DragValue::new(&mut x)).changed();
-        moved |= ui.add(egui::DragValue::new(&mut y)).changed();
+        let x = ui.add(egui::DragValue::new(&mut position.0));
+        let y = ui.add(egui::DragValue::new(&mut position.1));
+        cancelled = (x.has_focus() || y.has_focus() || x.lost_focus() || y.lost_focus())
+            && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        finished = x.drag_stopped() || y.drag_stopped() || x.lost_focus() || y.lost_focus();
+    });
+    ui.data_mut(|data| {
+        if finished || cancelled {
+            data.remove::<(i32, i32)>(position_key);
+        } else {
+            data.insert_temp(position_key, position);
+        }
     });
     let mut result = Ok(());
-    if moved {
-        result = ComponentService::move_instance(project, id, x, y);
+    if finished && !cancelled && position != (instance.x, instance.y) {
+        result = ComponentService::move_instance(project, id, position.0, position.1);
+    } else if !finished && !cancelled && position != (instance.x, instance.y) {
+        pending_edit.position = Some(position);
     }
     for parameter in &definition.parameters {
         ui.label(&parameter.name);
@@ -1119,12 +1201,20 @@ pub fn inspector(
         } else {
             Ok(serde_json::to_string(value).unwrap())
         };
-        let key = ui.id().with((id, parameter.id, project.revision()));
+        let key = ui.id().with((
+            project.ui_session_id(),
+            id,
+            parameter.id,
+            project.revision(),
+        ));
         let mut draft = ui.data_mut(|d| {
             d.get_temp::<String>(key)
                 .unwrap_or_else(|| initial_text.clone().unwrap_or_default())
         });
+        let mut apply = false;
+        let mut response = None;
         if parameter.kind == ComponentParameterKind::Graphic {
+            let previous = draft.clone();
             let mut value = serde_json::from_str(&draft).unwrap_or_default();
             crate::graphics::ui::select(ui, project, &mut value, |candidate, graphic| {
                 ComponentService::set_component_override(
@@ -1136,6 +1226,7 @@ pub fn inspector(
                 .map_err(|error| error.to_string())
             });
             draft = value.to_string();
+            apply = draft != previous;
         } else if parameter.kind == ComponentParameterKind::ObjectReference {
             if let Some(node) = definition
                 .nodes
@@ -1154,10 +1245,7 @@ pub fn inspector(
                             ui,
                             (id, parameter.id, "override_reference"),
                             "Choose referenced object…",
-                            &format!(
-                                "Choose the draft value for parameter '{}'. Use Set override to apply it.",
-                                parameter.name
-                            ),
+                            &format!("Choose the value for parameter '{}'.", parameter.name),
                             project,
                             None,
                             true,
@@ -1166,7 +1254,7 @@ pub fn inspector(
                                     || allowed_types.contains(&object.object_type())
                             },
                             |ui, selected| {
-                                ui.label("Preview after Set override:");
+                                ui.label("Preview after changing the reference:");
                                 crate::object_picker::impact::review_change(
                                     ui,
                                     project,
@@ -1192,6 +1280,7 @@ pub fn inspector(
                                 &selected.0.map(|id| crate::ObjectTarget::id(id.value())),
                             )
                             .unwrap();
+                            apply = true;
                         }
                     }
                 }
@@ -1200,7 +1289,7 @@ pub fn inspector(
         } else if parameter.kind == ComponentParameterKind::Text {
             match &initial_text {
                 Ok(_) => {
-                    ui.text_edit_singleline(&mut draft);
+                    response = Some(ui.text_edit_singleline(&mut draft));
                 }
                 Err(error) => {
                     ui.colored_label(
@@ -1210,27 +1299,47 @@ pub fn inspector(
                 }
             }
         } else {
-            ui.text_edit_singleline(&mut draft);
+            response = Some(ui.text_edit_singleline(&mut draft));
+        }
+        if let Some(response) = response {
+            let cancelled = (response.has_focus() || response.lost_focus())
+                && ui.input(|input| input.key_pressed(egui::Key::Escape));
+            if cancelled {
+                draft = initial_text.clone().unwrap_or_default();
+                response.surrender_focus();
+            } else if response.lost_focus()
+                || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            {
+                apply = initial_text.as_ref().is_ok_and(|initial| *initial != draft);
+                response.surrender_focus();
+            }
         }
         ui.data_mut(|d| d.insert_temp(key, draft.clone()));
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    parameter.kind != ComponentParameterKind::Text || initial_text.is_ok(),
-                    egui::Button::new("Set override"),
-                )
-                .clicked()
-            {
-                result = (if parameter.kind == ComponentParameterKind::Text {
-                    Ok(serde_json::Value::String(draft.clone()))
+        if apply {
+            result = (if parameter.kind == ComponentParameterKind::Text {
+                Ok(serde_json::Value::String(draft.clone()))
+            } else {
+                serde_json::from_str(&draft)
+            })
+            .map_err(|e| ComponentError::new("COMPONENT_OVERRIDE_TYPE_MISMATCH", e.to_string()))
+            .and_then(|edited| {
+                if &edited == value {
+                    Ok(())
                 } else {
-                    serde_json::from_str(&draft)
-                })
-                .map_err(|e| ComponentError::new("COMPONENT_OVERRIDE_TYPE_MISMATCH", e.to_string()))
-                .and_then(|value| {
-                    ComponentService::set_component_override(project, id, parameter.id, value)
-                });
+                    ComponentService::set_component_override(project, id, parameter.id, edited)
+                }
+            });
+        } else if initial_text.as_ref().is_ok_and(|initial| *initial != draft) {
+            let value = if parameter.kind == ComponentParameterKind::Text {
+                Some(serde_json::Value::String(draft))
+            } else {
+                serde_json::from_str(&draft).ok()
+            };
+            if let Some(value) = value {
+                pending_edit.overrides.insert(parameter.id, value);
             }
+        }
+        ui.horizontal(|ui| {
             if ui.button("Reset").clicked() {
                 result = ComponentService::reset_component_override(project, id, parameter.id);
                 ui.data_mut(|d| d.remove::<String>(key));
@@ -1262,6 +1371,17 @@ pub fn inspector(
     if let Err(e) = result {
         report_error(ui, e.to_string());
     }
+    let key = egui::Id::new("pending_component_inspectors");
+    ui.data_mut(|data| {
+        let mut pending = data
+            .get_temp::<Vec<PendingInspectorEdit>>(key)
+            .unwrap_or_default();
+        pending.retain(|edit| edit.instance != id || edit.session != project.ui_session_id());
+        if pending_edit.position.is_some() || !pending_edit.overrides.is_empty() {
+            pending.push(pending_edit);
+        }
+        data.insert_temp(key, pending);
+    });
 }
 
 fn report_error(ui: &mut egui::Ui, message: impl Into<String>) {
@@ -1274,6 +1394,128 @@ fn report_error(ui: &mut egui::Ui, message: impl Into<String>) {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn instance_text_draft_commits_once_when_inspector_disappears() {
+        use ag_iso_stack::object_pool::{ObjectPool, ObjectRef};
+        let mut pool = ObjectPool::default();
+        let mut mask = crate::default_object(ObjectType::DataMask);
+        mask.mut_id().set_value(1).unwrap();
+        if let Object::DataMask(mask) = &mut mask {
+            mask.object_refs.push(ObjectRef {
+                id: ObjectId::new(2).unwrap(),
+                offset: ag_iso_stack::object_pool::object_attributes::Point { x: 10, y: 20 },
+            });
+        }
+        let mut input = crate::default_object(ObjectType::InputBoolean);
+        input.mut_id().set_value(2).unwrap();
+        let mut font = crate::default_object(ObjectType::FontAttributes);
+        font.mut_id().set_value(3).unwrap();
+        if let Object::InputBoolean(input) = &mut input {
+            input.foreground_colour = ObjectId::new(3).unwrap().into();
+        }
+        pool.add(mask);
+        pool.add(input);
+        pool.add(font);
+        let mut project = EditorProject::from(pool);
+        let plan = plan_component_capture(&project, 2, "Switch".into()).unwrap();
+        let component = plan.definition.id;
+        let node = plan.definition.root_node;
+        let instance =
+            ComponentService::create_component_from_selection(&mut project, plan, false).unwrap();
+        let parameter = ComponentParameterId::default();
+        ComponentService::add_component_parameter(
+            &mut project,
+            component,
+            ComponentParameter {
+                id: parameter,
+                name: "State".into(),
+                description: None,
+                target_node: node,
+                property: ComponentParameterTarget::Property(
+                    crate::object_properties::PropertyKey::Value,
+                ),
+                kind: ComponentParameterKind::Boolean,
+                default_value: serde_json::json!(false),
+            },
+        )
+        .unwrap();
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let mut frame = |project: &mut EditorProject, events, visible| {
+            time += 0.1;
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 800.0),
+                    )),
+                    events,
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if visible {
+                            inspector(ui, project, instance, node);
+                        }
+                    });
+                    finish_inspector_edits(ctx, project);
+                },
+            )
+        };
+        let output = frame(&mut project, vec![], true);
+        let field = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "false" => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("boolean parameter text field");
+        for pressed in [true, false] {
+            frame(
+                &mut project,
+                vec![
+                    egui::Event::PointerMoved(field),
+                    egui::Event::PointerButton {
+                        pos: field,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                true,
+            );
+        }
+        let revision = project.revision();
+        frame(
+            &mut project,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text("true".into()),
+            ],
+            true,
+        );
+        assert_eq!(project.revision(), revision, "typing must remain a draft");
+        frame(&mut project, vec![], false);
+        assert_eq!(
+            project.component_source().instances[0].overrides[&parameter],
+            serde_json::json!(true)
+        );
+        assert!(project.undo_operation());
+        assert!(!project.component_source().instances[0]
+            .overrides
+            .contains_key(&parameter));
+    }
 
     fn input_boolean(value: serde_json::Value) -> ComponentNode {
         ComponentNode {

@@ -103,7 +103,12 @@ impl TransactionDiagnostics {
 
 pub(crate) fn containment_transaction_error(
     error: crate::layout_containment::ContainmentError,
+    object_info: &HashMap<ObjectId, ObjectInfo>,
 ) -> TransactionDiagnostics {
+    let object_name = ObjectId::new(error.child_id)
+        .ok()
+        .and_then(|id| object_info.get(&id))
+        .and_then(|info| info.name.clone());
     TransactionDiagnostics(vec![TransactionDiagnostic {
         severity: DiagnosticSeverity::Error,
         code: error.code().into(),
@@ -111,7 +116,7 @@ pub(crate) fn containment_transaction_error(
         operation_index: None,
         operation_type: None,
         object_id: Some(error.child_id),
-        object_name: None,
+        object_name,
         property: None,
         context: None,
         related_objects: vec![error.parent_id, error.child_id],
@@ -412,6 +417,7 @@ impl OperationExecutor {
                         OperationError::DuplicateObjectName(name.to_owned()),
                         "TRANSACTION_TOO_LARGE",
                         "Object name exceeds maximum length",
+                        &candidate_info,
                     )));
                 }
             }
@@ -427,6 +433,7 @@ impl OperationExecutor {
                                     OperationError::ObjectNotFound(*object_id),
                                     "OBJECT_NOT_FOUND",
                                     "Allocated object ID is invalid",
+                                    &candidate_info,
                                 ))
                             })?;
                             Operation::RestoreObject {
@@ -438,6 +445,7 @@ impl OperationExecutor {
                                             OperationError::ObjectNotFound(*object_id),
                                             "OBJECT_NOT_FOUND",
                                             "Created object disappeared",
+                                            &candidate_info,
                                         ))
                                     },
                                 )?,
@@ -451,7 +459,12 @@ impl OperationExecutor {
                 }
                 Err(error) => {
                     return Err(TransactionDiagnostics::single(operation_diagnostic(
-                        index, operation, error, "", "",
+                        index,
+                        operation,
+                        error,
+                        "",
+                        "",
+                        &candidate_info,
                     )))
                 }
             }
@@ -462,7 +475,7 @@ impl OperationExecutor {
             &placements.new_references(),
             soft_key_size,
         )
-        .map_err(containment_transaction_error)?;
+        .map_err(|error| containment_transaction_error(error, &candidate_info))?;
         let id_changes = crate::id_reassignment::compose_id_mappings(&transaction.operations);
         crate::layout_containment::validate_change_with_id_changes_and_soft_key_size(
             pool,
@@ -472,7 +485,7 @@ impl OperationExecutor {
             &id_changes,
             soft_key_size.map(|size| (size, size)),
         )
-        .map_err(containment_transaction_error)?;
+        .map_err(|error| containment_transaction_error(error, &candidate_info))?;
         let candidate_validation = crate::pool_validation::validate_pool_state_for_version(
             &candidate_pool,
             context.vt_version,
@@ -509,8 +522,17 @@ impl OperationExecutor {
                 message: d.message,
                 operation_index: None,
                 operation_type: None,
-                object_id: None,
-                object_name: None,
+                object_id: d
+                    .affected_objects
+                    .as_ref()
+                    .and_then(|ids| ids.first().copied()),
+                object_name: d
+                    .affected_objects
+                    .as_ref()
+                    .and_then(|ids| ids.first())
+                    .and_then(|id| ObjectId::new(*id).ok())
+                    .and_then(|id| candidate_info.get(&id))
+                    .and_then(|info| info.name.clone()),
                 property: None,
                 context: None,
                 related_objects: d.affected_objects.unwrap_or_default(),
@@ -651,6 +673,7 @@ fn operation_diagnostic(
     error: OperationError,
     forced_code: &str,
     forced_message: &str,
+    object_info: &HashMap<ObjectId, ObjectInfo>,
 ) -> TransactionDiagnostic {
     let (mut code, mut message, object_id, property, context, related) = match error {
         OperationError::ObjectNotFound(id) => (
@@ -790,12 +813,18 @@ fn operation_diagnostic(
         code = forced_code;
         message = forced_message.into();
     }
-    let object_name = primary_target(operation)
-        .and_then(|t| match t {
-            ObjectTarget::Name { name } => Some(name.clone()),
-            _ => None,
-        })
-        .or_else(|| operation_name(operation).map(str::to_owned));
+    let object_name = object_id
+        .and_then(|id| ObjectId::new(id).ok())
+        .and_then(|id| object_info.get(&id))
+        .and_then(|info| info.name.clone())
+        .or_else(|| {
+            primary_target(operation)
+                .and_then(|t| match t {
+                    ObjectTarget::Name { name } => Some(name.clone()),
+                    _ => None,
+                })
+                .or_else(|| operation_name(operation).map(str::to_owned))
+        });
     TransactionDiagnostic {
         severity: DiagnosticSeverity::Error,
         code: code.into(),

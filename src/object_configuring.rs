@@ -17,6 +17,7 @@ use ag_iso_stack::object_pool::object_attributes::{Event, MacroRef};
 use ag_iso_stack::object_pool::vt_version::VtVersion;
 use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectRef, ObjectType};
 use eframe::egui;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone)]
 enum PendingValue {
@@ -31,6 +32,114 @@ struct PendingPosition {
     revision: u64,
 }
 
+#[derive(Clone)]
+struct PendingOperation {
+    session: uuid::Uuid,
+    revision: u64,
+    operation: Option<Operation>,
+}
+
+#[derive(Clone, Default)]
+struct PropertyDraftRegistry {
+    entries: HashMap<egui::Id, PendingOperation>,
+    seen: HashSet<egui::Id>,
+}
+
+fn registry_id() -> egui::Id {
+    egui::Id::new("property_editor_pending_drafts")
+}
+
+fn touch_draft(ctx: &egui::Context, key: egui::Id) {
+    ctx.data_mut(|data| {
+        let registry_id = registry_id();
+        let mut registry = data
+            .get_temp::<PropertyDraftRegistry>(registry_id)
+            .unwrap_or_default();
+        if registry.entries.contains_key(&key) {
+            registry.seen.insert(key);
+            data.insert_temp(registry_id, registry);
+        }
+    });
+}
+
+fn update_draft(
+    ctx: &egui::Context,
+    key: egui::Id,
+    design: &EditorProject,
+    operation: Option<Operation>,
+) {
+    ctx.data_mut(|data| {
+        let registry_id = registry_id();
+        let mut registry = data
+            .get_temp::<PropertyDraftRegistry>(registry_id)
+            .unwrap_or_default();
+        registry.entries.insert(
+            key,
+            PendingOperation {
+                session: design.ui_session_id(),
+                revision: design.revision(),
+                operation,
+            },
+        );
+        registry.seen.insert(key);
+        data.insert_temp(registry_id, registry);
+    });
+}
+
+fn clear_draft(ctx: &egui::Context, key: egui::Id) {
+    ctx.data_mut(|data| {
+        let registry_id = registry_id();
+        if let Some(mut registry) = data.get_temp::<PropertyDraftRegistry>(registry_id) {
+            registry.entries.remove(&key);
+            registry.seen.remove(&key);
+            data.insert_temp(registry_id, registry);
+        }
+    });
+}
+
+/// Finish property drafts whose widgets disappeared since the previous frame.
+/// Call after rendering the editor panels and before committing queued edits.
+pub fn finish_property_edits(ctx: &egui::Context, design: &EditorProject) {
+    let operations = ctx.data_mut(|data| {
+        let registry_id = registry_id();
+        let mut registry = data
+            .get_temp::<PropertyDraftRegistry>(registry_id)
+            .unwrap_or_default();
+        let mut operations = Vec::new();
+        let mut expired_keys = Vec::new();
+        let seen = registry.seen.clone();
+        registry.entries.retain(|key, pending| {
+            if seen.contains(key) {
+                if pending.session == design.ui_session_id()
+                    && pending.revision == design.revision()
+                {
+                    return true;
+                }
+                expired_keys.push(*key);
+                return false;
+            }
+            if pending.session == design.ui_session_id() && pending.revision == design.revision() {
+                if let Some(operation) = pending.operation.take() {
+                    operations.push(operation);
+                }
+            }
+            expired_keys.push(*key);
+            false
+        });
+        registry.seen.clear();
+        data.insert_temp(registry_id, registry);
+        for key in expired_keys {
+            data.remove::<PendingValue>(key);
+            data.remove::<PendingPosition>(key);
+            data.remove::<u16>(key);
+        }
+        operations
+    });
+    for operation in operations {
+        design.queue_operation(operation);
+    }
+}
+
 /// A drag value changes on every pointer-move frame. Keep displaying those
 /// intermediate values, but only turn the edit into an operation when the
 /// pointer is released (or a keyboard edit loses focus).
@@ -40,6 +149,12 @@ fn drag_value_finished(response: &egui::Response) -> bool {
 
 /// Render every writable property declared for `object`.
 pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &EditorProject) {
+    ui.push_id((design.ui_session_id(), design.revision()), |ui| {
+        render_property_editor_scoped(ui, object, design);
+    });
+}
+
+fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &EditorProject) {
     ui.style_mut().spacing.combo_width = 0.0;
     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
     ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
@@ -188,9 +303,11 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             && property_key == PropertyKey::ExternalObjectId
         {
             let key = ui.make_persistent_id((id.value(), property_name));
+            touch_draft(ui.ctx(), key);
+            let original_foreign_id = value.as_u64().map_or(u16::MAX, |value| value as u16);
             let mut foreign_id = ui
                 .data(|data| data.get_temp::<u16>(key))
-                .unwrap_or_else(|| value.as_u64().map_or(u16::MAX, |value| value as u16));
+                .unwrap_or(original_foreign_id);
             ui.horizontal(|ui| {
                 ui.label(&label);
                 let format = design.object_id_format();
@@ -202,15 +319,36 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
                 );
                 if response.changed() {
                     ui.data_mut(|data| data.insert_temp(key, foreign_id));
+                    let operation = if foreign_id == u16::MAX {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(foreign_id)
+                    };
+                    update_draft(
+                        ui.ctx(),
+                        key,
+                        design,
+                        Some(property_operation(design, id, property_key, operation)),
+                    );
                 }
-                if drag_value_finished(&response) {
+                let cancelled =
+                    response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+                if cancelled {
+                    ui.data_mut(|data| data.remove::<u16>(key));
+                    clear_draft(ui.ctx(), key);
+                } else if drag_value_finished(&response)
+                    || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
                     let value = if foreign_id == u16::MAX {
                         serde_json::Value::Null
                     } else {
                         foreign_id.into()
                     };
-                    queue(design, id, property_key, value);
+                    if foreign_id != original_foreign_id {
+                        queue(design, id, property_key, value);
+                    }
                     ui.data_mut(|data| data.remove::<u16>(key));
+                    clear_draft(ui.ctx(), key);
                 }
             });
             ui.small("Object ID in the external ECU's pool; 65535 means no reference.");
@@ -356,6 +494,10 @@ pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &Edito
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
+    }
+
+    if let Object::PictureGraphic(picture) = object {
+        render_picture_dimensions(ui, picture, id, design);
     }
 
     if let Some(children) = crate::operations::operation::object_refs(object) {
@@ -770,6 +912,7 @@ fn render_positioned_children(
                 }
                 let position_key =
                     ui.make_persistent_id(("positioned_child_position", parent_id.value(), index));
+                touch_draft(ui.ctx(), position_key);
                 let revision = design.revision();
                 let mut edited = ui
                     .data(|data| data.get_temp::<PendingPosition>(position_key))
@@ -791,12 +934,35 @@ fn render_positioned_children(
                 );
                 if x_response.changed() || y_response.changed() {
                     ui.data_mut(|data| data.insert_temp(position_key, edited.clone()));
+                    let updated =
+                        positioned_children_with_position(children, index, edited.x, edited.y);
+                    update_draft(
+                        ui.ctx(),
+                        position_key,
+                        design,
+                        Some(Operation::SetChildren {
+                            parent: ObjectTarget::id(parent_id.value()),
+                            children: updated,
+                        }),
+                    );
                 }
-                if drag_value_finished(&x_response) || drag_value_finished(&y_response) {
+                let cancelled = (x_response.has_focus() || y_response.has_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Escape));
+                if cancelled {
+                    ui.data_mut(|data| data.remove::<PendingPosition>(position_key));
+                    clear_draft(ui.ctx(), position_key);
+                    edited.x = child_ref.offset.x;
+                    edited.y = child_ref.offset.y;
+                } else if drag_value_finished(&x_response)
+                    || drag_value_finished(&y_response)
+                    || (x_response.has_focus() || y_response.has_focus())
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
                     if edited.x != child_ref.offset.x || edited.y != child_ref.offset.y {
                         position = Some((index, edited.x, edited.y));
                     }
                     ui.data_mut(|data| data.remove::<PendingPosition>(position_key));
+                    clear_draft(ui.ctx(), position_key);
                 }
                 row_actions(ui, index, children.len(), &mut action);
                 ui.end_row();
@@ -1304,6 +1470,7 @@ fn render_identity(
     design: &EditorProject,
 ) {
     let key = ui.make_persistent_id(("object_id", id.value()));
+    touch_draft(ui.ctx(), key);
     let mut overridden = design
         .get_pool()
         .object_by_id(id)
@@ -1335,6 +1502,7 @@ fn render_identity(
             match assignment {
                 Ok(new_id) => {
                     design.queue_object_id_assignment(id, new_id, overridden);
+                    clear_draft(ui.ctx(), key);
                     value = new_id.value();
                     ui.data_mut(|data| {
                         data.remove::<PendingValue>(key);
@@ -1367,12 +1535,22 @@ fn render_identity(
         let invalid_macro = object_type == ObjectType::Macro
             && design.vt_version() < ag_iso_stack::object_pool::vt_version::VtVersion::Version5
             && value > 255;
+        if response.changed() {
+            let operation =
+                (!conflict && !invalid_macro).then_some(Operation::SetObjectIdAssignment {
+                    object_id: id.value(),
+                    new_id: value,
+                    overridden: true,
+                });
+            update_draft(ui.ctx(), key, design, operation);
+        }
         if overridden
             && !toggled
             && value != id.value()
             && !conflict
             && !invalid_macro
-            && drag_value_finished(&response)
+            && (drag_value_finished(&response)
+                || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
         {
             design.queue_operation(Operation::SetObjectIdAssignment {
                 object_id: id.value(),
@@ -1383,9 +1561,15 @@ fn render_identity(
                 data.remove::<PendingValue>(key);
                 data.remove::<String>(key.with("error"));
             });
+            clear_draft(ui.ctx(), key);
         }
         if conflict {
             ui.colored_label(ui.visuals().error_fg_color, "ID already in use");
+        }
+        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            value = id.value();
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
         }
         if invalid_macro {
             ui.colored_label(ui.visuals().error_fg_color, "VT2–4 macro IDs must be 0–255");
@@ -1397,6 +1581,15 @@ fn render_identity(
 }
 
 fn queue(design: &EditorProject, id: ObjectId, property: PropertyKey, value: serde_json::Value) {
+    design.queue_operation(property_operation(design, id, property, value));
+}
+
+fn property_operation(
+    design: &EditorProject,
+    id: ObjectId,
+    property: PropertyKey,
+    value: serde_json::Value,
+) -> Operation {
     let is_reference = design.get_pool().object_by_id(id).is_some_and(|object| {
         get_property_descriptors(object.object_type())
             .into_iter()
@@ -1416,17 +1609,17 @@ fn queue(design: &EditorProject, id: ObjectId, property: PropertyKey, value: ser
                 .ok()
                 .map(|id| ObjectTarget::id(id.value()))
         };
-        design.queue_operation(Operation::SetObjectReference {
+        Operation::SetObjectReference {
             object: ObjectTarget::id(id.value()),
             property,
             reference,
-        });
+        }
     } else {
-        design.queue_operation(Operation::SetProperty {
+        Operation::SetProperty {
             object: ObjectTarget::id(id.value()),
             property,
             value,
-        });
+        }
     }
 }
 
@@ -1593,10 +1786,39 @@ fn property_choice_is_valid(
 /// Preserve the JSON number kind exposed by the property's Rust type. In
 /// particular, integer properties must be committed as `42`, not `42.0`:
 /// serde_json deliberately does not expose the latter through `as_u64()`.
-fn number_after_edit(original: &serde_json::Value, edited: f64) -> Option<serde_json::Number> {
+fn number_after_edit(
+    original: &serde_json::Value,
+    edited: f64,
+    property: PropertyKey,
+) -> Option<serde_json::Number> {
     let serde_json::Value::Number(original) = original else {
         return None;
     };
+
+    match property {
+        PropertyKey::Offset => {
+            if edited.is_finite()
+                && edited.fract() == 0.0
+                && (i32::MIN as f64..=i32::MAX as f64).contains(&edited)
+            {
+                return Some(serde_json::Number::from(edited as i32));
+            }
+            return None;
+        }
+        PropertyKey::ViewportX
+        | PropertyKey::ViewportY
+        | PropertyKey::GraphicsCursorX
+        | PropertyKey::GraphicsCursorY => {
+            if edited.is_finite()
+                && edited.fract() == 0.0
+                && (i16::MIN as f64..=i16::MAX as f64).contains(&edited)
+            {
+                return Some(serde_json::Number::from(edited as i16));
+            }
+            return None;
+        }
+        _ => {}
+    }
 
     if original.is_u64() {
         if edited.is_finite() && edited.fract() == 0.0 && (0.0..=u64::MAX as f64).contains(&edited)
@@ -1638,7 +1860,7 @@ fn render_auto(
             ui,
             label,
             value,
-            0.0..=u64::MAX as f64,
+            numeric_range(property),
             id,
             property,
             design,
@@ -1657,16 +1879,44 @@ fn render_text(
     design: &EditorProject,
 ) {
     let key = ui.make_persistent_id((id.value(), property));
+    touch_draft(ui.ctx(), key);
     let mut edited = pending_text(ui, key).unwrap_or_else(|| current.to_owned());
     ui.horizontal(|ui| {
         ui.label(label);
         let response = ui.text_edit_singleline(&mut edited);
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(("test_property_input_rect", id.value(), property)),
+                response.rect,
+            )
+        });
         if response.changed() {
             ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+            update_draft(
+                ui.ctx(),
+                key,
+                design,
+                Some(property_operation(
+                    design,
+                    id,
+                    property,
+                    edited.clone().into(),
+                )),
+            );
         }
-        if response.lost_focus() && edited != current {
+        let cancelled =
+            response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if cancelled {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        } else if (response.lost_focus()
+            || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            && edited != current
+        {
             queue(design, id, property, edited.into());
             ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
         }
     });
 }
@@ -1685,6 +1935,7 @@ fn render_number(
         return;
     };
     let key = ui.make_persistent_id((id.value(), property));
+    touch_draft(ui.ctx(), key);
     let mut edited = ui
         .data(|data| match data.get_temp::<PendingValue>(key) {
             Some(PendingValue::Number(value)) => Some(value),
@@ -1696,16 +1947,140 @@ fn render_number(
         let response = ui.add(egui::DragValue::new(&mut edited).range(range).speed(1.0));
         if response.changed() {
             ui.data_mut(|data| data.insert_temp(key, PendingValue::Number(edited)));
+            let operation = number_after_edit(value, edited, property)
+                .map(serde_json::Value::Number)
+                .map(|value| property_operation(design, id, property, value));
+            update_draft(ui.ctx(), key, design, operation);
         }
-        if drag_value_finished(&response) {
+        let cancelled =
+            response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if cancelled {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        } else if drag_value_finished(&response)
+            || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        {
             if edited != current {
-                if let Some(number) = number_after_edit(value, edited) {
+                if let Some(number) = number_after_edit(value, edited, property) {
                     queue(design, id, property, number.into());
                 }
             }
             ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
         }
     });
+}
+
+/// Keep the editor's keyboard range aligned with the serialized Rust field
+/// type. Offset is signed by the object-pool definition even when its current
+/// value is zero, so it must never inherit the unsigned default range.
+fn numeric_range(property: PropertyKey) -> std::ops::RangeInclusive<f64> {
+    match property {
+        PropertyKey::Offset => i32::MIN as f64..=i32::MAX as f64,
+        PropertyKey::ViewportX
+        | PropertyKey::ViewportY
+        | PropertyKey::GraphicsCursorX
+        | PropertyKey::GraphicsCursorY => i16::MIN as f64..=i16::MAX as f64,
+        PropertyKey::Scale | PropertyKey::ViewportZoom => f32::MIN as f64..=f32::MAX as f64,
+        _ => 0.0..=u64::MAX as f64,
+    }
+}
+
+fn render_picture_dimensions(
+    ui: &mut egui::Ui,
+    picture: &ag_iso_stack::object_pool::object::PictureGraphic,
+    id: ObjectId,
+    design: &EditorProject,
+) {
+    let source_width = picture.actual_width as u32;
+    let source_height = picture.actual_height as u32;
+    ui.label(format!(
+        "Source resolution: {source_width} × {source_height} px"
+    ));
+    if source_width == 0 || source_height == 0 {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "Display height is unavailable for an image with zero source dimensions.",
+        );
+        return;
+    }
+    let key = ui.make_persistent_id((id.value(), "picture_display_height"));
+    touch_draft(ui.ctx(), key);
+    let current_height = displayed_picture_height(picture.width, source_width, source_height);
+    let mut edited = ui
+        .data(|data| match data.get_temp::<PendingValue>(key) {
+            Some(PendingValue::Number(value)) => Some(value as u16),
+            _ => None,
+        })
+        .unwrap_or(current_height);
+    ui.horizontal(|ui| {
+        ui.label("Display height:");
+        let response = ui.add(egui::DragValue::new(&mut edited).range(1..=u16::MAX));
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Number(edited.into())));
+            let width = picture_width_for_display_height(edited, source_width, source_height);
+            let candidate = serde_json::json!(width);
+            let operation = (edited != current_height)
+                .then(|| property_operation(design, id, PropertyKey::Width, candidate));
+            update_draft(ui.ctx(), key, design, operation);
+        }
+        let cancelled =
+            response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if cancelled {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        } else if drag_value_finished(&response)
+            || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        {
+            let width = picture_width_for_display_height(edited, source_width, source_height);
+            let candidate = serde_json::json!(width);
+            if edited != current_height {
+                queue(design, id, PropertyKey::Width, candidate);
+            }
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        }
+        ui.label(format!(
+            "Current: {} × {} px",
+            picture.width, current_height
+        ));
+    });
+}
+
+fn picture_width_for_display_height(height: u16, source_width: u32, source_height: u32) -> u16 {
+    if source_width == 0 || source_height == 0 {
+        return 0;
+    }
+    let numerator = u64::from(height) * u64::from(source_width);
+    let denominator = u64::from(source_height);
+    let ceil_ideal_width = numerator.div_ceil(denominator);
+    let mut candidates = vec![1_u16, u16::MAX];
+    for candidate in [
+        ceil_ideal_width.saturating_sub(1),
+        ceil_ideal_width,
+        ceil_ideal_width + 1,
+    ] {
+        candidates.push(candidate.clamp(1, u64::from(u16::MAX)) as u16);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .min_by_key(|&width| {
+            let rendered = displayed_picture_height(width, source_width, source_height);
+            let rendered_error = u64::from(rendered.abs_diff(height));
+            let aspect_error = (u64::from(width) * denominator).abs_diff(numerator);
+            (rendered_error, aspect_error, width)
+        })
+        .unwrap_or(1)
+}
+
+fn displayed_picture_height(width: u16, source_width: u32, source_height: u32) -> u16 {
+    if source_width == 0 {
+        return 0;
+    }
+    (u64::from(source_height) * u64::from(width) / u64::from(source_width)).min(u64::from(u16::MAX))
+        as u16
 }
 
 /// Enum-backed option bits keep their serialized enum representation when edited.
@@ -2278,20 +2653,7 @@ fn validate_pointer_target(
     });
     design
         .validate_transaction(&transaction)
-        .map_err(|diagnostics| {
-            diagnostics
-                .0
-                .first()
-                .map(|diagnostic| match diagnostic.object_id {
-                    Some(id) => format!(
-                        "Object {}: {}",
-                        design.format_object_id(id),
-                        diagnostic.message
-                    ),
-                    None => diagnostic.message.clone(),
-                })
-                .unwrap_or_else(|| "This reference is invalid.".to_owned())
-        })
+        .map_err(|diagnostics| design.format_transaction_diagnostics(&diagnostics))
 }
 
 fn render_justification(
@@ -2398,6 +2760,7 @@ fn render_json(
     design: &EditorProject,
 ) {
     let key = ui.make_persistent_id((id.value(), property));
+    touch_draft(ui.ctx(), key);
     let original = serde_json::to_string(value).unwrap_or_default();
     let mut edited = pending_text(ui, key).unwrap_or_else(|| original.clone());
     ui.label(label);
@@ -2408,11 +2771,28 @@ fn render_json(
     );
     if response.changed() {
         ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+        let operation = serde_json::from_str(&edited)
+            .ok()
+            .map(|value| property_operation(design, id, property, value));
+        update_draft(ui.ctx(), key, design, operation);
     }
-    if response.lost_focus() && edited != original {
+    let cancelled = response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+    if cancelled {
+        ui.data_mut(|data| data.remove::<PendingValue>(key));
+        clear_draft(ui.ctx(), key);
+    } else if response.lost_focus()
+        || response.has_focus()
+            && ui.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Enter))
+    {
+        if edited == original {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+            return;
+        }
         if let Ok(parsed) = serde_json::from_str(&edited) {
             queue(design, id, property, parsed);
             ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
         } else {
             ui.colored_label(ui.visuals().error_fg_color, "Invalid JSON");
         }
@@ -2432,6 +2812,128 @@ mod tests {
     use crate::{default_object, OperationTransaction};
     use ag_iso_stack::object_pool::ObjectPool;
 
+    #[test]
+    fn signed_number_offsets_accept_negative_values_from_zero() {
+        let range = numeric_range(PropertyKey::Offset);
+        assert!(*range.start() < 0.0);
+        assert_eq!(*range.end(), i32::MAX as f64);
+        let negative = number_after_edit(&serde_json::json!(0), -1.0, PropertyKey::Offset)
+            .expect("zero-valued signed offsets accept negative edits");
+        assert_eq!(i32::try_from(negative.as_i64().unwrap()).unwrap(), -1);
+        let negative_position =
+            number_after_edit(&serde_json::json!(0), -1.0, PropertyKey::ViewportX)
+                .expect("zero-valued signed positions accept negative edits");
+        assert_eq!(
+            i16::try_from(negative_position.as_i64().unwrap()).unwrap(),
+            -1
+        );
+        assert!(number_after_edit(
+            &serde_json::json!(0),
+            i32::MAX as f64 + 1.0,
+            PropertyKey::Offset
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn picture_height_maps_to_nearest_aspect_ratio_width_and_guards_zero_source() {
+        assert_eq!(picture_width_for_display_height(30, 40, 20), 60);
+        let width = picture_width_for_display_height(2, 100, 60);
+        assert_eq!(width, 4);
+        assert_eq!(displayed_picture_height(width, 100, 60), 2);
+        let unreachable = picture_width_for_display_height(u16::MAX, 2, 1);
+        assert_eq!(unreachable, u16::MAX);
+        assert_eq!(displayed_picture_height(unreachable, 2, 1), 32767);
+        assert_eq!(picture_width_for_display_height(1, 1, 3), 1);
+        assert_eq!(picture_width_for_display_height(20, 0, 10), 0);
+        assert_eq!(picture_width_for_display_height(20, 10, 0), 0);
+    }
+
+    #[test]
+    fn selection_change_finishes_text_draft_for_original_object_as_one_undo_step() {
+        let first = object(ObjectType::InputAttributes, 10);
+        let second = object(ObjectType::InputAttributes, 11);
+        let mut pool = ObjectPool::default();
+        pool.add(first);
+        pool.add(second);
+        let mut project = EditorProject::from(pool);
+        let first_id = ObjectId::new(10).unwrap();
+        let second_id = ObjectId::new(11).unwrap();
+        let ctx = egui::Context::default();
+
+        editor_frame_for(&ctx, &project, first_id, vec![]);
+        let input_rect = ctx
+            .data(|data| {
+                data.get_temp::<egui::Rect>(egui::Id::new((
+                    "test_property_input_rect",
+                    first_id.value(),
+                    PropertyKey::ValidationString,
+                )))
+            })
+            .expect("validation string input was rendered");
+        let pos = input_rect.center();
+        editor_frame_for(
+            &ctx,
+            &project,
+            first_id,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        editor_frame_for(
+            &ctx,
+            &project,
+            first_id,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        editor_frame_for(
+            &ctx,
+            &project,
+            first_id,
+            vec![egui::Event::Text("draft".to_owned())],
+        );
+        assert!(!project.commit_queued("premature draft"));
+
+        editor_frame_for(&ctx, &project, second_id, vec![]);
+        assert!(project.commit_queued("Finish previous property edit"));
+        assert_eq!(
+            get_object_property(
+                project.get_pool().object_by_id(first_id).unwrap(),
+                PropertyKey::ValidationString,
+            )
+            .unwrap(),
+            serde_json::json!("draft")
+        );
+        assert_eq!(
+            get_object_property(
+                project.get_pool().object_by_id(second_id).unwrap(),
+                PropertyKey::ValidationString,
+            )
+            .unwrap(),
+            serde_json::json!("")
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            get_object_property(
+                project.get_pool().object_by_id(first_id).unwrap(),
+                PropertyKey::ValidationString,
+            )
+            .unwrap(),
+            serde_json::json!("")
+        );
+    }
+
     fn object(object_type: ObjectType, id: u16) -> Object {
         let mut object = default_object(object_type);
         object.mut_id().set_value(id).unwrap();
@@ -2449,6 +2951,16 @@ mod tests {
         project: &EditorProject,
         events: Vec<egui::Event>,
     ) -> Vec<(String, egui::Rect)> {
+        let object_id = project.get_pool().objects().first().unwrap().id();
+        editor_frame_for(ctx, project, object_id, events)
+    }
+
+    fn editor_frame_for(
+        ctx: &egui::Context,
+        project: &EditorProject,
+        object_id: ObjectId,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, egui::Rect)> {
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -2460,12 +2972,10 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    render_property_editor(
-                        ui,
-                        project.get_pool().objects().first().unwrap(),
-                        project,
-                    );
+                    let object = project.get_pool().object_by_id(object_id).unwrap();
+                    render_property_editor(ui, object, project);
                 });
+                finish_property_edits(ctx, project);
             },
         );
         output
@@ -3116,7 +3626,12 @@ mod tests {
 
     #[test]
     fn numeric_edits_preserve_integer_and_float_json_kinds() {
-        let integer = number_after_edit(&serde_json::json!(0_u8), 42.0).unwrap();
+        let integer = number_after_edit(
+            &serde_json::json!(0_u8),
+            42.0,
+            PropertyKey::BackgroundColour,
+        )
+        .unwrap();
         assert_eq!(integer.as_u64(), Some(42));
         assert!(!integer.is_f64());
 
@@ -3132,7 +3647,8 @@ mod tests {
         )
         .is_ok());
 
-        let float = number_after_edit(&serde_json::json!(0.0_f64), 42.0).unwrap();
+        let float =
+            number_after_edit(&serde_json::json!(0.0_f64), 42.0, PropertyKey::Value).unwrap();
         assert!(float.is_f64());
         assert_eq!(float.as_f64(), Some(42.0));
     }

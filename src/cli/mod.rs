@@ -1,9 +1,13 @@
 //! Standalone CLI editing, inspection, exports, and session persistence.
 pub mod automation_service;
+pub mod commands;
+pub mod string_authoring;
+pub mod component_authoring;
 pub mod design_inspection;
 pub mod editing;
 pub mod export;
 pub mod preview;
+pub mod project_zip;
 pub mod protocol;
 pub mod schema;
 #[cfg(not(target_arch = "wasm32"))]

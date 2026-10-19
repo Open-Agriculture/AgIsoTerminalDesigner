@@ -1,1179 +1,20 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use ag_iso_stack::object_pool::ObjectType;
-    use ag_iso_terminal_designer::cli::protocol::AutomationAction;
-    use ag_iso_terminal_designer::cli::session::Session;
-    use ag_iso_terminal_designer::{
-        cli::editing::{
-            EditAction, EditActionKind, ParameterInput, RelationshipEdit, MAX_EDIT_ACTIONS,
-        },
-        components::{ComponentParameterKind, ComponentParameterTarget},
-        object_properties::PropertyKey,
-        operations::{ObjectTarget, Operation},
+    use ag_iso_terminal_designer::cli::{
+        commands::*,
+        editing::{EditAction, MAX_EDIT_ACTIONS},
+        protocol::AutomationAction,
+        session::Session,
     };
-    use clap::{CommandFactory, Parser, Subcommand};
+    use clap::{CommandFactory, Parser};
     use serde_json::{json, Value};
     use std::cell::RefCell;
     use std::{
-        collections::BTreeMap,
         fs,
         io::{self, Read},
         path::{Path, PathBuf},
         process::ExitCode,
     };
-
-    #[derive(Debug, Parser)]
-    #[command(
-        name = "aitd",
-        about = "Inspect and edit a standalone working project in this shell"
-    )]
-    struct Cli {
-        /// Validate an edit without changing the project.
-        #[arg(long, global = true)]
-        check: bool,
-        /// Print structured JSON instead of readable text.
-        #[arg(long, global = true)]
-        json: bool,
-        #[command(subcommand)]
-        command: Command,
-    }
-
-    #[derive(Debug, Subcommand, Clone)]
-    enum Command {
-        /// Show working project status.
-        Status,
-        /// Describe commands supported by this CLI.
-        Capabilities,
-        /// Discover retained project backups.
-        Backups {
-            #[command(subcommand)]
-            command: BackupCommand,
-        },
-        /// Generate a Bash completion script for this command tree.
-        Completions {
-            #[arg(value_parser = ["bash"])]
-            shell: String,
-        },
-        /// Inspect a mask or container hierarchy.
-        Tree {
-            root: u16,
-            #[arg(long, default_value_t = 6)]
-            depth: usize,
-        },
-        /// Read a design context.
-        Context {
-            #[arg(long, default_value = "active_mask")]
-            scope: String,
-            #[arg(long)]
-            root: Option<u16>,
-            #[arg(long, default_value_t = 3)]
-            depth: usize,
-            #[arg(long, default_value_t = 50)]
-            limit: usize,
-            #[arg(long, default_value_t = 0)]
-            offset: usize,
-            #[arg(long, default_value_t = 0)]
-            layout_offset: usize,
-            #[arg(long)]
-            include_properties: bool,
-            #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
-            include_references: bool,
-            #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
-            include_selection: bool,
-        },
-        /// Search project objects.
-        Object {
-            #[command(subcommand)]
-            command: ObjectCommand,
-        },
-        /// Assign, remap, or reorder object IDs.
-        Id {
-            #[command(subcommand)]
-            command: IdCommand,
-        },
-        /// Read writable properties and relationship rules.
-        Schema {
-            object_types: Vec<String>,
-            /// Return only the requested properties.
-            #[arg(long, value_delimiter = ',')]
-            properties: Vec<String>,
-        },
-        /// Validate the current project.
-        Validate,
-        /// Render a preview to a PNG file.
-        Preview {
-            #[arg(long)]
-            mask: Option<u16>,
-            #[arg(long)]
-            output: PathBuf,
-            #[arg(long)]
-            force: bool,
-        },
-        /// Save generated IOP, C header, or both.
-        Export {
-            #[command(subcommand)]
-            command: ExportCommand,
-        },
-        /// Apply edit commands atomically to the working project.
-        Run {
-            #[arg(long)]
-            file: String,
-        },
-        /// List reusable components.
-        Component {
-            #[command(subcommand)]
-            command: ComponentCommand,
-        },
-        /// Inspect or edit graphics.
-        Graphic {
-            #[command(subcommand)]
-            command: GraphicsCommand,
-        },
-        /// Inspect a specific design region.
-        Region {
-            root: u16,
-            #[arg(long,default_value="all",value_parser=["top","bottom","left","right","center","top_left","top_right","bottom_left","bottom_right","all"])]
-            region: String,
-            #[arg(long)]
-            types: Vec<String>,
-            #[arg(long, default_value_t = 12)]
-            limit: usize,
-        },
-        /// Resolve colour indexes in the current project.
-        Colours { colours: Vec<String> },
-        /// Show project settings or edit object ID ranges.
-        Project {
-            #[command(subcommand)]
-            command: ProjectCommand,
-        },
-        /// Inspect component instances.
-        Instance {
-            #[command(subcommand)]
-            command: InstanceCommand,
-        },
-        /// Edit a specific parent-child placement.
-        Placement {
-            #[command(subcommand)]
-            command: PlacementCommand,
-        },
-        /// Set an object's reference property.
-        Reference {
-            #[command(subcommand)]
-            command: ReferenceCommand,
-        },
-        /// Edit allowed pointer targets.
-        Pointer {
-            #[command(subcommand)]
-            command: PointerCommand,
-        },
-        /// Edit an object's ordered reference list.
-        List {
-            #[command(subcommand)]
-            command: ListCommand,
-        },
-        /// Bind or reorder event-to-macro actions.
-        Event {
-            #[command(subcommand)]
-            command: EventCommand,
-        },
-        /// Add or edit object labels.
-        Label {
-            #[command(subcommand)]
-            command: LabelCommand,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum BackupCommand {
-        List {
-            #[arg(long)]
-            project: Option<PathBuf>,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum ObjectCommand {
-        List {
-            #[arg(long)]
-            query: Option<String>,
-            #[arg(long = "type")]
-            object_type: Option<String>,
-            #[arg(long)]
-            parent: Option<u16>,
-            #[arg(long, default_value_t = 0)]
-            offset: usize,
-            #[arg(long, default_value_t = 100)]
-            limit: usize,
-            /// Read all matching pages.
-            #[arg(long)]
-            all: bool,
-        },
-        Get {
-            id: String,
-            #[arg(long)]
-            parents: bool,
-            #[arg(long)]
-            children: bool,
-            #[arg(long)]
-            macros: bool,
-            /// Include factual style examples from descendants.
-            #[arg(long)]
-            style: bool,
-            #[arg(long, default_value_t = 0)]
-            offset: usize,
-            #[arg(long, default_value_t = 0)]
-            parent_offset: usize,
-            #[arg(long, default_value_t = 0)]
-            property_offset: usize,
-        },
-        Create {
-            object_type: String,
-            #[arg(required_unless_present = "named", conflicts_with = "named")]
-            name: Option<String>,
-            #[arg(long = "name")]
-            named: Option<String>,
-            /// Assign an explicit object ID.
-            #[arg(long)]
-            id: Option<u16>,
-        },
-        Set {
-            id: String,
-            #[arg(required = true)]
-            assignments: Vec<String>,
-        },
-        Rename {
-            id: String,
-            name: String,
-        },
-        Delete {
-            id: String,
-        },
-        Order {
-            ids: Vec<String>,
-        },
-        Duplicate {
-            id: u16,
-            #[arg(long)]
-            name: Option<String>,
-        },
-        Field {
-            id: String,
-            property: String,
-            #[arg(required = true)]
-            assignments: Vec<String>,
-        },
-        Array {
-            #[command(subcommand)]
-            command: ObjectArrayCommand,
-        },
-        BytesImport {
-            id: String,
-            property: String,
-            file: PathBuf,
-        },
-        /// Save a byte-valued property without JSON encoding.
-        BytesExport {
-            id: String,
-            property: String,
-            #[arg(long)]
-            output: PathBuf,
-            #[arg(long)]
-            force: bool,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum ObjectArrayCommand {
-        Set {
-            object: String,
-            property: String,
-            index: u16,
-            #[arg(required = true)]
-            values: Vec<String>,
-        },
-        Append {
-            object: String,
-            property: String,
-            #[arg(required = true)]
-            values: Vec<String>,
-        },
-        Remove {
-            object: String,
-            property: String,
-            index: u16,
-        },
-        Clear {
-            object: String,
-            property: String,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum ComponentCommand {
-        List {
-            #[arg(long)]
-            query: Option<String>,
-            #[arg(long)]
-            category: Option<String>,
-            #[arg(long, default_value_t = 50)]
-            limit: u8,
-        },
-        Get {
-            id: String,
-            #[arg(long)]
-            nodes: bool,
-        },
-        Instantiate {
-            component_id: String,
-            parent: u16,
-            x: i32,
-            y: i32,
-        },
-        Move {
-            instance_id: String,
-            x: i32,
-            y: i32,
-        },
-        Duplicate {
-            instance_id: String,
-            x: i32,
-            y: i32,
-        },
-        Delete {
-            instance_id: String,
-        },
-        Detach {
-            instance_id: String,
-        },
-        Override {
-            instance_id: String,
-            parameter: String,
-            value: String,
-        },
-        Reset {
-            instance_id: String,
-            parameter: String,
-        },
-        DefinitionRename {
-            component_id: String,
-            name: String,
-        },
-        DefinitionDuplicate {
-            component_id: String,
-        },
-        DefinitionDelete {
-            component_id: String,
-        },
-        NodeSet {
-            component_id: String,
-            node_id: String,
-            property: String,
-            value: String,
-        },
-        /// Assign a node reference to an object, node:UUID, or null.
-        NodeReference {
-            component_id: String,
-            node_id: String,
-            property: String,
-            target: String,
-        },
-        ParameterRemove {
-            component_id: String,
-            parameter_id: String,
-        },
-        Capture {
-            root: u16,
-            name: String,
-        },
-        ParameterAdd {
-            component_id: String,
-            name: String,
-            target_node: String,
-            property: String,
-            kind: String,
-            default_value: String,
-        },
-        ParameterSet {
-            component_id: String,
-            parameter_id: String,
-            name: String,
-            target_node: String,
-            property: String,
-            kind: String,
-            default_value: String,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum ProjectCommand {
-        /// Load a project into this shell session.
-        Load {
-            path: PathBuf,
-            #[arg(long)]
-            discard: bool,
-        },
-        /// Start a new working project.
-        New {
-            #[arg(long)]
-            discard: bool,
-        },
-        /// Close this shell session project.
-        Close {
-            #[arg(long)]
-            discard: bool,
-        },
-        /// Validate and atomically save the working project.
-        Save {
-            path: PathBuf,
-            #[arg(long)]
-            force: bool,
-            #[arg(long)]
-            skip_validation: bool,
-        },
-        /// Identify the active project, original file path, and current save path.
-        Current,
-        Settings {
-            #[command(subcommand)]
-            command: Option<ProjectSettingsCommand>,
-        },
-        Set {
-            #[arg(long)]
-            mask_size: Option<u16>,
-            #[arg(long)]
-            vt_version: Option<u8>,
-            #[arg(long)]
-            soft_key_width: Option<u16>,
-            #[arg(long)]
-            soft_key_height: Option<u16>,
-        },
-        IdRangeSet {
-            object_type: String,
-            start: u16,
-            end: u16,
-        },
-        IdRangeReset,
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum ProjectSettingsCommand {
-        Show,
-        /// Change settings with typed key=value assignments.
-        Set {
-            #[arg(required = true)]
-            assignments: Vec<String>,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum InstanceCommand {
-        List,
-        Get { id: String },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum PlacementCommand {
-        Add {
-            parent: String,
-            child: String,
-            x: i16,
-            y: i16,
-            #[arg(long)]
-            occurrence: Option<usize>,
-        },
-        Move {
-            parent: String,
-            child: String,
-            x: i16,
-            y: i16,
-            #[arg(long)]
-            occurrence: Option<usize>,
-        },
-        Remove {
-            parent: String,
-            child: String,
-            #[arg(long)]
-            occurrence: Option<usize>,
-        },
-        Order {
-            parent: String,
-            children: Vec<String>,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum GraphicsCommand {
-        Get {
-            id: String,
-        },
-        /// Save an available asset or PictureGraphic as a PNG.
-        Export {
-            id: String,
-            #[arg(long)]
-            output: PathBuf,
-            #[arg(long)]
-            force: bool,
-        },
-        List {
-            #[arg(long)]
-            query: Option<String>,
-            #[arg(long, default_value = "all")]
-            status: String,
-            #[arg(long, default_value_t = 50)]
-            limit: u8,
-        },
-        Import {
-            file: PathBuf,
-            #[arg(long)]
-            name: Option<String>,
-        },
-        Assign {
-            asset_id: String,
-            object: String,
-        },
-        CreatePicture {
-            asset_id: String,
-        },
-        Rename {
-            asset_id: String,
-            name: String,
-        },
-        Delete {
-            asset_id: String,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum ExportCommand {
-        Iop {
-            #[arg(long)]
-            output: PathBuf,
-            #[arg(long)]
-            force: bool,
-        },
-        Header {
-            #[arg(long)]
-            output: PathBuf,
-            #[arg(long)]
-            force: bool,
-        },
-        Bundle {
-            #[arg(long)]
-            iop: PathBuf,
-            #[arg(long)]
-            header: PathBuf,
-            #[arg(long)]
-            force: bool,
-        },
-    }
-
-    #[derive(Debug, Subcommand, Clone)]
-    enum IdCommand {
-        Set {
-            object: String,
-            id: String,
-        },
-        Remap {
-            #[arg(required = true)]
-            mappings: Vec<String>,
-        },
-        Auto {
-            object: String,
-        },
-        Reassign {
-            #[arg(long)]
-            include_overrides: bool,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum ReferenceCommand {
-        Set {
-            object: String,
-            property: String,
-            target: String,
-        },
-        Clear {
-            object: String,
-            property: String,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum PointerCommand {
-        Set {
-            object: String,
-            targets: Vec<String>,
-        },
-        Clear {
-            object: String,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum ListCommand {
-        Set {
-            object: String,
-            targets: Vec<String>,
-        },
-        Insert {
-            object: String,
-            index: usize,
-            target: String,
-        },
-        Remove {
-            object: String,
-            index: usize,
-        },
-        Clear {
-            object: String,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum EventCommand {
-        Bind {
-            object: String,
-            #[arg(required = true)]
-            bindings: Vec<String>,
-        },
-        Set {
-            object: String,
-            #[arg(required = true)]
-            bindings: Vec<String>,
-        },
-        Unbind {
-            object: String,
-            event: String,
-        },
-        Order {
-            object: String,
-            #[arg(required = true)]
-            events: Vec<String>,
-        },
-        Clear {
-            object: String,
-        },
-    }
-    #[derive(Debug, Subcommand, Clone)]
-    enum LabelCommand {
-        Add {
-            object: String,
-            #[arg(required = true)]
-            fields: Vec<String>,
-        },
-        Set {
-            object: String,
-            #[arg(required = true)]
-            fields: Vec<String>,
-        },
-        Remove {
-            object: String,
-            id: String,
-        },
-        Clear {
-            object: String,
-        },
-    }
-
-    fn cli_id(value: &str) -> Result<u16, Value> {
-        let (digits, radix) = value
-            .strip_prefix("0x")
-            .map(|v| (v, 16))
-            .unwrap_or((value, 10));
-        u16::from_str_radix(digits, radix)
-            .map_err(|_| error("INVALID_USAGE", format!("'{value}' must be an object ID")))
-    }
-    /// Convert a Clap-validated command into the shared edit action.
-    /// File inputs resolve relative to `base`, which is cwd for shell commands
-    /// and the command file's parent for `run --file`.
-    fn typed_id<T: serde::de::DeserializeOwned>(value: &str, label: &str) -> Result<T, Value> {
-        serde_json::from_value(json!(value))
-            .map_err(|e| error("INVALID_USAGE", format!("invalid {label} '{value}': {e}")))
-    }
-    fn typed_object_type(value: &str) -> Result<ObjectType, Value> {
-        typed_id(value, "object type")
-    }
-    fn typed_property(value: &str) -> Result<PropertyKey, Value> {
-        value.parse().map_err(
-            |e: ag_iso_terminal_designer::object_properties::UnknownPropertyKey| {
-                error("INVALID_USAGE", e.to_string())
-            },
-        )
-    }
-    fn typed_property_path(path: &str) -> Result<(PropertyKey, String), Value> {
-        let (property, field) = path.split_once('.').unwrap_or((path, ""));
-        Ok((typed_property(property)?, field.to_owned()))
-    }
-    fn typed_target(value: &str) -> ObjectTarget {
-        if let Some(name) = value.strip_prefix("name:") {
-            ObjectTarget::Name {
-                name: name.to_owned(),
-            }
-        } else if let Ok(id) = cli_id(value) {
-            ObjectTarget::Id { id }
-        } else {
-            ObjectTarget::Name {
-                name: value.to_owned(),
-            }
-        }
-    }
-    fn typed_parameter_target(value: &str) -> Result<ComponentParameterTarget, Value> {
-        if value == "graphic" {
-            Ok(ComponentParameterTarget::Graphic)
-        } else {
-            typed_property(value).map(ComponentParameterTarget::Property)
-        }
-    }
-    fn typed_parameter_kind(value: &str) -> Result<ComponentParameterKind, Value> {
-        typed_id(value, "component parameter kind")
-    }
-    fn edit_action(kind: EditActionKind) -> EditAction {
-        EditAction::new(kind)
-    }
-    fn optional_target(value: &str) -> Option<ObjectTarget> {
-        (value != "null").then(|| typed_target(value))
-    }
-    fn typed_event(
-        value: &str,
-    ) -> Result<ag_iso_stack::object_pool::object_attributes::Event, Value> {
-        use ag_iso_stack::object_pool::object_attributes::Event;
-        let event = typed_id(value, "event")?;
-        if event == Event::Reserved {
-            return Err(error("INVALID_USAGE", "Reserved is not an editable event"));
-        }
-        Ok(event)
-    }
-    fn command_edit_actions(
-        command: &Command,
-        base: &Path,
-    ) -> Result<Option<Vec<EditAction>>, Value> {
-        let one = |kind| Ok(Some(vec![edit_action(kind)]));
-        match command {
-            Command::Object { command } => {
-                match command {
-                    ObjectCommand::Create {
-                        object_type,
-                        name,
-                        named,
-                        id,
-                    } => one(EditActionKind::Operation {
-                        operation: Operation::CreateObject {
-                            object_id: *id,
-                            object_type: typed_object_type(object_type)?,
-                            name: name.as_ref().or(named.as_ref()).unwrap().clone(),
-                        },
-                    }),
-                    ObjectCommand::Set {
-                        id,
-                        assignments,
-                    } => {
-                        let mut values = BTreeMap::new();
-                        for assignment in assignments {
-                            let (property, value) = assignment.split_once('=').ok_or_else(|| {
-                                error(
-                                    "INVALID_USAGE",
-                                    format!("expected property=value, got '{assignment}'"),
-                                )
-                            })?;
-                            if values.insert(typed_property(property)?, value.to_owned()).is_some() {
-                                return Err(error("INVALID_USAGE",format!("Repeated property '{property}'")));
-                            }
-                        }
-                        one(EditActionKind::SetProperties {
-                            object: typed_target(id),
-                            values,
-                        })
-                    }
-                    ObjectCommand::Rename { id, name } => one(EditActionKind::Operation {
-                        operation: Operation::RenameObject {
-                            object: typed_target(id),
-                            name: name.clone(),
-                        },
-                    }),
-                    ObjectCommand::Delete { id } => one(EditActionKind::Relationship {
-                        object: Some(typed_target(id)),
-                        operation: Operation::DeleteObject { object_id: 0 },
-                    }),
-                    ObjectCommand::Duplicate { id, name } => one(EditActionKind::ObjectDuplicate {
-                        object_id: *id,
-                        name: name.clone(),
-                    }),
-                    ObjectCommand::Order { ids } => one(EditActionKind::Operation {
-                        operation: Operation::ReorderObjects {
-                            object_ids: ids.iter().map(|id| cli_id(id)).collect::<Result<_, _>>()?,
-                        },
-                    }),
-                    ObjectCommand::Field { id, property, assignments } => {
-                        let (property,field)=property.split_once('.').unwrap_or((property,""));
-                        one(EditActionKind::ObjectFieldSet {object:typed_target(id),property:typed_property(property)?,field:field.to_owned(),values:assignments.clone()})
-                    },
-                    ObjectCommand::Array { command } => {
-                        let (object,path)=match command {
-                            ObjectArrayCommand::Set {object,property,..} | ObjectArrayCommand::Append {object,property,..} |
-                            ObjectArrayCommand::Remove {object,property,..} | ObjectArrayCommand::Clear {object,property} => (object,property),
-                        };
-                        let object=typed_target(object);
-                        let (property,field)=typed_property_path(path)?;
-                        one(match command {
-                            ObjectArrayCommand::Set {index,values,..}=>EditActionKind::ObjectArraySet {object,property,field,index:usize::from(*index),values:values.clone()},
-                            ObjectArrayCommand::Append {values,..}=>EditActionKind::ObjectArrayAppend {object,property,field,values:values.clone()},
-                            ObjectArrayCommand::Remove {index,..}=>EditActionKind::ObjectArrayRemove {object,property,field,index:usize::from(*index)},
-                            ObjectArrayCommand::Clear {..}=>EditActionKind::ObjectArrayClear {object,property,field},
-                        })
-                    },
-                    ObjectCommand::BytesImport { id, property, file } => {
-                        let bytes = fs::read(base.join(file))
-                            .map_err(|e| error("INPUT_FAILED", e.to_string()))?;
-                        one(EditActionKind::ObjectBytesSet {
-                            object: typed_target(id),
-                            property: typed_property(property)?,
-                            bytes,
-                        })
-                    }
-                    _ => Ok(None),
-                }
-            }
-            Command::Id { command } => match command {
-                IdCommand::Set { object, id } => one(EditActionKind::Operation { operation: Operation::SetObjectIdAssignment { object_id: cli_id(object)?, new_id: cli_id(id)?, overridden: true } }),
-                IdCommand::Auto { object } => one(EditActionKind::ObjectIdAuto { object_id: cli_id(object)? }),
-                IdCommand::Reassign { include_overrides } => one(EditActionKind::ObjectIdReassign { include_overrides: *include_overrides, mappings: None }),
-                IdCommand::Remap { mappings } => one(EditActionKind::Operation { operation: Operation::RemapObjectIds {
-                    mappings: mappings.iter().map(|pair| {
-                        let (old,new)=pair.split_once(':').ok_or_else(|| error("INVALID_USAGE", "expected old:new ID pair"))?;
-                        Ok((cli_id(old)?,cli_id(new)?))
-                    }).collect::<Result<_,Value>>()?, target_types: Vec::new(),
-                } }),
-            },
-            Command::Project {
-                command:
-                    ProjectCommand::Set {
-                        mask_size,
-                        vt_version,
-                        soft_key_width,
-                        soft_key_height,
-                    },
-            } => {
-                let values = [
-                    ("mask_size", mask_size.map(|v| v.to_string())),
-                    ("vt_version", vt_version.map(|v| v.to_string())),
-                    ("soft_key_width", soft_key_width.map(|v| v.to_string())),
-                    ("soft_key_height", soft_key_height.map(|v| v.to_string())),
-                ]
-                .into_iter()
-                .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value)))
-                .collect();
-                one(EditActionKind::Settings { values })
-            }
-            Command::Project {
-                command:
-                    ProjectCommand::Settings {
-                        command: Some(ProjectSettingsCommand::Set { assignments }),
-                    },
-            } => {
-                let mut values = BTreeMap::new();
-                for assignment in assignments {
-                    let (key, value) = assignment.split_once('=').ok_or_else(|| {
-                        error(
-                            "INVALID_USAGE",
-                            format!("expected key=value, got '{assignment}'"),
-                        )
-                    })?;
-                    if values.insert(key.to_owned(), value.to_owned()).is_some() {
-                        return Err(error("INVALID_USAGE",format!("Repeated setting '{key}'")));
-                    }
-                }
-                one(EditActionKind::Settings { values })
-            }
-            Command::Project {
-                command:
-                    ProjectCommand::IdRangeSet {
-                        object_type,
-                        start,
-                        end,
-                    },
-            } => one(EditActionKind::IdRangeSet {
-                object_type: typed_object_type(object_type)?,
-                start: *start,
-                end: *end,
-            }),
-            Command::Project {
-                command: ProjectCommand::IdRangeReset,
-            } => one(EditActionKind::IdRangeReset),
-            Command::Placement { command } => match command {
-                PlacementCommand::Add {
-                    parent,
-                    child,
-                    x,
-                    y,
-                    occurrence,
-                } => {
-                    if occurrence.is_some() {
-                        return Err(error(
-                            "INVALID_USAGE",
-                            "placement add does not accept --occurrence",
-                        ));
-                    }
-                    one(EditActionKind::Operation {
-                        operation: Operation::AddChild {
-                            parent: typed_target(parent),
-                            child: typed_target(child),
-                            x: *x,
-                            y: *y,
-                        },
-                    })
-                }
-                PlacementCommand::Move {
-                    parent,
-                    child,
-                    x,
-                    y,
-                    occurrence,
-                } => one(EditActionKind::RelationshipEdit {
-                    edit: RelationshipEdit::PlacementMove {
-                        parent: typed_target(parent),
-                        child: typed_target(child),
-                        x: *x,
-                        y: *y,
-                        occurrence: *occurrence,
-                    },
-                }),
-                PlacementCommand::Remove {
-                    parent,
-                    child,
-                    occurrence,
-                } => one(EditActionKind::RelationshipEdit {
-                    edit: RelationshipEdit::PlacementRemove {
-                        parent: typed_target(parent),
-                        child: typed_target(child),
-                        occurrence: *occurrence,
-                    },
-                }),
-                PlacementCommand::Order { parent, children } => {
-                    if children.is_empty() {
-                        return Err(error(
-                            "INVALID_USAGE",
-                            "placement order requires every child occurrence",
-                        ));
-                    }
-                    one(EditActionKind::RelationshipEdit {
-                        edit: RelationshipEdit::PlacementOrder {
-                            parent: typed_target(parent),
-                            children: children.iter().map(|child| typed_target(child)).collect(),
-                        },
-                    })
-                }
-            },
-            Command::Reference { command } => {
-                let (object,property,target)=match command {
-                    ReferenceCommand::Set { object,property,target } => (object,property,optional_target(target)),
-                    ReferenceCommand::Clear { object,property } => (object,property,None),
-                };
-                one(EditActionKind::Operation { operation: Operation::SetObjectReference { object:typed_target(object),property:typed_property(property)?,reference:target } })
-            }
-            Command::Pointer { command } => {
-                let (object,targets)=match command {
-                    PointerCommand::Set { object,targets } => (object,targets.as_slice()),
-                    PointerCommand::Clear { object } => (object,&[][..]),
-                };
-                one(EditActionKind::Operation { operation: Operation::SetObjectPointerAllowedReferences { object:typed_target(object), references:targets.iter().map(|s| typed_target(s)).collect() } })
-            }
-            Command::List { command } => one(EditActionKind::RelationshipEdit { edit:match command {
-                ListCommand::Set { object,targets } => RelationshipEdit::ListSet { object:typed_target(object), required:None,objects:targets.iter().map(|s|optional_target(s)).collect() },
-                ListCommand::Clear { object } => RelationshipEdit::ListSet { object:typed_target(object), required:None,objects:Vec::new() },
-                ListCommand::Insert { object,index,target } => RelationshipEdit::ListInsert { object:typed_target(object),index:*index,target:optional_target(target) },
-                ListCommand::Remove { object,index } => RelationshipEdit::ListRemove { object:typed_target(object),index:*index },
-            } }),
-            Command::Event { command } => one(EditActionKind::RelationshipEdit { edit:match command {
-                EventCommand::Bind { object,bindings } | EventCommand::Set { object,bindings } => RelationshipEdit::MacroBindings {
-                    object:typed_target(object),replace:matches!(command,EventCommand::Set {..}),
-                    bindings:bindings.iter().map(|binding| {
-                        let (event,target)=binding.split_once('=').ok_or_else(||error("INVALID_USAGE","expected EVENT=TARGET"))?;
-                        Ok(ag_iso_terminal_designer::MacroReferenceTarget { event_id:typed_event(event)?,macro_object:typed_target(target) })
-                    }).collect::<Result<_,Value>>()?,
-                },
-                EventCommand::Clear { object } => RelationshipEdit::MacroBindings { object:typed_target(object),replace:true,bindings:Vec::new() },
-                EventCommand::Unbind { object,event } => RelationshipEdit::MacroUnbind { object:typed_target(object),event:typed_event(event)? },
-                EventCommand::Order { object,events } => RelationshipEdit::MacroOrder { object:typed_target(object),events:events.iter().map(|e|typed_event(e)).collect::<Result<_,_>>()? },
-            } }),
-            Command::Label { command } => one(EditActionKind::RelationshipEdit { edit:match command {
-                LabelCommand::Clear { object } => RelationshipEdit::LabelClear { object:typed_target(object) },
-                LabelCommand::Remove { object,id } => RelationshipEdit::LabelRemove { object:typed_target(object),id:typed_target(id) },
-                LabelCommand::Add { object,fields } | LabelCommand::Set { object,fields } => {
-                    let mut values=BTreeMap::new();
-                    for field in fields {
-                        let (key,value)=field.split_once('=').ok_or_else(||error("INVALID_USAGE","expected FIELD=VALUE"))?;
-                        if !["id","string","graphic","font"].contains(&key) || values.insert(key,value).is_some() { return Err(error("INVALID_USAGE",format!("Unknown or repeated label field '{key}'"))); }
-                    }
-                    RelationshipEdit::LabelSet { object:typed_target(object),replace:matches!(command,LabelCommand::Set {..}),
-                        id:typed_target(values.get("id").ok_or_else(||error("INVALID_USAGE","label requires id=TARGET"))?),
-                        string:values.get("string").and_then(|s|optional_target(s)),graphic:values.get("graphic").and_then(|s|optional_target(s)),
-                        font:values.get("font").ok_or_else(||error("INVALID_USAGE","label requires font=NUMBER"))?.parse::<u8>().map_err(|_|error("INVALID_USAGE","font must be 0..255"))?,
-                    }
-                }
-            } }),
-            Command::Component { command } => match command {
-                ComponentCommand::Instantiate {
-                    component_id,
-                    parent,
-                    x,
-                    y,
-                } => one(EditActionKind::Component {
-                    action:
-                        ag_iso_terminal_designer::components::ComponentIntent::InstantiateComponent {
-                            instance_id: None,
-                            component_id: typed_id(component_id, "component ID")?,
-                            parent: *parent,
-                            x: *x,
-                            y: *y,
-                            overrides: BTreeMap::new(),
-                        },
-                }),
-                ComponentCommand::Move { instance_id, x, y } => one(EditActionKind::ComponentMove {
-                    instance_id: typed_id(instance_id, "component instance ID")?,
-                    x: *x,
-                    y: *y,
-                }),
-                ComponentCommand::Duplicate { instance_id, x, y } => {
-                    one(EditActionKind::ComponentDuplicate {
-                        instance_id: typed_id(instance_id, "component instance ID")?,
-                        x: *x,
-                        y: *y,
-                    })
-                }
-                ComponentCommand::Delete { instance_id } => one(EditActionKind::ComponentDelete {
-                    instance_id: typed_id(instance_id, "component instance ID")?,
-                }),
-                ComponentCommand::Detach { instance_id } => one(EditActionKind::ComponentDetach {
-                    instance_id: typed_id(instance_id, "component instance ID")?,
-                }),
-                ComponentCommand::Override {
-                    instance_id,
-                    parameter,
-                    value,
-                } => one(EditActionKind::ComponentOverride {
-                    instance_id: typed_id(instance_id, "component instance ID")?,
-                    parameter: parameter.clone(),
-                    value: value.clone(),
-                }),
-                ComponentCommand::Reset {
-                    instance_id,
-                    parameter,
-                } => one(EditActionKind::ComponentReset {
-                    instance_id: typed_id(instance_id, "component instance ID")?,
-                    parameter: parameter.clone(),
-                }),
-                ComponentCommand::DefinitionRename { component_id, name } => {
-                    one(EditActionKind::ComponentDefinitionRename {
-                        component_id: typed_id(component_id, "component ID")?,
-                        name: name.clone(),
-                    })
-                }
-                ComponentCommand::DefinitionDuplicate { component_id } => {
-                    one(EditActionKind::ComponentDefinitionDuplicate {
-                        component_id: typed_id(component_id, "component ID")?,
-                    })
-                }
-                ComponentCommand::DefinitionDelete { component_id } => {
-                    one(EditActionKind::ComponentDefinitionDelete {
-                        component_id: typed_id(component_id, "component ID")?,
-                    })
-                }
-                ComponentCommand::NodeSet {
-                    component_id,
-                    node_id,
-                    property,
-                    value,
-                } => one(EditActionKind::ComponentNodeSet {
-                    component_id: typed_id(component_id, "component ID")?,
-                    node_id: typed_id(node_id, "component node ID")?,
-                    property: typed_property(property)?,
-                    value: value.clone(),
-                }),
-                ComponentCommand::NodeReference {
-                    component_id,
-                    node_id,
-                    property,
-                    target,
-                } => one(EditActionKind::ComponentNodeReference {
-                    component_id: typed_id(component_id, "component ID")?,
-                    node_id: typed_id(node_id, "component node ID")?,
-                    property: typed_property(property)?,
-                    target: target.clone(),
-                }),
-                ComponentCommand::ParameterRemove {
-                    component_id,
-                    parameter_id,
-                } => one(EditActionKind::ComponentParameterRemove {
-                    component_id: typed_id(component_id, "component ID")?,
-                    parameter_id: typed_id(parameter_id, "component parameter ID")?,
-                }),
-                ComponentCommand::Capture { root, name } => one(EditActionKind::ComponentCapture {
-                    root: *root,
-                    name: name.clone(),
-                    keep_external_references: false,
-                }),
-                ComponentCommand::ParameterAdd {
-                    component_id,
-                    name,
-                    target_node,
-                    property,
-                    kind,
-                    default_value,
-                } => one(EditActionKind::ComponentParameterAdd {
-                    component_id: typed_id(component_id, "component ID")?,
-                    parameter: ParameterInput {
-                        id: None,
-                        name: name.clone(),
-                        description: None,
-                        target_node: typed_id(target_node, "component node ID")?,
-                        property: typed_parameter_target(property)?,
-                        kind: typed_parameter_kind(kind)?,
-                        default_value: Some(default_value.clone()),
-                    },
-                }),
-                ComponentCommand::ParameterSet {
-                    component_id,
-                    parameter_id,
-                    name,
-                    target_node,
-                    property,
-                    kind,
-                    default_value,
-                } => one(EditActionKind::ComponentParameterSet {
-                    component_id: typed_id(component_id, "component ID")?,
-                    parameter: ParameterInput {
-                        id: Some(typed_id(parameter_id, "component parameter ID")?),
-                        name: name.clone(),
-                        description: None,
-                        target_node: typed_id(target_node, "component node ID")?,
-                        property: typed_parameter_target(property)?,
-                        kind: typed_parameter_kind(kind)?,
-                        default_value: Some(default_value.clone()),
-                    },
-                }),
-                _ => Ok(None),
-            },
-            Command::Graphic { command } => match command {
-                GraphicsCommand::Import { file, name } => {
-                    let path = base.join(file);
-                    let bytes = fs::read(&path).map_err(|e| error("INPUT_FAILED", e.to_string()))?;
-                    one(EditActionKind::GraphicImport {
-                        filename: path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("graphic")
-                            .to_owned(),
-                        bytes,
-                        name: name.clone(),
-                    })
-                }
-                GraphicsCommand::Assign { asset_id, object } => one(EditActionKind::GraphicAssign {
-                    asset_id: typed_id(asset_id, "graphic asset ID")?,
-                    object: cli_id(object)?,
-                }),
-                GraphicsCommand::CreatePicture { asset_id } => {
-                    one(EditActionKind::GraphicCreatePicture {
-                        asset_id: typed_id(asset_id, "graphic asset ID")?,
-                    })
-                }
-                GraphicsCommand::Rename { asset_id, name } => one(EditActionKind::GraphicRename {
-                    asset_id: typed_id(asset_id, "graphic asset ID")?,
-                    name: name.clone(),
-                }),
-                GraphicsCommand::Delete { asset_id } => one(EditActionKind::GraphicDelete {
-                    asset_id: typed_id(asset_id, "graphic asset ID")?,
-                }),
-                _ => Ok(None),
-            },
-            _ => Ok(None),
-        }
-    }
 
     fn error(code: &str, message: impl Into<String>) -> Value {
         json!({"error":{"code":code,"message":message.into()}})
@@ -1323,7 +164,9 @@ mod native {
             check: cli.check,
         };
         let base = std::env::current_dir().map_err(|e| error("INPUT_FAILED", e.to_string()))?;
-        if let Some(actions) = command_edit_actions(&cli.command, &base)? {
+        if let Some(actions) = command_edit_actions(&cli.command, &base, &|path| {
+            fs::read(path).map_err(|e| e.to_string())
+        })? {
             return client.edit(actions);
         }
         if cli.check && !matches!(cli.command, Command::Run { .. }) {
@@ -1494,6 +337,7 @@ mod native {
     }
     fn export(client: &Client, command: ExportCommand) -> Result<Value, Value> {
         let (format, outputs, force) = match command {
+            ExportCommand::Project { output_dir } => return export_project(client, &output_dir),
             ExportCommand::Iop { output, force } => ("iop", vec![("iop", output)], force),
             ExportCommand::Header { output, force } => ("header", vec![("header", output)], force),
             ExportCommand::Bundle { iop, header, force } => {
@@ -1539,76 +383,113 @@ mod native {
         }}))
     }
 
-    /// Shell-style quoting without expansion or command execution.
-    fn split_line(line: &str) -> Result<Vec<String>, String> {
-        let mut words = Vec::new();
-        let mut word = String::new();
-        let mut quote = None;
-        let mut started = false;
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            if quote == Some('\'') {
-                if c == '\'' {
-                    quote = None;
-                } else {
-                    word.push(c);
-                }
-            } else if c == '\\' {
-                let next = chars.next().ok_or("trailing escape")?;
-                if quote == Some('"') && !matches!(next, '"' | '\\' | '$' | '`') {
-                    word.push('\\');
-                }
-                word.push(next);
-                started = true;
-            } else if let Some(q) = quote {
-                if c == q {
-                    quote = None;
-                } else {
-                    word.push(c);
-                }
-            } else if c == '\'' || c == '"' {
-                quote = Some(c);
-                started = true;
-            } else if c.is_whitespace() {
-                if started {
-                    words.push(std::mem::take(&mut word));
-                    started = false;
-                }
-            } else {
-                word.push(c);
-                started = true;
+    fn export_project(client: &Client, output: &Path) -> Result<Value, Value> {
+        if fs::symlink_metadata(output).is_ok() {
+            return Err(error(
+                "OUTPUT_EXISTS",
+                format!("{} already exists", output.display()),
+            ));
+        }
+        let validation = client.request(AutomationAction::ValidateDesign, json!({}))?;
+        if validation["result"]["valid"] != true {
+            return Err(error(
+                "VALIDATION_FAILED",
+                format!(
+                    "Project validation failed: {}",
+                    validation["result"]["diagnostics"]
+                ),
+            ));
+        }
+        let session = client.session.borrow();
+        let project = session
+            .project()
+            .map_err(|e| error("PROJECT_NOT_OPEN", e))?;
+        let project_bytes = project
+            .save_project()
+            .map_err(|e| error("EXPORT_FAILED", e.to_string()))?;
+        let iop = project
+            .export_iop()
+            .map_err(|e| error("EXPORT_FAILED", e.to_string()))?;
+        let parent = output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let staged = parent.join(format!(".aitd-export-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&staged).map_err(|e| error("OUTPUT_FAILED", e.to_string()))?;
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
             }
         }
-        if quote.is_some() {
-            return Err("unclosed quote".into());
-        }
-        if started {
-            words.push(word);
-        }
-        Ok(words)
+        let _cleanup = Cleanup(staged.clone());
+        fs::write(staged.join("project.aitp"), &project_bytes)
+            .and_then(|_| fs::write(staged.join("project.iop"), &iop))
+            .map_err(|e| error("OUTPUT_FAILED", e.to_string()))?;
+        publish_directory(&staged, output).map_err(|e| {
+            error(
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    "OUTPUT_EXISTS"
+                } else {
+                    "OUTPUT_FAILED"
+                },
+                e.to_string(),
+            )
+        })?;
+        Ok(
+            json!({"success":true,"result":{"output_dir":output,"project_bytes":project_bytes.len(),"iop_bytes":iop.len()}}),
+        )
     }
 
-    fn continues(line: &str) -> bool {
-        let mut quote = None;
-        let mut escape = false;
-        for c in line.chars() {
-            if escape {
-                escape = false;
-            } else if quote == Some('\'') {
-                if c == '\'' {
-                    quote = None;
-                }
-            } else if c == '\\' {
-                escape = true;
-            } else if let Some(q) = quote {
-                if c == q {
-                    quote = None;
-                }
-            } else if c == '\'' || c == '"' {
-                quote = Some(c);
-            }
+    #[cfg(target_os = "linux")]
+    fn publish_directory(staged: &Path, output: &Path) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let staged = std::ffi::CString::new(staged.as_os_str().as_bytes())?;
+        let output = std::ffi::CString::new(output.as_os_str().as_bytes())?;
+        // RENAME_NOREPLACE prevents replacing even an empty directory created
+        // by another process between the initial check and publication.
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                staged.as_ptr(),
+                libc::AT_FDCWD,
+                output.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
-        escape
+    }
+
+    #[cfg(target_os = "macos")]
+    fn publish_directory(staged: &Path, output: &Path) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let staged = std::ffi::CString::new(staged.as_os_str().as_bytes())?;
+        let output = std::ffi::CString::new(output.as_os_str().as_bytes())?;
+        let result =
+            unsafe { libc::renamex_np(staged.as_ptr(), output.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(windows)]
+    fn publish_directory(staged: &Path, output: &Path) -> io::Result<()> {
+        // Windows refuses to replace an existing destination directory.
+        fs::rename(staged, output)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    fn publish_directory(_staged: &Path, _output: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Atomic directory export without replacement is unavailable on this platform",
+        ))
     }
 
     fn run_file(client: &Client, file: &str) -> Result<Value, Value> {
@@ -1625,66 +506,9 @@ mod native {
                 path.parent().unwrap_or(Path::new(".")).to_path_buf(),
             )
         };
-        let mut actions = Vec::new();
-        let mut logical_lines = Vec::new();
-        let mut pending = String::new();
-        let mut start_line = 1;
-        for (index, line) in contents.lines().enumerate() {
-            if pending.is_empty() {
-                start_line = index + 1;
-            }
-            pending.push_str(line);
-            if continues(&pending) {
-                pending.pop();
-                pending.push(' ');
-            } else {
-                logical_lines.push((start_line, std::mem::take(&mut pending)));
-            }
-        }
-        if !pending.is_empty() {
-            return Err(error(
-                "SCRIPT_PARSE_ERROR",
-                format!("line {start_line}: trailing continuation"),
-            ));
-        }
-        for (line_number, line) in logical_lines {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let tokens = split_line(line)
-                .map_err(|e| error("SCRIPT_PARSE_ERROR", format!("line {line_number}: {e}")))?;
-            let cli = Cli::try_parse_from(
-                std::iter::once("aitd").chain(tokens.iter().map(String::as_str)),
-            )
-            .map_err(|e| error("SCRIPT_PARSE_ERROR", format!("line {line_number}: {e}")))?;
-            if cli.json || cli.check {
-                return Err(error("SCRIPT_COMMAND_UNSUPPORTED",format!("line {line_number}: select output format and --check on run, not inside the batch")));
-            }
-            let line_actions = command_edit_actions(&cli.command, &base)
-                .map_err(|mut e| {
-                    if let Some(message) = e.pointer_mut("/error/message") {
-                        if let Some(text) = message.as_str().map(str::to_owned) {
-                            *message = json!(format!("line {line_number}: {text}"));
-                        }
-                    }
-                    e
-                })?
-                .ok_or_else(|| error(
-                    "SCRIPT_COMMAND_UNSUPPORTED",
-                    format!("line {line_number}: output or inspection commands cannot run in a batch"),
-                ))?;
-            actions.extend(line_actions.into_iter().map(|mut action| {
-                action.line = Some(line_number as u32);
-                action
-            }));
-            if actions.len() > MAX_EDIT_ACTIONS {
-                return Err(error(
-                    "SCRIPT_LIMIT",
-                    format!("A command file may contain at most {MAX_EDIT_ACTIONS} edit actions."),
-                ));
-            }
-        }
+        let actions = parse_commands(&contents, &base, &|path| {
+            fs::read(path).map_err(|e| e.to_string())
+        })?;
         client.edit(actions)
     }
 
@@ -1801,34 +625,6 @@ mod native {
         script.push_str("  esac\n  COMPREPLY=( $(compgen -W \"$words\" -- \"$cur\") )\n}\ncomplete -F _aitd_complete aitd\n");
         script
     }
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        #[test]
-        fn command_files_preserve_shell_quoted_text() {
-            assert_eq!(
-                split_line(r#"object set Text 'value=123' 'path=C:\work' value=\"quoted\" ''"#)
-                    .unwrap(),
-                [
-                    "object",
-                    "set",
-                    "Text",
-                    "value=123",
-                    r"path=C:\work",
-                    "value=\"quoted\"",
-                    ""
-                ]
-            );
-            assert_eq!(
-                split_line(r#"object set Text "value=hello \n world""#).unwrap()[3],
-                r"value=hello \n world"
-            );
-            assert!(split_line("'unterminated").is_err());
-            assert!(continues("object set Text value=hello\\"));
-            assert!(!continues("object set Text 'value=hello\\'"));
-        }
-    }
-
     pub fn run() -> ExitCode {
         let args: Vec<_> = std::env::args_os().collect();
         let machine = args.iter().any(|arg| arg == "--json");

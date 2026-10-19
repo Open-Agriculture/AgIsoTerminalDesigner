@@ -15,7 +15,6 @@ pub fn prepare_compiled_ids(
     ranges: &ObjectIdRanges,
 ) -> ComponentResult<()> {
     let mut used: BTreeSet<u16> = pool.objects().iter().map(|o| o.id().value()).collect();
-    source.instances.sort_by_key(|i| i.id);
     for instance in &mut source.instances {
         let definition = source
             .definitions
@@ -36,7 +35,10 @@ pub fn prepare_compiled_ids(
         }
     }
     let mut allocations = Vec::new();
-    for (instance_index, instance) in source.instances.iter().enumerate() {
+    // Allocation order is deterministic without rewriting authoring order.
+    let mut ordered_instances: Vec<_> = source.instances.iter().enumerate().collect();
+    ordered_instances.sort_by_key(|(_, instance)| instance.id);
+    for (instance_index, instance) in ordered_instances {
         let definition = source
             .definitions
             .get(&instance.component_id)

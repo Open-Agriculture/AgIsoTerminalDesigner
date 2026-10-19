@@ -498,3 +498,33 @@ fn separate_shells_have_independent_sessions() {
     assert_eq!(status["result"]["loaded"], false, "{status}");
     std::fs::remove_dir_all(cwd).unwrap();
 }
+
+#[test]
+fn project_export_publishes_validated_artifacts_and_refuses_existing_outputs() {
+    let _session = CLI_SESSION.lock().unwrap_or_else(|error| error.into_inner());
+    let cwd = temp_dir("aitd-project-export");
+    new_session(&cwd);
+    success(cli(&cwd, &["object", "create", "NumberVariable", "Counter", "--id", "6100"]));
+    success(cli(&cwd, &["object", "set", "Counter", "value=42"]));
+    success(cli(&cwd, &["export", "project", "--output-dir", "build"]));
+    let saved = std::fs::read(cwd.join("build/project.aitp")).unwrap();
+    let restored = EditorProject::load_project(saved.clone()).unwrap();
+    assert_eq!(std::fs::read(cwd.join("build/project.iop")).unwrap(), restored.export_iop().unwrap());
+    let rejected = failure(cli(&cwd, &["export", "project", "--output-dir", "build"]));
+    assert_eq!(rejected["error"]["code"], "OUTPUT_EXISTS");
+    assert_eq!(std::fs::read(cwd.join("build/project.aitp")).unwrap(), saved);
+    std::fs::create_dir(cwd.join("empty")).unwrap();
+    assert_eq!(failure(cli(&cwd, &["export", "project", "--output-dir", "empty"]))["error"]["code"], "OUTPUT_EXISTS");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("missing", cwd.join("link")).unwrap();
+        assert_eq!(failure(cli(&cwd, &["export", "project", "--output-dir", "link"]))["error"]["code"], "OUTPUT_EXISTS");
+    }
+    std::fs::write(cwd.join("invalid.aitp"), incompatible_project_bytes()).unwrap();
+    success(cli(&cwd, &["project", "load", "invalid.aitp", "--discard"]));
+    assert_eq!(failure(cli(&cwd, &["export", "project", "--output-dir", "failed"]))["error"]["code"], "VALIDATION_FAILED");
+    assert!(!cwd.join("failed").exists());
+    assert!(std::fs::read_dir(&cwd).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".aitd-export-")));
+    success(cli(&cwd, &["project", "close", "--discard"]));
+    std::fs::remove_dir_all(cwd).unwrap();
+}

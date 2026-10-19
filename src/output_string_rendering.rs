@@ -187,6 +187,30 @@ pub(crate) fn clipping(object: &OutputString, pool: &ObjectPool) -> Option<TextC
     })
 }
 
+/// Logical text width uses the same character cells as the preview renderer.
+pub(crate) fn text_width(
+    ui: &egui::Ui,
+    font: &ag_iso_stack::object_pool::object::FontAttributes,
+    text: &str,
+) -> f32 {
+    match font.font_size {
+        FontSize::NonProportional(size) => text.chars().count() as f32 * size.width() as f32,
+        FontSize::Proportional(height) => text
+            .chars()
+            .map(|c| {
+                let galley = ui.fonts(|f| {
+                    f.layout_no_wrap(
+                        c.to_string(),
+                        FontId::proportional(height as f32),
+                        Color32::WHITE,
+                    )
+                });
+                galley.size().x * height as f32 / galley.size().y.max(1.0)
+            })
+            .sum(),
+    }
+}
+
 /// Fit styled glyph geometry inside its character box. Texture coordinates stay
 /// in atlas texels so egui can normalize them after all glyphs have been loaded.
 fn styled_glyph(mut galley: Arc<Galley>, width: f32, height: f32, style: FontStyle) -> Arc<Galley> {
@@ -353,6 +377,24 @@ pub(crate) fn render(
         });
         let advance =
             cell_width.unwrap_or_else(|| galley.size().x * height / galley.size().y.max(1.0));
+        // Rasterize at the final visual scale, then fit the mesh back into its
+        // unchanged logical character cell. egui supplies device DPI itself.
+        let scale = ui
+            .ctx()
+            .data(|data| data.get_temp::<f32>(egui::Id::new("vt_render_scale")))
+            .unwrap_or(1.0)
+            .clamp(1.0, 8.0);
+        let galley = if scale > 1.0 {
+            ui.fonts(|f| {
+                f.layout_no_wrap(
+                    display.to_string(),
+                    FontId::new(height * scale, family.clone()),
+                    foreground,
+                )
+            })
+        } else {
+            galley
+        };
         glyphs.insert(
             c,
             Glyph {
@@ -457,6 +499,64 @@ mod tests {
         assert_eq!(lines("a-bcd", 4.0, false), ["a-bc", "d"]);
         assert_eq!(lines("a\u{a0}bc", 3.0, false), ["a\u{a0}b", "c"]);
         assert_eq!(lines("A\r B", 4.0, false), ["A", " B"]);
+    }
+
+    #[test]
+    fn sharper_rasterization_preserves_logical_positions_and_sizes() {
+        use ag_iso_stack::object_pool::{ObjectId, ObjectType};
+        let mut pool = ObjectPool::new();
+        let mut font = crate::default_object(ObjectType::FontAttributes);
+        *font.mut_id() = ObjectId::new(1).unwrap();
+        if let Object::FontAttributes(font) = &mut font {
+            font.font_size = FontSize::Proportional(18);
+        }
+        pool.add(font);
+        let Object::OutputString(mut object) = crate::default_object(ObjectType::OutputString)
+        else {
+            unreachable!()
+        };
+        object.font_attributes = ObjectId::new(1).unwrap().into();
+        object.width = 100;
+        object.height = 40;
+        object.value = "ABC".into();
+        let ctx = egui::Context::default();
+        let mut frames = Vec::new();
+        for scale in [1.0_f32, 3.0] {
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new("vt_render_scale"), scale));
+            let out = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render(
+                        &object,
+                        ui,
+                        &pool,
+                        Point::default(),
+                        ag_iso_stack::object_pool::vt_version::VtVersion::Version6,
+                    )
+                });
+            });
+            let glyphs: Vec<_> = out
+                .shapes
+                .into_iter()
+                .filter_map(|shape| match shape.shape {
+                    egui::Shape::Text(text) => Some((
+                        text.pos,
+                        text.galley.size(),
+                        text.galley.rows[0].visuals.mesh.vertices[0].uv,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            frames.push(glyphs);
+        }
+        assert_eq!(frames[0].len(), 3);
+        for (normal, sharp) in frames[0].iter().zip(&frames[1]) {
+            assert_eq!(normal.0, sharp.0);
+            assert_eq!(normal.1, sharp.1);
+            assert_ne!(
+                normal.2, sharp.2,
+                "glyphs should use a different atlas raster"
+            );
+        }
     }
 
     #[test]

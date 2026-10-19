@@ -2,16 +2,13 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use std::{cell::RefCell, collections::HashSet, ops::Sub};
+use std::{cell::RefCell, collections::HashSet};
 
 use ag_iso_stack::object_pool::object::*;
 use ag_iso_stack::object_pool::object_attributes::ButtonState;
-use ag_iso_stack::object_pool::object_attributes::FontSize;
 use ag_iso_stack::object_pool::object_attributes::FormatType;
-use ag_iso_stack::object_pool::object_attributes::HorizontalAlignment;
 use ag_iso_stack::object_pool::object_attributes::LineDirection;
 use ag_iso_stack::object_pool::object_attributes::Point;
-use ag_iso_stack::object_pool::object_attributes::VerticalAlignment;
 use ag_iso_stack::object_pool::vt_version::VtVersion;
 use ag_iso_stack::object_pool::Colour;
 use ag_iso_stack::object_pool::ObjectPool;
@@ -43,7 +40,20 @@ pub fn render_object_with_version(
         data.insert_temp(render_version_id(), version);
         previous
     });
+    let origin_key = egui::Id::new("vt_pattern_origin");
+    let previous_origin = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<egui::Pos2>(origin_key);
+        data.insert_temp(origin_key, ui.max_rect().min);
+        previous
+    });
     object.render(ui, pool, position);
+    ui.ctx().data_mut(|data| {
+        if let Some(previous) = previous_origin {
+            data.insert_temp(origin_key, previous);
+        } else {
+            data.remove_temp::<egui::Pos2>(origin_key);
+        }
+    });
     ui.ctx().data_mut(|data| match previous {
         Some(previous) => data.insert_temp(render_version_id(), previous),
         None => {
@@ -202,12 +212,9 @@ fn darken_color(color: egui::Color32, amount: f32) -> egui::Color32 {
 }
 
 fn create_relative_rect(ui: &mut egui::Ui, position: Point<i16>, size: egui::Vec2) -> egui::Rect {
-    let width = ui.max_rect().width().sub(position.x as f32).min(size.x);
-    let height = ui.max_rect().height().sub(position.y as f32).min(size.y);
-
     egui::Rect::from_min_size(
         ui.max_rect().min + egui::vec2(position.x as f32, position.y as f32),
-        egui::vec2(width, height),
+        size,
     )
 }
 
@@ -521,193 +528,75 @@ impl RenderableObject for InputBoolean {
 
 impl RenderableObject for InputString {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
-            ui,
-            position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
-        );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "InputString not implemented");
-        });
+        // B.8.3 shares Output String formatting, including variable contents,
+        // character sets, control characters, wrapping and justification.
+        let output = OutputString {
+            id: self.id,
+            width: self.width,
+            height: self.height,
+            background_colour: self.background_colour,
+            font_attributes: self.font_attributes,
+            options: ag_iso_stack::object_pool::object_attributes::OutputStringOptions {
+                transparent: self.options.transparent,
+                auto_wrap: self.options.auto_wrap,
+                wrap_on_hyphen: self.options.wrap_on_hyphen,
+            },
+            variable_reference: self.variable_reference,
+            justification: self.justification,
+            value: self.value.clone(),
+            macro_refs: Vec::new(),
+        };
+        output.render(ui, pool, position);
+        if !self.enabled {
+            let rect = create_relative_rect(
+                ui,
+                position,
+                egui::vec2(self.width as f32, self.height as f32),
+            );
+            ui.painter()
+                .with_clip_rect(rect.intersect(ui.clip_rect()))
+                .rect_filled(
+                    rect,
+                    0.0,
+                    Color32::from_rgba_premultiplied(128, 128, 128, 100),
+                );
+        }
     }
 }
 
 impl RenderableObject for InputNumber {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
-            ui,
-            position,
-            egui::Vec2::new(self.width as f32, self.height as f32),
-        );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            // Look up the font attributes. If missing, show an error.
-            let font_attributes = match pool.object_by_nullable_id(self.font_attributes) {
-                Some(Object::FontAttributes(fa)) => fa,
-                _ => {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        format!(
-                            "Missing FontAttributes for InputNumber ID {:?}",
-                            self.id.value()
-                        ),
-                    );
-                    return;
-                }
-            };
-
-            // Get the background colour from the pool.
-            let background_colour =
-                crate::effective_colour::colour(pool, self.background_colour).convert();
-            // Fill the background if the NumberOptions do not specify transparency.
-            if !self.options.transparent {
-                ui.painter().rect_filled(rect, 0.0, background_colour);
-            }
-
-            // Determine the “raw” number value to use: if a variable_reference exists, use the referenced
-            // NumberVariable’s value; otherwise use our own value.
-            let raw_value: u32 = if let Some(var_id) = self.variable_reference.0 {
-                match pool.object_by_id(var_id) {
-                    Some(Object::NumberVariable(num_var)) => num_var.value,
-                    _ => self.value,
-                }
-            } else {
-                self.value
-            };
-
-            // Compute the displayed value using double precision:
-            //   displayed_value = (raw_value + offset) * scale
-            let mut displayed_value = {
-                let float_raw = raw_value as f64;
-                let float_offset = self.offset as f64;
-                let float_scale = self.scale as f64;
-                (float_raw + float_offset) * float_scale
-            };
-
-            // Use the number of decimals (up to 7) and the "truncate" flag from NumberOptions
-            let decimals = self.nr_of_decimals.min(7);
-            let power_of_ten = 10f64.powi(decimals as i32);
-            if self.options.truncate {
-                displayed_value = (displayed_value * power_of_ten).trunc() / power_of_ten;
-            } else {
-                displayed_value = (displayed_value * power_of_ten).round() / power_of_ten;
-            }
-
-            // If the "display_zero_as_blank" option is set and the computed value is exactly zero, show nothing.
-            if self.options.display_zero_as_blank && displayed_value == 0.0 {
-                return;
-            }
-
-            // Format the number to a string. Use exponential formatting if requested.
-            let mut number_string = if self.format == FormatType::Exponential {
-                format!("{:.*e}", decimals as usize, displayed_value)
-            } else {
-                format!("{:.*}", decimals as usize, displayed_value)
-            };
-
-            // If the "display_leading_zeros" option is set, try to pad the text on the left with zeros
-            // so that it fills (or exceeds) the available field width.
-            if self.options.display_leading_zeros {
-                let fonts = ui.fonts(|f| f.clone());
-                let font_height = match font_attributes.font_size {
-                    FontSize::NonProportional(size) => size.height() as f32,
-                    FontSize::Proportional(h) => h as f32,
-                };
-                let font_id = egui::FontId::new(font_height, egui::FontFamily::Proportional);
-                let mut zero_padded = number_string.clone();
-                let max_loop = 1000; // safety to avoid an infinite loop
-                for _ in 0..max_loop {
-                    let galley = fonts.layout_no_wrap(
-                        zero_padded.clone(),
-                        font_id.clone(),
-                        crate::effective_colour::colour(pool, font_attributes.font_colour)
-                            .convert(),
-                    );
-                    if galley.size().x >= rect.width() {
-                        number_string = zero_padded;
-                        break;
-                    } else {
-                        zero_padded.insert(0, '0');
-                    }
-                }
-            }
-
-            // Get the font colour.
-            let font_colour =
-                crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
-
-            // Choose the font family and height according to the font size:
-            let (font_family, font_height) = match font_attributes.font_size {
-                FontSize::NonProportional(npsize) => {
-                    (egui::FontFamily::Monospace, npsize.height() as f32)
-                }
-                FontSize::Proportional(h) => (egui::FontFamily::Proportional, h as f32),
-            };
-            let font_id = egui::FontId::new(font_height, font_family);
-
-            // Lay out the text.
-            let fonts = ui.fonts(|f| f.clone());
-            let galley = fonts.layout(
-                number_string.clone(),
-                font_id.clone(),
-                font_colour,
-                f32::INFINITY,
+        let output = OutputNumber {
+            id: self.id,
+            width: self.width,
+            height: self.height,
+            background_colour: self.background_colour,
+            font_attributes: self.font_attributes,
+            options: self.options,
+            variable_reference: self.variable_reference,
+            value: self.value,
+            offset: self.offset,
+            scale: self.scale,
+            nr_of_decimals: self.nr_of_decimals,
+            format: self.format,
+            justification: self.justification,
+            macro_refs: Vec::new(),
+        };
+        output.render(ui, pool, position);
+        if !self.options2.enabled {
+            let rect = create_relative_rect(
+                ui,
+                position,
+                egui::vec2(self.width as f32, self.height as f32),
             );
-            let text_size = galley.size();
-
-            // Compute the text’s paint position according to the horizontal and vertical justification.
-            let mut paint_pos = rect.min;
-            match self.justification.horizontal {
-                HorizontalAlignment::Left => {
-                    paint_pos.x = rect.min.x;
-                }
-                HorizontalAlignment::Middle => {
-                    paint_pos.x = rect.center().x - text_size.x * 0.5;
-                }
-                HorizontalAlignment::Right => {
-                    paint_pos.x = rect.max.x - text_size.x;
-                }
-                HorizontalAlignment::Reserved => {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        "Invalid horizontal alignment for InputNumber",
-                    );
-                    return;
-                }
-            }
-            match self.justification.vertical {
-                VerticalAlignment::Top => {
-                    paint_pos.y = rect.min.y;
-                }
-                VerticalAlignment::Middle => {
-                    paint_pos.y = rect.center().y - text_size.y * 0.5;
-                }
-                VerticalAlignment::Bottom => {
-                    paint_pos.y = rect.max.y - text_size.y;
-                }
-                VerticalAlignment::Reserved => {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        "Invalid vertical alignment for InputNumber",
-                    );
-                    return;
-                }
-            }
-
-            // Draw the number string.
-            ui.painter().galley(paint_pos, galley, font_colour);
-
-            // If the InputNumber object is not enabled (according to its InputNumberOptions),
-            // overlay a semi‐transparent gray rectangle.
-            if !self.options2.enabled {
-                ui.painter().rect_filled(
+            ui.painter()
+                .with_clip_rect(ui.clip_rect().intersect(rect))
+                .rect_filled(
                     rect,
                     0.0,
-                    egui::Color32::from_rgba_premultiplied(128, 128, 128, 100),
+                    Color32::from_rgba_premultiplied(128, 128, 128, 100),
                 );
-            }
-        });
+        }
     }
 }
 
@@ -716,12 +605,50 @@ impl RenderableObject for InputList {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::vec2(self.width as f32, self.height as f32),
         );
-
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "InputList not implemented");
+            ui.shrink_clip_rect(rect);
+            render_list_item(
+                ui,
+                pool,
+                self.variable_reference,
+                self.value,
+                &self.list_items,
+            );
+            if !self.options.enabled {
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    Color32::from_rgba_premultiplied(128, 128, 128, 100),
+                );
+            }
         });
+    }
+}
+
+fn render_list_item(
+    ui: &mut egui::Ui,
+    pool: &ObjectPool,
+    variable: ag_iso_stack::object_pool::NullableObjectId,
+    value: u8,
+    items: &[ag_iso_stack::object_pool::NullableObjectId],
+) {
+    let index = variable
+        .0
+        .and_then(|id| match pool.object_by_id(id) {
+            Some(Object::NumberVariable(variable)) => Some(variable.value),
+            _ => None,
+        })
+        .unwrap_or(u32::from(value));
+    // ISO 11783-6 B.8.5: 255 explicitly means no selection.
+    if index == 255 {
+        return;
+    }
+    if let Some(id) = items.get(index as usize).and_then(|item| item.0) {
+        if let Some(object) = pool.object_by_id(id) {
+            object.render(ui, pool, Point::default());
+        }
     }
 }
 
@@ -765,187 +692,108 @@ impl RenderableObject for OutputString {
     }
 }
 
+/// ISO 11783-6 B.8.4/B.9.3: apply the signed offset before scaling.
+fn format_number(
+    raw: u32,
+    offset: i32,
+    scale: f32,
+    decimals: u8,
+    format: FormatType,
+    options: ag_iso_stack::object_pool::object_attributes::NumberOptions,
+) -> String {
+    let value = (f64::from(raw) + f64::from(offset)) * f64::from(scale);
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    if options.display_zero_as_blank && value == 0.0 {
+        return String::new();
+    }
+    let decimals = decimals.min(7) as usize;
+    if format == FormatType::Exponential {
+        // Decimal places apply to the mantissa, not the unnormalized value.
+        let exponent = if value == 0.0 {
+            0
+        } else {
+            value.abs().log10().floor() as i32
+        };
+        let power = 10f64.powi(exponent);
+        let mut mantissa = value / power;
+        let precision = 10f64.powi(decimals as i32);
+        mantissa = if options.truncate {
+            (mantissa * precision).trunc() / precision
+        } else {
+            (mantissa * precision).round() / precision
+        };
+        let mut exponent = exponent;
+        if mantissa.abs() >= 10.0 {
+            mantissa /= 10.0;
+            exponent += 1;
+        }
+        format!("{mantissa:.decimals$}E{exponent:+03}")
+    } else {
+        let precision = 10f64.powi(decimals as i32);
+        let value = if options.truncate {
+            (value * precision).trunc() / precision
+        } else {
+            (value * precision).round() / precision
+        };
+        let value = if value == 0.0 { 0.0 } else { value };
+        format!("{value:.decimals$}")
+    }
+}
+
 impl RenderableObject for OutputNumber {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
-            ui,
-            position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        let raw = self
+            .variable_reference
+            .0
+            .and_then(|id| match pool.object_by_id(id) {
+                Some(Object::NumberVariable(variable)) => Some(variable.value),
+                _ => None,
+            })
+            .unwrap_or(self.value);
+        let mut value = format_number(
+            raw,
+            self.offset,
+            self.scale,
+            self.nr_of_decimals,
+            self.format,
+            self.options,
         );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            // 1. Get the font attributes
-            let font_attributes = match pool.object_by_nullable_id(self.font_attributes) {
-                Some(Object::FontAttributes(fa)) => fa,
-                _ => {
-                    ui.colored_label(
-                        Color32::RED,
-                        format!(
-                            "Missing FontAttributes for OutputNumber ID {:?}",
-                            self.id.value()
-                        ),
-                    );
-                    return;
-                }
-            };
-
-            // 2. Convert the pool color indices to `egui::Color32`
-            let background_colour =
-                crate::effective_colour::colour(pool, self.background_colour).convert();
-            let font_colour =
-                crate::effective_colour::colour(pool, font_attributes.font_colour).convert();
-
-            // 3. Determine if we need to fill the background or remain transparent
-            if !self.options.transparent {
-                ui.painter().rect_filled(rect, 0.0, background_colour);
-            }
-
-            // 4. Retrieve the raw value (either from variable_reference or this object’s own `value`)
-            let raw_value = if let Some(var_id) = self.variable_reference.into() {
-                // If we have a referenced NumberVariable, use it
-                match pool.object_by_id(var_id) {
-                    Some(Object::NumberVariable(num_var)) => num_var.value,
-                    _ => self.value,
-                }
-            } else {
-                self.value
-            };
-
-            // 5. Compute the displayed value using double precision to reduce rounding errors
-            let mut displayed_value = {
-                let float_raw = raw_value as f64;
-                let float_offset = self.offset as f64;
-                let float_scale = self.scale as f64;
-                (float_raw + float_offset) * float_scale
-            };
-
-            // 6. Apply truncation or rounding to the number of decimals
-            let decimals = self.nr_of_decimals.min(7); // standard says 0–7 decimals
-            let power_of_ten = 10f64.powi(decimals as i32);
-
-            if self.options.truncate {
-                // Truncate
-                displayed_value = (displayed_value * power_of_ten).trunc() / power_of_ten;
-            } else {
-                // Round
-                displayed_value = (displayed_value * power_of_ten).round() / power_of_ten;
-            }
-
-            // 7. If "display_zero_as_blank" and the final number is exactly zero, display blank
-            //    We interpret "exactly zero" after the rounding/truncation step
-            if self.options.display_zero_as_blank && displayed_value == 0.0 {
-                return;
-            }
-
-            // 8. Convert the (possibly truncated/rounded) displayed_value to string
-            //    Depending on the "format" attribute, use decimal or exponential
-            let mut number_string = if self.format == FormatType::Exponential {
-                format!("{:.*e}", decimals as usize, displayed_value)
-            } else {
-                format!("{:.*}", decimals as usize, displayed_value)
-            };
-
-            // 9. The standard states that we must always display at least one digit
-            //    before the decimal point (i.e., "0.xxxx" if the absolute value < 1)
-            //    Normal Rust formatting already ensures e.g. "0.12" for 0.12,
-            //    so we usually don't need a special patch here. But we keep the note.
-            //
-            // 10. If display_leading_zeros is set, we *attempt* to fill the entire width
-            //     with zeros to the left before applying alignment. (ISO 11783 says
-            //     "fill left to width of field with zeros, then apply justification.")
-            //     Below is a best-effort approach: we measure the text in a loop,
-            //     and keep prepending '0' until it meets or exceeds the available width.
-            //     We also place a reasonable safety limit to avoid infinite loops.
-            //
-            if self.options.display_leading_zeros {
-                let fonts = ui.fonts(|f| f.clone());
-                let font_height = match font_attributes.font_size {
-                    FontSize::NonProportional(s) => s.height() as f32,
-                    FontSize::Proportional(h) => h as f32,
-                };
-                let font_id = egui::FontId::new(font_height, egui::FontFamily::Proportional);
-                let mut zero_padded = number_string.clone();
-                let max_loop = 1000; // safety net to avoid infinite loops
-                for _ in 0..max_loop {
-                    // Measure the current galley
-                    let galley = fonts.layout(
-                        zero_padded.as_str().to_owned(),
-                        font_id.clone(),
-                        font_colour,
-                        f32::INFINITY, // no wrap
-                    );
-                    if galley.size().x >= rect.width() {
-                        // Enough zeros to fill or exceed the field width
-                        number_string = zero_padded;
-                        break;
-                    } else {
-                        zero_padded.insert(0, '0');
-                    }
+        if self.options.display_leading_zeros && !value.is_empty() {
+            if let Some(Object::FontAttributes(font)) =
+                pool.object_by_nullable_id(self.font_attributes)
+            {
+                // Use the same cell advances as the text renderer; only complete
+                // leading characters that fit in the field are added.
+                let measure =
+                    |text: &str| crate::output_string_rendering::text_width(ui, font, text);
+                let zero_width = measure("0");
+                if zero_width > 0.0 {
+                    let count = ((self.width as f32 - measure(&value)) / zero_width)
+                        .floor()
+                        .max(0.0) as usize;
+                    value.insert_str(usize::from(value.starts_with('-')), &"0".repeat(count));
                 }
             }
-
-            // 11. We have the final text we want to display in `number_string`.
-            //     Next, figure out the font size and alignment. This is similar
-            //     to the `OutputString` example.
-            let fonts = ui.fonts(|fonts| fonts.clone());
-            let (font_family, font_height) = match font_attributes.font_size {
-                FontSize::NonProportional(npsize) => {
-                    // For simplicity, treat it as monospace
-                    (egui::FontFamily::Monospace, npsize.height() as f32)
-                }
-                FontSize::Proportional(h) => (egui::FontFamily::Proportional, h as f32),
-            };
-            let font_id = egui::FontId::new(font_height, font_family);
-            let galley = fonts.layout(
-                number_string.clone(),
-                font_id.clone(),
-                font_colour,
-                f32::INFINITY, // no wrapping
-            );
-            let text_size = galley.size();
-
-            // 12. Determine text anchor point based on the justification bits
-            let mut paint_pos = rect.min;
-            match self.justification.horizontal {
-                HorizontalAlignment::Left => {
-                    paint_pos.x = rect.min.x;
-                }
-                HorizontalAlignment::Middle => {
-                    paint_pos.x = rect.center().x - (text_size.x * 0.5);
-                }
-                HorizontalAlignment::Right => {
-                    paint_pos.x = rect.max.x - text_size.x;
-                }
-                HorizontalAlignment::Reserved => {
-                    ui.colored_label(
-                        Color32::RED,
-                        "Configuration incorrect: horizontal alignment is set to Reserved",
-                    );
-                    return;
-                }
-            }
-            match self.justification.vertical {
-                VerticalAlignment::Top => {
-                    paint_pos.y = rect.min.y;
-                }
-                VerticalAlignment::Middle => {
-                    paint_pos.y = rect.center().y - (text_size.y * 0.5);
-                }
-                VerticalAlignment::Bottom => {
-                    paint_pos.y = rect.max.y - text_size.y;
-                }
-                VerticalAlignment::Reserved => {
-                    ui.colored_label(
-                        Color32::RED,
-                        "Configuration incorrect: vertical alignment is set to Reserved",
-                    );
-                    return;
-                }
-            }
-
-            // 13. Finally, paint the text
-            ui.painter().galley(paint_pos, galley, font_colour);
-        });
+        }
+        let output = OutputString {
+            id: self.id,
+            width: self.width,
+            height: self.height,
+            background_colour: self.background_colour,
+            font_attributes: self.font_attributes,
+            options: ag_iso_stack::object_pool::object_attributes::OutputStringOptions {
+                transparent: self.options.transparent,
+                auto_wrap: false,
+                wrap_on_hyphen: false,
+            },
+            variable_reference: ag_iso_stack::object_pool::NullableObjectId(None),
+            justification: self.justification,
+            value: value.into(),
+            macro_refs: Vec::new(),
+        };
+        output.render(ui, pool, position);
     }
 }
 
@@ -963,37 +811,13 @@ impl RenderableObject for OutputList {
                 ui.colored_label(Color32::RED, "OutputList requires VT4 or later");
                 return;
             }
-            let index = self
-                .variable_reference
-                .0
-                .and_then(|id| match pool.object_by_id(id) {
-                    Some(Object::NumberVariable(variable)) => Some(variable.value),
-                    _ => None,
-                })
-                .unwrap_or(u32::from(self.value));
-            let Some(item) = usize::try_from(index)
-                .ok()
-                .and_then(|index| self.list_items.get(index))
-                .and_then(|id| id.0)
-            else {
-                return;
-            };
-            match pool.object_by_id(item) {
-                Some(Object::ObjectPointer(pointer)) => {
-                    if let Some(id) = pointer.value.0 {
-                        if let Some(object) = pool.object_by_id(id) {
-                            object.render(ui, pool, Point::default());
-                        }
-                    }
-                }
-                Some(object) => object.render(ui, pool, Point::default()),
-                None => {
-                    ui.colored_label(
-                        Color32::RED,
-                        format!("Missing OutputList item #{}", item.value()),
-                    );
-                }
-            };
+            render_list_item(
+                ui,
+                pool,
+                self.variable_reference,
+                self.value,
+                &self.list_items,
+            );
         });
     }
 }
@@ -1118,17 +942,257 @@ impl RenderableObject for OutputRectangle {
     }
 }
 
+/// Ray/ellipse intersection: ISO angles are geometric angles, not the
+/// parameter angle of a stretched circle (Figure B.8).
+fn ellipse_point(rect: egui::Rect, angle: f32) -> egui::Pos2 {
+    let radius = rect.size() * 0.5;
+    let direction = egui::vec2(angle.cos(), -angle.sin());
+    let distance =
+        1.0 / ((direction.x / radius.x).powi(2) + (direction.y / radius.y).powi(2)).sqrt();
+    rect.center() + direction * distance
+}
+
+fn ellipse_path(rect: egui::Rect, kind: u8, start: u8, end: u8) -> Vec<egui::Pos2> {
+    let full = kind == 0 || start == end;
+    let start_angle = if kind == 0 {
+        0.0
+    } else {
+        (f32::from(start) * 2.0).to_radians()
+    };
+    let sweep = if full {
+        std::f32::consts::TAU
+    } else {
+        ((f32::from(end) - f32::from(start)) * 2.0)
+            .to_radians()
+            .rem_euclid(std::f32::consts::TAU)
+    };
+    let steps = ((rect.width() + rect.height()) * sweep)
+        .ceil()
+        .clamp(8.0, 8192.0) as usize;
+    let mut points: Vec<_> = (0..=steps)
+        .map(|i| ellipse_point(rect, start_angle + sweep * i as f32 / steps as f32))
+        .collect();
+    if kind == 2 && !full {
+        points.push(rect.center());
+    }
+    if kind != 1 || full {
+        points.push(points[0]);
+    }
+    // Table B.31 note 2 additionally draws the radius for an equal-angle segment.
+    if kind == 2 && start == end {
+        points.push(rect.center());
+        points.push(points[0]);
+    }
+    points
+}
+
 impl RenderableObject for OutputEllipse {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::vec2(self.width as f32, self.height as f32),
         );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "OutputEllipse not implemented");
-        });
+        let clip = rect.intersect(ui.clip_rect());
+        if !clip.is_positive() || self.ellipse_type > 3 {
+            return;
+        }
+        let Some(Object::LineAttributes(line)) = pool.object_by_nullable_id(self.line_attributes)
+        else {
+            ui.painter().text(
+                rect.min,
+                egui::Align2::LEFT_TOP,
+                format!("OutputEllipse #{}: missing LineAttributes", self.id.value()),
+                egui::FontId::monospace(10.0),
+                Color32::RED,
+            );
+            return;
+        };
+        let line_colour = crate::effective_colour::colour(pool, line.line_colour).convert();
+        let painter = ui.painter().with_clip_rect(clip);
+        // Output shape dimensions include the complete square brush footprint.
+        let inset = (f32::from(line.line_width) * 0.5)
+            .min((rect.width().min(rect.height()) * 0.5 - 0.001).max(0.0));
+        let points = ellipse_path(
+            rect.shrink(inset),
+            self.ellipse_type,
+            self.start_angle,
+            self.end_angle,
+        );
+        let y_start = clip.top().floor() as i32;
+        let y_end = clip.bottom().ceil() as i32;
+        // Keep all brush footprints, including skipped line-art bits, so fill
+        // never leaks into the border (4.6.21). Restrict work to visible rows.
+        let mut borders = vec![Vec::<(f32, f32, bool)>::new(); (y_end - y_start) as usize];
+        let width = f32::from(line.line_width);
+        let mut distance = 0.0;
+        if width > 0.0 {
+            for pair in points.windows(2) {
+                let delta = pair[1] - pair[0];
+                let length = delta.length();
+                if !egui::Rect::from_two_pos(pair[0], pair[1])
+                    .expand(width)
+                    .intersects(clip)
+                {
+                    distance += length;
+                    continue;
+                }
+                let count = (length / 0.75).ceil().max(1.0) as usize;
+                for i in 0..=count {
+                    let t = i as f32 / count as f32;
+                    let point = pair[0] + delta * t;
+                    let bit = ((distance + length * t) / width).floor() as usize % 16;
+                    let visible = line.line_art & (0x8000 >> bit) != 0;
+                    let brush = egui::Rect::from_center_size(point, egui::vec2(width, width));
+                    for y in (brush.top().floor() as i32).max(y_start)
+                        ..(brush.bottom().ceil() as i32).min(y_end)
+                    {
+                        if y as f32 + 0.5 >= brush.top() && (y as f32 + 0.5) < brush.bottom() {
+                            borders[(y - y_start) as usize].push((
+                                brush.left(),
+                                brush.right(),
+                                visible,
+                            ));
+                        }
+                    }
+                }
+                distance += length;
+            }
+        }
+        let closed = self.ellipse_type != 1 || self.start_angle == self.end_angle;
+        let fill = if closed {
+            pool.object_by_nullable_id(self.fill_attributes)
+        } else {
+            None
+        };
+        let pattern = match fill {
+            Some(Object::FillAttributes(fill)) if fill.fill_type == 3 => {
+                if let Some(Object::PictureGraphic(picture)) =
+                    pool.object_by_nullable_id(fill.fill_pattern)
+                {
+                    if picture.actual_width > 0 && picture.actual_height > 0 {
+                        let mut picture = picture.clone();
+                        picture.options.transparent = false;
+                        Some(crate::graphics::preview::decode_picture(&picture, pool))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let solid = match fill {
+            Some(Object::FillAttributes(fill)) if fill.fill_type == 1 => Some(line_colour),
+            Some(Object::FillAttributes(fill)) if fill.fill_type == 2 => {
+                Some(crate::effective_colour::colour(pool, fill.fill_colour).convert())
+            }
+            _ => None,
+        };
+        let anchor = ui
+            .ctx()
+            .data(|data| data.get_temp::<egui::Pos2>(egui::Id::new("vt_pattern_origin")))
+            .unwrap_or(egui::Pos2::ZERO);
+        for y in y_start..y_end {
+            let row = &borders[(y - y_start) as usize];
+            if solid.is_some() || pattern.is_some() {
+                let sample_y = y as f32 + 0.5;
+                let mut crossings = Vec::new();
+                for edge in points.windows(2) {
+                    let (a, b) = (edge[0], edge[1]);
+                    if (a.y <= sample_y && sample_y < b.y) || (b.y <= sample_y && sample_y < a.y) {
+                        crossings.push(a.x + (sample_y - a.y) * (b.x - a.x) / (b.y - a.y));
+                    }
+                }
+                crossings.sort_by(f32::total_cmp);
+                for interval in crossings.chunks_exact(2) {
+                    let mut cuts: Vec<_> = row.iter().map(|(a, b, _)| (*a, *b)).collect();
+                    cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let mut left = interval[0].max(clip.left());
+                    let right = interval[1].min(clip.right());
+                    cuts.push((right, right));
+                    for (a, b) in cuts {
+                        let end = a.min(right);
+                        if end > left {
+                            if let Some(colour) = solid {
+                                painter.rect_filled(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(left, y as f32),
+                                        egui::pos2(end, y as f32 + 1.0),
+                                    ),
+                                    0.0,
+                                    colour,
+                                );
+                            } else if let Some(pattern) = &pattern {
+                                let py = ((y as f32 - anchor.y).floor() as i64)
+                                    .rem_euclid(pattern.size[1] as i64)
+                                    as usize;
+                                let mut x = left.ceil() as i32;
+                                let stop = end.ceil() as i32;
+                                while x < stop {
+                                    let px = ((x as f32 - anchor.x).floor() as i64)
+                                        .rem_euclid(pattern.size[0] as i64)
+                                        as usize;
+                                    let colour = pattern.pixels[py * pattern.size[0] + px];
+                                    let start = x;
+                                    x += 1;
+                                    while x < stop {
+                                        let px = ((x as f32 - anchor.x).floor() as i64)
+                                            .rem_euclid(pattern.size[0] as i64)
+                                            as usize;
+                                        if pattern.pixels[py * pattern.size[0] + px] != colour {
+                                            break;
+                                        }
+                                        x += 1;
+                                    }
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(start as f32, y as f32),
+                                            egui::vec2((x - start) as f32, 1.0),
+                                        ),
+                                        0.0,
+                                        colour,
+                                    );
+                                }
+                            }
+                        }
+                        left = left.max(b);
+                        if left >= right {
+                            break;
+                        }
+                    }
+                }
+            }
+            // Coalesce brush footprints into runs to keep the shape count small.
+            let mut visible: Vec<_> = row
+                .iter()
+                .filter(|(_, _, visible)| *visible)
+                .map(|(a, b, _)| (*a, *b))
+                .collect();
+            visible.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut run: Option<(f32, f32)> = None;
+            for (a, b) in visible
+                .into_iter()
+                .chain(std::iter::once((f32::INFINITY, f32::INFINITY)))
+            {
+                match run {
+                    Some((left, right)) if a <= right => run = Some((left, right.max(b))),
+                    Some((left, right)) => {
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(left, y as f32),
+                                egui::pos2(right, y as f32 + 1.0),
+                            ),
+                            0.0,
+                            line_colour,
+                        );
+                        run = Some((a, b));
+                    }
+                    None => run = Some((a, b)),
+                }
+            }
+        }
     }
 }
 
@@ -1381,6 +1445,253 @@ impl RenderableObject for AuxiliaryControlDesignatorType2 {
                     );
                 }
             }
+        });
+    }
+}
+
+#[cfg(test)]
+mod rendering_tests {
+    use super::*;
+    use ag_iso_stack::object_pool::object_attributes::NumberOptions;
+    use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectType};
+
+    fn options() -> NumberOptions {
+        NumberOptions {
+            transparent: false,
+            display_leading_zeros: false,
+            display_zero_as_blank: false,
+            truncate: false,
+        }
+    }
+
+    #[test]
+    fn numbers_apply_signed_offset_before_scale_and_format_mantissa() {
+        assert_eq!(
+            format_number(20, -30, 0.5, 2, FormatType::Decimal, options()),
+            "-5.00"
+        );
+        assert_eq!(
+            format_number(u32::MAX, i32::MIN, 1.0, 0, FormatType::Decimal, options()),
+            "2147483647"
+        );
+        assert_eq!(
+            format_number(12345, 0, 1.0, 2, FormatType::Exponential, options()),
+            "1.23E+04"
+        );
+        assert_eq!(
+            format_number(9999, 0, 1.0, 2, FormatType::Exponential, options()),
+            "1.00E+04"
+        );
+        assert_eq!(
+            format_number(1, 0, 0.125, 2, FormatType::Exponential, options()),
+            "1.25E-01"
+        );
+        let mut truncate = options();
+        truncate.truncate = true;
+        assert_eq!(
+            format_number(12399, 0, 1.0, 2, FormatType::Exponential, truncate),
+            "1.23E+04"
+        );
+        assert_eq!(
+            format_number(125, -250, 0.125, 2, FormatType::Decimal, truncate),
+            "-15.62"
+        );
+        let mut blank = options();
+        blank.display_zero_as_blank = true;
+        assert_eq!(
+            format_number(10, -10, 2.0, 2, FormatType::Decimal, blank),
+            ""
+        );
+        assert_eq!(
+            format_number(1, 0, 0.125, 0, FormatType::Decimal, blank),
+            "0"
+        );
+    }
+
+    #[test]
+    fn ellipse_angles_match_figure_b8_even_when_not_circular() {
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(120.0, 60.0));
+        for degrees in [45.0_f32, 90.0, 315.0] {
+            let p = ellipse_point(rect, degrees.to_radians());
+            let delta = p - rect.center();
+            let measured = (-delta.y).atan2(delta.x).to_degrees().rem_euclid(360.0);
+            assert!((measured - degrees).abs() < 0.001);
+            assert!(((delta.x / 60.0).powi(2) + (delta.y / 30.0).powi(2) - 1.0).abs() < 0.001);
+        }
+        let sector = ellipse_path(rect, 2, 20, 100);
+        assert!(sector.contains(&rect.center()));
+        assert_eq!(sector.first(), sector.last());
+        let chord = ellipse_path(rect, 3, 20, 100);
+        assert!(!chord.contains(&rect.center()));
+        assert_eq!(chord.first(), chord.last());
+        let open = ellipse_path(rect, 1, 20, 100);
+        assert_ne!(open.first(), open.last());
+        assert!(ellipse_path(rect, 2, 20, 20).contains(&rect.center()));
+    }
+
+    #[test]
+    fn input_list_uses_variable_index_and_blanks_null_and_invalid_choices() {
+        let mut pool = ObjectPool::new();
+        let mut child = crate::default_object(ObjectType::OutputRectangle);
+        *child.mut_id() = ObjectId::new(10).unwrap();
+        let Object::OutputRectangle(rectangle) = &mut child else {
+            unreachable!()
+        };
+        rectangle.width = 10;
+        rectangle.height = 10;
+        rectangle.line_attributes = ObjectId::new(11).unwrap().into();
+        pool.add(child);
+        let mut line = crate::default_object(ObjectType::LineAttributes);
+        *line.mut_id() = ObjectId::new(11).unwrap();
+        if let Object::LineAttributes(line) = &mut line {
+            line.line_width = 1;
+            line.line_art = 0xffff;
+        }
+
+        pool.add(line);
+        let mut variable = crate::default_object(ObjectType::NumberVariable);
+        *variable.mut_id() = ObjectId::new(12).unwrap();
+        if let Object::NumberVariable(v) = &mut variable {
+            v.value = 1;
+        }
+        pool.add(variable);
+        let items = vec![NullableObjectId(None), ObjectId::new(10).unwrap().into()];
+        let render = |reference, index| {
+            let ctx = egui::Context::default();
+            let out = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_list_item(ui, &pool, reference, index, &items)
+                });
+            });
+            out.shapes
+                .iter()
+                .filter(|shape| matches!(&shape.shape, egui::Shape::Rect(_)))
+                .count()
+        };
+        let blank = render(NullableObjectId(None), 0);
+        assert!(render(ObjectId::new(12).unwrap().into(), 0) > blank);
+        assert_eq!(render(NullableObjectId(None), 255), blank);
+        assert_eq!(render(NullableObjectId(None), 2), blank);
+    }
+
+    #[test]
+    fn rendered_ellipse_preserves_complete_border_inside_declared_dimensions() {
+        for width in [1_u8, 4] {
+            let mut pool = ObjectPool::new();
+            let mut line = crate::default_object(ObjectType::LineAttributes);
+            *line.mut_id() = ObjectId::new(11).unwrap();
+            let Object::LineAttributes(attributes) = &mut line else {
+                unreachable!()
+            };
+            attributes.line_width = width;
+            attributes.line_art = 0xffff;
+            attributes.line_colour = 2;
+            let colour = crate::effective_colour::colour(&pool, attributes.line_colour).convert();
+            pool.add(line);
+            let Object::OutputEllipse(mut ellipse) =
+                crate::default_object(ObjectType::OutputEllipse)
+            else {
+                unreachable!()
+            };
+            ellipse.width = 100;
+            ellipse.height = 60;
+            ellipse.ellipse_type = 0;
+            ellipse.line_attributes = ObjectId::new(11).unwrap().into();
+            ellipse.fill_attributes = NullableObjectId(None);
+            let ctx = egui::Context::default();
+            let mut expected = egui::Rect::NOTHING;
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    expected =
+                        egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(100.0, 60.0));
+                    ellipse.render(ui, &pool, Point::default());
+                });
+            });
+            let painted: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) if rect.fill == colour => Some(rect.rect),
+                    _ => None,
+                })
+                .collect();
+            assert!(!painted.is_empty());
+            assert!(painted
+                .iter()
+                .all(|rect| expected.expand(0.001).contains_rect(*rect)));
+            let bounds = painted
+                .iter()
+                .fold(egui::Rect::NOTHING, |bounds, rect| bounds.union(*rect));
+            assert!((bounds.top() - expected.top()).abs() < 0.001);
+            assert!((bounds.bottom() - expected.bottom()).abs() < 0.001);
+            assert!((bounds.left() - expected.left()).abs() < 0.001);
+            assert!((bounds.right() - expected.right()).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn input_string_renders_variable_contents_and_disabled_indication() {
+        let mut pool = ObjectPool::new();
+        let mut font = crate::default_object(ObjectType::FontAttributes);
+        *font.mut_id() = ObjectId::new(1).unwrap();
+        if let Object::FontAttributes(font) = &mut font {
+            font.font_size =
+                ag_iso_stack::object_pool::object_attributes::FontSize::Proportional(12);
+        }
+        pool.add(font);
+        let mut variable = crate::default_object(ObjectType::StringVariable);
+        *variable.mut_id() = ObjectId::new(2).unwrap();
+        if let Object::StringVariable(variable) = &mut variable {
+            variable.value = "AB".into();
+        }
+        pool.add(variable);
+        let Object::InputString(mut input) = crate::default_object(ObjectType::InputString) else {
+            unreachable!()
+        };
+        input.font_attributes = ObjectId::new(1).unwrap().into();
+        input.variable_reference = ObjectId::new(2).unwrap().into();
+        input.value = "X".into();
+        input.width = 24;
+        input.height = 24;
+        for enabled in [true, false] {
+            input.enabled = enabled;
+            let ctx = egui::Context::default();
+            let out = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| input.render(ui, &pool, Point::default()));
+            });
+            let glyphs: Vec<_> = out
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(glyphs, ["A", "B"]);
+            let overlay=out.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.fill==Color32::from_rgba_premultiplied(128,128,128,100)));
+            assert_eq!(overlay, !enabled);
+        }
+    }
+
+    #[test]
+    fn object_layout_preserves_dimensions_at_parent_edges() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let size = ui.max_rect().size();
+                let rect = create_relative_rect(
+                    ui,
+                    Point {
+                        x: (size.x - 5.0) as i16,
+                        y: 0,
+                    },
+                    egui::vec2(100.0, 30.0),
+                );
+                assert_eq!(rect.width(), 100.0);
+                assert_eq!(rect.height(), 30.0);
+            });
         });
     }
 }

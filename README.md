@@ -41,6 +41,8 @@ This project is under **active development**. While some features may not yet be
 - Browse the focused mask's placement and linked soft-key hierarchy, or search all objects by name/ID
 - Rearrange the workspace with dockable tabs, splits, and floating panes; layouts persist locally
 - Follow the system appearance or choose coordinated light and dark themes
+- Rename objects by double-clicking their hierarchy row or pressing F2; name and property edits commit on Enter or focus loss
+- Filter the Add Object menu by typing, and import multiple images into Graphics in one file selection
 - Use hyperlinks to navigate to referenced objects
 - Preview multiple data/alarm masks with their linked soft keys on one canvas; edit the focused mask with undo/redo
 - Limit selecting macro's and object references to allowed types only.
@@ -57,19 +59,22 @@ Check masks in the Objects pane to preview them side by side. Click a mask row o
 | Ctrl-click / Ctrl-marquee | Select nested objects |
 | Shift-drag / Ctrl-drag | Constrain movement / bypass snapping |
 | Alt-drag / Ctrl+D | Duplicate independently editable primitive objects and positioned descendants |
+| F2 | Rename the selected hierarchy object |
 | Alt-hover | Measure spacing to another object or the parent |
 | Arrow / Shift+Arrow | Move by 1 / 10 pool pixels |
 | Resize handle + Shift / Alt | Preserve aspect ratio / resize from center |
 | Delete / Escape | Remove selected placements / cancel a gesture or clear selection |
-| Space-drag or middle mouse | Pan |
+| Space-drag, middle mouse, or right mouse drag | Pan (stationary right-click opens the context menu) |
 | Ctrl-wheel | Zoom around the pointer |
 | Shift+1 / Shift+2 | Fit mask / fit selection |
 
-The canvas toolbar provides X/Y and supported W/H fields, alignment/distribution, snapping switches, and a shortcut reference. Alignment and distribution operate on selections sharing a parent; hold Shift while aligning to align the selection as a group to that parent.
+The canvas toolbar provides X/Y and supported W/H fields, alignment/distribution, snapping switches, an optional grid overlay, and a shortcut reference. Grid spacing follows zoom automatically, down to one pool pixel, independently of snapping. Alignment and distribution operate on selections sharing a parent; hold Shift while aligning to align the selection as a group to that parent.
 
 Moving a repeated reference updates its exact child-list occurrence. Resizing changes the shared object's dimensions at every reference; the toolbar identifies shared dimensions. Removing a placement retains its primitive object definition in the pool. Component instances move and duplicate as units; their internal geometry stays controlled by their component definitions.
 
-Primitive copies receive fresh object IDs and metadata identities. Internal references within the copied positioned subtree are remapped; external styles and resources remain shared. Component copies retain their master and overrides. Completed gestures and numeric edits each create one undo action.
+Primitive copies receive fresh object IDs and metadata identities. PictureGraphic placements reuse the original image object, including pictures inside copied parents. Internal references within the copied positioned subtree are remapped; external styles and resources remain shared. Component copies retain their master and overrides. Completed gestures and numeric edits each create one undo action.
+
+Properties provides Duplicate for the selected placement, or an unplaced copy for a standalone copyable object. Delete removes the selected placement and keeps its object definition. Drag hierarchy placements onto another positioned parent to move them; their canvas position is preserved where possible and adjusted to fit the new parent. Clicking a mask's title or uncovered background selects its properties. PictureGraphic properties show source resolution and allow either display dimension to be edited while preserving the aspect ratio.
 
 ### Output String preview
 
@@ -85,9 +90,7 @@ The list below outlines some of the features and improvements that are planned t
 
 - Add the remaining objects for configuration and rendering.
 - Display a preview of the active soft key mask.
-- Implement the ability to give objects custom names.
 - Add a colour picker for colour attributes.
-- Add a search bar to quickly find objects.
 - Show a pop-up when creating a new object for initial configuration.
 
 If you have any suggestions or would like to contribute, feel free to open an issue or submit a pull request!
@@ -142,15 +145,15 @@ The lists below only apply to version 3 of the VT specification. There are 3 sta
 - :yellow_circle: Key
 - :green_circle: Button
 - :yellow_circle: InputBoolean
-- :white_circle: InputString
+- :green_circle: InputString
 - :yellow_circle: InputNumber
-- :white_circle: InputList
+- :green_circle: InputList
 - :yellow_circle: OutputString
 - :yellow_circle: OutputNumber
 - :white_circle: OutputList
 - :yellow_circle: OutputLine
 - :yellow_circle: OutputRectangle
-- :white_circle: OutputEllipse
+- :green_circle: OutputEllipse
 - :white_circle: OutputPolygon
 - :white_circle: OutputMeter
 - :white_circle: OutputLinearBarGraph
@@ -177,6 +180,13 @@ cargo run --release
 ```
 
 ### Using the standalone CLI
+
+**File → Export CLI ZIP…** exports the open project as readable CLI commands,
+PNG assets, and `build.sh`. Extract it and run `bash build.sh` with `aitd` on
+`PATH`, or set `AITD=/path/to/aitd`. The script validates and produces
+`build/project.aitp` and `build/project.iop`, refusing existing build outputs.
+The editor preflights the complete workflow and rejects content it cannot
+reproduce exactly; original available graphic files are converted to PNG.
 
 Build the CLI without opening the desktop editor:
 

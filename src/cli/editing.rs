@@ -103,6 +103,9 @@ pub enum EditActionKind {
     Component {
         action: ComponentIntent,
     },
+    AuthorComponent {
+        action: crate::cli::component_authoring::ComponentAuthoringAction,
+    },
     Settings {
         values: BTreeMap<String, String>,
     },
@@ -244,6 +247,54 @@ pub enum EditActionKind {
         bytes: Vec<u8>,
         #[serde(default)]
         name: Option<String>,
+        #[serde(default)]
+        asset_id: Option<crate::graphics::GraphicAssetId>,
+        #[serde(default)]
+        original_file_name: Option<String>,
+        #[serde(default)]
+        clear_original_name: bool,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+    GraphicAssignFile {
+        object: u16,
+        #[serde(with = "base64_bytes")]
+        bytes: Vec<u8>,
+        format: crate::graphics::PictureGraphicFormat,
+        encoding: crate::graphics::DataCodeType,
+    },
+    MacroAppend {
+        object: ObjectTarget,
+        instruction: String,
+        #[serde(default)]
+        arguments: Vec<String>,
+    },
+    ObjectMetadataSet {
+        object: ObjectTarget,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "nullable_update"
+        )]
+        name: Option<Option<String>>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "nullable_update"
+        )]
+        description: Option<Option<String>>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "nullable_update"
+        )]
+        notes: Option<Option<String>>,
+        #[serde(default)]
+        tags: Option<Vec<String>>,
+        #[serde(default)]
+        id_overridden: Option<bool>,
     },
     GraphicAssign {
         asset_id: crate::graphics::GraphicAssetId,
@@ -259,6 +310,15 @@ pub enum EditActionKind {
     GraphicDelete {
         asset_id: crate::graphics::GraphicAssetId,
     },
+}
+
+// Missing means leave unchanged; an explicit null means clear the field.
+fn nullable_update<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// Relationship edits whose values depend on the current project content.
@@ -347,7 +407,7 @@ pub struct ParameterInput {
     pub default_value: Option<String>,
 }
 
-mod base64_bytes {
+pub(crate) mod base64_bytes {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -396,6 +456,7 @@ fn apply_kind(project: &mut EditorProject, action: EditActionKind) -> Result<(),
             name,
             keep_external_references,
         } => component_capture(project, root, &name, keep_external_references),
+        A::AuthorComponent { action } => crate::cli::component_authoring::apply(project, action),
         A::ComponentMove { instance_id, x, y } => {
             ComponentService::move_instance(project, instance_id, x, y).map_err(|e| e.to_string())
         }
@@ -550,15 +611,52 @@ fn apply_kind(project: &mut EditorProject, action: EditActionKind) -> Result<(),
             filename,
             bytes,
             name,
-        } => {
-            let id =
-                GraphicService::upload(project, &filename, bytes).map_err(|e| e.to_string())?;
-            if let Some(name) = name {
-                GraphicService::rename_available_asset(project, id, name)
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        }
+            asset_id,
+            original_file_name,
+            clear_original_name,
+            description,
+            tags,
+        } => GraphicService::upload_with_metadata(
+            project,
+            &filename,
+            bytes,
+            asset_id.unwrap_or_default(),
+            name,
+            original_file_name,
+            clear_original_name,
+            description,
+            Some(tags),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string()),
+        A::GraphicAssignFile {
+            object,
+            bytes,
+            format,
+            encoding,
+        } => GraphicService::assign_indexed_png(project, object, &bytes, format, encoding)
+            .map_err(|e| e.to_string()),
+        A::MacroAppend {
+            object,
+            instruction,
+            arguments,
+        } => macro_append(project, &object, &instruction, &arguments),
+        A::ObjectMetadataSet {
+            object,
+            name,
+            description,
+            notes,
+            tags,
+            id_overridden,
+        } => object_metadata_set(
+            project,
+            &object,
+            name,
+            description,
+            notes,
+            tags,
+            id_overridden,
+        ),
         A::GraphicAssign { asset_id, object } => {
             GraphicService::convert_asset_into_picture_graphic(project, asset_id, object)
                 .map_err(|e| e.to_string())
@@ -735,6 +833,85 @@ fn component_reset(
         .map_err(|e| e.to_string())
 }
 
+fn macro_append(
+    project: &mut EditorProject,
+    target: &ObjectTarget,
+    instruction: &str,
+    arguments: &[String],
+) -> Result<(), String> {
+    let object_id = resolve_object(project, target)?;
+    let encoded = crate::macro_authoring::encode_macro_instruction(
+        instruction,
+        arguments,
+        project.vt_version,
+    )?;
+    let version = project.vt_version;
+    project
+        .edit_source("Append Macro instruction", |pool, _, _, _| {
+            let id = ObjectId::new(object_id).map_err(|_| {
+                crate::components::ComponentError::new("OBJECT_NOT_FOUND", "Invalid object ID")
+            })?;
+            let Some(Object::Macro(macro_object)) = pool.object_mut_by_id(id) else {
+                return Err(crate::components::ComponentError::new(
+                    "INVALID_OBJECT_TYPE",
+                    format!("Object {object_id} is not a Macro"),
+                ));
+            };
+            let mut commands = macro_object.commands.clone();
+            commands.extend_from_slice(&encoded);
+            crate::vt_macro_commands::validate_macro_commands(&commands, version).map_err(
+                |error| crate::components::ComponentError::new("INVALID_MACRO_COMMANDS", error),
+            )?;
+            macro_object.commands = commands;
+            Ok(())
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn object_metadata_set(
+    project: &mut EditorProject,
+    target: &ObjectTarget,
+    name: Option<Option<String>>,
+    description: Option<Option<String>>,
+    notes: Option<Option<String>>,
+    tags: Option<Vec<String>>,
+    id_overridden: Option<bool>,
+) -> Result<(), String> {
+    let object_id = resolve_object(project, target)?;
+    project
+        .edit_source("Edit object metadata", |pool, _, _, object_info| {
+            let id = ObjectId::new(object_id).map_err(|_| {
+                crate::components::ComponentError::new("OBJECT_NOT_FOUND", "Invalid object ID")
+            })?;
+            let object = pool.object_by_id(id).ok_or_else(|| {
+                crate::components::ComponentError::new(
+                    "OBJECT_NOT_FOUND",
+                    format!("Object {object_id} not found"),
+                )
+            })?;
+            let info = object_info
+                .entry(id)
+                .or_insert_with(|| ObjectInfo::new(object));
+            if let Some(name) = name {
+                info.name = name;
+            }
+            if let Some(description) = description {
+                info.description = description;
+            }
+            if let Some(notes) = notes {
+                info.notes = notes;
+            }
+            if let Some(tags) = tags {
+                info.tags = tags;
+            }
+            if let Some(overridden) = id_overridden {
+                info.id_overridden = overridden;
+            }
+            Ok(())
+        })
+        .map_err(|error| error.to_string())
+}
+
 fn component_parameter(
     project: &mut EditorProject,
     component_id: ComponentId,
@@ -891,6 +1068,7 @@ fn object_duplicate(
     let mut info = ObjectInfo::new(&duplicate);
     info.name = Some(name);
     info.description = source_info.description;
+    info.notes = source_info.notes;
     info.tags = source_info.tags;
     info.allowed_references = source_info.allowed_references;
     operation(
@@ -1771,7 +1949,23 @@ fn settings(project: &mut EditorProject, values: BTreeMap<String, String>) -> Re
     let mut size = project.soft_key_size();
     let mut version = project.vt_version();
     let mut layout = project.soft_key_layout();
+    let mut id_ranges = project.object_id_ranges().clone();
     for (key, value) in values {
+        if let Some(object_type) = key.strip_prefix("id_range.") {
+            let object_type: ObjectType = serde_json::from_value(json!(object_type))
+                .map_err(|_| format!("Unknown object type '{object_type}'"))?;
+            let (start, end) = value
+                .split_once(':')
+                .ok_or_else(|| format!("{key} must be START:END"))?;
+            let start: u16 = start
+                .parse()
+                .map_err(|_| format!("{key} start must be an integer from 0 to 65535"))?;
+            let end: u16 = end
+                .parse()
+                .map_err(|_| format!("{key} end must be an integer from 0 to 65535"))?;
+            id_ranges.set_range(object_type, crate::ObjectIdRange { start, end });
+            continue;
+        }
         match key.as_str() {
             "mask_size" => {
                 mask = value
@@ -1824,13 +2018,7 @@ fn settings(project: &mut EditorProject, values: BTreeMap<String, String>) -> Re
         }
     }
     project
-        .set_project_configuration_with_id_ranges(
-            mask,
-            size,
-            version,
-            layout,
-            project.object_id_ranges().clone(),
-        )
+        .set_project_configuration_with_id_ranges(mask, size, version, layout, id_ranges)
         .map_err(|e| e.to_string())
 }
 

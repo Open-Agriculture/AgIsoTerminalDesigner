@@ -14,6 +14,62 @@ fn object_id(value: u16) -> ObjectId {
 }
 
 #[test]
+fn signed_numeric_offsets_survive_project_and_iop_round_trips() {
+    let mut pool = ObjectPool::default();
+    for (kind, id) in [
+        (ObjectType::FontAttributes, 1),
+        (ObjectType::InputNumber, 2),
+        (ObjectType::OutputNumber, 3),
+    ] {
+        let mut object = default_object(kind);
+        object.mut_id().set_value(id).unwrap();
+        match &mut object {
+            Object::InputNumber(number) => {
+                number.font_attributes = object_id(1).into();
+                number.max_value = 1000;
+            }
+            Object::OutputNumber(number) => number.font_attributes = object_id(1).into(),
+            _ => {}
+        }
+        pool.add(object);
+    }
+    let mut project = EditorProject::from(pool);
+    let mut transaction = OperationTransaction::new(None);
+    for id in [2, 3] {
+        for (property, value) in [
+            ("offset", json!(-100)),
+            ("value", json!(250)),
+            ("scale", json!(0.5)),
+        ] {
+            transaction.add_operation(Operation::SetProperty {
+                object: ObjectTarget::id(id),
+                property: property.parse().unwrap(),
+                value,
+            });
+        }
+    }
+    project.execute_transaction(transaction).unwrap();
+    let saved = EditorProject::load_project(project.save_project().unwrap()).unwrap();
+    let imported =
+        EditorProject::import_iop(project.export_iop().unwrap(), VtVersion::Version6).unwrap();
+    for candidate in [&saved, &imported] {
+        for id in [2, 3] {
+            let object = candidate.get_pool().object_by_id(object_id(id)).unwrap();
+            let (value, offset, scale) = match object {
+                Object::InputNumber(number) => (number.value, number.offset, number.scale),
+                Object::OutputNumber(number) => (number.value, number.offset, number.scale),
+                _ => unreachable!(),
+            };
+            assert_eq!((value, offset, scale), (250, -100, 0.5));
+            assert_eq!(
+                (f64::from(value) + f64::from(offset)) * f64::from(scale),
+                75.0
+            );
+        }
+    }
+}
+
+#[test]
 fn availability_labels_include_introductions_and_vt2_only_objects() {
     use ag_iso_terminal_designer::vt_compatibility::{
         availability_description, supported_object_type,

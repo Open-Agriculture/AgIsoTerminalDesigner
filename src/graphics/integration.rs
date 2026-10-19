@@ -1,7 +1,11 @@
 //! Project integration for the two-state graphics model.
 use super::*;
 use crate::{components::ComponentError, EditorProject};
-use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool, ObjectType};
+use ag_iso_stack::object_pool::{
+    object::Object,
+    object_attributes::{DataCodeType, PictureGraphicFormat},
+    ObjectId, ObjectPool, ObjectType,
+};
 use std::collections::HashMap;
 
 /// Assets are converted before materialization, so rendering only sees ordinary
@@ -75,6 +79,82 @@ impl GraphicService {
             Ok(())
         })?;
         Ok(id)
+    }
+
+    /// Import an available graphic with a caller-selected stable UUID.
+    pub fn upload_with_id(
+        project: &mut EditorProject,
+        filename: &str,
+        bytes: Vec<u8>,
+        id: GraphicAssetId,
+        name: Option<String>,
+    ) -> crate::components::ComponentResult<GraphicAssetId> {
+        Self::upload_with_metadata(project, filename, bytes, id, name, None, false, None, None)
+    }
+
+    /// Import an available graphic with stable identity and restored authoring metadata.
+    pub fn upload_with_metadata(
+        project: &mut EditorProject,
+        filename: &str,
+        bytes: Vec<u8>,
+        id: GraphicAssetId,
+        name: Option<String>,
+        original_file_name: Option<String>,
+        clear_original_file_name: bool,
+        description: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> crate::components::ComponentResult<GraphicAssetId> {
+        let mut asset = GraphicAsset::from_upload_with_id(filename, bytes, id)
+            .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))?;
+        if let Some(name) = name {
+            asset.name = name;
+        }
+        if let Some(original_file_name) = original_file_name {
+            asset.original_file_name = Some(original_file_name);
+        }
+        if clear_original_file_name {
+            asset.original_file_name = None;
+        }
+        asset.description = description;
+        if let Some(tags) = tags {
+            asset.tags = tags;
+        }
+        project.edit_source("Import graphic", |_, _, graphics, _| {
+            if graphics.assets.contains_key(&id) {
+                return Err(ComponentError::new(
+                    "GRAPHIC_ASSET_ID_CONFLICT",
+                    format!("Graphic asset UUID {id} already exists"),
+                ));
+            }
+            graphics.assets.insert(id, asset);
+            Ok(())
+        })?;
+        Ok(id)
+    }
+
+    /// Assign a lossless indexed PNG directly to an existing PictureGraphic.
+    pub fn assign_indexed_png(
+        project: &mut EditorProject,
+        object_id: u16,
+        bytes: &[u8],
+        format: PictureGraphicFormat,
+        encoding: DataCodeType,
+    ) -> crate::components::ComponentResult<()> {
+        let bytes = bytes.to_vec();
+        project.edit_source("Assign indexed PNG", |pool, _, _, _| {
+            let palette_pool = pool.clone();
+            let picture = ObjectId::new(object_id)
+                .ok()
+                .and_then(|id| pool.object_mut_by_id(id));
+            let Some(Object::PictureGraphic(picture)) = picture else {
+                return Err(ComponentError::new(
+                    "GRAPHIC_TARGET_INVALID",
+                    format!("Target {object_id} must be a PictureGraphic"),
+                ));
+            };
+            super::indexed_png::apply_png(picture, &palette_pool, &bytes, format, encoding)
+                .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))
+        })
     }
 
     pub fn rename_available_asset(

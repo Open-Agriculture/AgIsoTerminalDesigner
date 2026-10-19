@@ -1,10 +1,9 @@
 //! Project-local original images and single-owner source bindings.
-use ag_iso_stack::object_pool::{
-    object::PictureGraphic,
-    object_attributes::{DataCodeType, PictureGraphicFormat},
-};
+use ag_iso_stack::object_pool::object::PictureGraphic;
+pub use ag_iso_stack::object_pool::object_attributes::{DataCodeType, PictureGraphicFormat};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+pub mod indexed_png;
 pub mod integration;
 pub mod preview;
 pub mod ui;
@@ -66,6 +65,38 @@ impl GraphicAsset {
                 .unwrap_or_else(|| format!("{}.{}", self.name, self.format)),
             &self.original_bytes,
         )
+    }
+
+    /// Convert an available original to PNG without changing its authoring identity.
+    pub fn as_png(&self) -> Result<Self, String> {
+        let decoded = decode(&self.original_bytes)?;
+        if matches!(
+            decoded.color(),
+            image::ColorType::Rgb32F | image::ColorType::Rgba32F
+        ) {
+            return Err(
+                "Floating-point graphic pixels cannot be represented losslessly in PNG".into(),
+            );
+        }
+        let decoded = decoded.to_rgba16();
+        let mut output = std::io::Cursor::new(Vec::new());
+        decoded
+            .write_to(&mut output, image::ImageFormat::Png)
+            .map_err(|error| error.to_string())?;
+        let mut converted = self.clone();
+        converted.format = "png".into();
+        converted.original_bytes = output.into_inner();
+        Ok(converted)
+    }
+
+    pub fn from_upload_with_id(
+        filename: &str,
+        bytes: Vec<u8>,
+        id: GraphicAssetId,
+    ) -> Result<Self, String> {
+        let mut asset = Self::from_upload(filename, bytes)?;
+        asset.id = id;
+        Ok(asset)
     }
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -257,4 +288,43 @@ pub fn convert_picture_graphic_format(picture: &mut PictureGraphic, target: Pict
     }
     picture.format = target;
     picture.options.data_code_type = DataCodeType::Raw;
+}
+
+#[cfg(test)]
+mod indexed_asset_tests {
+    use super::*;
+
+    #[test]
+    fn png_conversion_preserves_sixteen_bit_pixels_and_asset_metadata() {
+        let pixels = vec![
+            0x1234, 0x5678, 0x9abc, 0xdef0, 0xffff, 0x0001, 0x8000, 0x2468,
+        ];
+        let image =
+            image::ImageBuffer::<image::Rgba<u16>, _>::from_raw(2, 1, pixels.clone()).unwrap();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let asset = GraphicAsset {
+            id: GraphicAssetId(uuid::Uuid::from_u128(0x1234)),
+            name: "Hydraulic warning".into(),
+            description: Some("Original 16-bit artwork".into()),
+            tags: vec!["warning".into(), "hydraulics".into()],
+            original_file_name: Some("hydraulic-warning.tif".into()),
+            format: "tiff".into(),
+            original_bytes: encoded.into_inner(),
+        };
+
+        let converted = asset.as_png().unwrap();
+        let decoded = image::load_from_memory(&converted.original_bytes)
+            .unwrap()
+            .to_rgba16();
+        assert_eq!(decoded.as_raw(), &pixels);
+        assert_eq!(converted.id, asset.id);
+        assert_eq!(converted.name, asset.name);
+        assert_eq!(converted.description, asset.description);
+        assert_eq!(converted.tags, asset.tags);
+        assert_eq!(converted.original_file_name, asset.original_file_name);
+        assert_eq!(converted.format, "png");
+    }
 }

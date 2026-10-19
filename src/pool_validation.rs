@@ -35,6 +35,18 @@ pub fn format_validation_diagnostic(
     diagnostic: &ValidationDiagnostic,
     format: crate::ObjectIdFormat,
 ) -> String {
+    format_validation_diagnostic_with_names(diagnostic, format, &std::collections::HashMap::new())
+}
+
+/// Format a diagnostic with project names when a name is available.
+///
+/// The serialized diagnostic remains ID-based; names are supplied by the
+/// owning project at presentation time so they always reflect current metadata.
+pub fn format_validation_diagnostic_with_names(
+    diagnostic: &ValidationDiagnostic,
+    format: crate::ObjectIdFormat,
+    names: &std::collections::HashMap<u16, String>,
+) -> String {
     let Some(objects) = diagnostic
         .affected_objects
         .as_ref()
@@ -44,7 +56,7 @@ pub fn format_validation_diagnostic(
     };
     let objects = objects
         .iter()
-        .map(|id| format.format(*id))
+        .map(|id| format_object_identity(*id, format, names.get(id).map(String::as_str)))
         .collect::<Vec<_>>()
         .join(", ");
     let subject = if diagnostic
@@ -57,6 +69,18 @@ pub fn format_validation_diagnostic(
         "Object"
     };
     format!("{subject} {objects}: {}", diagnostic.message)
+}
+
+/// Format one object's name and ID, falling back to its ID when unnamed.
+pub(crate) fn format_object_identity(
+    id: u16,
+    format: crate::ObjectIdFormat,
+    name: Option<&str>,
+) -> String {
+    match name.filter(|name| !name.trim().is_empty()) {
+        Some(name) => format!("‘{name}’ ({})", format.format(id)),
+        None => format.format(id),
+    }
 }
 
 /// Check if adding a reference from parent_id to child_id would create a circular dependency
@@ -437,6 +461,26 @@ mod tests {
         assert_eq!(
             format_validation_diagnostic(&diagnostic, crate::ObjectIdFormat::Hexadecimal),
             "Object 0x00AF: Property value is invalid"
+        );
+    }
+
+    #[test]
+    fn named_diagnostic_keeps_selected_id_format_and_falls_back_for_unnamed_objects() {
+        let diagnostic = ValidationDiagnostic {
+            severity: ValidationSeverity::Error,
+            message: "Invalid relationship".into(),
+            affected_objects: Some(vec![175, 176]),
+            code: "TEST".into(),
+        };
+        let names = [(175, "Header".to_owned())].into_iter().collect();
+
+        assert_eq!(
+            format_validation_diagnostic_with_names(
+                &diagnostic,
+                crate::ObjectIdFormat::Hexadecimal,
+                &names,
+            ),
+            "Objects ‘Header’ (0x00AF), 0x00B0: Invalid relationship"
         );
     }
 }

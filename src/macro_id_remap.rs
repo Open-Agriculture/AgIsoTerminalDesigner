@@ -138,7 +138,7 @@ pub fn remap_macro_object_ids<F>(
 where
     F: FnMut(u16, Option<u8>) -> MacroAttributeValueKind,
 {
-    remap_macro_ids(bytes, mapping, target_version, attribute_kind, None)
+    remap_macro_ids(bytes, mapping, target_version, attribute_kind, None, None)
 }
 
 /// Validate every local reference against the original pool before rewriting.
@@ -160,12 +160,39 @@ pub(crate) fn remap_macro_object_ids_checked(
                 })
         },
         Some(object_types),
+        None,
     )
+}
+
+/// Inspect local IDs with the same semantic layouts used for safe remapping.
+/// Unknown attribute payload semantics return an error instead of guessing IDs.
+pub(crate) fn macro_object_references(
+    bytes: &[u8],
+    version: VtVersion,
+    object_types: &HashMap<u16, ObjectType>,
+) -> Result<Vec<u16>, String> {
+    let references = std::cell::RefCell::new(std::collections::BTreeSet::new());
+    remap_macro_ids(
+        bytes,
+        &HashMap::new(),
+        version,
+        |id, aid| {
+            object_types
+                .get(&id)
+                .map_or(MacroAttributeValueKind::Unknown, |ty| {
+                    macro_attribute_value_kind(*ty, aid, version)
+                })
+        },
+        None,
+        Some(&references),
+    )?;
+    Ok(references.into_inner().into_iter().collect())
 }
 
 struct IdRemapping<'a> {
     ids: &'a HashMap<u16, u16>,
     object_types: Option<&'a HashMap<u16, ObjectType>>,
+    references: Option<&'a std::cell::RefCell<std::collections::BTreeSet<u16>>>,
 }
 
 impl IdRemapping<'_> {
@@ -173,6 +200,9 @@ impl IdRemapping<'_> {
         self.ids.get(id)
     }
     fn validate(&self, id: u16, macro_target: bool) -> Result<(), String> {
+        if let Some(references) = self.references {
+            references.borrow_mut().insert(id);
+        }
         if let Some(types) = self.object_types {
             let ty = types
                 .get(&id)
@@ -191,6 +221,7 @@ fn remap_macro_ids<F>(
     target_version: VtVersion,
     mut attribute_kind: F,
     object_types: Option<&HashMap<u16, ObjectType>>,
+    references: Option<&std::cell::RefCell<std::collections::BTreeSet<u16>>>,
 ) -> Result<Vec<u8>, String>
 where
     F: FnMut(u16, Option<u8>) -> MacroAttributeValueKind,
@@ -198,6 +229,7 @@ where
     let mapping = &IdRemapping {
         ids: mapping,
         object_types,
+        references,
     };
     validate_macro_commands(bytes, target_version)?;
     let mut remapped = bytes.to_vec();

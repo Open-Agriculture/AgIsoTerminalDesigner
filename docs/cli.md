@@ -117,7 +117,7 @@ aitd --check object set Counter value=77
 
 A file contains up to 256 edit actions. Commands execute in order on an isolated working-copy candidate. Every command must be valid when reached: create referenced objects first, repair incompatibilities before changing VT, and resize/reposition before shrinking their available bounds. Any failure discards the entire batch. A successful batch updates the working copy atomically. `--check` runs the same checks without changing the working project.
 
-Command files support single/double quotes, escaped characters, trailing backslash continuations, blank lines, and lines beginning with `#`. They perform no variable expansion, command substitution, or shell execution. Image and binary resource paths resolve relative to the command file; stdin command files resolve paths relative to the current directory. `--json` and `--check` belong on `run`, not inside the file. Inspection and output commands cannot be included in an edit batch. A Bash script can coordinate multiple `.aitcmd` files and individual CLI commands; the 256-action limit applies to each file independently.
+Command files support single/double quotes (including literal newlines inside quotes), escaped characters, trailing backslash continuations, blank lines, and lines beginning with `#`. They perform no variable expansion, command substitution, or shell execution. Image and binary resource paths resolve relative to the command file; stdin command files resolve paths relative to the current directory. `--json` and `--check` belong on `run`, not inside the file. Inspection and output commands cannot be included in an edit batch. A Bash script can coordinate multiple `.aitcmd` files and individual CLI commands; the 256-action limit applies to each file independently.
 
 ## Settings and validation
 
@@ -139,9 +139,39 @@ Readable text is the default. `--json` selects machine-readable output; successe
 aitd validate --json
 aitd preview --mask 1000 --output build/layout.png
 aitd export bundle --iop build/pool.iop --header build/pool.h
+aitd export project --output-dir release
 aitd graphic export ASSET_ID --output build/image.png
 ```
 
 Previews are schematic geometry images, not screenshots of the full VT renderer. Binary export applies its own target compatibility checks, independently of save-time validation. Existing output files require `--force`; bundle artifacts are generated and staged before publishing. C header export rejects colliding or reserved identifiers.
+
+`export project --output-dir DIR` validates the project and creates a new directory containing `project.aitp` and `project.iop`. Both artifacts are prepared before the directory is published. The destination must not exist, including an empty directory or symbolic link; there is no overwrite option. Failed generation leaves no final output directory.
+
+The visual editor's **File → Export CLI ZIP…** uses ordinary authoring commands
+to recreate the open project. Extract the archive and run `bash build.sh` from
+any directory. Bash and an installed compatible `aitd` are the only tools
+required; `AITD=/absolute/path/to/aitd bash build.sh` selects a specific binary.
+Each mask has its own directory, shared and unused objects live in `shared/`,
+and component definitions live in `components/`. The root script runs global
+phases across these directories. Edit `.aitd` files and PNG assets to change
+the project, move the old `build/` directory aside, and rebuild.
+
+Object metadata is editable with `object metadata ID --name TEXT
+--description TEXT --notes TEXT --tag TAG --id-policy automatic|manual`;
+`--clear-name`, `--clear-description`, `--clear-notes`, and `--clear-tags`
+explicitly clear optional values. ID ranges can be updated together through
+`project settings set id_range.Button=6000:6999 id_range.Key=5000:5999`.
+`component --help` lists definition, node, parameter, and instance authoring
+commands with explicit UUIDs and compiled ID assignments.
+
+`macro append ID change-numeric-value OBJECT VALUE` and other named
+instructions author Macro streams without byte payloads. `graphic assign-file
+ID FILE --format eight_bit --encoding raw` imports an indexed PNG into an
+existing PictureGraphic, retaining its palette indices. Four-bit and monochrome
+formats and run-length encoding are also supported. The PNG palette must match
+the project's effective palette. ZIP export compares regenerated picture bytes
+and rejects non-reproducible encodings, unsupported binary content, and invalid
+drafts before showing the save dialog. Available graphic originals are converted
+to lossless PNG with their authoring metadata preserved.
 
 The backup listing includes timestamps, original project paths, backup paths, and sizes. Exit codes are `0` for success, `1` for other failures, `2` for invalid usage, `3` for inspection/edit commands without a loaded project, `4` for a changed source, and `5` for validation failure.

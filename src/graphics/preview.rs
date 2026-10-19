@@ -130,17 +130,5 @@ fn cached_texture(
 }
 
 pub fn picture_png(picture: &PictureGraphic, pool: &ObjectPool) -> Result<Vec<u8>, String> {
-    let decoded = decode_picture(picture, pool);
-    let bytes = decoded
-        .pixels
-        .iter()
-        .flat_map(|color| color.to_srgba_unmultiplied())
-        .collect();
-    let image = image::RgbaImage::from_raw(decoded.size[0] as u32, decoded.size[1] as u32, bytes)
-        .ok_or("Invalid graphic dimensions")?;
-    let mut output = std::io::Cursor::new(Vec::new());
-    image
-        .write_to(&mut output, image::ImageFormat::Png)
-        .map_err(|error| error.to_string())?;
-    Ok(output.into_inner())
+    super::indexed_png::picture_png(picture, pool)
 }

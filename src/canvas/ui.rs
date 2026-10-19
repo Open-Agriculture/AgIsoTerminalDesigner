@@ -18,6 +18,9 @@ pub struct CanvasState {
     softkey_page: usize,
     revision: u64,
     selected: Vec<Vec<usize>>,
+    scene_identity: Vec<(Vec<usize>, u16, Option<PlacementTarget>)>,
+    scene_origins: HashMap<Vec<usize>, Pos2>,
+    placement_owner: Option<u16>,
     context: Vec<usize>,
     inspector: Option<u16>,
     zoom: f32,
@@ -28,6 +31,8 @@ pub struct CanvasState {
     error: Option<String>,
     snap_objects: bool,
     snap_spacing: bool,
+    grid_visible: bool,
+    secondary_panned: bool,
     fit: Option<bool>,
     fit_all: bool,
     initially_fitted: bool,
@@ -44,6 +49,9 @@ impl Default for CanvasState {
             softkey_page: 0,
             revision: 0,
             selected: vec![],
+            scene_identity: vec![],
+            scene_origins: HashMap::new(),
+            placement_owner: None,
             context: vec![],
             inspector: None,
             zoom: 1.0,
@@ -54,6 +62,8 @@ impl Default for CanvasState {
             error: None,
             snap_objects: true,
             snap_spacing: true,
+            grid_visible: false,
+            secondary_panned: false,
             fit: None,
             fit_all: false,
             initially_fitted: false,
@@ -93,6 +103,277 @@ struct Gesture {
 }
 
 impl CanvasState {
+    /// Whether the non-snapping, mask-coordinate grid overlay is visible.
+    pub fn grid_visible(&self) -> bool {
+        self.grid_visible
+    }
+
+    /// Toggle the grid without changing placement or snapping behavior.
+    pub fn set_grid_visible(&mut self, visible: bool) {
+        self.grid_visible = visible;
+    }
+
+    /// Return the single selected editable occurrence, revalidated against the project.
+    pub fn selected_placement(&self, project: &EditorProject) -> Option<PlacementTarget> {
+        if self.selected.len() != 1 {
+            return None;
+        }
+        let materialized = project.materialize().ok()?;
+        let scene = geometry::build_page(project, &materialized, self.mask?, self.softkey_page);
+        let selected = self.reconciled_selection(&scene);
+        let path = selected.first()?;
+        let item = scene.items.iter().find(|i| &i.path == path)?;
+        if project.get_selected().0.map(|id| id.value()) != Some(item.object_id) {
+            return None;
+        }
+        item.target.clone()
+    }
+
+    /// Whether the inspector still refers to a selected placement, even if a
+    /// structural edit made its occurrence stale. Such a selection must be
+    /// explicitly selected again rather than treated as an unplaced definition.
+    pub fn has_placement_selection(&self, project: &EditorProject) -> bool {
+        self.placement_owner.is_some()
+            && self.placement_owner == project.get_selected().0.map(|id| id.value())
+    }
+
+    fn scene_identity(scene: &Scene) -> Vec<(Vec<usize>, u16, Option<PlacementTarget>)> {
+        scene
+            .items
+            .iter()
+            .map(|item| (item.path.clone(), item.object_id, item.target.clone()))
+            .collect()
+    }
+
+    fn remember_scene(&mut self, scene: &Scene) {
+        self.scene_identity = Self::scene_identity(scene);
+        self.scene_origins = scene
+            .items
+            .iter()
+            .map(|item| (item.path.clone(), item.rect.min))
+            .collect();
+    }
+
+    fn reconciled_selection(&self, scene: &Scene) -> Vec<Vec<usize>> {
+        if self.scene_identity == Self::scene_identity(scene) {
+            return self.selected.clone();
+        }
+        self.selected
+            .iter()
+            .filter_map(|path| {
+                let (_, object, target) =
+                    self.scene_identity.iter().find(|(old, _, _)| old == path)?;
+                let origin = self.scene_origins.get(path)?;
+                let mut matches = scene.items.iter().filter(|item| {
+                    let same_parent = match (target, &item.target) {
+                        (
+                            Some(PlacementTarget::Primitive { parent_id: old, .. }),
+                            Some(PlacementTarget::Primitive { parent_id: new, .. }),
+                        ) => old == new,
+                        (
+                            Some(PlacementTarget::Component { instance_id: old }),
+                            Some(PlacementTarget::Component { instance_id: new }),
+                        ) => old == new,
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    item.object_id == *object
+                        && item.rect.min == *origin
+                        && same_parent
+                        && super::softkeys::area(path) == super::softkeys::area(&item.path)
+                });
+                let matched = matches.next()?;
+                matches.next().is_none().then(|| matched.path.clone())
+            })
+            .collect()
+    }
+
+    /// Return a tree parent's mask-local child origin, including soft-key slots.
+    /// Tree paths begin with zero for the data/alarm mask or `slot + 1` for
+    /// a linked soft-key occurrence. Remaining indices are canonical primitive
+    /// child-list indices; `usize::MAX` enters an ObjectPointer target.
+    pub fn hierarchy_child_origin(
+        &self,
+        project: &EditorProject,
+        root: u16,
+        path: &[usize],
+    ) -> Result<Pos2, String> {
+        let Some((&branch, children)) = path.split_first() else {
+            return edits::hierarchy_child_origin(project, root, &[]);
+        };
+        if branch == 0 {
+            return edits::hierarchy_child_origin(project, root, children);
+        }
+        let slot_index = branch - 1;
+        let page = self.pages.get(&root).map_or(0, |entry| entry.1);
+        let mut keys = super::softkeys::build(project, project.get_pool(), root, page);
+        let capacity = usize::from(project.soft_key_layout().physical_key_count)
+            - usize::from(keys.navigation);
+        if !keys.slots.iter().any(|slot| {
+            slot.index == slot_index && matches!(slot.content, super::softkeys::SlotContent::Key(_))
+        }) {
+            keys = super::softkeys::build(project, project.get_pool(), root, slot_index / capacity);
+        }
+        let slot = keys
+            .slots
+            .iter()
+            .find(|slot| {
+                slot.index == slot_index
+                    && matches!(slot.content, super::softkeys::SlotContent::Key(_))
+            })
+            .ok_or("Missing soft-key occurrence")?;
+        let mask_id = keys
+            .mask_id
+            .and_then(|id| ObjectId::new(id).ok())
+            .ok_or("Missing soft-key mask")?;
+        let Some(ag_iso_stack::object_pool::object::Object::SoftKeyMask(mask)) =
+            project.get_pool().object_by_id(mask_id)
+        else {
+            return Err("Invalid soft-key mask".into());
+        };
+        let key = mask
+            .objects
+            .get(slot_index)
+            .ok_or("Missing soft-key reference")?;
+        let local = edits::hierarchy_child_origin(project, key.value(), children)?;
+        Ok(slot.rect.min + local.to_vec2())
+    }
+
+    /// Reparent a tree occurrence while preserving its mask-local canvas position.
+    /// Paths use the synthetic mask/soft-key branch prefix documented by
+    /// `hierarchy_child_origin`, and may cross between mask and key content.
+    pub fn reparent_in_hierarchy(
+        &self,
+        project: &mut EditorProject,
+        target: &PlacementTarget,
+        source_root: u16,
+        source_parent_path: &[usize],
+        dest_root: u16,
+        dest_parent_path: &[usize],
+        new_parent: u16,
+    ) -> Result<PlacementTarget, String> {
+        let source = self.hierarchy_child_origin(project, source_root, source_parent_path)?;
+        let dest = self.hierarchy_child_origin(project, dest_root, dest_parent_path)?;
+        let (x, y) = position(project, target).ok_or("Missing source occurrence")?;
+        let local = source + egui::vec2(f32::from(x), f32::from(y)) - dest;
+        edits::reparent_at(
+            project,
+            target,
+            new_parent,
+            local.x.round() as i32,
+            local.y.round() as i32,
+        )
+    }
+
+    /// Resolve a visible hierarchy path to its exact editable placement.
+    pub fn occurrence_target(
+        &self,
+        project: &EditorProject,
+        root: u16,
+        path: &[usize],
+    ) -> Option<PlacementTarget> {
+        let materialized = project.materialize().ok()?;
+        geometry::build_page(
+            project,
+            &materialized,
+            root,
+            self.pages.get(&root).map_or(0, |page| page.1),
+        )
+        .items
+        .into_iter()
+        .find(|item| item.path == path)?
+        .target
+    }
+
+    /// Select a visible hierarchy occurrence, retaining repeated-object identity.
+    pub fn select_occurrence(
+        &mut self,
+        project: &EditorProject,
+        root: u16,
+        path: &[usize],
+    ) -> bool {
+        let Ok(materialized) = project.materialize() else {
+            return false;
+        };
+        let page = self.pages.get(&root).map_or(0, |page| page.1);
+        let scene = geometry::build_page(project, &materialized, root, page);
+        if !scene
+            .items
+            .iter()
+            .any(|item| item.path == path && item.target.is_some())
+        {
+            return false;
+        }
+        let keys = super::softkeys::build(project, &materialized.pool, root, page);
+        self.pages.insert(root, (keys.mask_id, keys.page));
+        self.switch_mask(Some(root));
+        self.softkey_mask = keys.mask_id;
+        self.softkey_page = keys.page;
+        self.revision = project.revision();
+        self.selected = vec![path.to_vec()];
+        self.sync_selection(project, &scene);
+        true
+    }
+
+    /// Select an exact editable occurrence within a mask after hierarchy navigation.
+    pub fn select_placement(
+        &mut self,
+        project: &EditorProject,
+        root: u16,
+        target: PlacementTarget,
+    ) -> bool {
+        let Ok(materialized) = project.materialize() else {
+            return false;
+        };
+        let page = self.pages.get(&root).map_or(0, |page| page.1);
+        let scene = geometry::build_page(project, &materialized, root, page);
+        let Some(item) = scene
+            .items
+            .iter()
+            .find(|item| item.target.as_ref() == Some(&target))
+        else {
+            return false;
+        };
+        let keys = super::softkeys::build(project, &materialized.pool, root, page);
+        self.pages.insert(root, (keys.mask_id, keys.page));
+        self.switch_mask(Some(root));
+        self.softkey_mask = keys.mask_id;
+        self.softkey_page = keys.page;
+        self.revision = project.revision();
+        self.selected = vec![item.path.clone()];
+        self.sync_selection(project, &scene);
+        true
+    }
+
+    /// Duplicate the selected placement through the canvas's undoable copy operation.
+    pub fn duplicate_selection(&mut self, project: &mut EditorProject) -> bool {
+        let Some(target) = self.selected_placement(project) else {
+            return false;
+        };
+        let Some((x, y)) = position(project, &target) else {
+            return false;
+        };
+        self.commit(
+            project,
+            "Duplicate placements",
+            vec![CanvasEdit::Duplicate { target, x, y }],
+        );
+        true
+    }
+
+    /// Remove only the selected occurrence, retaining its underlying object definition.
+    pub fn remove_selection(&mut self, project: &mut EditorProject) -> bool {
+        let Some(target) = self.selected_placement(project) else {
+            return false;
+        };
+        self.commit(
+            project,
+            "Remove placement",
+            vec![CanvasEdit::Remove { target }],
+        );
+        true
+    }
+
     /// Cancel unfinished canvas edits when its pane is hidden or moved.
     /// Completed edits, selection, zoom, and pan remain intact.
     pub fn cancel_interaction(&mut self) {
@@ -135,8 +416,17 @@ impl CanvasState {
         let capacity = usize::from(project.soft_key_layout().physical_key_count)
             - usize::from(keys.navigation);
         let page = (slot / capacity).min(keys.pages - 1);
+        let retains_occurrence = self.mask == Some(root)
+            && self.softkey_mask == keys.mask_id
+            && self.softkey_page == page
+            && self
+                .selected
+                .iter()
+                .any(|path| path.starts_with(&[super::softkeys::PATH_PREFIX, slot]));
         self.pages.insert(root, (keys.mask_id, page));
-        if self.mask == Some(root) {
+        if self.mask == Some(root)
+            && (self.softkey_mask != keys.mask_id || self.softkey_page != page)
+        {
             self.softkey_mask = keys.mask_id;
             self.change_softkey_page(page);
         }
@@ -145,7 +435,9 @@ impl CanvasState {
             slot,
             project.get_mut_selected().get().0.map(|id| id.value()),
         ));
-        self.inspector = None;
+        if !retains_occurrence {
+            self.inspector = None;
+        }
     }
 
     /// Reveal the first soft-key page containing an externally selected object,
@@ -199,11 +491,15 @@ impl CanvasState {
         self.inspector = None;
         self.error = None;
         self.mask = mask;
+        self.scene_identity.clear();
+        self.scene_origins.clear();
+        self.placement_owner = None;
         let (linked, page) = mask
             .and_then(|id| self.pages.get(&id).copied())
             .unwrap_or((None, 0));
         self.softkey_mask = linked;
         self.softkey_page = page;
+        self.scene_identity.clear();
         if let Some(root) = self.mask {
             self.pages.insert(root, (self.softkey_mask, page));
         }
@@ -277,9 +573,6 @@ impl CanvasState {
         let mut root = self.mask.unwrap_or(u16::MAX);
         if self.revision != project.revision() {
             self.gesture = None;
-            self.selected.clear();
-            self.context.clear();
-            self.inspector = None;
             self.field_draft = None;
             self.revision = project.revision();
         }
@@ -322,6 +615,14 @@ impl CanvasState {
             }
         }
         let mut scene = geometry::build_page(project, materialized, root, self.softkey_page);
+        let identity = Self::scene_identity(&scene);
+        if !self.scene_identity.is_empty() && self.scene_identity != identity {
+            self.selected = self.reconciled_selection(&scene);
+            self.context.clear();
+            // Keep inspector identity and placement ownership, so an invalidated
+            // occurrence cannot silently become a pool-definition action.
+        }
+        self.remember_scene(&scene);
         self.selected
             .retain(|p| scene.items.iter().any(|i| &i.path == p));
         if !scene.items.iter().any(|i| i.path == self.context) {
@@ -340,6 +641,16 @@ impl CanvasState {
                 .find(|i| (i.target.is_some() || i.path.first() == Some(&super::softkeys::PATH_PREFIX)) && (Some(i.object_id) == inspector || inspector.and_then(|id| materialized.source_map.by_object_id.get(&id)).is_some_and(|source| matches!((source, &i.target), (crate::components::MaterializedSource::ComponentNode { instance_id, .. }, Some(PlacementTarget::Component { instance_id: target })) if instance_id == target))))
                 .map(|i| vec![i.path.clone()])
                 .unwrap_or_default();
+            self.placement_owner = self
+                .selected
+                .last()
+                .and_then(|path| {
+                    scene
+                        .items
+                        .iter()
+                        .find(|item| &item.path == path && item.target.is_some())
+                })
+                .map(|item| item.object_id);
         }
         let mut items = self.selection(&scene);
         let mut commands = vec![];
@@ -436,9 +747,18 @@ impl CanvasState {
         if pointer.button_pressed(egui::PointerButton::Primary) && response.hovered() && !space {
             if let Some(p) = pointer.interact_pos() {
                 let world = Pos2::ZERO + (p - viewport.min - self.pan) / self.zoom;
-                if let Some(&(clicked, clicked_offset, _)) = pairs
-                    .iter()
-                    .find(|(_, offset, rect)| rect.translate(*offset).contains(world))
+                if let Some(&(clicked, clicked_offset, _)) =
+                    pairs.iter().find(|(_, offset, rect)| {
+                        rect.translate(*offset).contains(world)
+                            || captions && {
+                                let origin = viewport.min + self.pan + *offset * self.zoom;
+                                Rect::from_min_size(
+                                    origin - egui::vec2(0.0, 26.0),
+                                    egui::vec2(rect.width() * self.zoom, 24.0),
+                                )
+                                .contains(p)
+                            }
+                    })
                 {
                     if self.mask != Some(clicked) {
                         // Losing a numeric field's focus must not commit its
@@ -540,6 +860,16 @@ impl CanvasState {
                     if !modifiers.shift {
                         self.selected.clear();
                     }
+                    if !modifiers.shift
+                        && (mask_rect.contains(pool_pos)
+                            || captions
+                                && pool_pos.y < 0.0
+                                && pool_pos.y >= -26.0 / self.zoom
+                                && pool_pos.x >= 0.0
+                                && pool_pos.x <= mask_rect.width())
+                    {
+                        self.selected = vec![Vec::new()];
+                    }
                     GestureKind::Marquee
                 };
                 self.sync_selection(project, &scene);
@@ -557,7 +887,13 @@ impl CanvasState {
                 });
             }
         }
-        if pointer.button_pressed(egui::PointerButton::Middle) && response.hovered() {
+        if pointer.button_pressed(egui::PointerButton::Secondary) {
+            self.secondary_panned = false;
+        }
+        if (pointer.button_pressed(egui::PointerButton::Middle)
+            || pointer.button_pressed(egui::PointerButton::Secondary))
+            && response.hovered()
+        {
             if let Some(p) = pointer.interact_pos() {
                 self.gesture = Some(Gesture {
                     kind: GestureKind::Pan,
@@ -575,8 +911,10 @@ impl CanvasState {
         }
         let owns_pointer = response.hovered()
             || response.dragged_by(egui::PointerButton::Primary)
+            || response.dragged_by(egui::PointerButton::Secondary)
             || response.dragged_by(egui::PointerButton::Middle)
             || response.drag_stopped_by(egui::PointerButton::Primary)
+            || response.drag_stopped_by(egui::PointerButton::Secondary)
             || response.drag_stopped_by(egui::PointerButton::Middle);
         if let Some(p) = owns_pointer
             .then(|| pointer.interact_pos())
@@ -599,6 +937,9 @@ impl CanvasState {
                     match gesture.kind {
                         GestureKind::Pan => {
                             self.pan += pointer.delta();
+                            self.secondary_panned |= pointer
+                                .button_down(egui::PointerButton::Secondary)
+                                || pointer.button_released(egui::PointerButton::Secondary);
                         }
                         GestureKind::Marquee => {
                             let marquee = Rect::from_two_pos(gesture.start, gesture.current);
@@ -681,9 +1022,11 @@ impl CanvasState {
                     }
                 }
                 let stopped = response.drag_stopped_by(egui::PointerButton::Primary)
+                    || response.drag_stopped_by(egui::PointerButton::Secondary)
                     || response.drag_stopped_by(egui::PointerButton::Middle)
                     || response.hovered()
                         && (pointer.button_released(egui::PointerButton::Primary)
+                            || pointer.button_released(egui::PointerButton::Secondary)
                             || pointer.button_released(egui::PointerButton::Middle));
                 if stopped {
                     if gesture.changed && gesture.draft.is_some() && !gesture.edits.is_empty() {
@@ -742,6 +1085,55 @@ impl CanvasState {
                 pair_transform,
                 &pair_keys,
             );
+            if self.selected.iter().any(Vec::is_empty) && self.inspector == Some(pair_root) {
+                workspace_painter.rect_stroke(
+                    pair_transform * mask_rect,
+                    0.0,
+                    Stroke::new(1.5, selection_color),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if self.grid_visible {
+                let mask_screen = pair_transform * mask_rect;
+                let grid_painter =
+                    workspace_painter.with_clip_rect(viewport.intersect(mask_screen));
+                let minimum = (8.0 / self.zoom).max(1.0);
+                let magnitude = 10.0_f32.powf(minimum.log10().floor());
+                let step = [1.0, 2.0, 5.0, 10.0]
+                    .into_iter()
+                    .map(|factor| factor * magnitude)
+                    .find(|step| *step >= minimum)
+                    .unwrap_or(10.0 * magnitude);
+                let color = ui.visuals().text_color().gamma_multiply(0.25);
+                let visible = (pair_transform.inverse() * viewport).intersect(mask_rect);
+                if visible.is_positive() {
+                    for horizontal in [false, true] {
+                        let (start, end) = if horizontal {
+                            (visible.top(), visible.bottom())
+                        } else {
+                            (visible.left(), visible.right())
+                        };
+                        for index in (start / step).ceil() as i32..=(end / step).floor() as i32 {
+                            let coordinate = index as f32 * step;
+                            let (a, b) = if horizontal {
+                                (
+                                    egui::pos2(visible.left(), coordinate),
+                                    egui::pos2(visible.right(), coordinate),
+                                )
+                            } else {
+                                (
+                                    egui::pos2(coordinate, visible.top()),
+                                    egui::pos2(coordinate, visible.bottom()),
+                                )
+                            };
+                            grid_painter.line_segment(
+                                [pair_transform * a, pair_transform * b],
+                                Stroke::new(1.0, color),
+                            );
+                        }
+                    }
+                }
+            }
             if captions {
                 if let Some(object) = ObjectId::new(pair_root)
                     .ok()
@@ -899,71 +1291,74 @@ impl CanvasState {
             }
         }
         let hit_tolerance = 3.0 / self.zoom;
-        response.context_menu(|ui| {
-            ui.menu_button("Select layer", |ui| {
-                if let Some(pos) = hover {
-                    for item in scene.items.iter().rev().filter(|i| {
-                        i.target.is_some()
-                            && i.hit_rect.width() >= 0.0
-                            && i.hit_rect.height() >= 0.0
-                            && i.hit_rect.expand(hit_tolerance).contains(pos)
-                    }) {
-                        if ui
-                            .button(format!(
-                                "{} · depth {}",
-                                project.format_object_id(item.object_id),
-                                item.path.len()
-                            ))
-                            .clicked()
-                        {
-                            self.selected = vec![item.path.clone()];
-                            self.context = item.path[..item.path.len().saturating_sub(1)].to_vec();
-                            self.sync_selection(project, &scene);
-                            ui.close();
+        if !self.secondary_panned {
+            response.context_menu(|ui| {
+                ui.menu_button("Select layer", |ui| {
+                    if let Some(pos) = hover {
+                        for item in scene.items.iter().rev().filter(|i| {
+                            i.target.is_some()
+                                && i.hit_rect.width() >= 0.0
+                                && i.hit_rect.height() >= 0.0
+                                && i.hit_rect.expand(hit_tolerance).contains(pos)
+                        }) {
+                            if ui
+                                .button(format!(
+                                    "{} · depth {}",
+                                    project.format_object_id(item.object_id),
+                                    item.path.len()
+                                ))
+                                .clicked()
+                            {
+                                self.selected = vec![item.path.clone()];
+                                self.context =
+                                    item.path[..item.path.len().saturating_sub(1)].to_vec();
+                                self.sync_selection(project, &scene);
+                                ui.close();
+                            }
                         }
                     }
+                });
+                if ui
+                    .add_enabled(!items.is_empty(), egui::Button::new("Duplicate · Ctrl+D"))
+                    .clicked()
+                {
+                    self.commit(
+                        project,
+                        "Duplicate placements",
+                        move_edits(project, &root_items(items.clone()), Vec2::ZERO, true),
+                    );
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        !items.is_empty(),
+                        egui::Button::new("Remove placements · Delete"),
+                    )
+                    .clicked()
+                {
+                    self.commit(
+                        project,
+                        "Remove placements",
+                        root_items(items.clone())
+                            .into_iter()
+                            .filter_map(|i| i.target.map(|target| CanvasEdit::Remove { target }))
+                            .collect(),
+                    );
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(self.mask.is_some(), egui::Button::new("Fit mask · Shift+1"))
+                    .clicked()
+                {
+                    self.fit = Some(false);
+                    ui.close();
+                }
+                if ui.button("Fit selection · Shift+2").clicked() {
+                    self.fit = Some(true);
+                    ui.close();
                 }
             });
-            if ui
-                .add_enabled(!items.is_empty(), egui::Button::new("Duplicate · Ctrl+D"))
-                .clicked()
-            {
-                self.commit(
-                    project,
-                    "Duplicate placements",
-                    move_edits(project, &root_items(items.clone()), Vec2::ZERO, true),
-                );
-                ui.close();
-            }
-            if ui
-                .add_enabled(
-                    !items.is_empty(),
-                    egui::Button::new("Remove placements · Delete"),
-                )
-                .clicked()
-            {
-                self.commit(
-                    project,
-                    "Remove placements",
-                    root_items(items.clone())
-                        .into_iter()
-                        .filter_map(|i| i.target.map(|target| CanvasEdit::Remove { target }))
-                        .collect(),
-                );
-                ui.close();
-            }
-            if ui
-                .add_enabled(self.mask.is_some(), egui::Button::new("Fit mask · Shift+1"))
-                .clicked()
-            {
-                self.fit = Some(false);
-                ui.close();
-            }
-            if ui.button("Fit selection · Shift+2").clicked() {
-                self.fit = Some(true);
-                ui.close();
-            }
-        });
+        }
         if matches!(
             self.gesture.as_ref().map(|g| &g.kind),
             Some(GestureKind::Pan)
@@ -999,6 +1394,12 @@ impl CanvasState {
         transform: egui::emath::TSTransform,
         softkeys: &super::softkeys::SoftKeys,
     ) {
+        let render_scale_id = egui::Id::new("vt_render_scale");
+        let previous_scale = ui.ctx().data_mut(|data| {
+            let previous = data.get_temp::<f32>(render_scale_id);
+            data.insert_temp(render_scale_id, transform.scaling);
+            previous
+        });
         let workspace_painter = ui.painter().with_clip_rect(viewport);
         let mask_fill = ui.visuals().extreme_bg_color;
         let mask_screen_rect = transform * mask_rect;
@@ -1108,6 +1509,13 @@ impl CanvasState {
                 super::softkeys::SlotContent::Empty => {}
             }
         }
+        ui.ctx().data_mut(|data| {
+            if let Some(scale) = previous_scale {
+                data.insert_temp(render_scale_id, scale);
+            } else {
+                data.remove::<f32>(render_scale_id);
+            }
+        });
     }
 
     fn change_softkey_page(&mut self, page: usize) {
@@ -1125,7 +1533,7 @@ impl CanvasState {
         scene
             .items
             .iter()
-            .filter(|i| self.selected.contains(&i.path))
+            .filter(|i| !i.path.is_empty() && self.selected.contains(&i.path))
             .cloned()
             .collect()
     }
@@ -1170,6 +1578,17 @@ impl CanvasState {
             .and_then(|p| scene.items.iter().find(|i| &i.path == p))
             .map(|i| i.object_id);
         self.inspector = id;
+        self.remember_scene(scene);
+        self.placement_owner = self
+            .selected
+            .last()
+            .and_then(|path| {
+                scene
+                    .items
+                    .iter()
+                    .find(|item| &item.path == path && item.target.is_some())
+            })
+            .map(|item| item.object_id);
         project
             .get_mut_selected()
             .set(NullableObjectId(id.and_then(|id| ObjectId::new(id).ok())));
@@ -1239,6 +1658,7 @@ impl CanvasState {
                 self.fit_all = true;
             }
             ui.separator();
+            ui.checkbox(&mut self.grid_visible, "Grid");
             ui.strong("SNAP");
             ui.checkbox(&mut self.snap_objects, "Snap objects");
             ui.checkbox(&mut self.snap_spacing, "Snap spacing");
@@ -1250,7 +1670,7 @@ impl CanvasState {
                 ui.label("Alt-hover: measure · Arrow: 1 px · Shift+Arrow: 10 px");
                 ui.label("Resize: Shift = aspect ratio · Alt = from center");
                 ui.label("Ctrl+D: duplicate · Delete: remove placement · Esc: cancel");
-                ui.label("Space-drag / middle mouse: pan · Ctrl-wheel: zoom");
+                ui.label("Space-drag / middle / right mouse: pan · Ctrl-wheel: zoom");
                 ui.label("Shift+1: fit mask · Shift+2: fit selection");
             });
         });

@@ -239,31 +239,91 @@ fn download(filename: &str, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+type UploadedFile = Result<(String, Vec<u8>), String>;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn execute_file_dialog(future: impl std::future::Future<Output = ()> + Send + 'static) {
+    std::thread::spawn(move || futures::executor::block_on(future));
+}
+
+#[cfg(target_arch = "wasm32")]
+fn execute_file_dialog(future: impl std::future::Future<Output = ()> + 'static) {
+    wasm_bindgen_futures::spawn_local(future);
+}
+
+fn start_graphic_upload(ui: &egui::Ui, busy_key: egui::Id, files_key: egui::Id) {
+    ui.data_mut(|data| data.insert_temp(busy_key, true));
+    let ctx = ui.ctx().clone();
+    execute_file_dialog(async move {
+        let files = rfd::AsyncFileDialog::new()
+            .add_filter(
+                "Image Files",
+                &[
+                    "png", "jpg", "jpeg", "bmp", "gif", "ico", "tiff", "tif", "webp",
+                ],
+            )
+            .pick_files()
+            .await;
+        let mut loaded = Vec::new();
+        if let Some(files) = files {
+            for file in files {
+                let filename = file.file_name();
+                #[cfg(not(target_arch = "wasm32"))]
+                let result = std::fs::read(file.path())
+                    .map(|bytes| (filename.clone(), bytes))
+                    .map_err(|error| format!("{filename}: {error}"));
+                #[cfg(target_arch = "wasm32")]
+                let result: UploadedFile = Ok((filename, file.read().await));
+                loaded.push(result);
+            }
+        }
+        ctx.data_mut(|data| {
+            data.insert_temp(files_key, loaded);
+            data.insert_temp(busy_key, false);
+        });
+        ctx.request_repaint();
+    });
+}
+
 pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
     ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
     ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
     ui.spacing_mut().interact_size.y = 26.0;
     ui.heading("Graphics");
     let mut error = None;
-    #[cfg(not(target_arch = "wasm32"))]
-    if ui.button("Upload Graphic").clicked() {
-        if let Some(path) = rfd::FileDialog::new().pick_file() {
-            let result = std::fs::read(&path)
-                .map_err(|error| error.to_string())
-                .and_then(|bytes| {
-                    GraphicService::upload(project, &path.to_string_lossy(), bytes)
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                });
-            error = result.err();
+    let project_session = project.ui_session_id();
+    let busy_key = egui::Id::new(("graphic_upload_busy", project_session));
+    let files_key = egui::Id::new(("graphic_upload_files", project_session));
+    if let Some(files) = ui.data_mut(|data| data.get_temp::<Vec<UploadedFile>>(files_key)) {
+        ui.data_mut(|data| data.remove::<Vec<UploadedFile>>(files_key));
+        let failures = upload_graphic_files(project, files);
+        if !failures.is_empty() {
+            error = Some(format!(
+                "Some graphics could not be imported:\n{}",
+                failures.join("\n")
+            ));
         }
     }
-    let search_key = ui.id().with("graphic_search");
+    let busy = ui.data_mut(|data| data.get_temp::<bool>(busy_key).unwrap_or(false));
+    if ui
+        .add_enabled(
+            !busy,
+            egui::Button::new(if busy {
+                "Importing…"
+            } else {
+                "Upload Graphics"
+            }),
+        )
+        .clicked()
+    {
+        start_graphic_upload(ui, busy_key, files_key);
+    }
+    let search_key = ui.id().with(("graphic_search", project_session));
     let mut search = ui.data_mut(|data| data.get_temp::<String>(search_key).unwrap_or_default());
     ui.add(egui::TextEdit::singleline(&mut search).hint_text("Search graphics..."));
     ui.data_mut(|data| data.insert_temp(search_key, search.clone()));
     let search = search.to_lowercase();
-    let assign_key = ui.id().with("graphic_assign");
+    let assign_key = ui.id().with(("graphic_assign", project_session));
     let mut assigning = ui.data_mut(|data| data.get_temp::<GraphicAssetId>(assign_key));
 
     ui.strong("PICTURE GRAPHICS");
@@ -394,7 +454,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
             data.insert_temp(assign_key, id);
         }
     });
-    let key = ui.id().with("graphic_error");
+    let key = ui.id().with(("graphic_error", project_session));
     if let Some(error) = error {
         ui.data_mut(|data| data.insert_temp(key, error));
     }
@@ -404,6 +464,21 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
             ui.data_mut(|data| data.remove::<String>(key));
         }
     }
+}
+
+fn upload_graphic_files(project: &mut EditorProject, files: Vec<UploadedFile>) -> Vec<String> {
+    files
+        .into_iter()
+        .filter_map(|file| {
+            let (filename, bytes) = match file {
+                Ok(file) => file,
+                Err(error) => return Some(error),
+            };
+            GraphicService::upload(project, &filename, bytes)
+                .err()
+                .map(|error| format!("{filename}: {error}"))
+        })
+        .collect()
 }
 
 /// Shared picker for component references, retaining create-from-asset behavior.
@@ -494,6 +569,13 @@ pub fn select(
 mod tests {
     use super::*;
 
+    fn png_bytes() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(2, 3, image::Rgba([10, 20, 30, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
     #[test]
     fn thumbnail_grid_reflows_when_panel_narrows() {
         let context = egui::Context::default();
@@ -529,5 +611,31 @@ mod tests {
                 assert!(positions.iter().all(|rect| rect.right() <= width));
             }
         }
+    }
+
+    #[test]
+    fn multi_file_import_keeps_valid_files_and_names_each_failure() {
+        let mut project = EditorProject::new_pool();
+        let failures = upload_graphic_files(
+            &mut project,
+            vec![
+                Ok(("good.png".into(), png_bytes())),
+                Ok(("broken.webp".into(), b"not an image".to_vec())),
+            ],
+        );
+
+        assert_eq!(project.graphic_library().assets.len(), 1);
+        assert_eq!(
+            project
+                .graphic_library()
+                .assets
+                .values()
+                .next()
+                .unwrap()
+                .name,
+            "good"
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].starts_with("broken.webp: "));
     }
 }

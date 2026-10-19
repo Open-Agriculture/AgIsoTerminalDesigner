@@ -15,7 +15,7 @@ pub struct SharedAttributes {
     kind: ObjectType,
     query: String,
     name: String,
-    draft_key: Option<(ObjectId, u64)>,
+    draft_key: Option<(ObjectId, u64, uuid::Uuid)>,
     session: u64,
 }
 
@@ -122,6 +122,20 @@ impl SharedAttributes {
         project: &mut EditorProject,
         error: &mut Option<String>,
     ) -> bool {
+        // A different pane can change selection before this window is rendered.
+        // Finish the old name against its original object rather than replacing it.
+        if let Some((id, revision, session)) = self.draft_key {
+            if !self.open || project.get_selected().0 != Some(id) {
+                if revision == project.revision() && session == project.ui_session_id() {
+                    if let Some(object) = project.get_pool().object_by_id(id) {
+                        if self.name != project.get_object_info(object).get_name(object) {
+                            project.rename_object(id, self.name.clone());
+                        }
+                    }
+                }
+                self.draft_key = None;
+            }
+        }
         if !self.open {
             return false;
         }
@@ -131,7 +145,7 @@ impl SharedAttributes {
             .and_then(|id| project.get_pool().object_by_id(id))
             .filter(|object| TYPES.iter().any(|(kind, _)| *kind == object.object_type()));
         if let Some(object) = selected {
-            let key = (object.id(), project.revision());
+            let key = (object.id(), project.revision(), project.ui_session_id());
             if self.draft_key != Some(key) {
                 if self.draft_key.map(|key| key.0) != Some(object.id()) {
                     self.kind = object.object_type();
@@ -149,7 +163,7 @@ impl SharedAttributes {
             .open(&mut self.open)
             .default_size([800.0, 580.0])
             .show(ctx, |ui| {
-                ui.label("Edits apply immediately and are undoable. Every consumer shares the same attribute object.");
+                ui.label("Press Enter or leave a field to save. Edits are undoable, and every consumer shares the same attribute object.");
                 ui.horizontal(|ui| {
                     for (kind, label) in TYPES {
                         ui.selectable_value(&mut next_kind, kind, label);
@@ -188,8 +202,20 @@ impl SharedAttributes {
                             let id = object.id();
                             let uses = usage(project, id);
                             ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(220.0));
-                                if ui.button("Rename").clicked() { action = Some(Action::Rename(id, self.name.clone())); }
+                                let response = ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(220.0));
+                                let original = project.get_object_info(object).get_name(object);
+                                let cancelled = response.has_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Escape));
+                                if cancelled {
+                                    self.name = original;
+                                    response.surrender_focus();
+                                } else if (response.lost_focus()
+                                    || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))))
+                                    && self.name != original
+                                {
+                                    action = Some(Action::Rename(id, self.name.clone()));
+                                    response.surrender_focus();
+                                }
                             });
                             ui.horizontal(|ui| {
                                 if ui.button("Duplicate").clicked() { action = Some(Action::Duplicate(id)); }
@@ -289,6 +315,39 @@ mod tests {
         let mut project = EditorProject::from(pool);
         project.mask_size = 500;
         project
+    }
+
+    #[test]
+    fn name_draft_follows_its_original_object_when_selection_changes() {
+        let mut project = project();
+        let id = ObjectId::new(23000).unwrap();
+        let original = project
+            .get_object_info(project.get_pool().object_by_id(id).unwrap())
+            .get_name(project.get_pool().object_by_id(id).unwrap());
+        let mut attributes = SharedAttributes {
+            name: "Renamed font".into(),
+            draft_key: Some((id, project.revision(), project.ui_session_id())),
+            ..Default::default()
+        };
+        project
+            .get_mut_selected()
+            .set(ObjectId::new(11000).unwrap().into());
+        project.update_selected();
+        attributes.show(&egui::Context::default(), &mut project, &mut None);
+        assert_eq!(
+            project
+                .get_object_info(project.get_pool().object_by_id(id).unwrap())
+                .name
+                .as_deref(),
+            Some("Renamed font")
+        );
+        assert!(project.undo_operation());
+        assert_eq!(
+            project
+                .get_object_info(project.get_pool().object_by_id(id).unwrap())
+                .get_name(project.get_pool().object_by_id(id).unwrap()),
+            original
+        );
     }
 
     #[test]

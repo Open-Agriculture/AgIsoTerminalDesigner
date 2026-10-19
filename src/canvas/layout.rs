@@ -807,13 +807,20 @@ pub(super) fn snap_delta(
     (result.round(), guides)
 }
 pub(super) fn label(p: &egui::Painter, pos: Pos2, text: String, color: Color32) {
-    p.text(
-        pos + egui::vec2(3.0, -3.0),
-        egui::Align2::LEFT_BOTTOM,
-        text,
-        egui::FontId::monospace(11.0),
-        color,
+    let galley = p.layout_no_wrap(text, egui::FontId::monospace(14.0), color);
+    let mut rect = Rect::from_min_size(
+        pos + egui::vec2(3.0, -3.0) - egui::vec2(0.0, galley.size().y),
+        galley.size(),
+    )
+    .expand2(egui::vec2(4.0, 2.0));
+    let clip = p.clip_rect();
+    let shift = egui::vec2(
+        (clip.left() - rect.left()).max(0.0) - (rect.right() - clip.right()).max(0.0),
+        (clip.top() - rect.top()).max(0.0) - (rect.bottom() - clip.bottom()).max(0.0),
     );
+    rect = rect.translate(shift);
+    p.rect_filled(rect, 3.0, Color32::from_rgba_unmultiplied(20, 23, 27, 240));
+    p.galley(rect.min + egui::vec2(4.0, 2.0), galley, color);
 }
 pub(super) fn measure(
     p: &egui::Painter,

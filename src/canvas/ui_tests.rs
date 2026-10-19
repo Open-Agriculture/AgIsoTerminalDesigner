@@ -268,6 +268,13 @@ fn external_structure_change_does_not_retarget_canvas_selection() {
         }],
     });
     h.project.execute_transaction(transaction).unwrap();
+    assert_eq!(
+        h.state.selected_placement(&h.project),
+        Some(PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index: 0,
+        })
+    );
     h.frame(vec![], Modifiers::NONE);
     assert_eq!(h.state.selected, vec![vec![0]]);
     h.key(Key::ArrowRight, Modifiers::NONE);
@@ -926,4 +933,342 @@ fn mask_navigation_centers_the_pair_and_only_zooms_out() {
     assert_eq!(h.masks.as_ref().unwrap().focused, Some(1));
     assert_eq!(h.state.pan, pan);
     assert_eq!(h.state.zoom, zoom);
+}
+
+#[test]
+fn background_selects_mask_without_allowing_placement_deletion() {
+    let mut h = Harness::new(false);
+    let p = h.screen(egui::pos2(10.0, 10.0));
+    h.pointer(p, Some(true), Modifiers::NONE);
+    h.pointer(p, Some(false), Modifiers::NONE);
+    assert_eq!(h.project.get_selected().0.map(|id| id.value()), Some(1));
+    assert!(h.state.selected_placement(&h.project).is_none());
+    let revision = h.project.revision();
+    h.key(Key::Delete, Modifiers::NONE);
+    assert_eq!(h.project.revision(), revision);
+}
+
+#[test]
+fn secondary_drag_pans_without_changing_selection_or_project() {
+    let mut h = Harness::new(false);
+    let selected_pos = h.screen(egui::pos2(110.0, 110.0));
+    h.pointer(selected_pos, Some(true), Modifiers::NONE);
+    h.pointer(selected_pos, Some(false), Modifiers::NONE);
+    let selected = h.project.get_selected();
+    let revision = h.project.revision();
+    let initial = h.state.pan;
+    let p = h.screen(egui::pos2(110.0, 110.0));
+    h.frame(
+        vec![
+            egui::Event::PointerMoved(p),
+            egui::Event::PointerButton {
+                pos: p,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+        Modifiers::NONE,
+    );
+    let end = p + egui::vec2(32.0, 18.0);
+    h.frame(vec![egui::Event::PointerMoved(end)], Modifiers::NONE);
+    h.frame(
+        vec![egui::Event::PointerButton {
+            pos: end,
+            button: egui::PointerButton::Secondary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+        Modifiers::NONE,
+    );
+    assert_eq!(h.state.pan, initial + egui::vec2(32.0, 18.0));
+    assert!(h.state.gesture.is_none());
+    assert_eq!(h.project.get_selected(), selected);
+    assert_eq!(h.project.revision(), revision);
+    assert!(!h.output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains("Duplicate ·"))));
+}
+
+#[test]
+fn grid_overlay_does_not_edit_or_change_snapping() {
+    let mut h = Harness::new(false);
+    let revision = h.project.revision();
+    assert!(!h.state.grid_visible());
+    h.state.set_grid_visible(true);
+    h.frame(vec![], Modifiers::NONE);
+    assert!(h.state.grid_visible());
+    assert!(h.state.snap_objects && h.state.snap_spacing);
+    assert_eq!(h.project.revision(), revision);
+}
+
+#[test]
+fn mask_caption_selects_the_mask() {
+    let mut h = Harness::new(false);
+    let mut masks = super::super::MaskViewState::default();
+    masks.visible = vec![1];
+    masks.focused = Some(1);
+    h.masks = Some(masks);
+    h.frame(vec![], Modifiers::NONE);
+    let offset = h.state.pair_layout[0].1;
+    let p = h.screen(egui::pos2(20.0, -12.0) + offset);
+    h.pointer(p, Some(true), Modifiers::NONE);
+    h.pointer(p, Some(false), Modifiers::NONE);
+    assert_eq!(h.project.get_selected().0.map(|id| id.value()), Some(1));
+}
+
+#[test]
+fn stationary_secondary_click_still_opens_canvas_context_menu() {
+    let mut h = Harness::new(false);
+    let p = h.screen(egui::pos2(80.0, 80.0));
+    let before = h.state.pan;
+    for pressed in [true, false] {
+        h.frame(
+            vec![
+                egui::Event::PointerMoved(p),
+                egui::Event::PointerButton {
+                    pos: p,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            Modifiers::NONE,
+        );
+    }
+    h.frame(vec![], Modifiers::NONE);
+    assert_eq!(h.state.pan, before);
+    assert!(!h.state.secondary_panned);
+    assert!(h.output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text().contains("Duplicate ·"))));
+}
+
+#[test]
+fn tree_softkey_origins_and_cross_mask_reparent_use_physical_key_geometry() {
+    let mut h = Harness::new(false);
+    let mut pool = h.project.get_pool().clone();
+    if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(1).unwrap()) {
+        mask.soft_key_mask = NullableObjectId::new(10);
+    }
+    let mut softmask = default_object(ObjectType::SoftKeyMask);
+    softmask.mut_id().set_value(10).unwrap();
+    if let Object::SoftKeyMask(mask) = &mut softmask {
+        mask.objects = vec![ObjectId::new(11).unwrap(), ObjectId::new(12).unwrap()];
+    }
+    let mut key = default_object(ObjectType::Key);
+    key.mut_id().set_value(11).unwrap();
+    if let Object::Key(key) = &mut key {
+        key.object_refs = vec![ObjectRef {
+            id: ObjectId::new(2).unwrap(),
+            offset: Point { x: 5, y: 5 },
+        }];
+    }
+    let mut pointer = default_object(ObjectType::ObjectPointer);
+    pointer.mut_id().set_value(12).unwrap();
+    if let Object::ObjectPointer(pointer) = &mut pointer {
+        pointer.value = NullableObjectId::new(11);
+    }
+    pool.add(softmask);
+    pool.add(key);
+    pool.add(pointer);
+    h.project = EditorProject::from(pool);
+    h.project.mask_size = 500;
+    h.state = CanvasState::default();
+    h.frame(vec![], Modifiers::NONE);
+    let keys = super::super::softkeys::build(&h.project, h.project.get_pool(), 1, 0);
+    assert_eq!(
+        h.state.hierarchy_child_origin(&h.project, 1, &[0]).unwrap(),
+        Pos2::ZERO
+    );
+    assert_eq!(
+        h.state.hierarchy_child_origin(&h.project, 1, &[1]).unwrap(),
+        keys.slots[0].rect.min
+    );
+    assert_eq!(
+        h.state
+            .hierarchy_child_origin(&h.project, 1, &[2, usize::MAX])
+            .unwrap(),
+        keys.slots[1].rect.min
+    );
+    let target = PlacementTarget::Primitive {
+        parent_id: 1,
+        child_index: 0,
+    };
+    let moved = h
+        .state
+        .reparent_in_hierarchy(&mut h.project, &target, 1, &[0], 1, &[1], 11)
+        .unwrap();
+    assert_eq!(
+        position(&h.project, &moved),
+        Some((
+            0,
+            100.min(i32::from(h.project.soft_key_size().1) - 30) as i16
+        ))
+    );
+    let (x, y) = position(&h.project, &moved).unwrap();
+    let expected = keys.slots[0].rect.min + egui::vec2(f32::from(x), f32::from(y));
+    let returned = h
+        .state
+        .reparent_in_hierarchy(&mut h.project, &moved, 1, &[1], 1, &[0], 1)
+        .unwrap();
+    assert_eq!(
+        position(&h.project, &returned),
+        Some((
+            expected.x.round().clamp(0.0, 460.0) as i16,
+            expected.y.round().clamp(0.0, 470.0) as i16
+        ))
+    );
+}
+
+#[test]
+fn hidden_nonstructural_edits_retain_the_second_occurrence_for_duplicate_and_remove() {
+    for duplicate in [true, false] {
+        let mut h = Harness::new(false);
+        let second = PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index: 1,
+        };
+        assert!(h.state.select_placement(&h.project, 1, second.clone()));
+        h.project.update_selected();
+        h.project.queue_operation(Operation::RenameObject {
+            object: ObjectTarget::id(2),
+            name: "Renamed rectangle".into(),
+        });
+        assert!(h.project.commit_queued("Rename while canvas hidden"));
+        edits::apply(
+            &mut h.project,
+            "Resize while canvas hidden",
+            &[CanvasEdit::Resize {
+                object_id: 2,
+                width: Some(41),
+                height: None,
+            }],
+        )
+        .unwrap();
+        if !duplicate {
+            h.frame(vec![], Modifiers::NONE);
+        }
+        assert_eq!(h.state.selected_placement(&h.project), Some(second));
+        assert!(h.state.has_placement_selection(&h.project));
+        if duplicate {
+            assert!(h.state.duplicate_selection(&mut h.project));
+            let Object::DataMask(mask) = h
+                .project
+                .get_pool()
+                .object_by_id(ObjectId::new(1).unwrap())
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(mask.object_refs.len(), 3);
+            assert_eq!(mask.object_refs[2].offset, Point { x: 220, y: 100 });
+        } else {
+            assert!(h.state.remove_selection(&mut h.project));
+            let Object::DataMask(mask) = h
+                .project
+                .get_pool()
+                .object_by_id(ObjectId::new(1).unwrap())
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(mask.object_refs.len(), 1);
+            assert_eq!(mask.object_refs[0].offset, Point { x: 100, y: 100 });
+        }
+    }
+}
+
+#[test]
+fn structural_revision_keeps_stale_occurrences_distinct_from_pool_definitions() {
+    let mut h = Harness::new(false);
+    assert!(h.state.select_placement(
+        &h.project,
+        1,
+        PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index: 1
+        }
+    ));
+    h.project.update_selected();
+    edits::apply(
+        &mut h.project,
+        "Remove selected occurrence",
+        &[CanvasEdit::Remove {
+            target: PlacementTarget::Primitive {
+                parent_id: 1,
+                child_index: 1,
+            },
+        }],
+    )
+    .unwrap();
+    assert!(h.state.selected_placement(&h.project).is_none());
+    assert!(h.state.has_placement_selection(&h.project));
+    h.frame(vec![], Modifiers::NONE);
+    assert!(h.state.selected_placement(&h.project).is_none());
+    assert!(h.state.has_placement_selection(&h.project));
+}
+
+#[test]
+fn revealing_the_same_softkey_page_retains_the_second_child_occurrence() {
+    for duplicate in [true, false] {
+        let mut h = Harness::new(false);
+        let mut pool = h.project.get_pool().clone();
+        if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(1).unwrap()) {
+            mask.soft_key_mask = NullableObjectId::new(10);
+        }
+        let mut softmask = default_object(ObjectType::SoftKeyMask);
+        softmask.mut_id().set_value(10).unwrap();
+        if let Object::SoftKeyMask(mask) = &mut softmask {
+            mask.objects = vec![ObjectId::new(11).unwrap()];
+        }
+        let mut key = default_object(ObjectType::Key);
+        key.mut_id().set_value(11).unwrap();
+        if let Object::Key(key) = &mut key {
+            key.object_refs = vec![
+                ObjectRef {
+                    id: ObjectId::new(2).unwrap(),
+                    offset: Point { x: 5, y: 5 },
+                },
+                ObjectRef {
+                    id: ObjectId::new(2).unwrap(),
+                    offset: Point { x: 50, y: 5 },
+                },
+            ];
+        }
+        pool.add(softmask);
+        pool.add(key);
+        h.project = EditorProject::from(pool);
+        h.project.mask_size = 500;
+        h.state = CanvasState::default();
+        h.frame(vec![], Modifiers::NONE);
+        let second = PlacementTarget::Primitive {
+            parent_id: 11,
+            child_index: 1,
+        };
+        h.state.select_softkey_slot(&h.project, 1, 0);
+        assert!(h.state.select_placement(&h.project, 1, second.clone()));
+        h.project.update_selected();
+        // Repeated reveal must also retain the exact occurrence when called
+        // after selection, as older hierarchy call sites did.
+        h.state.select_softkey_slot(&h.project, 1, 0);
+        h.frame(vec![], Modifiers::NONE);
+        assert_eq!(h.state.selected_placement(&h.project), Some(second));
+        if duplicate {
+            assert!(h.state.duplicate_selection(&mut h.project));
+        } else {
+            assert!(h.state.remove_selection(&mut h.project));
+        }
+        let Object::Key(key) = h
+            .project
+            .get_pool()
+            .object_by_id(ObjectId::new(11).unwrap())
+            .unwrap()
+        else {
+            panic!()
+        };
+        if duplicate {
+            assert_eq!(key.object_refs.len(), 3);
+            assert_eq!(key.object_refs[2].offset, Point { x: 50, y: 5 });
+        } else {
+            assert_eq!(key.object_refs.len(), 1);
+            assert_eq!(key.object_refs[0].offset, Point { x: 5, y: 5 });
+        }
+    }
 }

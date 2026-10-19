@@ -19,6 +19,9 @@ pub struct ObjectInfo {
     /// Optional semantic description used by graphics discovery.
     pub description: Option<String>,
 
+    /// Optional authoring notes that are persisted with the project.
+    pub notes: Option<String>,
+
     /// Searchable semantic tags used by graphics discovery.
     pub tags: Vec<String>,
 
@@ -36,6 +39,7 @@ impl ObjectInfo {
             unique_id: Uuid::new_v4(),
             name: None,
             description: None,
+            notes: None,
             tags: vec![],
             allowed_references: vec![],
             id_overridden: false,
@@ -66,6 +70,7 @@ impl ObjectInfo {
     pub(crate) fn content_eq(&self, other: &Self) -> bool {
         self.name == other.name
             && self.description == other.description
+            && self.notes == other.notes
             && self.tags == other.tags
             && self.allowed_references == other.allowed_references
             && self.id_overridden == other.id_overridden

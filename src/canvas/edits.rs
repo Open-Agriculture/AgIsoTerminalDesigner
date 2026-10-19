@@ -161,6 +161,224 @@ pub fn apply(
     Ok(touched)
 }
 
+/// Return the canvas origin for children of a canonical hierarchy occurrence.
+/// Paths use primitive child-list indices, with `usize::MAX` entering an
+/// ObjectPointer target, as displayed by the editor tree. Button face insets are
+/// included. The returned origin is mask-local and independent of viewport pan.
+pub fn hierarchy_child_origin(
+    project: &EditorProject,
+    root: u16,
+    path: &[usize],
+) -> Result<egui::Pos2, String> {
+    use ag_iso_stack::object_pool::object::Object;
+    let mut id = root;
+    let mut origin = egui::Pos2::ZERO;
+    for &index in path {
+        let object = project
+            .get_pool()
+            .object_by_id(object_id(id).map_err(|e| e.to_string())?)
+            .ok_or("Missing hierarchy object")?;
+        if index == usize::MAX {
+            let Object::ObjectPointer(pointer) = object else {
+                return Err("Invalid pointer hierarchy path".into());
+            };
+            id = pointer.value.0.ok_or("Empty pointer target")?.value();
+        } else {
+            if matches!(object, Object::Button(_)) {
+                origin += egui::vec2(
+                    crate::object_rendering::BUTTON_BORDER_INSET,
+                    crate::object_rendering::BUTTON_BORDER_INSET,
+                );
+            }
+            let child = object_refs(object)
+                .and_then(|children| children.get(index))
+                .ok_or("Invalid hierarchy path")?;
+            origin += egui::vec2(f32::from(child.offset.x), f32::from(child.offset.y));
+            id = child.id.value();
+        }
+    }
+    let parent = project
+        .get_pool()
+        .object_by_id(object_id(id).map_err(|e| e.to_string())?)
+        .ok_or("Missing destination object")?;
+    if matches!(parent, Object::Button(_)) {
+        origin += egui::vec2(
+            crate::object_rendering::BUTTON_BORDER_INSET,
+            crate::object_rendering::BUTTON_BORDER_INSET,
+        );
+    }
+    Ok(origin)
+}
+
+/// Reparent a tree occurrence while preserving its mask-local canvas position.
+/// Source and destination paths identify primitive parent occurrences, avoiding
+/// ambiguity when the same parent is placed more than once. Between masks, the
+/// position is retained relative to each mask's origin, rather than dock layout.
+pub fn reparent_in_hierarchy(
+    project: &mut EditorProject,
+    target: &PlacementTarget,
+    source_root: u16,
+    source_parent_path: &[usize],
+    dest_root: u16,
+    dest_parent_path: &[usize],
+    new_parent: u16,
+) -> Result<PlacementTarget, String> {
+    let source_origin = hierarchy_child_origin(project, source_root, source_parent_path)?;
+    let destination_origin = hierarchy_child_origin(project, dest_root, dest_parent_path)?;
+    let (x, y) = position(project, target).ok_or("Missing source occurrence")?;
+    let local = source_origin + egui::vec2(f32::from(x), f32::from(y)) - destination_origin;
+    reparent_at(
+        project,
+        target,
+        new_parent,
+        local.x.round() as i32,
+        local.y.round() as i32,
+    )
+}
+
+/// Move one exact occurrence into a primitive positioned-child parent.
+/// Local coordinates are retained where possible and clamped to fit the new
+/// parent's viewport. Oversized children, invalid relationships and cycles fail
+/// atomically; component instances retain their identities and overrides.
+pub fn reparent(
+    project: &mut EditorProject,
+    target: &PlacementTarget,
+    new_parent: u16,
+) -> Result<PlacementTarget, String> {
+    let (x, y) = position(project, target).ok_or("Missing source occurrence")?;
+    reparent_at(project, target, new_parent, i32::from(x), i32::from(y))
+}
+
+/// Reparent an occurrence at the requested destination-local coordinates.
+/// Callers preserving its canvas position subtract the destination child origin
+/// from the source canvas position before calling. Coordinates are clamped to
+/// fit the destination; failures leave source, destination and history intact.
+pub fn reparent_at(
+    project: &mut EditorProject,
+    target: &PlacementTarget,
+    new_parent: u16,
+    x: i32,
+    y: i32,
+) -> Result<PlacementTarget, String> {
+    use ag_iso_stack::object_pool::object::Object;
+    let materialized = project.materialize().map_err(|error| error.to_string())?;
+    let (child_id, old_parent) = match target {
+        PlacementTarget::Primitive {
+            parent_id,
+            child_index,
+        } => {
+            let placement =
+                child_placements(project.get_pool(), *parent_id).map_err(|e| e.to_string())?;
+            let child = placement
+                .get(*child_index)
+                .and_then(|p| target_id(&p.child))
+                .ok_or("Missing source occurrence")?;
+            (child, *parent_id)
+        }
+        PlacementTarget::Component { instance_id } => {
+            let instance = project
+                .component_source()
+                .instances
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .ok_or("Missing component occurrence")?;
+            let definition = &project.component_source().definitions[&instance.component_id];
+            let child = *materialized
+                .source_map
+                .by_component_node
+                .get(&(*instance_id, definition.root_node))
+                .ok_or("Missing component root")?;
+            let EditorParentRef::Primitive(parent) = instance.parent;
+            (child, parent)
+        }
+    };
+    if old_parent == new_parent {
+        return Ok(target.clone());
+    }
+    let parent = project
+        .get_pool()
+        .object_by_id(object_id(new_parent).map_err(|e| e.to_string())?)
+        .ok_or("Missing destination parent")?;
+    if object_refs(parent).is_none() {
+        return Err(format!(
+            "Destination {} (ID {new_parent}) does not support positioned children",
+            project.get_object_info(parent).get_name(parent)
+        ));
+    }
+    let (mut width, mut height) = match parent {
+        Object::DataMask(_) | Object::AlarmMask(_) => (project.mask_size, project.mask_size),
+        Object::Key(_) => project.soft_key_size(),
+        _ => project.get_pool().content_size(parent),
+    };
+    if matches!(parent, Object::Button(_)) {
+        let inset = (crate::object_rendering::BUTTON_BORDER_INSET * 2.0) as u16;
+        width = width.saturating_sub(inset);
+        height = height.saturating_sub(inset);
+    }
+    let child = materialized
+        .pool
+        .object_by_id(object_id(child_id).map_err(|e| e.to_string())?)
+        .ok_or("Missing source object")?;
+    let (child_width, child_height) = materialized.pool.content_size(child);
+    if child_width > width || child_height > height {
+        return Err(format!(
+            "Object {} (ID {child_id}) is too large for destination {} (ID {new_parent})",
+            project.get_object_info(child).get_name(child),
+            project.get_object_info(parent).get_name(parent)
+        ));
+    }
+    let x = x
+        .clamp(0, i32::from(width - child_width))
+        .min(i32::from(i16::MAX)) as i16;
+    let y = y
+        .clamp(0, i32::from(height - child_height))
+        .min(i32::from(i16::MAX)) as i16;
+    let version = project.vt_version;
+    let mut result = target.clone();
+    project
+        .edit_source(
+            "Move placement to parent",
+            |pool, source, _graphics, _info| {
+                match target {
+                    PlacementTarget::Primitive { .. } => {
+                        remove_target(pool, source, target, version)?;
+                        let mut children = child_placements(pool, new_parent)?;
+                        let index = children.len();
+                        children.push(ChildPlacement {
+                            child: ObjectTarget::id(child_id),
+                            x,
+                            y,
+                        });
+                        set_child_placements(pool, new_parent, children, version)?;
+                        result = PlacementTarget::Primitive {
+                            parent_id: new_parent,
+                            child_index: index,
+                        };
+                    }
+                    PlacementTarget::Component { instance_id } => {
+                        let instance = source
+                            .instances
+                            .iter()
+                            .find(|instance| instance.id == *instance_id)
+                            .cloned()
+                            .ok_or_else(invalid_placement)?;
+                        remove_target(pool, source, target, version)?;
+                        let mut moved = instance;
+                        moved.parent = EditorParentRef::Primitive(new_parent);
+                        moved.child_index =
+                            Some(insertion_index(pool, source, moved.parent.clone()));
+                        moved.x = i32::from(x);
+                        moved.y = i32::from(y);
+                        source.instances.push(moved);
+                    }
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
 fn normalize_touched_targets(targets: &mut [PlacementTarget], removals: &[PlacementTarget]) {
     for target in targets {
         if let PlacementTarget::Primitive {
@@ -383,7 +601,7 @@ fn duplicate_target(
                 .map_err(|e| ComponentError::new("CANVAS_DUPLICATE_FAILED", e.to_string()))?;
                 mapping.insert(*old, new);
             }
-            let new_root = mapping[&root_id];
+            let new_root = mapping.get(&root_id).copied().unwrap_or(root_id);
             for (old_id, new_id) in &mapping {
                 let old_object_id = object_id(*old_id)?;
                 let new_object_id = object_id(*new_id)?;
@@ -396,6 +614,7 @@ fn duplicate_target(
                 metadata.id_overridden = false;
                 if let Some(original) = copied_info.get(&old_object_id) {
                     metadata.description = original.description.clone();
+                    metadata.notes = original.notes.clone();
                     metadata.tags = original.tags.clone();
                     metadata.allowed_references = original
                         .allowed_references
@@ -452,6 +671,14 @@ fn collect_positioned_subtree(
     let object = pool.object_by_id(object_id(id)?).ok_or_else(|| {
         ComponentError::new("CANVAS_EDIT_INVALID", format!("Missing object {id}"))
     })?;
+    // Image data is a shared resource: duplicating placements and containers
+    // retains PictureGraphic identities rather than copying their pixel payload.
+    if matches!(
+        object,
+        ag_iso_stack::object_pool::object::Object::PictureGraphic(_)
+    ) {
+        return Ok(());
+    }
     ordered.push(id);
     for reference in object_refs(object).unwrap_or_default() {
         collect_positioned_subtree(pool, reference.id.value(), visited, ordered)?;
@@ -658,6 +885,265 @@ mod tests {
         let mut project = EditorProject::from(pool);
         project.mask_size = 500;
         project
+    }
+
+    #[test]
+    fn duplicated_picture_placements_and_nested_pictures_reuse_image_objects() {
+        let mut pool = ObjectPool::new();
+        pool.add(object_with_id(ObjectType::DataMask, 1));
+        pool.add(object_with_id(ObjectType::Container, 2));
+        pool.add(object_with_id(ObjectType::PictureGraphic, 3));
+        add_positioned_child(&mut pool, 1, 2, 0, 0);
+        add_positioned_child(&mut pool, 2, 3, 0, 0);
+        add_positioned_child(&mut pool, 1, 3, 0, 0);
+        let mut project = project(pool);
+        apply(
+            &mut project,
+            "Duplicate picture and parent",
+            &[
+                CanvasEdit::Duplicate {
+                    target: PlacementTarget::Primitive {
+                        parent_id: 1,
+                        child_index: 0,
+                    },
+                    x: 0,
+                    y: 0,
+                },
+                CanvasEdit::Duplicate {
+                    target: PlacementTarget::Primitive {
+                        parent_id: 1,
+                        child_index: 1,
+                    },
+                    x: 10,
+                    y: 10,
+                },
+            ],
+        )
+        .unwrap();
+        let placements = child_placements(project.get_pool(), 1).unwrap();
+        let copied_parent = target_id(&placements[2].child).unwrap();
+        assert_ne!(copied_parent, 2);
+        assert_eq!(
+            target_id(&child_placements(project.get_pool(), copied_parent).unwrap()[0].child),
+            Some(3)
+        );
+        assert_eq!(target_id(&placements[3].child), Some(3));
+        assert_eq!(
+            project
+                .get_pool()
+                .objects_by_type(ObjectType::PictureGraphic)
+                .len(),
+            1
+        );
+        assert!(project.undo_operation());
+        assert_eq!(child_placements(project.get_pool(), 1).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reparent_moves_one_repeated_occurrence_clamps_and_undoes_atomically() {
+        let mut pool = ObjectPool::new();
+        pool.add(object_with_id(ObjectType::DataMask, 1));
+        let mut container = object_with_id(ObjectType::Container, 2);
+        if let Object::Container(container) = &mut container {
+            container.width = 100;
+            container.height = 80;
+        }
+        pool.add(container);
+        let mut rectangle = object_with_id(ObjectType::OutputRectangle, 3);
+        if let Object::OutputRectangle(rectangle) = &mut rectangle {
+            rectangle.width = 30;
+            rectangle.height = 20;
+        }
+        pool.add(rectangle);
+        add_positioned_child(&mut pool, 1, 2, 0, 0);
+        add_positioned_child(&mut pool, 1, 3, 150, -10);
+        add_positioned_child(&mut pool, 1, 3, 5, 5);
+        let mut project = project(pool);
+        let target = PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index: 1,
+        };
+        let moved = reparent(&mut project, &target, 2).unwrap();
+        assert_eq!(position(&project, &moved), Some((70, 0)));
+        assert_eq!(child_placements(project.get_pool(), 1).unwrap().len(), 2);
+        assert_eq!(child_placements(project.get_pool(), 1).unwrap()[1].x, 5);
+        assert!(project.undo_operation());
+        assert_eq!(position(&project, &target), Some((150, -10)));
+        assert!(child_placements(project.get_pool(), 2).unwrap().is_empty());
+        let revision = project.revision();
+        assert!(reparent(
+            &mut project,
+            &PlacementTarget::Primitive {
+                parent_id: 1,
+                child_index: 0
+            },
+            2
+        )
+        .is_err());
+        assert_eq!(project.revision(), revision);
+        apply(
+            &mut project,
+            "Shrink empty destination",
+            &[CanvasEdit::Resize {
+                object_id: 2,
+                width: Some(10),
+                height: Some(10),
+            }],
+        )
+        .unwrap();
+        let revision = project.revision();
+        assert!(reparent(&mut project, &target, 2)
+            .unwrap_err()
+            .contains("too large"));
+        assert_eq!(project.revision(), revision);
+    }
+
+    #[test]
+    fn hierarchy_reparent_preserves_canvas_position_for_exact_parent_occurrence() {
+        let mut pool = ObjectPool::new();
+        pool.add(object_with_id(ObjectType::DataMask, 1));
+        let mut container = object_with_id(ObjectType::Container, 2);
+        if let Object::Container(container) = &mut container {
+            container.width = 100;
+            container.height = 80;
+        }
+        pool.add(container);
+        let mut rectangle = object_with_id(ObjectType::OutputRectangle, 3);
+        if let Object::OutputRectangle(rectangle) = &mut rectangle {
+            rectangle.width = 30;
+            rectangle.height = 20;
+        }
+        pool.add(rectangle);
+        add_positioned_child(&mut pool, 1, 2, 100, 50);
+        add_positioned_child(&mut pool, 1, 2, 200, 100);
+        add_positioned_child(&mut pool, 1, 3, 150, 100);
+        let mut project = project(pool);
+        let moved = reparent_in_hierarchy(
+            &mut project,
+            &PlacementTarget::Primitive {
+                parent_id: 1,
+                child_index: 2,
+            },
+            1,
+            &[],
+            1,
+            &[0],
+            2,
+        )
+        .unwrap();
+        assert_eq!(position(&project, &moved), Some((50, 50)));
+        assert!(project.undo_operation());
+        let moved = reparent_in_hierarchy(
+            &mut project,
+            &PlacementTarget::Primitive {
+                parent_id: 1,
+                child_index: 2,
+            },
+            1,
+            &[],
+            1,
+            &[1],
+            2,
+        )
+        .unwrap();
+        assert_eq!(position(&project, &moved), Some((0, 0)));
+    }
+
+    #[test]
+    fn hierarchy_reparent_accounts_for_nested_button_face_origins() {
+        let mut pool = ObjectPool::new();
+        pool.add(object_with_id(ObjectType::DataMask, 1));
+        let mut button = object_with_id(ObjectType::Button, 2);
+        if let Object::Button(button) = &mut button {
+            button.width = 100;
+            button.height = 100;
+        }
+        pool.add(button);
+        let mut rectangle = object_with_id(ObjectType::OutputRectangle, 3);
+        if let Object::OutputRectangle(rectangle) = &mut rectangle {
+            rectangle.width = 20;
+            rectangle.height = 10;
+        }
+        pool.add(rectangle);
+        let mut container = object_with_id(ObjectType::Container, 4);
+        if let Object::Container(container) = &mut container {
+            container.width = 200;
+            container.height = 100;
+        }
+        pool.add(container);
+        add_positioned_child(&mut pool, 1, 2, 100, 50);
+        add_positioned_child(&mut pool, 1, 4, 50, 10);
+        add_positioned_child(&mut pool, 2, 3, 10, 20);
+        let mut project = project(pool);
+        let moved = reparent_in_hierarchy(
+            &mut project,
+            &PlacementTarget::Primitive {
+                parent_id: 2,
+                child_index: 0,
+            },
+            1,
+            &[0],
+            1,
+            &[1],
+            4,
+        )
+        .unwrap();
+        assert_eq!(position(&project, &moved), Some((64, 64)));
+        let returned = reparent_in_hierarchy(&mut project, &moved, 1, &[1], 1, &[0], 2).unwrap();
+        assert_eq!(position(&project, &returned), Some((10, 20)));
+    }
+
+    #[test]
+    fn reparent_component_preserves_identity_and_undoes() {
+        let mut pool = ObjectPool::new();
+        pool.add(object_with_id(ObjectType::DataMask, 1));
+        let mut container = object_with_id(ObjectType::Container, 2);
+        if let Object::Container(container) = &mut container {
+            container.width = 100;
+            container.height = 80;
+        }
+        pool.add(container);
+        add_positioned_child(&mut pool, 1, 2, 0, 0);
+        let mut project = project(pool);
+        let instance_id = add_component_instance(&mut project, 1, 400, 400);
+        let component_id = project.component_source().instances[0].component_id;
+        let mut definition = project.component_source().definitions[&component_id].clone();
+        let root = definition
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == definition.root_node)
+            .unwrap();
+        root.properties
+            .insert(crate::object_properties::PropertyKey::Width, json!(60));
+        root.properties
+            .insert(crate::object_properties::PropertyKey::Height, json!(30));
+        ComponentService::edit_component_definition(&mut project, definition).unwrap();
+        let target = PlacementTarget::Component { instance_id };
+        assert_eq!(reparent(&mut project, &target, 2).unwrap(), target);
+        let moved = project
+            .component_source()
+            .instances
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .unwrap();
+        assert_eq!(moved.parent, EditorParentRef::Primitive(2));
+        assert_eq!((moved.x, moved.y), (40, 50));
+        assert!(project.undo_operation());
+        let moved = project
+            .component_source()
+            .instances
+            .iter()
+            .find(|instance| instance.id == instance_id)
+            .unwrap();
+        assert_eq!(moved.parent, EditorParentRef::Primitive(1));
+        assert_eq!((moved.x, moved.y), (400, 400));
+        let source = PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index: 0,
+        };
+        let revision = project.revision();
+        assert!(reparent(&mut project, &source, 2).is_err());
+        assert_eq!(project.revision(), revision);
     }
 
     #[test]
@@ -1184,6 +1670,7 @@ mod tests {
         match object {
             Object::DataMask(mask) => mask.object_refs.push(reference),
             Object::Container(container) => container.object_refs.push(reference),
+            Object::Button(button) => button.object_refs.push(reference),
             _ => panic!("unsupported test parent"),
         }
     }

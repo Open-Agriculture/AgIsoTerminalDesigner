@@ -44,6 +44,7 @@ pub struct ObjectMetadata {
     pub name: Option<String>,
 
     /// Notes or comments about the object
+    #[serde(default)]
     pub notes: Option<String>,
 
     #[serde(default)]
@@ -155,7 +156,7 @@ impl ProjectFile {
         for (id, info) in object_info {
             let metadata = ObjectMetadata {
                 name: info.name.clone(),
-                notes: None, // Future feature
+                notes: info.notes.clone(),
                 description: info.description.clone(),
                 tags: info.tags.clone(),
                 allowed_references: info.allowed_references.clone(),

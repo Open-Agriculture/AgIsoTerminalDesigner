@@ -37,6 +37,17 @@ use wasm_bindgen::{closure::Closure, JsCast as _};
 const OBJECT_HIERARCHY_ID: &str = "object_hierarchy_ui";
 const SELECTED_ANCESTRY_HIERARCHY_ID: &str = "selected_ancestry_hierarchy_ui";
 
+#[derive(Clone)]
+struct TreeDragPayload {
+    root: u16,
+    source_parent_path: Vec<usize>,
+    target: ag_iso_terminal_designer::canvas::edits::PlacementTarget,
+}
+
+fn clone_tree_path(path: &[usize]) -> Vec<usize> {
+    path.to_vec()
+}
+
 #[derive(Clone, Copy)]
 enum FileDialogReason {
     LoadPool,
@@ -129,6 +140,11 @@ pub struct DesignerApp {
     recovery: Option<RecoveryRecord>,
     recovery_load_error: bool,
     error_message: Option<String>,
+    property_name_draft: Option<(u128, u64, u16, String, String)>,
+    property_name_draft_seen: bool,
+    add_object_query: String,
+    add_object_menu_open: bool,
+    add_object_menu_seen: bool,
     #[cfg(not(target_arch = "wasm32"))]
     recent_projects: Vec<RecentProject>,
     #[cfg(target_arch = "wasm32")]
@@ -201,8 +217,18 @@ impl DesignerApp {
                     self.discard_on_replace = false;
                     match diagnostics {
                         Ok(diagnostics) if !diagnostics.is_empty() => {
-                            self.error_message = Some(format!("Imported for repair. Resolve compatibility issues before IOP export:\n{}",
-                                diagnostics.iter().map(|diagnostic| ag_iso_terminal_designer::pool_validation::format_validation_diagnostic(diagnostic, self.preferences.object_id_format)).collect::<Vec<_>>().join("\n")));
+                            self.error_message = Some(format!(
+                                "Imported for repair. Resolve compatibility issues before IOP export:\n{}",
+                                diagnostics
+                                    .iter()
+                                    .map(|diagnostic| self
+                                        .project
+                                        .as_ref()
+                                        .unwrap()
+                                        .format_validation_diagnostic(diagnostic))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ));
                         }
                         Err(error) => {
                             self.error_message = Some(error.to_string());
@@ -457,6 +483,11 @@ impl DesignerApp {
             recovery,
             recovery_load_error,
             error_message,
+            property_name_draft: None,
+            property_name_draft_seen: false,
+            add_object_query: String::new(),
+            add_object_menu_open: false,
+            add_object_menu_seen: false,
             #[cfg(not(target_arch = "wasm32"))]
             recent_projects,
             #[cfg(target_arch = "wasm32")]
@@ -552,8 +583,15 @@ impl DesignerApp {
                         Ok(project) => {
                             match project.compatibility_diagnostics() {
                                 Ok(diagnostics) if !diagnostics.is_empty() => {
-                                    self.error_message = Some(format!("Opened for repair. Resolve compatibility issues before IOP export:\n{}",
-                                        diagnostics.iter().map(|diagnostic| ag_iso_terminal_designer::pool_validation::format_validation_diagnostic(diagnostic, self.preferences.object_id_format)).collect::<Vec<_>>().join("\n")));
+                                    self.error_message = Some(format!(
+                                        "Opened for repair. Resolve compatibility issues before IOP export:\n{}",
+                                        diagnostics
+                                            .iter()
+                                            .map(|diagnostic| project
+                                                .format_validation_diagnostic(diagnostic))
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
+                                    ));
                                 }
                                 Err(error) => {
                                     self.error_message = Some(error.to_string());
@@ -936,6 +974,34 @@ impl DesignerApp {
         }
     }
 
+    fn save_cli_zip(&mut self, ctx: &egui::Context) {
+        let Some(project) = &self.project else { return; };
+        // Generate and preflight before asking for a destination. Generation
+        // uses its own project copy and never edits the open authoring state.
+        let contents = match ag_iso_terminal_designer::cli::project_zip::generate(project)
+            .and_then(|archive| archive.to_zip()) {
+            Ok(contents) => contents,
+            Err(error) => {
+                self.error_message = Some(format!("Could not generate CLI ZIP: {error}"));
+                return;
+            }
+        };
+        let sender = self.file_channel.0.clone();
+        let ctx = ctx.clone();
+        let task = rfd::AsyncFileDialog::new()
+            .set_file_name("project.zip")
+            .add_filter("CLI project ZIP", &["zip"])
+            .save_file();
+        execute(async move {
+            if let Some(file) = task.await {
+                if let Err(error) = file.write(&contents).await {
+                    let _ = sender.send(FileEvent::Failed(format!("Failed to save CLI ZIP: {error}")));
+                    ctx.request_repaint();
+                }
+            }
+        });
+    }
+
     fn render_startup(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(ctx.style().visuals.faint_bg_color))
@@ -1047,7 +1113,60 @@ fn recovery_age_label(saved_at: u64) -> String {
     }
 }
 
-fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &EditorProject) -> bool {
+fn duplicate_standalone_object(project: &mut EditorProject, source_id: u16) -> bool {
+    let Ok(source_object_id) = ObjectId::new(source_id) else {
+        return false;
+    };
+    let Some(source) = project.get_pool().object_by_id(source_object_id).cloned() else {
+        return false;
+    };
+    if matches!(source, Object::PictureGraphic(_)) {
+        return false;
+    }
+    let Ok(new_id) = project.allocate_object_id(source.object_type()) else {
+        return false;
+    };
+    let source_info = project.get_object_info(&source);
+    let base_name = format!("Copy of {}", source_info.get_name(&source));
+    let names: HashSet<_> = project
+        .get_pool()
+        .objects()
+        .iter()
+        .map(|object| project.get_object_info(object).get_name(object))
+        .collect();
+    let mut name = base_name.clone();
+    let mut suffix = 2;
+    while names.contains(&name) {
+        name = format!("{base_name} ({suffix})");
+        suffix += 1;
+    }
+    let mut duplicate = source;
+    if duplicate.mut_id().set_value(new_id.value()).is_err() {
+        return false;
+    }
+    let mut info = ag_iso_terminal_designer::ObjectInfo::new(&duplicate);
+    info.name = Some(name);
+    info.description = source_info.description;
+    info.notes = source_info.notes;
+    info.tags = source_info.tags;
+    info.allowed_references = source_info.allowed_references;
+    project.queue_operation(Operation::RestoreObject {
+        object: duplicate,
+        info: Some(info),
+    });
+    project
+        .get_mut_selected()
+        .set(NullableObjectId::new(new_id.value()));
+    true
+}
+
+fn render_selectable_object(
+    ui: &mut egui::Ui,
+    object: &Object,
+    project: &EditorProject,
+    drag_payload: Option<TreeDragPayload>,
+    drop_destination: Option<(u16, u16, Vec<usize>)>,
+) -> bool {
     let this_ui_id = ui.id();
     let object_info = project.get_object_info(object);
 
@@ -1064,8 +1183,12 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
             ui.add(egui::TextEdit::singleline(&mut name).desired_width(ui.available_width()));
         project.set_renaming_object(this_ui_id, object.id(), name); // Update the name in the project
         let cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        if response.lost_focus() {
-            project.finish_renaming_object(!cancelled);
+        let confirmed = response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if cancelled {
+            project.finish_renaming_object(false);
+            response.surrender_focus();
+        } else if confirmed || response.lost_focus() {
+            project.finish_renaming_object(true);
         } else if !response.has_focus() {
             // We need to focus the text edit when we start renaming
             response.request_focus();
@@ -1075,6 +1198,9 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
         let is_selected = project.get_selected() == object.id().into();
         let label_text = project.object_display_name(object);
         let response = tree_row(ui, is_selected, label_text);
+        if let Some(payload) = drag_payload {
+            response.dnd_set_drag_payload(payload);
+        }
 
         if response.clicked() {
             project
@@ -1082,6 +1208,15 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
                 .set(NullableObjectId(Some(object.id())));
         }
         if response.double_clicked() {
+            project.set_renaming_object(this_ui_id, object.id(), object_info.get_name(object));
+        }
+        if is_selected
+            && ui.input(|input| input.key_pressed(egui::Key::F2))
+            && (!ui.ctx().wants_keyboard_input() || response.has_focus())
+        {
+            ui.ctx().input_mut(|input| {
+                input.consume_key(egui::Modifiers::NONE, egui::Key::F2);
+            });
             project.set_renaming_object(this_ui_id, object.id(), object_info.get_name(object));
         }
 
@@ -1095,6 +1230,25 @@ fn render_selectable_object(ui: &mut egui::Ui, object: &Object, project: &Editor
                 ui.close();
             }
         });
+        if response.contains_pointer() && ui.input(|input| input.pointer.any_released()) {
+            if let Some(payload) = egui::DragAndDrop::take_payload::<TreeDragPayload>(ui.ctx()) {
+                if let Some((dest_root, parent_id, dest_path)) = drop_destination {
+                    ui.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("pending_tree_reparent"),
+                            (
+                                payload.root,
+                                payload.target.clone(),
+                                payload.source_parent_path.clone(),
+                                dest_root,
+                                dest_path,
+                                parent_id,
+                            ),
+                        )
+                    });
+                }
+            }
+        }
         response.clicked()
     }
 }
@@ -1128,7 +1282,7 @@ fn render_filtered_object_list(
         });
     }
     for object in matches {
-        if render_selectable_object(ui, object, project) {
+        if render_selectable_object(ui, object, project, None, None) {
             mask_view.navigate(project, object.id().value());
         }
     }
@@ -1146,6 +1300,7 @@ fn render_mask_object_hierarchy(
     visiting: &mut HashSet<u16>,
     softkey_slot: Option<usize>,
     open_selection: bool,
+    placement_source: Option<TreeDragPayload>,
 ) {
     let id_value = object.id().value();
     if !visiting.insert(id_value) {
@@ -1175,11 +1330,20 @@ fn render_mask_object_hierarchy(
     let selected_id = project.get_selected().0.map(|id| id.value());
     let expand = open_selection
         && selected_id.is_some_and(|selected| {
-            mask_branch_contains(project, object, selected, &mut HashSet::new())
+            selected != id_value && {
+                mask_branch_contains(project, object, selected, &mut HashSet::new())
+            }
         });
 
     if has_children {
-        let selected_in_header = std::cell::Cell::new(None);
+        let selected_in_header = std::cell::Cell::new(
+            None::<(
+                u16,
+                Option<usize>,
+                Option<ag_iso_terminal_designer::canvas::edits::PlacementTarget>,
+            )>,
+        );
+        let header_path = path.clone();
         if expand {
             let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),
@@ -1194,12 +1358,25 @@ fn render_mask_object_hierarchy(
             occurrence_id,
             expand,
             |ui| {
-                if render_selectable_object(ui, object, project) {
-                    selected_in_header.set(Some((id_value, softkey_slot)));
+                if render_selectable_object(
+                    ui,
+                    object,
+                    project,
+                    placement_source.clone(),
+                    Some((root, id_value, clone_tree_path(&header_path))),
+                ) {
+                    selected_in_header.set(Some((
+                        id_value,
+                        softkey_slot,
+                        placement_source
+                            .as_ref()
+                            .map(|source| source.target.clone()),
+                    )));
                 }
             },
             |ui| {
                 for (index, reference) in placed.iter().enumerate() {
+                    let source_parent_path = clone_tree_path(path);
                     path.push(index);
                     if let Some(child) = project.get_pool().object_by_id(reference.id) {
                         render_mask_object_hierarchy(
@@ -1214,6 +1391,7 @@ fn render_mask_object_hierarchy(
                             visiting,
                             softkey_slot,
                             open_selection,
+                            Some(TreeDragPayload { root, source_parent_path, target: ag_iso_terminal_designer::canvas::edits::PlacementTarget::Primitive { parent_id: id_value, child_index: index } }),
                         );
                     } else {
                         ui.colored_label(
@@ -1265,6 +1443,7 @@ fn render_mask_object_hierarchy(
                                         visiting,
                                         softkey_slot,
                                         open_selection,
+                                        None,
                                     );
                                     path.pop();
                                 });
@@ -1301,38 +1480,57 @@ fn render_mask_object_hierarchy(
                         .show(ui, |ui| {
                             for node in &definition.nodes {
                                 let node_id = instance.compiled_ids[&node.id];
-                                if tree_row(
+                                let row = tree_row(
                                     ui,
-                                    project
-                                        .get_selected()
-                                        .0
-                                        .is_some_and(|selected| selected.value() == node_id),
+                                    project.get_selected().0.is_some_and(|selected| selected.value() == node_id),
                                     &node.name,
-                                )
-                                .clicked()
-                                {
+                                );
+                                row.dnd_set_drag_payload(TreeDragPayload {
+                                    root,
+                                    source_parent_path: clone_tree_path(path),
+                                    target: ag_iso_terminal_designer::canvas::edits::PlacementTarget::Component { instance_id: instance.id },
+                                });
+                                if row.contains_pointer() && ui.input(|input| input.pointer.any_released()) {
+                                    if let Some(payload) = egui::DragAndDrop::take_payload::<TreeDragPayload>(ui.ctx()) {
+                                        ui.data_mut(|data| data.insert_temp(egui::Id::new("pending_tree_reparent"), (payload.root, payload.target.clone(), payload.source_parent_path.clone(), root, clone_tree_path(path), id_value)));
+                                    }
+                                }
+                                if row.clicked() {
                                     project
                                         .get_mut_selected()
                                         .set(NullableObjectId::new(node_id));
                                     if let Some(slot) = softkey_slot {
                                         canvas.select_softkey_slot(project, root, slot);
                                     }
+                                    canvas.select_placement(project, root, ag_iso_terminal_designer::canvas::edits::PlacementTarget::Component { instance_id: instance.id });
                                 }
                             }
                         });
                 }
             },
         );
-        if let Some((selected, slot)) = selected_in_header.get() {
+        if let Some((selected, slot, target)) = selected_in_header.take() {
             mask_view.navigate(project, selected);
             if let Some(slot) = slot {
                 canvas.select_softkey_slot(project, root, slot);
             }
+            if let Some(target) = target {
+                canvas.select_placement(project, root, target);
+            }
         }
-    } else if render_selectable_object(ui, object, project) {
+    } else if render_selectable_object(
+        ui,
+        object,
+        project,
+        placement_source.clone(),
+        Some((root, id_value, clone_tree_path(path))),
+    ) {
         mask_view.navigate(project, id_value);
         if let Some(slot) = softkey_slot {
             canvas.select_softkey_slot(project, root, slot);
+        }
+        if let Some(source) = placement_source.as_ref() {
+            canvas.select_placement(project, root, source.target.clone());
         }
     }
     visiting.remove(&id_value);
@@ -1420,6 +1618,7 @@ fn render_focused_mask_hierarchy(
             &mut HashSet::new(),
             slot,
             open_selection,
+            None,
         );
     };
     visit(ui, mask, 0, None);
@@ -1472,7 +1671,7 @@ fn render_focused_mask_hierarchy(
                     section_id,
                     opens_softkeys,
                     |ui| {
-                        if render_selectable_object(ui, softkey_mask, project) {
+                        if render_selectable_object(ui, softkey_mask, project, None, None) {
                             selected_softkey_mask.set(true);
                         }
                     },
@@ -1708,7 +1907,7 @@ fn render_selected_ancestry_hierarchy(
     if parents.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(ui.spacing().indent);
-            render_selectable_object(ui, object, project);
+            render_selectable_object(ui, object, project, None, None);
         });
         return;
     }
@@ -1719,7 +1918,7 @@ fn render_selected_ancestry_hierarchy(
         id,
         true,
         |ui| {
-            render_selectable_object(ui, object, project);
+            render_selectable_object(ui, object, project, None, None);
         },
         |ui| {
             for (idx, parent) in parents.iter().enumerate() {
@@ -1795,6 +1994,10 @@ fn render_selected_ancestry_panel(ui: &mut egui::Ui, project: &EditorProject) {
 
 impl eframe::App for DesignerApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+        self.canvas.set_grid_visible(self.preferences.show_grid);
+        self.add_object_menu_seen = false;
+        self.property_name_draft_seen = false;
+        ctx.data_mut(|data| data.remove::<bool>(egui::Id::new("tree_row_had_focus")));
         self.mask_view.begin_frame();
         self.preferences.apply(ctx);
         ctx.style_mut(|style| {
@@ -2069,6 +2272,10 @@ impl eframe::App for DesignerApp {
                             self.save_header();
                             ui.close();
                         }
+                        if ui.button("Export CLI ZIP…").clicked() {
+                            self.save_cli_zip(ctx);
+                            ui.close();
+                        }
                     });
                 });
                 let add_object_shortcut =
@@ -2167,6 +2374,7 @@ impl eframe::App for DesignerApp {
                 }
             });
         });
+        self.add_object_menu_open = self.add_object_menu_seen;
 
         self.show_id_reassignment(ctx);
 
@@ -2201,6 +2409,40 @@ impl eframe::App for DesignerApp {
         } else {
             self.render_startup(ctx);
         }
+        self.preferences.show_grid = self.canvas.grid_visible();
+        let tree_row_focused = ctx.data(|data| {
+            data.get_temp::<bool>(egui::Id::new("tree_row_had_focus"))
+                .unwrap_or(false)
+        });
+        if ctx.input(|input| input.key_pressed(egui::Key::Delete))
+            && (!ctx.wants_keyboard_input() || tree_row_focused)
+            && self.new_object_dialog.is_none()
+        {
+            if let Some(project) = self.project.as_mut() {
+                if !self.canvas.remove_selection(project) {
+                    if !self.canvas.has_placement_selection(project) {
+                        if let Some(id) = project.get_selected().0.map(|id| id.value()) {
+                            if project
+                                .get_pool()
+                                .object_by_id(ObjectId::new(id).unwrap())
+                                .is_some_and(|object| {
+                                    !matches!(
+                                        object,
+                                        Object::DataMask(_)
+                                            | Object::AlarmMask(_)
+                                            | Object::SoftKeyMask(_)
+                                    )
+                                })
+                            {
+                                if let Ok(id) = ObjectId::new(id) {
+                                    project.request_delete_object(id);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Some(pool) = &mut self.project {
             pool.set_object_id_format(self.preferences.object_id_format);
             pool.set_show_object_ids(self.preferences.show_object_ids);
@@ -2233,6 +2475,27 @@ impl eframe::App for DesignerApp {
                 explicit_navigation = true;
             }
 
+            if !self.property_name_draft_seen {
+                if let Some((session, revision, draft_id, baseline, draft)) =
+                    self.property_name_draft.take()
+                {
+                    let unchanged = session == pool.ui_session_id().as_u128()
+                        && revision == pool.revision()
+                        && ObjectId::new(draft_id)
+                            .ok()
+                            .and_then(|id| pool.get_pool().object_by_id(id))
+                            .is_some_and(|object| {
+                                pool.get_object_info(object).get_name(object) == baseline
+                            });
+                    if unchanged {
+                        if let Ok(id) = ObjectId::new(draft_id) {
+                            pool.rename_object(id, draft);
+                        }
+                    }
+                }
+            }
+            ag_iso_terminal_designer::finish_property_edits(ctx, pool);
+            ag_iso_terminal_designer::components::ui::finish_inspector_edits(ctx, pool);
             if pool.commit_queued("Edit object pool") {
                 ctx.request_repaint();
             }
@@ -2483,6 +2746,30 @@ impl DesignerApp {
             }
             Pane::Properties => {
                 let materialized = pool.materialize_shared();
+                if let Some((draft_session, draft_revision, draft_id, baseline, draft)) =
+                    self.property_name_draft.clone()
+                {
+                    let current_name = ObjectId::new(draft_id)
+                        .ok()
+                        .and_then(|id| pool.get_pool().object_by_id(id))
+                        .map(|object| pool.get_object_info(object).get_name(object));
+                    let switching = draft_session != pool.ui_session_id().as_u128()
+                        || draft_revision != pool.revision()
+                        || pool.get_selected().0.map(|id| id.value()) != Some(draft_id)
+                        || pool.editor_selection().is_some()
+                        || current_name.as_deref() != Some(baseline.as_str());
+                    if switching {
+                        self.property_name_draft = None;
+                        if draft_session == pool.ui_session_id().as_u128()
+                            && draft_revision == pool.revision()
+                            && current_name.as_deref() == Some(baseline.as_str())
+                        {
+                            if let Ok(draft_id) = ObjectId::new(draft_id) {
+                                pool.rename_object(draft_id, draft);
+                            }
+                        }
+                    }
+                }
                 if let Some(
                     ag_iso_terminal_designer::components::EditorSelection::ComponentNode {
                         instance_id,
@@ -2497,37 +2784,97 @@ impl DesignerApp {
                         node_id,
                     );
                 } else if let Some(id) = pool.get_selected().into() {
-                    if let Some(original) = pool.get_pool().object_by_id(id) {
+                    if let Some(original) = pool.get_pool().object_by_id(id).cloned() {
                         egui::ScrollArea::vertical().show(ui, |ui| {
+                            let project_key = pool.ui_session_id().as_u128();
+                            let project_revision = pool.revision();
+                            let object_id = original.id().value();
+                            let original_name = pool.get_object_info(&original).get_name(&original);
+                            let has_placement = self.canvas.has_placement_selection(pool);
+                            let duplicate_enabled = self.canvas.selected_placement(pool).is_some()
+                                || (!has_placement
+                                    && !matches!(&original, Object::PictureGraphic(_)));
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(duplicate_enabled, egui::Button::new("Duplicate"))
+                                    .clicked()
+                                {
+                                    if !self.canvas.duplicate_selection(pool) {
+                                        if !has_placement {
+                                            duplicate_standalone_object(pool, object_id);
+                                        }
+                                    }
+                                }
+                                if ui.button("Delete").clicked() {
+                                    if !self.canvas.remove_selection(pool) {
+                                        if !self.canvas.has_placement_selection(pool)
+                                            && !matches!(
+                                                &original,
+                                                Object::DataMask(_)
+                                                    | Object::AlarmMask(_)
+                                                    | Object::SoftKeyMask(_)
+                                            )
+                                        {
+                                            pool.request_delete_object(original.id());
+                                        }
+                                    }
+                                }
+                            });
                             // Display editable object name as header
                             ui.horizontal(|ui| {
                                 ui.label("Name:");
-
-                                let object_info = pool.get_object_info(original);
-                                let mut name = object_info.get_name(original);
+                                self.property_name_draft_seen = true;
+                                let mut name = self
+                                    .property_name_draft
+                                    .as_ref()
+                                    .filter(|(key, revision, draft_id, _, _)| {
+                                        *key == project_key
+                                            && *revision == project_revision
+                                            && *draft_id == object_id
+                                    })
+                                    .map(|(_, _, _, _, draft)| draft.clone())
+                                    .unwrap_or_else(|| original_name.clone());
                                 let response = ui.add(
                                     egui::TextEdit::singleline(&mut name)
                                         .desired_width(ui.available_width()),
                                 );
-
                                 if response.changed() {
-                                    pool.queue_operation(Operation::RenameObject {
-                                        object: ag_iso_terminal_designer::ObjectTarget::id(
-                                            original.id().value(),
-                                        ),
-                                        name,
-                                    });
+                                    self.property_name_draft = Some((
+                                        project_key,
+                                        project_revision,
+                                        object_id,
+                                        original_name.clone(),
+                                        name.clone(),
+                                    ));
+                                }
+                                let enter = response.has_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                                let escape = response.has_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Escape));
+                                if escape {
+                                    self.property_name_draft = None;
+                                    response.surrender_focus();
+                                } else if enter || response.lost_focus() {
+                                    if let Some((_, _, _, _, draft)) =
+                                        self.property_name_draft.take()
+                                    {
+                                        if draft != original_name {
+                                            if let Ok(object_id) = ObjectId::new(object_id) {
+                                                pool.rename_object(object_id, draft);
+                                            }
+                                        }
+                                    }
                                 }
                             });
                             ui.separator();
 
-                            render_property_editor(ui, original, pool);
+                            render_property_editor(ui, &original, pool);
                             let effective = materialized
                                 .as_ref()
                                 .map(|m| &m.pool)
                                 .unwrap_or(pool.get_pool());
                             let rendered =
-                                effective.object_by_id(original.id()).unwrap_or(original);
+                                effective.object_by_id(original.id()).unwrap_or(&original);
                             let (width, height) = effective.content_size(rendered);
                             ui.separator();
                             let desired_size = egui::Vec2::new(width as f32, height as f32);
@@ -2619,16 +2966,77 @@ impl DesignerApp {
                     .show_inside(ui, &mut PaneViewer { app: self });
             });
         self.workspace.dock = dock;
+        if let Some((
+            source_root,
+            target,
+            source_parent_path,
+            dest_root,
+            dest_parent_path,
+            new_parent,
+        )) = ctx.data_mut(|data| {
+            let id = egui::Id::new("pending_tree_reparent");
+            let payload = data.get_temp::<(
+                u16,
+                ag_iso_terminal_designer::canvas::edits::PlacementTarget,
+                Vec<usize>,
+                u16,
+                Vec<usize>,
+                u16,
+            )>(id);
+            data.remove::<(
+                u16,
+                ag_iso_terminal_designer::canvas::edits::PlacementTarget,
+                Vec<usize>,
+                u16,
+                Vec<usize>,
+                u16,
+            )>(id);
+            payload
+        }) {
+            if let Some(project) = self.project.as_mut() {
+                match self.canvas.reparent_in_hierarchy(
+                    project,
+                    &target,
+                    source_root,
+                    &source_parent_path,
+                    dest_root,
+                    &dest_parent_path,
+                    new_parent,
+                ) {
+                    Ok(moved) => {
+                        self.canvas.select_placement(project, dest_root, moved);
+                    }
+                    Err(error) => self.error_message = Some(error),
+                }
+            }
+        }
         if !self.canvas_visible {
             self.canvas.cancel_interaction();
         }
     }
     fn show_add_object_menu(&mut self, ui: &mut egui::Ui) {
+        let opening = !self.add_object_menu_open && !self.add_object_menu_seen;
+        if opening {
+            self.add_object_query.clear();
+        }
+        self.add_object_menu_seen = true;
         let version = self.project.as_ref().unwrap().vt_version();
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.add_object_query)
+                .hint_text("Search object types…")
+                .desired_width(ui.available_width()),
+        );
+        if opening && !response.has_focus() {
+            response.request_focus();
+        }
+        let query = self.add_object_query.to_lowercase();
         egui::ScrollArea::vertical()
             .max_height(400.0)
             .show(ui, |ui| {
                 for object_type in ObjectType::values() {
+                    if !format!("{object_type:?}").to_lowercase().contains(&query) {
+                        continue;
+                    }
                     let supported = ag_iso_terminal_designer::vt_compatibility::supported_object_type(
                         object_type, version,
                     );
@@ -2659,6 +3067,12 @@ impl DesignerApp {
 
     fn show_view_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.menu_button("View", |ui| {
+            if ui
+                .checkbox(&mut self.preferences.show_grid, "Show grid overlay")
+                .changed()
+            {
+                self.canvas.set_grid_visible(self.preferences.show_grid);
+            }
             ui.menu_button("Theme", |ui| {
                 for (theme, label) in [
                     (egui::ThemePreference::System, "System"),
@@ -2758,12 +3172,17 @@ fn tree_row(ui: &mut egui::Ui, selected: bool, label: impl Into<String>) -> egui
         egui::vec2(ui.available_width().max(0.0), height),
         egui::Sense::hover(),
     );
+    #[cfg(test)]
+    ui.data_mut(|data| data.insert_temp(egui::Id::new("test_tree_row_rect"), label_rect));
     let row_rect = egui::Rect::from_min_max(
         egui::pos2(bounds.left(), label_rect.top()),
         egui::pos2(bounds.right(), label_rect.bottom()),
     );
     // The expand arrow owns its hit area; row selection starts at the label.
-    let response = ui.interact(label_rect, ui.next_auto_id(), egui::Sense::click());
+    let response = ui.interact(label_rect, ui.next_auto_id(), egui::Sense::click_and_drag());
+    if response.has_focus() {
+        ui.data_mut(|data| data.insert_temp(egui::Id::new("tree_row_had_focus"), true));
+    }
     let fill = if selected {
         ui.visuals().selection.bg_fill
     } else if response.hovered() {
@@ -2780,16 +3199,17 @@ fn tree_row(ui: &mut egui::Ui, selected: bool, label: impl Into<String>) -> egui
             ui.visuals().selection.stroke.color,
         );
     }
-    let text = egui::RichText::new(label.into()).color(if selected {
+    let text_color = if selected {
         ui.visuals().selection.stroke.color
     } else {
         ui.visuals().text_color()
-    });
-    ui.put(
-        label_rect,
-        egui::Label::new(text)
-            .truncate()
-            .sense(egui::Sense::hover()),
+    };
+    ui.painter().with_clip_rect(label_rect).text(
+        label_rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        label.into(),
+        egui::TextStyle::Body.resolve(ui.style()),
+        text_color,
     );
     if response.has_focus() {
         ui.painter().rect_stroke(
@@ -2800,4 +3220,124 @@ fn tree_row(ui: &mut egui::Ui, selected: bool, label: impl Into<String>) -> egui
         );
     }
     response
+}
+
+#[cfg(test)]
+mod main_ui_tests {
+    use super::*;
+
+    fn tree_fixture() -> EditorProject {
+        let mut object = ag_iso_terminal_designer::default_object(ObjectType::OutputRectangle);
+        object.mut_id().set_value(1).unwrap();
+        let mut pool = ObjectPool::default();
+        pool.add(object);
+        EditorProject::from(pool)
+    }
+
+    #[test]
+    fn selected_tree_row_f2_starts_rename_and_escape_cancels() {
+        let ctx = egui::Context::default();
+        let mut project = tree_fixture();
+        let run = |ctx: &egui::Context,
+                   project: &mut EditorProject,
+                   time: f64,
+                   events: Vec<egui::Event>| {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(500.0, 300.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let object = project.get_pool().objects().first().unwrap();
+                        ui.data_mut(|data| {
+                            data.insert_temp(egui::Id::new("tree_row_bounds"), ui.max_rect())
+                        });
+                        render_selectable_object(
+                            ui,
+                            object,
+                            project,
+                            Some(TreeDragPayload {
+                                root: 1,
+                                source_parent_path: vec![],
+                                target: ag_iso_terminal_designer::canvas::edits::PlacementTarget::Primitive {
+                                    parent_id: 1,
+                                    child_index: 0,
+                                },
+                            }),
+                            Some((1, 1, vec![])),
+                        );
+                    });
+                },
+            );
+            project.update_selected();
+        };
+        run(&ctx, &mut project, 1.0, vec![]);
+        let row_pos = ctx.data(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("test_tree_row_rect"))
+                .unwrap()
+                .center()
+        });
+        run(
+            &ctx,
+            &mut project,
+            1.05,
+            vec![egui::Event::PointerMoved(row_pos)],
+        );
+        run(
+            &ctx,
+            &mut project,
+            1.10,
+            vec![egui::Event::PointerButton {
+                pos: row_pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        run(
+            &ctx,
+            &mut project,
+            1.15,
+            vec![egui::Event::PointerButton {
+                pos: row_pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(project.get_selected(), NullableObjectId::new(1));
+        run(
+            &ctx,
+            &mut project,
+            1.2,
+            vec![egui::Event::Key {
+                key: egui::Key::F2,
+                physical_key: Some(egui::Key::F2),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(project.get_renaming_object().is_some());
+        run(
+            &ctx,
+            &mut project,
+            1.3,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: Some(egui::Key::Escape),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(project.get_renaming_object().is_none());
+        assert!(project.take_rename_request().is_none());
+    }
 }
