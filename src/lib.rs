@@ -19,14 +19,10 @@ mod project_file;
 mod smart_naming;
 mod soft_key_layout;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub mod cli_session;
-
 // Operation system and automation support
-pub mod ai;
 pub mod canvas;
+pub mod cli;
 pub mod components;
-pub mod editing;
 pub mod effective_colour;
 pub mod graphics;
 pub mod isobus_colour;
@@ -52,8 +48,8 @@ pub use object_rendering::{render_object_with_version, RenderableObject};
 pub use soft_key_layout::{SoftKeyArrangement, SoftKeyLayout};
 
 // Operation system exports
-pub use ai::snapshot::{DesignSnapshot, PoolSnapshot};
-pub use ai::{AiDesignState, ProjectRevision};
+pub use cli::snapshot::{DesignSnapshot, PoolSnapshot};
+pub use cli::{AiDesignState, ProjectRevision};
 pub use object_properties::{
     get_properties, PropertyAccess, PropertyAccessError, PropertyDescriptor, PropertyError,
     PropertyKey, PropertySemantic,

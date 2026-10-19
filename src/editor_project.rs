@@ -14,8 +14,8 @@ use ag_iso_stack::object_pool::{
     object::Object, vt_version::VtVersion, NullableObjectId, ObjectId, ObjectPool, ObjectType,
 };
 
-use crate::ai::snapshot::{DesignContextRequest, DesignSnapshot, SnapshotError};
-use crate::ai::{AiDesignState, ProjectRevision};
+use crate::cli::snapshot::{DesignContextRequest, DesignSnapshot, SnapshotError};
+use crate::cli::{AiDesignState, ProjectRevision};
 use crate::operations::{
     AppliedTransaction, ObjectTarget, Operation, OperationError, OperationExecutor,
     OperationHistory, OperationTransaction, PreparedTransaction, TransactionDiagnostics,
@@ -2450,7 +2450,7 @@ impl EditorProject {
 
     /// Capture the default factual project context.
     pub fn snapshot(&self) -> Result<DesignSnapshot, SnapshotError> {
-        crate::ai::get_design_context(&self.ai_design_state(), DesignContextRequest::default())
+        crate::cli::get_design_context(&self.ai_design_state(), DesignContextRequest::default())
             .map_err(|error| SnapshotError::SerializationFailed(format!("{error:?}")))
     }
 

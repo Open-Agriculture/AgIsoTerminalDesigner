@@ -36,7 +36,7 @@ struct Comparison {
 
 struct CachedReview {
     owner: egui::Id,
-    revision: crate::ai::ProjectRevision,
+    revision: crate::cli::ProjectRevision,
     object_id_format: crate::ObjectIdFormat,
     result: Result<Comparison, String>,
 }

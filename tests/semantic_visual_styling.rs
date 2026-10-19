@@ -1,7 +1,7 @@
 use ag_iso_stack::object_pool::{
     object::Object, vt_version::VtVersion, Colour, NullableObjectId, ObjectId, ObjectType,
 };
-use ag_iso_terminal_designer::{ai, default_object, effective_colour as colours, AiDesignState};
+use ag_iso_terminal_designer::{cli, default_object, effective_colour as colours, AiDesignState};
 use serde_json::json;
 fn state() -> AiDesignState {
     let mut s = AiDesignState {
@@ -63,9 +63,9 @@ fn custom_palette_map_read_and_resolver_agree() {
     if let Some(Object::DataMask(mask)) = s.pool.object_mut_by_id(id(2)) {
         mask.background_colour = 6;
     }
-    let objects = ai::get_objects(
+    let objects = cli::get_objects(
         &s,
-        ai::GetObjectsRequest {
+        cli::GetObjectsRequest {
             ids: vec![2],
             ..Default::default()
         },
@@ -122,9 +122,9 @@ fn context_region_and_compact_styles_all_enrich_colours() {
     let mut s = state();
     labels(&mut s);
     let context = serde_json::to_value(
-        ai::get_design_context(
+        cli::get_design_context(
             &s,
-            ai::DesignContextRequest {
+            cli::DesignContextRequest {
                 include_properties: true,
                 ..Default::default()
             },
@@ -138,9 +138,9 @@ fn context_region_and_compact_styles_all_enrich_colours() {
         .iter()
         .any(|o| o["properties"]["background_colour"]["rgb"].is_string()));
     let objects = serde_json::to_value(
-        ai::get_objects(
+        cli::get_objects(
             &s,
-            ai::GetObjectsRequest {
+            cli::GetObjectsRequest {
                 ids: vec![2],
                 include_nearby_style: true,
                 ..Default::default()
@@ -153,7 +153,7 @@ fn context_region_and_compact_styles_all_enrich_colours() {
     assert!(example["background_colour"]["rgb"].is_string());
     assert!(example["font_attributes"]["font_colour"]["rgb"].is_string());
     let region = serde_json::to_value(
-        ai::design_inspection::inspect_design_region(
+        cli::design_inspection::inspect_design_region(
             &s,
             serde_json::from_value(json!({"root_id":2,"region":"all"})).unwrap(),
         )

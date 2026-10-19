@@ -7,7 +7,7 @@ authors = ["Daan Steenbergen <d.steenbergen@student.tue.nl>"]
 
 [[bin]]
 name = "aitd"
-path = "src/bin/aitd.rs"
+path = "src/cli/main.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

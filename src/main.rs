@@ -914,7 +914,8 @@ impl DesignerApp {
     /// Open a file dialog to save a C header file with object IDs
     fn save_header(&mut self) {
         if let Some(project) = &self.project {
-            let contents = match ag_iso_terminal_designer::ai::export::header_for_project(project) {
+            let contents = match ag_iso_terminal_designer::cli::export::header_for_project(project)
+            {
                 Ok(contents) => contents,
                 Err(error) => {
                     self.error_message =

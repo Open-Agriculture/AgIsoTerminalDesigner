@@ -1,11 +1,13 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use ag_iso_stack::object_pool::ObjectType;
-    use ag_iso_terminal_designer::ai::protocol::AutomationAction;
-    use ag_iso_terminal_designer::cli_session::Session;
+    use ag_iso_terminal_designer::cli::protocol::AutomationAction;
+    use ag_iso_terminal_designer::cli::session::Session;
     use ag_iso_terminal_designer::{
+        cli::editing::{
+            EditAction, EditActionKind, ParameterInput, RelationshipEdit, MAX_EDIT_ACTIONS,
+        },
         components::{ComponentParameterKind, ComponentParameterTarget},
-        editing::{EditAction, EditActionKind, ParameterInput, RelationshipEdit, MAX_EDIT_ACTIONS},
         object_properties::PropertyKey,
         operations::{ObjectTarget, Operation},
     };
@@ -1189,13 +1191,13 @@ mod native {
                 .project()
                 .map_err(|e| error("PROJECT_NOT_OPEN", e))?;
             let result =
-                ag_iso_terminal_designer::ai::automation_service::execute(project, action, args)
+                ag_iso_terminal_designer::cli::automation_service::execute(project, action, args)
                     .map_err(|e| error(e.code, e.message))?;
             Ok(json!({"success":true,"result":result}))
         }
         fn edit(&self, actions: Vec<EditAction>) -> Result<Value, Value> {
             let mut session = self.session.borrow_mut();
-            let result = ag_iso_terminal_designer::editing::execute_batch(
+            let result = ag_iso_terminal_designer::cli::editing::execute_batch(
                 session
                     .project_mut()
                     .map_err(|e| error("PROJECT_NOT_OPEN", e))?,
@@ -1293,7 +1295,7 @@ mod native {
                     } => session
                         .save(path, *force, *skip_validation, |project| {
                             let validation =
-                                ag_iso_terminal_designer::ai::automation_service::execute(
+                                ag_iso_terminal_designer::cli::automation_service::execute(
                                     project,
                                     A::ValidateDesign,
                                     json!({}),
@@ -1516,7 +1518,7 @@ mod native {
         let project = session
             .project()
             .map_err(|e| error("PROJECT_NOT_OPEN", e))?;
-        let artifacts = ag_iso_terminal_designer::ai::export::artifacts(project, format)
+        let artifacts = ag_iso_terminal_designer::cli::export::artifacts(project, format)
             .map_err(|e| error("VALIDATION_FAILED", e.to_string()))?;
         let staged = outputs
             .into_iter()

@@ -1,5 +1,5 @@
 use super::AiDesignState;
-use crate::ai::snapshot::{
+use crate::cli::snapshot::{
     active_mask, object_snapshot_sections, selected_ids, DesignContextRequest, DesignSnapshot,
     SnapshotScope, MAX_SNAPSHOT_OBJECTS,
 };
@@ -58,7 +58,7 @@ impl Default for GetObjectsRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct ObjectDetails {
     #[serde(flatten)]
-    pub object: crate::ai::snapshot::ObjectSnapshot,
+    pub object: crate::cli::snapshot::ObjectSnapshot,
     pub truncated: bool,
     pub next_detail_offset: Option<usize>,
     pub next_property_offset: Option<usize>,
@@ -94,7 +94,7 @@ pub fn get_design_context(
     } else {
         request.scope
     };
-    let depth = request.depth.min(crate::ai::snapshot::MAX_CONTEXT_DEPTH);
+    let depth = request.depth.min(crate::cli::snapshot::MAX_CONTEXT_DEPTH);
     let (all_ids, depth_limited) = selected_ids(&state.pool, root, scope, depth);
     let total_matching_objects = all_ids.len();
     let limit = request.max_objects.clamp(1, MAX_SNAPSHOT_OBJECTS);
@@ -112,7 +112,7 @@ pub fn get_design_context(
             .then_some(request.offset.saturating_add(ids.len()));
         if scope != SnapshotScope::EntirePool {
             layout =
-                crate::ai::snapshot::context_layout(&state.pool, &state.object_info, root, depth)
+                crate::cli::snapshot::context_layout(&state.pool, &state.object_info, root, depth)
                     .filter(|p| ids.iter().any(|id| id.value() == p.object.id))
                     .skip(request.layout_offset)
                     .take(limit + 1)
@@ -129,7 +129,7 @@ pub fn get_design_context(
             }
         }
         for (index, placement) in
-            crate::ai::snapshot::context_layout(&state.pool, &state.object_info, root, depth)
+            crate::cli::snapshot::context_layout(&state.pool, &state.object_info, root, depth)
                 .enumerate()
         {
             if index < request.layout_offset {
@@ -153,8 +153,8 @@ pub fn get_design_context(
             let mut object = if request.include_properties || request.include_references {
                 object_snapshot_sections(&state.pool, &state.object_info, *id, false)?
             } else {
-                let summary = crate::ai::snapshot::summary(&state.pool, &state.object_info, *id)?;
-                crate::ai::snapshot::ObjectSnapshot {
+                let summary = crate::cli::snapshot::summary(&state.pool, &state.object_info, *id)?;
+                crate::cli::snapshot::ObjectSnapshot {
                     id: summary.id,
                     name: summary.name,
                     object_type: summary.object_type,
@@ -183,7 +183,7 @@ pub fn get_design_context(
             Some(object)
         })
         .collect();
-    let summary = crate::ai::snapshot::project_summary(state);
+    let summary = crate::cli::snapshot::project_summary(state);
     Ok(DesignSnapshot {
         schema_version: 5,
         project: summary.project,
@@ -277,10 +277,10 @@ pub fn get_objects(
             );
             if let Some(list) = &mut object.object_list {
                 match list {
-                    crate::ai::snapshot::ObjectListSnapshot::Required(v) => {
+                    crate::cli::snapshot::ObjectListSnapshot::Required(v) => {
                         page(v, request.detail_offset, limit, &mut more)
                     }
-                    crate::ai::snapshot::ObjectListSnapshot::Nullable(v) => {
+                    crate::cli::snapshot::ObjectListSnapshot::Nullable(v) => {
                         page(v, request.detail_offset, limit, &mut more)
                     }
                 }
@@ -314,7 +314,7 @@ fn nearby_style(state: &AiDesignState, root: ObjectId, offset: usize) -> Value {
     let mut examples = Vec::new();
     let mut more = false;
     for placement in
-        crate::ai::snapshot::context_layout(&state.pool, &state.object_info, Some(root), 2)
+        crate::cli::snapshot::context_layout(&state.pool, &state.object_info, Some(root), 2)
             .skip(offset)
             .take(MAX_NEARBY_STYLE + 1)
     {
@@ -421,7 +421,7 @@ pub fn source_context(source: &crate::components::ComponentSource, id: u16) -> O
 
 pub fn component_design_context(
     state: &AiDesignState,
-    snapshot: crate::ai::snapshot::DesignSnapshot,
+    snapshot: crate::cli::snapshot::DesignSnapshot,
 ) -> Value {
     let mut context = serde_json::to_value(snapshot).expect("snapshot serializes");
     let map = crate::components::source_map(&state.components);

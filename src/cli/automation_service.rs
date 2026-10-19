@@ -1,6 +1,6 @@
 //! Shared project inspection and export operations used by the standalone CLI.
 use super::protocol::AutomationAction;
-use crate::ai;
+use crate::cli;
 use ag_iso_stack::object_pool::ObjectType;
 use serde_json::{json, Value};
 
@@ -19,16 +19,16 @@ impl DomainError {
     }
 }
 
-fn inspection_error(error: ai::AiToolError) -> DomainError {
+fn inspection_error(error: cli::AiToolError) -> DomainError {
     match error {
-        ai::AiToolError::ObjectNotFound(id) => {
+        cli::AiToolError::ObjectNotFound(id) => {
             DomainError::new("OBJECT_NOT_FOUND", format!("Object {id} was not found"))
         }
-        ai::AiToolError::RequestTooLarge => DomainError::new(
+        cli::AiToolError::RequestTooLarge => DomainError::new(
             "INVALID_ARGUMENTS",
             "Object request exceeds the supported limit",
         ),
-        ai::AiToolError::InvalidScope => {
+        cli::AiToolError::InvalidScope => {
             DomainError::new("INVALID_ARGUMENTS", "Invalid design inspection scope")
         }
     }
@@ -96,8 +96,8 @@ pub fn execute(
             }
             let request = serde_json::from_value(args)
                 .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
-            let context = ai::get_design_context(state, request).map_err(inspection_error)?;
-            Ok(json!({"context": ai::tools::component_design_context(state, context)}))
+            let context = cli::get_design_context(state, request).map_err(inspection_error)?;
+            Ok(json!({"context": cli::tools::component_design_context(state, context)}))
         }
         AutomationAction::GetObjects => {
             if let Some(targets) = args.get("targets").and_then(Value::as_array) {
@@ -120,10 +120,10 @@ pub fn execute(
             }
             let request = serde_json::from_value(args)
                 .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
-            let objects = ai::get_objects(state, request).map_err(inspection_error)?;
+            let objects = cli::get_objects(state, request).map_err(inspection_error)?;
             let sources = objects
                 .iter()
-                .filter_map(|o| ai::tools::source_context(&state.components, o.object.id))
+                .filter_map(|o| cli::tools::source_context(&state.components, o.object.id))
                 .collect::<Vec<_>>();
             let values = serde_json::to_value(objects).unwrap();
             Ok(json!({"sources":sources,"objects":values}))
@@ -159,11 +159,11 @@ pub fn execute(
                 ag_iso_stack::object_pool::ObjectId::new(parent_id)
                     .ok()
                     .map(|root| {
-                        ai::snapshot::layout_instances(
+                        cli::snapshot::layout_instances(
                             &state.pool,
                             &state.object_info,
                             Some(root),
-                            ai::snapshot::MAX_SNAPSHOT_DEPTH,
+                            cli::snapshot::MAX_SNAPSHOT_DEPTH,
                         )
                         .into_iter()
                         .filter(|placement| placement.parent.id == parent_id)
@@ -249,7 +249,7 @@ pub fn execute(
                             format!("Unknown object type: {name}"),
                         )
                     })?;
-                let mut schema = ai::get_object_schema(state, ty);
+                let mut schema = cli::get_object_schema(state, ty);
                 if let Some(properties) = args["properties"].as_array().filter(|p| !p.is_empty()) {
                     if let Some(fields) = schema["properties"].as_array_mut() {
                         fields.retain(|field| properties.contains(&field["name"]));
@@ -263,7 +263,7 @@ pub fn execute(
             let query = args["query"].as_str().unwrap_or("").to_lowercase();
             let category = args["category"].as_str().unwrap_or("").to_lowercase();
             let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 50) as usize;
-            let catalog = ai::tools::component_catalog(state);
+            let catalog = cli::tools::component_catalog(state);
             let matching: Vec<_> = catalog
                 .as_array()
                 .unwrap()
@@ -296,7 +296,7 @@ pub fn execute(
                 state.components.definitions.get(&id).ok_or_else(|| {
                     DomainError::new("COMPONENT_NOT_FOUND", "Component not found")
                 })?;
-            let mut metadata = ai::tools::component_catalog(state)
+            let mut metadata = cli::tools::component_catalog(state)
                 .as_array()
                 .unwrap()
                 .iter()
@@ -381,7 +381,7 @@ pub fn execute(
                     })
                 })
                 .transpose()?;
-            let preview = ai::preview::render_design_preview(state, mask_id)
+            let preview = cli::preview::render_design_preview(state, mask_id)
                 .map_err(|error| DomainError::new("INSPECTION_FAILED", format!("{error:?}")))?;
             Ok(
                 json!({"width":preview.width,"height":preview.height,"mask_id":preview.mask_id,"png_base64":base64::Engine::encode(&base64::engine::general_purpose::STANDARD,&preview.image.bytes)}),
@@ -473,7 +473,7 @@ pub fn execute(
         AutomationAction::InspectDesignRegion => {
             let request = serde_json::from_value(args)
                 .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
-            let region = ai::design_inspection::inspect_design_region(state, request)
+            let region = cli::design_inspection::inspect_design_region(state, request)
                 .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
             Ok(json!({"region":region}))
         }
