@@ -19,6 +19,9 @@ mod project_file;
 mod smart_naming;
 mod soft_key_layout;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cli_session;
+
 // Operation system and automation support
 pub mod ai;
 pub mod canvas;

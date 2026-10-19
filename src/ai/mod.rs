@@ -1,6 +1,4 @@
-//! Factual design inspection and authenticated editor automation.
-#[cfg(not(target_arch = "wasm32"))]
-pub mod automation_bridge;
+//! Factual design inspection and direct automation domain operations.
 pub mod automation_service;
 pub mod design_inspection;
 pub mod export;

@@ -1,9 +1,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use ag_iso_stack::object_pool::ObjectType;
-    use ag_iso_terminal_designer::ai::automation_bridge::{
-        invoke_runtime_request, AutomationAction, AutomationRequest, AutomationResponse,
-    };
+    use ag_iso_terminal_designer::ai::protocol::AutomationAction;
+    use ag_iso_terminal_designer::cli_session::Session;
     use ag_iso_terminal_designer::{
         components::{ComponentParameterKind, ComponentParameterTarget},
         editing::{EditAction, EditActionKind, ParameterInput, RelationshipEdit, MAX_EDIT_ACTIONS},
@@ -12,6 +11,7 @@ mod native {
     };
     use clap::{CommandFactory, Parser, Subcommand};
     use serde_json::{json, Value};
+    use std::cell::RefCell;
     use std::{
         collections::BTreeMap,
         fs,
@@ -23,18 +23,9 @@ mod native {
     #[derive(Debug, Parser)]
     #[command(
         name = "aitd",
-        about = "Inspect and edit a running AgIsoTerminalDesigner project"
+        about = "Inspect and edit a standalone working project in this shell"
     )]
     struct Cli {
-        /// Select an editor when more than one is running.
-        #[arg(long, global = true)]
-        instance: Option<String>,
-        /// Guard commands against a different project.
-        #[arg(long, global = true)]
-        project_instance: Option<String>,
-        /// Guard commands against a different project revision.
-        #[arg(long, global = true)]
-        revision: Option<u64>,
         /// Validate an edit without changing the project.
         #[arg(long, global = true)]
         check: bool,
@@ -47,12 +38,15 @@ mod native {
 
     #[derive(Debug, Subcommand, Clone)]
     enum Command {
-        /// Show editor and project status.
+        /// Show working project status.
         Status,
         /// Describe commands supported by this CLI.
         Capabilities,
-        /// List reachable desktop editors.
-        Editors,
+        /// Discover retained project backups.
+        Backups {
+            #[command(subcommand)]
+            command: BackupCommand,
+        },
         /// Generate a Bash completion script for this command tree.
         Completions {
             #[arg(value_parser = ["bash"])]
@@ -118,7 +112,7 @@ mod native {
             #[command(subcommand)]
             command: ExportCommand,
         },
-        /// Apply command lines atomically as one undo step.
+        /// Apply edit commands atomically to the working project.
         Run {
             #[arg(long)]
             file: String,
@@ -187,6 +181,13 @@ mod native {
         },
     }
     #[derive(Debug, Subcommand, Clone)]
+    enum BackupCommand {
+        List {
+            #[arg(long)]
+            project: Option<PathBuf>,
+        },
+    }
+    #[derive(Debug, Subcommand, Clone)]
     enum ObjectCommand {
         List {
             #[arg(long)]
@@ -199,7 +200,7 @@ mod native {
             offset: usize,
             #[arg(long, default_value_t = 100)]
             limit: usize,
-            /// Read all matching pages from one revision.
+            /// Read all matching pages.
             #[arg(long)]
             all: bool,
         },
@@ -227,14 +228,14 @@ mod native {
             name: Option<String>,
             #[arg(long = "name")]
             named: Option<String>,
+            /// Assign an explicit object ID.
+            #[arg(long)]
+            id: Option<u16>,
         },
         Set {
             id: String,
-            #[arg(required_unless_present = "value_file")]
+            #[arg(required = true)]
             assignments: Vec<String>,
-            /// Read the value for a single named property from a text file.
-            #[arg(long)]
-            value_file: Option<PathBuf>,
         },
         Rename {
             id: String,
@@ -398,6 +399,30 @@ mod native {
     }
     #[derive(Debug, Subcommand, Clone)]
     enum ProjectCommand {
+        /// Load a project into this shell session.
+        Load {
+            path: PathBuf,
+            #[arg(long)]
+            discard: bool,
+        },
+        /// Start a new working project.
+        New {
+            #[arg(long)]
+            discard: bool,
+        },
+        /// Close this shell session project.
+        Close {
+            #[arg(long)]
+            discard: bool,
+        },
+        /// Validate and atomically save the working project.
+        Save {
+            path: PathBuf,
+            #[arg(long)]
+            force: bool,
+            #[arg(long)]
+            skip_validation: bool,
+        },
         /// Identify the active project, original file path, and current save path.
         Current,
         Settings {
@@ -714,9 +739,10 @@ mod native {
                         object_type,
                         name,
                         named,
+                        id,
                     } => one(EditActionKind::Operation {
                         operation: Operation::CreateObject {
-                            object_id: None,
+                            object_id: *id,
                             object_type: typed_object_type(object_type)?,
                             name: name.as_ref().or(named.as_ref()).unwrap().clone(),
                         },
@@ -724,17 +750,7 @@ mod native {
                     ObjectCommand::Set {
                         id,
                         assignments,
-                        value_file,
                     } => {
-                        let mut assignments = assignments.clone();
-                        if let Some(file) = value_file {
-                            if assignments.len() != 1 || assignments[0].contains('=') {
-                                return Err(error("INVALID_USAGE", "Use object set TARGET PROPERTY --value-file PATH for one text value."));
-                            }
-                            let text = fs::read_to_string(base.join(file))
-                                .map_err(|e| error("INPUT_FAILED", e.to_string()))?;
-                            assignments[0] = format!("{}={text}", assignments[0]);
-                        }
                         let mut values = BTreeMap::new();
                         for assignment in assignments {
                             let (property, value) = assignment.split_once('=').ok_or_else(|| {
@@ -1161,74 +1177,35 @@ mod native {
         json!({"error":{"code":code,"message":message.into()}})
     }
 
-    fn response_value(response: AutomationResponse) -> Result<Value, Value> {
-        let success = response.success;
-        let value = serde_json::to_value(response).expect("automation responses are serializable");
-        if success {
-            Ok(value)
-        } else {
-            Err(value)
-        }
-    }
-
-    /// One editor and revision, resolved once for this invocation.
+    /// Holds the session lock for the entire invocation, including outputs.
     struct Client {
-        editor: String,
-        project: String,
-        revision: u64,
+        session: RefCell<Session>,
         check: bool,
     }
     impl Client {
-        fn connect(cli: &Cli) -> Result<(Self, Value), Value> {
-            let selected = cli
-                .instance
-                .clone()
-                .or_else(|| std::env::var("AG_ISO_EDITOR_INSTANCE_ID").ok());
-            let status = Self::send(
-                selected.as_deref(),
-                AutomationRequest {
-                    project_instance_id: None,
-                    revision: None,
-                    action: AutomationAction::GetProjectStatus,
-                    args: Value::Null,
-                },
-            )?;
-            Ok((
-                Self {
-                    editor: status["editor_instance_id"].as_str().unwrap().to_owned(),
-                    project: cli.project_instance.clone().unwrap_or_else(|| {
-                        status["project_instance_id"].as_str().unwrap().to_owned()
-                    }),
-                    revision: cli
-                        .revision
-                        .or_else(|| status["revision"].as_u64())
-                        .unwrap_or(0),
-                    check: cli.check,
-                },
-                status,
-            ))
-        }
-        fn send(editor: Option<&str>, request: AutomationRequest) -> Result<Value, Value> {
-            invoke_runtime_request(editor, request)
-                .map_err(|e| json!({"error":{"code":e.code,"message":e.message,"expected_revision":e.expected_revision,"current_revision":e.current_revision}}))
-                .and_then(response_value)
-        }
         fn request(&self, action: AutomationAction, args: Value) -> Result<Value, Value> {
-            Self::send(
-                Some(&self.editor),
-                AutomationRequest {
-                    project_instance_id: Some(self.project.clone()),
-                    revision: Some(self.revision),
-                    action,
-                    args,
-                },
-            )
+            let session = self.session.borrow();
+            let project = session
+                .project()
+                .map_err(|e| error("PROJECT_NOT_OPEN", e))?;
+            let result =
+                ag_iso_terminal_designer::ai::automation_service::execute(project, action, args)
+                    .map_err(|e| error(e.code, e.message))?;
+            Ok(json!({"success":true,"result":result}))
         }
         fn edit(&self, actions: Vec<EditAction>) -> Result<Value, Value> {
-            self.request(
-                AutomationAction::EditProject,
+            let mut session = self.session.borrow_mut();
+            let result = ag_iso_terminal_designer::editing::execute_batch(
+                session
+                    .project_mut()
+                    .map_err(|e| error("PROJECT_NOT_OPEN", e))?,
                 json!({"actions":actions,"check":self.check}),
             )
+            .map_err(|e| error(e.code, e.message))?;
+            if !self.check {
+                session.persist().map_err(|e| error("SESSION_FAILED", e))?;
+            }
+            Ok(json!({"success":true,"result":result}))
         }
         fn output(
             &self,
@@ -1251,7 +1228,7 @@ mod native {
         if cli.check
             && matches!(
                 cli.command,
-                Command::Capabilities | Command::Completions { .. } | Command::Editors
+                Command::Capabilities | Command::Completions { .. } | Command::Backups { .. }
             )
         {
             return Err(error(
@@ -1261,22 +1238,88 @@ mod native {
         }
         match &cli.command {
             Command::Capabilities => {
-                return Ok(json!({"result":{
-                    "automation_api_version":3,"json_input":false,"atomic_command_files":true,"max_edit_actions":MAX_EDIT_ACTIONS,
+                return Ok(json!({"success":true,"result":{
+                    "cli_api_version":4,"json_input":false,"atomic_command_files":true,"max_edit_actions":MAX_EDIT_ACTIONS,
                     "commands":Cli::command().get_subcommands().map(|c|json!({"name":c.get_name(),"description":c.get_about().map(ToString::to_string),"subcommands":c.get_subcommands().map(|s|s.get_name()).collect::<Vec<_>>()})).collect::<Vec<_>>()
                 }}))
             }
             Command::Completions { shell } => {
-                return Ok(json!({"result":{"shell":shell,"script":bash_completions()}}))
+                return Ok(
+                    json!({"success":true,"result":{"shell":shell,"script":bash_completions()}}),
+                )
             }
-            Command::Editors => {
-                return ag_iso_terminal_designer::ai::automation_bridge::list_runtime_instances()
-                    .map(|editors| json!({"result":{"editors":editors}}))
-                    .map_err(|e| error("EDITOR_CONNECTION_FAILED", e))
+            Command::Backups {
+                command: BackupCommand::List { project },
+            } => {
+                return Session::backups_list(project.as_deref())
+                    .map(|backups| json!({"success":true,"result":{"backups":backups}}))
+                    .map_err(|e| error("BACKUP_FAILED", e));
             }
             _ => {}
         }
-        let (client, status) = Client::connect(&cli)?;
+        let mut session = Session::open().map_err(|e| error("SESSION_FAILED", e))?;
+        if let Command::Project { command } = &cli.command {
+            let lifecycle = matches!(
+                command,
+                ProjectCommand::Load { .. }
+                    | ProjectCommand::New { .. }
+                    | ProjectCommand::Close { .. }
+                    | ProjectCommand::Save { .. }
+            );
+            if lifecycle {
+                if cli.check {
+                    return Err(error(
+                        "INVALID_USAGE",
+                        "--check is only supported by edit commands and run",
+                    ));
+                }
+                let result = match command {
+                    ProjectCommand::Load { path, discard } => session
+                        .load(path, *discard)
+                        .map(|_| json!(session.status()))
+                        .map_err(|e| error("PROJECT_FAILED", e)),
+                    ProjectCommand::New { discard } => session
+                        .new_project(*discard)
+                        .map(|_| json!(session.status()))
+                        .map_err(|e| error("PROJECT_FAILED", e)),
+                    ProjectCommand::Close { discard } => session
+                        .close(*discard)
+                        .map(|_| json!(session.status()))
+                        .map_err(|e| error("PROJECT_FAILED", e)),
+                    ProjectCommand::Save {
+                        path,
+                        force,
+                        skip_validation,
+                    } => session
+                        .save(path, *force, *skip_validation, |project| {
+                            let validation =
+                                ag_iso_terminal_designer::ai::automation_service::execute(
+                                    project,
+                                    A::ValidateDesign,
+                                    json!({}),
+                                )
+                                .map_err(|e| e.message)?;
+                            if validation["valid"] == true {
+                                Ok(())
+                            } else {
+                                Err(format!(
+                                    "Project validation failed: {}",
+                                    validation["diagnostics"]
+                                ))
+                            }
+                        })
+                        .map(|saved| json!(saved))
+                        .map_err(|e| error(e.code, e.message)),
+                    _ => unreachable!(),
+                }?;
+                return Ok(json!({"success":true,"result":result}));
+            }
+        }
+        let status = json!({"success":true,"result":session.status()});
+        let client = Client {
+            session: RefCell::new(session),
+            check: cli.check,
+        };
         let base = std::env::current_dir().map_err(|e| error("INPUT_FAILED", e.to_string()))?;
         if let Some(actions) = command_edit_actions(&cli.command, &base)? {
             return client.edit(actions);
@@ -1325,7 +1368,14 @@ mod native {
                 GraphicsCommand::Export {id,output,force}=>client.output(A::GetGraphic,json!({"id":id,"export":true}),"/graphic/png_base64",&output,force),
                 _=>unreachable!("edit command converted above"),
             },
-            Command::Validate=>client.request(A::ValidateDesign,json!({})),
+            Command::Validate=> {
+                let mut response = client.request(A::ValidateDesign,json!({}))?;
+                if response["result"]["valid"] == false {
+                    response["success"] = json!(false);
+                    response["error"] = json!({"code":"VALIDATION_FAILED","message":"Project validation failed"});
+                    Err(response)
+                } else { Ok(response) }
+            },
             Command::Preview {mask,output,force}=>client.output(A::PreviewDesign,json!({"mask_id":mask}),"png_base64",&output,force),
             Command::Export {command}=>export(&client,command),
             Command::Run {file}=>run_file(&client,&file),
@@ -1462,20 +1512,29 @@ mod native {
                 ));
             }
         }
-        let mut response = client.request(
-            AutomationAction::ExportArtifacts,
-            json!({"format":format,"expected_revision":client.revision}),
-        )?;
+        let session = client.session.borrow();
+        let project = session
+            .project()
+            .map_err(|e| error("PROJECT_NOT_OPEN", e))?;
+        let artifacts = ag_iso_terminal_designer::ai::export::artifacts(project, format)
+            .map_err(|e| error("VALIDATION_FAILED", e.to_string()))?;
         let staged = outputs
             .into_iter()
             .map(|(key, path)| {
-                let bytes = decode_output(&response["result"]["artifacts"], key)?;
-                stage_output(&path, &bytes)
+                let bytes = match key {
+                    "iop" => artifacts.iop.as_deref(),
+                    "header" => artifacts.header.as_deref(),
+                    _ => unreachable!(),
+                }
+                .ok_or_else(|| error("EXPORT_FAILED", "Requested artifact is missing"))?;
+                stage_output(&path, bytes)
             })
             .collect::<Result<Vec<_>, Value>>()?;
         publish_outputs(&staged, force)?;
-        response["result"] = json!({"outputs":staged.iter().map(|o|json!({"path":o.path,"bytes":o.bytes})).collect::<Vec<_>>(),"vt_version":response["result"]["vt_version"]});
-        Ok(response)
+        Ok(json!({"success":true,"result":{
+            "outputs":staged.iter().map(|o|json!({"path":o.path,"bytes":o.bytes})).collect::<Vec<_>>(),
+            "vt_version":artifacts.vt_version
+        }}))
     }
 
     /// Shell-style quoting without expansion or command execution.
@@ -1597,13 +1656,8 @@ mod native {
                 std::iter::once("aitd").chain(tokens.iter().map(String::as_str)),
             )
             .map_err(|e| error("SCRIPT_PARSE_ERROR", format!("line {line_number}: {e}")))?;
-            if cli.instance.is_some()
-                || cli.project_instance.is_some()
-                || cli.revision.is_some()
-                || cli.json
-                || cli.check
-            {
-                return Err(error("SCRIPT_COMMAND_UNSUPPORTED",format!("line {line_number}: select editor, guards, output format and --check on run, not inside the batch")));
+            if cli.json || cli.check {
+                return Err(error("SCRIPT_COMMAND_UNSUPPORTED",format!("line {line_number}: select output format and --check on run, not inside the batch")));
             }
             let line_actions = command_edit_actions(&cli.command, &base)
                 .map_err(|mut e| {
@@ -1815,13 +1869,8 @@ mod native {
                 let code = value["error"]["code"].as_str().unwrap_or("");
                 match code {
                     "INVALID_USAGE" | "INVALID_ARGUMENTS" => ExitCode::from(2),
-                    "PROJECT_NOT_OPEN" | "EDITOR_NOT_FOUND" | "EDITOR_CONNECTION_FAILED" => {
-                        ExitCode::from(3)
-                    }
-                    "STALE_PROJECT"
-                    | "PROJECT_INSTANCE_MISMATCH"
-                    | "PROJECT_REVISION_MISMATCH"
-                    | "EXPORT_REVISION_CONFLICT" => ExitCode::from(4),
+                    "PROJECT_NOT_OPEN" => ExitCode::from(3),
+                    "SOURCE_CHANGED" => ExitCode::from(4),
                     "VALIDATION_FAILED" => ExitCode::from(5),
                     _ => ExitCode::FAILURE,
                 }

@@ -129,6 +129,64 @@ struct Glyph {
     advance: f32,
 }
 
+/// Whether the current value of a fixed-cell Output String exceeds its box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextClipping {
+    pub horizontal: bool,
+    pub vertical: bool,
+}
+
+/// Measure an Output String using the same control handling and line layout as
+/// the preview. Proportional fonts are intentionally omitted because their
+/// terminal-specific glyph widths cannot be inferred reliably from the editor.
+pub(crate) fn clipping(object: &OutputString, pool: &ObjectPool) -> Option<TextClipping> {
+    let Object::FontAttributes(font) = pool.object_by_nullable_id(object.font_attributes)? else {
+        return None;
+    };
+    let FontSize::NonProportional(font_size) = font.font_size else {
+        return None;
+    };
+    if object.justification.horizontal == HorizontalAlignment::Reserved
+        || object.justification.vertical == VerticalAlignment::Reserved
+    {
+        return None;
+    }
+    let value = if let Some(id) = object.variable_reference.0 {
+        let Object::StringVariable(variable) = pool.object_by_id(id)? else {
+            return None;
+        };
+        &variable.value
+    } else {
+        &object.value
+    };
+    let text = value.decode(font.font_type).ok()?;
+    // NUL terminates presentation text; a string beginning with it has no
+    // visible content to clip.
+    if text.is_empty() || text.starts_with('\0') {
+        return None;
+    }
+
+    let height = font_size.height() as f32;
+    let cell_width = font_size.width() as f32;
+    let paragraphs = controls(&text);
+    let lines = layout(
+        paragraphs,
+        object.width as f32,
+        object.options.auto_wrap,
+        object.options.wrap_on_hyphen,
+        object.justification.horizontal,
+        |_| cell_width,
+    );
+    let horizontal = lines
+        .iter()
+        .any(|line| line.len() as f32 * cell_width > object.width as f32);
+    let vertical = lines.len() as f32 * height > object.height as f32;
+    Some(TextClipping {
+        horizontal,
+        vertical,
+    })
+}
+
 /// Fit styled glyph geometry inside its character box. Texture coordinates stay
 /// in atlas texels so egui can normalize them after all glyphs have been loaded.
 fn styled_glyph(mut galley: Arc<Galley>, width: f32, height: f32, style: FontStyle) -> Arc<Galley> {
@@ -463,5 +521,207 @@ mod tests {
         assert_eq!(glyphs[1].1.pos.x - glyphs[0].1.pos.x, 8.0);
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Rect(background) if background.rect.size() == egui::vec2(40.0, 24.0) && shape.clip_rect.width() == 20.0)));
+    }
+
+    #[test]
+    fn clipping_diagnostics_follow_fixed_cell_wrapping_and_string_references() {
+        use ag_iso_stack::object_pool::{ObjectId, ObjectType};
+        let mut pool = ObjectPool::default();
+        let mut font = crate::default_object(ObjectType::FontAttributes);
+        let Object::FontAttributes(attributes) = &mut font else {
+            unreachable!()
+        };
+        attributes.id = ObjectId::new(1).unwrap();
+        attributes.font_size = FontSize::NonProportional(
+            ag_iso_stack::object_pool::object_attributes::NonProportionalFontSize::Px8x12,
+        );
+        pool.add(font);
+
+        let mut variable = crate::default_object(ObjectType::StringVariable);
+        let Object::StringVariable(variable_value) = &mut variable else {
+            unreachable!()
+        };
+        variable_value.id = ObjectId::new(2).unwrap();
+        variable_value.value = "READY".into();
+        pool.add(variable);
+
+        let mut output = crate::default_object(ObjectType::OutputString);
+        let Object::OutputString(value) = &mut output else {
+            unreachable!()
+        };
+        value.id = ObjectId::new(3).unwrap();
+        value.font_attributes = ObjectId::new(1).unwrap().into();
+        value.variable_reference = ObjectId::new(2).unwrap().into();
+        value.width = 32;
+        value.height = 24;
+        value.options.auto_wrap = true;
+        pool.add(output);
+
+        let Object::OutputString(output) = pool.object_by_id(ObjectId::new(3).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            clipping(output, &pool),
+            Some(TextClipping {
+                horizontal: false,
+                vertical: false
+            })
+        );
+
+        let Object::OutputString(output) =
+            pool.object_mut_by_id(ObjectId::new(3).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        output.width = 16;
+        output.height = 24;
+        output.options.auto_wrap = false;
+        let Object::OutputString(output) = pool.object_by_id(ObjectId::new(3).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            clipping(output, &pool),
+            Some(TextClipping {
+                horizontal: true,
+                vertical: false
+            })
+        );
+
+        let Object::OutputString(output) =
+            pool.object_mut_by_id(ObjectId::new(3).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        output.width = 16;
+        output.height = 12;
+        output.options.auto_wrap = true;
+        let Object::OutputString(output) = pool.object_by_id(ObjectId::new(3).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            clipping(output, &pool),
+            Some(TextClipping {
+                horizontal: false,
+                vertical: true
+            })
+        );
+
+        let diagnostics = crate::pool_validation::validate_pool_state(&pool);
+        let clipped: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == "TEXT_CLIPPED")
+            .collect();
+        assert_eq!(clipped.len(), 1);
+        assert_eq!(
+            clipped[0].severity,
+            crate::pool_validation::ValidationSeverity::Warning
+        );
+        assert_eq!(clipped[0].affected_objects, Some(vec![3]));
+
+        let Object::OutputString(output) =
+            pool.object_mut_by_id(ObjectId::new(3).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        output.width = 8;
+        output.height = 8;
+        output.options.auto_wrap = false;
+        let clipped: Vec<_> = crate::pool_validation::validate_pool_state(&pool)
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == "TEXT_CLIPPED")
+            .collect();
+        assert_eq!(clipped.len(), 1);
+        assert!(clipped[0].message.contains("horizontally and vertically"));
+    }
+
+    #[test]
+    fn clipping_diagnostics_skip_unresolved_and_proportional_text() {
+        use ag_iso_stack::object_pool::{ObjectId, ObjectType};
+        let mut pool = ObjectPool::default();
+        let mut font = crate::default_object(ObjectType::FontAttributes);
+        let Object::FontAttributes(attributes) = &mut font else {
+            unreachable!()
+        };
+        attributes.id = ObjectId::new(1).unwrap();
+        attributes.font_size = FontSize::Proportional(12);
+        pool.add(font);
+
+        let mut output = crate::default_object(ObjectType::OutputString);
+        let Object::OutputString(value) = &mut output else {
+            unreachable!()
+        };
+        value.id = ObjectId::new(2).unwrap();
+        value.font_attributes = ObjectId::new(1).unwrap().into();
+        value.width = 1;
+        value.height = 1;
+        value.value = "long".into();
+        pool.add(output);
+        let Object::OutputString(output) = pool.object_by_id(ObjectId::new(2).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(clipping(output, &pool), None);
+
+        let Object::FontAttributes(font) =
+            pool.object_mut_by_id(ObjectId::new(1).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        font.font_size = FontSize::NonProportional(
+            ag_iso_stack::object_pool::object_attributes::NonProportionalFontSize::Px8x12,
+        );
+        let Object::OutputString(output) =
+            pool.object_mut_by_id(ObjectId::new(2).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        output.variable_reference = ObjectId::new(55).unwrap().into();
+        let Object::OutputString(output) = pool.object_by_id(ObjectId::new(2).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(clipping(output, &pool), None);
+
+        let Object::FontAttributes(font) =
+            pool.object_mut_by_id(ObjectId::new(1).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        font.font_type = ag_iso_stack::object_pool::object_attributes::FontType::Reserved(3);
+        let Object::OutputString(output) =
+            pool.object_mut_by_id(ObjectId::new(2).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        output.variable_reference = ObjectId::new(0).unwrap().into();
+        output.value = ag_iso_stack::object_pool::object::VtString::Encoded {
+            encoded_bytes: vec![b'X'; 32],
+        };
+        let Object::OutputString(output) = pool.object_by_id(ObjectId::new(2).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(clipping(output, &pool), None);
+
+        let Object::FontAttributes(font) =
+            pool.object_mut_by_id(ObjectId::new(1).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        font.font_type = ag_iso_stack::object_pool::object_attributes::FontType::Latin1;
+        let Object::OutputString(output) =
+            pool.object_mut_by_id(ObjectId::new(2).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        output.value = "\0not displayed".into();
+        let Object::OutputString(output) = pool.object_by_id(ObjectId::new(2).unwrap()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(clipping(output, &pool), None);
     }
 }

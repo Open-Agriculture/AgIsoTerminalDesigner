@@ -289,6 +289,32 @@ pub fn validate_pool_state_for_version(
         }
     }
 
+    // Fixed-width text fit is advisory: it does not affect whether a pool can
+    // be serialized or executed. This uses the preview's own text normalization
+    // and wrapping logic so valid wrapping does not create false positives.
+    for obj in pool.objects() {
+        if let ag_iso_stack::object_pool::object::Object::OutputString(output) = obj {
+            let Some(clipping) = crate::output_string_rendering::clipping(output, pool) else {
+                continue;
+            };
+            if !clipping.horizontal && !clipping.vertical {
+                continue;
+            }
+            let dimensions = match (clipping.horizontal, clipping.vertical) {
+                (true, true) => "horizontally and vertically",
+                (true, false) => "horizontally",
+                (false, true) => "vertically",
+                (false, false) => unreachable!(),
+            };
+            diagnostics.push(ValidationDiagnostic {
+                severity: ValidationSeverity::Warning,
+                message: format!("Output String text is clipped {dimensions}"),
+                affected_objects: Some(vec![obj.id().value()]),
+                code: "TEXT_CLIPPED".into(),
+            });
+        }
+    }
+
     diagnostics.extend(crate::vt_compatibility::validate_pool_compatibility(
         pool, vt_version,
     ));

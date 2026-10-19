@@ -1,4 +1,4 @@
-//! Domain operations exposed through the authenticated automation bridge.
+//! Shared project inspection and export operations used by the standalone CLI.
 use super::protocol::AutomationAction;
 use crate::ai;
 use ag_iso_stack::object_pool::ObjectType;
@@ -477,9 +477,5 @@ pub fn execute(
                 .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
             Ok(json!({"region":region}))
         }
-        _ => Err(DomainError::new(
-            "UNSUPPORTED_OPERATION",
-            format!("Unsupported tool: {tool}"),
-        )),
     }
 }

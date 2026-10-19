@@ -176,29 +176,24 @@ The lists below only apply to version 3 of the VT specification. There are 3 sta
 cargo run --release
 ```
 
-### Automating the desktop editor
+### Using the standalone CLI
 
-Build both the editor and the `aitd` CLI, then run the editor with a project open:
-
-```bash
-cargo build --release
-cargo run --release
-```
-
-The CLI is at `target/release/aitd`. Add that directory to `PATH`, or invoke it by its full path. `aitd` uses commands for input and supports readable text or structured JSON output. Start with `aitd --help` or see the [CLI guide](docs/cli.md):
+Build the CLI without opening the desktop editor:
 
 ```bash
-aitd status
-aitd object list --type Button
-aitd object set 10 width=120
-aitd --check run --file changes.aitd
-aitd run --file changes.aitd
-aitd export bundle --iop build/object_pool.iop --header build/object_pool.h
+cargo build --release --bin aitd
 ```
 
-The CLI edits the project open in the desktop editor immediately, through the same validated editing APIs used by the UI. Each edit, or an entire command file, is one undoable action. A failed command file leaves the project unchanged; `--check` validates without applying. Inputs are shell commands and plain command files, including field assignments for structured properties; JSON is supported only for output. Project saving remains an editor action. The browser editor remains manual-only. See the [CLI guide](docs/cli.md) for edit syntax, project guards, validation, exports, completion, and exit codes.
+The CLI is at `target/release/aitd`. Add that directory to `PATH`, or invoke it by its full path. Commands in the same shell share a temporary working project, while separate shells and terminals have independent sessions. Load or create a project, make edits, validate, then explicitly save it:
 
-If multiple editors are running, use `--instance <editor-instance-id>` or set `AG_ISO_EDITOR_INSTANCE_ID`. Connection details are in owner-only runtime files under the system temporary directory in `ag-iso-terminal-designer-<user>/`. The authenticated loopback bridge currently requires Unix owner-only file permissions.
+```bash
+aitd project load machine.aitp
+aitd run --file resources/changes.aitcmd
+aitd validate
+aitd project save machine.aitp
+```
+
+See the [CLI guide](docs/cli.md) for project lifecycle, backups, command files, validation, exports, and exit codes. The [standalone example](examples/standalone/README.md) runs the complete workflow without a desktop editor or display. Browser-based editing remains available through the [Web Application](https://open-agriculture.github.io/AgIsoTerminalDesigner/).
 
 ### Running the Web Application
 

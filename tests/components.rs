@@ -164,6 +164,62 @@ fn master_update_preserves_overrides_and_ids_without_generated_source_mutation()
         objects_by_id(&p.materialize().unwrap().pool)
     );
 }
+
+#[test]
+fn materialized_component_text_override_reports_clipping_on_instance_object() {
+    let (mut project, component, instance_id) = captured();
+    let parameter_id = parameter(&mut project, component);
+    ComponentService::set_component_override(
+        &mut project,
+        instance_id,
+        parameter_id,
+        json!("READY FOR WORK"),
+    )
+    .unwrap();
+
+    let mut definition = project.component_source().definitions[&component].clone();
+    let label_node = definition
+        .nodes
+        .iter_mut()
+        .find(|node| node.object_type == ObjectType::OutputString)
+        .unwrap();
+    label_node.properties.insert(property("width"), json!(24));
+    label_node.properties.insert(property("height"), json!(8));
+    ComponentService::edit_component_definition(&mut project, definition).unwrap();
+
+    let instance = project
+        .component_source()
+        .instances
+        .iter()
+        .find(|instance| instance.id == instance_id)
+        .unwrap();
+    let label_node = project.component_source().definitions[&component]
+        .nodes
+        .iter()
+        .find(|node| node.object_type == ObjectType::OutputString)
+        .unwrap();
+    let materialized_id = instance.compiled_ids[&label_node.id];
+    let materialized = project.materialize().unwrap();
+    assert!(matches!(
+        materialized
+            .pool
+            .object_by_id(ObjectId::new(materialized_id).unwrap()),
+        Some(Object::OutputString(label))
+            if label.value.decode(FontType::Latin1).unwrap() == "READY FOR WORK"
+    ));
+    let clipped: Vec<_> = project
+        .compatibility_diagnostics()
+        .unwrap()
+        .into_iter()
+        .filter(|diagnostic| diagnostic.code == "TEXT_CLIPPED")
+        .collect();
+
+    assert_eq!(clipped.len(), 1);
+    assert_eq!(clipped[0].severity, ValidationSeverity::Warning);
+    assert_eq!(clipped[0].affected_objects, Some(vec![materialized_id]));
+    assert!(clipped[0].message.contains("horizontally"));
+}
+
 #[test]
 fn save_load_detach_and_history_preserve_source_and_output() {
     let (mut p, component, a) = captured();

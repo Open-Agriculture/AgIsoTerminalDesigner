@@ -15,8 +15,6 @@ use ag_iso_stack::object_pool::NullableObjectId;
 use ag_iso_stack::object_pool::ObjectId;
 use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectType;
-#[cfg(not(target_arch = "wasm32"))]
-use ag_iso_terminal_designer::ai::automation_bridge::EditorAutomationBridge;
 use ag_iso_terminal_designer::canvas::{mask_view::MaskViewState, CanvasState};
 use ag_iso_terminal_designer::render_property_editor;
 use ag_iso_terminal_designer::{EditorProject, Operation};
@@ -137,8 +135,6 @@ pub struct DesignerApp {
     browser_dirty: Rc<Cell<bool>>,
     #[cfg(target_arch = "wasm32")]
     _before_unload: Option<Closure<dyn FnMut(web_sys::BeforeUnloadEvent)>>,
-    #[cfg(not(target_arch = "wasm32"))]
-    automation_bridge: Option<EditorAutomationBridge>,
 }
 
 impl DesignerApp {
@@ -198,7 +194,6 @@ impl DesignerApp {
                     {
                         self.project_path = None;
                         self.original_source_path = source_path;
-                        self.invalidate_automation_identity();
                     }
                     if self.discard_on_replace {
                         self.clear_recovery();
@@ -403,15 +398,6 @@ impl DesignerApp {
             }
         };
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let automation_bridge = match EditorAutomationBridge::start(_cc.egui_ctx.clone()) {
-            Ok(bridge) => Some(bridge),
-            Err(error) => {
-                error_message = Some(error);
-                None
-            }
-        };
-
         #[cfg(target_arch = "wasm32")]
         let browser_dirty = Rc::new(Cell::new(false));
         #[cfg(target_arch = "wasm32")]
@@ -477,19 +463,11 @@ impl DesignerApp {
             browser_dirty,
             #[cfg(target_arch = "wasm32")]
             _before_unload: before_unload,
-            #[cfg(not(target_arch = "wasm32"))]
-            automation_bridge,
         }
     }
 }
 
 impl DesignerApp {
-    #[cfg(not(target_arch = "wasm32"))]
-    fn invalidate_automation_identity(&mut self) {
-        if let Some(bridge) = &mut self.automation_bridge {
-            bridge.project_changed();
-        }
-    }
     /// Open a file dialog
     fn open_file_dialog(&mut self, reason: FileDialogReason, ctx: &egui::Context) {
         if matches!(
@@ -583,8 +561,6 @@ impl DesignerApp {
                                 _ => {}
                             }
                             self.open_in_progress = false;
-                            #[cfg(not(target_arch = "wasm32"))]
-                            self.invalidate_automation_identity();
                             self.close_project_settings();
                             self.canvas = CanvasState::default();
                             self.mask_view = MaskViewState::default();
@@ -813,8 +789,6 @@ impl DesignerApp {
     fn perform_action(&mut self, action: PendingAction, ctx: &egui::Context) {
         match action {
             PendingAction::NewPool => {
-                #[cfg(not(target_arch = "wasm32"))]
-                self.invalidate_automation_identity();
                 self.close_project_settings();
                 self.canvas = CanvasState::default();
                 self.mask_view = MaskViewState::default();
@@ -864,8 +838,6 @@ impl DesignerApp {
                     match EditorProject::load_project(record.project_json.into_bytes()) {
                         Ok(project) => {
                             project.mark_recovered();
-                            #[cfg(not(target_arch = "wasm32"))]
-                            self.invalidate_automation_identity();
                             self.close_project_settings();
                             self.canvas = CanvasState::default();
                             self.mask_view = MaskViewState::default();
@@ -1835,16 +1807,6 @@ impl eframe::App for DesignerApp {
             project.set_object_id_format(self.preferences.object_id_format);
             project.set_show_object_ids(self.preferences.show_object_ids);
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(bridge) = &mut self.automation_bridge {
-            bridge.set_project_location(
-                self.project_path.as_deref(),
-                self.original_source_path.as_deref(),
-                &self.project_display_name,
-            );
-            bridge.poll(self.project.as_mut());
-        }
-
         #[cfg(not(target_arch = "wasm32"))]
         if ctx.input(|input| input.viewport().close_requested()) {
             if self.project.as_ref().is_some_and(EditorProject::is_dirty) {

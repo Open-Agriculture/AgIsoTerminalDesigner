@@ -5,7 +5,86 @@ pub const MAX_EDIT_ACTIONS: usize = 256;
 
 use ag_iso_stack::object_pool::{object_attributes::Event, ObjectType};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
+
+/// Error returned while decoding or applying an atomic edit batch.
+#[derive(Debug, Clone)]
+pub struct EditBatchError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for EditBatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EditBatchError {}
+
+/// Decode and apply a batch using the normal transactional project editor.
+/// `args` has the shape `{ "actions": [...], "check": false }`. Check-only
+/// batches validate their candidate but leave the project and history unchanged.
+pub fn execute_batch(
+    project: &mut crate::EditorProject,
+    args: Value,
+) -> Result<Value, EditBatchError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BatchArgs {
+        actions: Vec<EditAction>,
+        #[serde(default)]
+        check: bool,
+    }
+
+    let args: BatchArgs = serde_json::from_value(args).map_err(|error| EditBatchError {
+        code: "VALIDATION_FAILED",
+        message: error.to_string(),
+    })?;
+    if args.actions.is_empty() || args.actions.len() > MAX_EDIT_ACTIONS {
+        return Err(EditBatchError {
+            code: "INVALID_ARGUMENTS",
+            message: format!("A batch requires 1..{} edit actions", MAX_EDIT_ACTIONS),
+        });
+    }
+
+    let before: std::collections::HashSet<_> = project
+        .get_pool()
+        .objects()
+        .iter()
+        .map(|object| object.id().value())
+        .collect();
+    let applied = project
+        .edit_batch(
+            "CLI edit",
+            |scratch| {
+                for action in args.actions {
+                    apply(scratch, action)?;
+                }
+                Ok(())
+            },
+            args.check,
+        )
+        .map_err(|message| EditBatchError {
+            code: "VALIDATION_FAILED",
+            message,
+        })?;
+    let allocated: Vec<_> = project
+        .get_pool()
+        .objects()
+        .iter()
+        .map(|object| object.id().value())
+        .filter(|id| !before.contains(id))
+        .collect();
+
+    Ok(json!({
+        "transaction_id": applied.as_ref().map(|transaction| &transaction.transaction_id),
+        "changed_ids": applied.as_ref().map(|transaction| transaction.affected_objects.as_slice()).unwrap_or_default(),
+        "allocated_ids": allocated,
+        "check": args.check,
+    }))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditAction {
@@ -308,8 +387,6 @@ use crate::{
 use ag_iso_stack::object_pool::{
     object::Object, object_attributes::ObjectLabel, NullableObjectId, ObjectId,
 };
-use serde_json::{json, Value};
-
 // Dispatch commands through the same services used by the editor.
 fn apply_kind(project: &mut EditorProject, action: EditActionKind) -> Result<(), String> {
     use EditActionKind as A;
@@ -1922,5 +1999,59 @@ mod tests {
         )
         .is_err());
         assert_eq!(project.mask_size, 500);
+    }
+
+    #[test]
+    fn execute_batch_checks_without_mutating_and_commits_atomically() {
+        let action = EditAction::new(EditActionKind::Operation {
+            operation: Operation::CreateObject {
+                object_id: Some(100),
+                object_type: ObjectType::OutputString,
+                name: "Status".into(),
+            },
+        });
+        let mut project = EditorProject::default();
+
+        let checked = execute_batch(
+            &mut project,
+            json!({"actions": [action.clone()], "check": true}),
+        )
+        .unwrap();
+        assert_eq!(checked["check"], true);
+        assert!(project
+            .get_pool()
+            .object_by_id(ObjectId::new(100).unwrap())
+            .is_none());
+
+        let applied =
+            execute_batch(&mut project, json!({"actions": [action], "check": false})).unwrap();
+        assert_eq!(applied["allocated_ids"], json!([100]));
+        assert!(applied["transaction_id"].is_string());
+        assert!(project
+            .get_pool()
+            .object_by_id(ObjectId::new(100).unwrap())
+            .is_some());
+    }
+
+    #[test]
+    fn execute_batch_enforces_action_count_bounds() {
+        let error =
+            execute_batch(&mut EditorProject::default(), json!({"actions": []})).unwrap_err();
+        assert_eq!(error.code, "INVALID_ARGUMENTS");
+        let action = EditAction::new(EditActionKind::Settings {
+            values: BTreeMap::from([("mask_size".into(), "500".into())]),
+        });
+        let mut project = EditorProject::default();
+        execute_batch(
+            &mut project,
+            json!({"actions": vec![action.clone(); MAX_EDIT_ACTIONS], "check": true}),
+        )
+        .unwrap();
+        let oversized = execute_batch(
+            &mut project,
+            json!({"actions": vec![action; MAX_EDIT_ACTIONS + 1]}),
+        )
+        .unwrap_err();
+        assert_eq!(oversized.code, "INVALID_ARGUMENTS");
     }
 }
