@@ -1728,6 +1728,54 @@ mod tests {
     use super::*;
     use ag_iso_stack::object_pool::ObjectPool;
 
+    fn add_export_scaffolding(pool: &mut ObjectPool) {
+        let mut next_id = 65_000u16;
+        let mut allocate_id = || loop {
+            let candidate = ag_iso_stack::object_pool::ObjectId::new(next_id).unwrap();
+            next_id -= 1;
+            if pool.object_by_id(candidate).is_none() {
+                break candidate;
+            }
+        };
+        let font_id = allocate_id();
+        let string_id = allocate_id();
+        let mask_id = allocate_id();
+        let working_set_id = allocate_id();
+
+        let mut font = crate::default_object(ObjectType::FontAttributes);
+        *font.mut_id() = font_id;
+        pool.add(font);
+
+        let mut identifier = crate::default_object(ObjectType::OutputString);
+        *identifier.mut_id() = string_id;
+        if let Object::OutputString(identifier) = &mut identifier {
+            identifier.font_attributes = font_id.into();
+        }
+        pool.add(identifier);
+
+        let mut mask = crate::default_object(ObjectType::DataMask);
+        *mask.mut_id() = mask_id;
+        pool.add(mask);
+
+        let mut working_set = crate::default_object(ObjectType::WorkingSet);
+        *working_set.mut_id() = working_set_id;
+        if let Object::WorkingSet(working_set) = &mut working_set {
+            working_set.active_mask = mask_id;
+            working_set
+                .object_refs
+                .push(ag_iso_stack::object_pool::object_attributes::ObjectRef {
+                    id: string_id,
+                    offset: ag_iso_stack::object_pool::object_attributes::Point::default(),
+                });
+        }
+        pool.add(working_set);
+    }
+
+    fn project_with_export_scaffolding(mut pool: ObjectPool) -> EditorProject {
+        add_export_scaffolding(&mut pool);
+        EditorProject::from(pool)
+    }
+
     fn variables(count: u16) -> EditorProject {
         let mut pool = ObjectPool::default();
         for id in 1..=count {
@@ -1738,7 +1786,7 @@ mod tests {
             }
             pool.add(object);
         }
-        EditorProject::from(pool)
+        project_with_export_scaffolding(pool)
     }
 
     #[test]
@@ -1759,7 +1807,7 @@ mod tests {
             }
             pool.add(object);
         }
-        let mut project = EditorProject::from(pool);
+        let mut project = project_with_export_scaffolding(pool);
         assert!(project.set_object_id_overridden(
             ag_iso_stack::object_pool::ObjectId::new(first).unwrap(),
             true
@@ -1814,7 +1862,7 @@ mod tests {
             unreachable!()
         };
         mac.commands = commands;
-        let mut project = EditorProject::from(pool);
+        let mut project = project_with_export_scaffolding(pool);
         for (id, name) in [
             (10, "null"),
             (11, "name:Stroke"),
@@ -2113,7 +2161,7 @@ mod tests {
                         .any(|line| line.contains("object create"))
             })
             .collect();
-        assert_eq!(creation.len(), 300);
+        assert_eq!(creation.len(), 303);
         assert_eq!(
             archive.to_zip().unwrap(),
             generate(&project).unwrap().to_zip().unwrap()
@@ -2200,13 +2248,15 @@ mod tests {
         let mut picture = crate::default_object(ObjectType::PictureGraphic);
         picture.mut_id().set_value(7).unwrap();
         pool.add(picture);
-        assert!(generate(&EditorProject::from(pool)).is_err());
+        assert!(generate(&project_with_export_scaffolding(pool)).is_err());
 
         let mut pool = ObjectPool::default();
         let mut graphic = crate::default_object(ObjectType::GraphicData);
         graphic.mut_id().set_value(9).unwrap();
         pool.add(graphic);
-        let error = generate(&EditorProject::from(pool)).err().unwrap();
+        let error = generate(&project_with_export_scaffolding(pool))
+            .err()
+            .unwrap();
         assert!(error.contains("graphic-data"), "{error}");
     }
 

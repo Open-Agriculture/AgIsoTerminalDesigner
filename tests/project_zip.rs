@@ -69,6 +69,10 @@ fn source_project() -> (EditorProject, ComponentParameterId, GraphicAssetId) {
     }
     if let Some(Object::WorkingSet(working_set)) = pool.object_mut_by_id(object_id(256)) {
         working_set.active_mask = object_id(2);
+        working_set.object_refs.push(ObjectRef {
+            id: object_id(201),
+            offset: Point::default(),
+        });
         working_set.language_codes = vec!["en".into(), "nl".into(), "de".into()];
     }
     if let Some(Object::Button(button)) = pool.object_mut_by_id(object_id(100)) {
@@ -394,6 +398,24 @@ fn exported_zip_replays_numeric_graphic_enums() {
         graphic.scale_type = 4 | (2 << 3) | (1 << 5);
     }
 
+    let mut working_set = object_with_id(ObjectType::WorkingSet, 256);
+    if let Object::WorkingSet(ws) = &mut working_set {
+        ws.active_mask = object_id(2);
+        ws.object_refs.push(ObjectRef {
+            id: object_id(200),
+            offset: Point::default(),
+        });
+    }
+    pool.add(working_set);
+    pool.add(object_with_id(ObjectType::DataMask, 2));
+    let mut identifier = object_with_id(ObjectType::PictureGraphic, 200);
+    if let Object::PictureGraphic(picture) = &mut identifier {
+        picture.width = 8;
+        picture.actual_width = 8;
+        picture.actual_height = 1;
+        picture.data = vec![0];
+    }
+    pool.add(identifier);
     let mut project = EditorProject::from(pool);
     project.set_vt_version(VtVersion::Version6).unwrap();
     // This test compares protocol IDs after rebuilding, so reserve them explicitly.

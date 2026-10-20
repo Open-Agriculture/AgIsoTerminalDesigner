@@ -3345,7 +3345,11 @@ mod tests {
         assert!(!editor_frame(&ctx, &project, vec![])
             .iter()
             .any(|(text, _)| text == "Disabled"));
-        assert!(project.compatibility_diagnostics().unwrap().is_empty());
+        assert!(!project
+            .compatibility_diagnostics()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic.code.starts_with("VT_")));
         project.undo();
         assert!(editor_frame(&ctx, &project, vec![])
             .iter()

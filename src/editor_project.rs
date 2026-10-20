@@ -553,11 +553,15 @@ impl EditorProject {
         self.cache.borrow_mut().property_choices.insert(key, valid);
         valid
     }
-    /// Export the materialized pool, rejecting strings whose encoded byte
-    /// length exceeds the ISO field limit.
+    /// Export a complete, compatible materialized pool, rejecting strings
+    /// whose encoded byte length exceeds the ISO field limit.
     pub fn export_iop(&self) -> ComponentResult<Vec<u8>> {
         let materialized = self.materialize_shared()?;
-        let diagnostics = self.compatibility_diagnostics_from_pool(&materialized.pool)?;
+        let mut diagnostics = self.compatibility_diagnostics_from_pool(&materialized.pool)?;
+        diagnostics.extend(crate::pool_validation::validate_complete_pool_requirements(
+            &materialized.pool,
+            self.vt_version,
+        ));
         let errors: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.severity == crate::ValidationSeverity::Error)
@@ -1076,9 +1080,18 @@ impl EditorProject {
         self.set_project_settings(self.mask_size, self.soft_key_size, version)
     }
 
-    /// Compatibility diagnostics for the materialized project, including components.
+    /// Compatibility and complete-pool diagnostics for the materialized
+    /// project, including components. Draft projects remain saveable; these
+    /// completeness diagnostics block IOP export.
     pub fn compatibility_diagnostics(&self) -> ComponentResult<Vec<crate::ValidationDiagnostic>> {
-        self.compatibility_diagnostics_from_pool(&self.materialize_shared()?.pool)
+        let materialized = self.materialize_shared()?;
+        let pool = &materialized.pool;
+        let mut diagnostics = self.compatibility_diagnostics_from_pool(pool)?;
+        diagnostics.extend(crate::pool_validation::validate_complete_pool_requirements(
+            pool,
+            self.vt_version,
+        ));
+        Ok(diagnostics)
     }
 
     fn compatibility_diagnostics_from_pool(
@@ -2854,6 +2867,39 @@ mod tests {
     use crate::{default_object, ChildPlacement, MacroReferenceTarget};
 
     #[test]
+    fn incomplete_draft_round_trips_but_complete_diagnostics_and_iop_export_reject_it() {
+        let mut project = EditorProject::default();
+        let mut create = OperationTransaction::new(None);
+        create.add_operation(Operation::CreateObject {
+            object_id: Some(1),
+            object_type: ObjectType::OutputRectangle,
+            name: "Draft rectangle".into(),
+        });
+        project.execute_transaction(create).unwrap();
+        let restored = EditorProject::load_project(project.save_project().unwrap()).unwrap();
+
+        assert!(restored.save_project().is_ok());
+        let diagnostics = restored.compatibility_diagnostics().unwrap();
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "WORKING_SET_CARDINALITY" }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E007_OBJECT_NOT_FOUND"
+                && diagnostic.affected_objects == Some(vec![0])
+        }));
+
+        let mut edit_width = OperationTransaction::new(None);
+        edit_width.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(1),
+            property: crate::PropertyKey::Width,
+            value: 40.into(),
+        });
+        let mut restored = restored;
+        restored.execute_transaction(edit_width).unwrap();
+        assert!(restored.export_iop().is_err());
+    }
+
+    #[test]
     fn transaction_error_formatting_includes_names_and_all_affected_ids() {
         let mut project = EditorProject::default();
         project.set_object_id_format(ObjectIdFormat::Hexadecimal);
@@ -3485,6 +3531,21 @@ mod tests {
         pool.add(object_with_id(ObjectType::FontAttributes, font_id.value()));
         pool.add(object_with_id(ObjectType::OutputString, string_id.value()));
         pool.add(object_with_id(ObjectType::OutputNumber, number_id.value()));
+        let mut working_set = default_object(ObjectType::WorkingSet);
+        *working_set.mut_id() = ObjectId::new(40_104).unwrap();
+        if let Object::WorkingSet(working_set) = &mut working_set {
+            working_set.active_mask = ObjectId::new(40_105).unwrap();
+            working_set
+                .object_refs
+                .push(ag_iso_stack::object_pool::object_attributes::ObjectRef {
+                    id: string_id,
+                    offset: ag_iso_stack::object_pool::object_attributes::Point::default(),
+                });
+        }
+        pool.add(working_set);
+        let mut data_mask = default_object(ObjectType::DataMask);
+        *data_mask.mut_id() = ObjectId::new(40_105).unwrap();
+        pool.add(data_mask);
         let mut project = EditorProject::from(pool);
         let mut references = OperationTransaction::new(Some("Share font".into()));
         for consumer_id in [string_id, number_id] {

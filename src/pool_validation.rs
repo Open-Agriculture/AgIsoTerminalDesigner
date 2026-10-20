@@ -192,19 +192,19 @@ pub fn validate_parent_child_relationship_for_version(
     Ok(())
 }
 
-/// Check if an object ID is valid (1-65534; 0 and 65535 are reserved as NULL)
+/// Check if an object ID is valid (0-65534; 65535 denotes NULL).
 pub fn validate_object_id(id: u16) -> Result<ObjectId, ValidationDiagnostic> {
-    if id == 0 || id == u16::MAX {
+    if id == u16::MAX {
         return Err(ValidationDiagnostic {
             severity: ValidationSeverity::Error,
-            message: "Object ID is invalid (must be 1-65534)".to_owned(),
+            message: "Object ID is invalid (must be 0-65534; 65535 denotes NULL)".to_owned(),
             affected_objects: Some(vec![id]),
             code: "E006_INVALID_OBJECT_ID".to_string(),
         });
     }
     ObjectId::new(id).map_err(|_| ValidationDiagnostic {
         severity: ValidationSeverity::Error,
-        message: "Object ID is invalid (must be 1-65534)".to_owned(),
+        message: "Object ID is invalid (must be 0-65534; 65535 denotes NULL)".to_owned(),
         affected_objects: Some(vec![id]),
         code: "E006_INVALID_OBJECT_ID".to_string(),
     })
@@ -250,13 +250,19 @@ pub fn get_referencing_objects(pool: &ObjectPool, object_id: ObjectId) -> Vec<Ob
         .collect()
 }
 
-/// Comprehensive pool validation
-/// Returns all validation diagnostics (errors, warnings, info)
+/// Validate references, wire constraints, and compatibility for an editable
+/// pool. This incremental contract permits unresolved default references to
+/// ID 0 and omits whole-pool cardinality and property-reference type checks.
+/// Explicit reference assignments are validated by their operations. Use [`validate_complete_pool_state_for_version`] for project
+/// diagnostics and export.
 pub fn validate_pool_state(pool: &ObjectPool) -> Vec<ValidationDiagnostic> {
     validate_pool_state_for_version(pool, VtVersion::Version6)
 }
 
-/// Comprehensive pool validation using the project's VT version.
+/// Validate an editable pool using the project's VT version, permitting
+/// unresolved ID 0 defaults as in [`validate_pool_state`]. Whole-pool
+/// completeness and property-reference types are checked by
+/// [`validate_complete_pool_state_for_version`].
 pub fn validate_pool_state_for_version(
     pool: &ObjectPool,
     vt_version: VtVersion,
@@ -295,9 +301,10 @@ pub fn validate_pool_state_for_version(
                 code: "VT_WIRE_INVALID".into(),
             });
         }
-        for referenced_id in obj.referenced_objects() {
-            // Default editor objects use ObjectId(0) as an unresolved required
-            // reference until the user assigns one. It is not a pool object.
+        for referenced_id in references_for_validation(obj, vt_version) {
+            // Object ID zero is a temporary unresolved value in authoring
+            // defaults. Complete-pool validation below checks it as a normal
+            // ID so incomplete drafts remain editable.
             if referenced_id.value() == 0 {
                 continue;
             }
@@ -344,6 +351,177 @@ pub fn validate_pool_state_for_version(
     ));
 
     diagnostics
+}
+
+/// Validate a pool that is expected to be complete enough for project
+/// diagnostics or IOP export. Incremental validation deliberately omits these
+/// whole-pool requirements so drafts remain editable and saveable.
+pub fn validate_complete_pool_state_for_version(
+    pool: &ObjectPool,
+    vt_version: VtVersion,
+) -> Vec<ValidationDiagnostic> {
+    let mut diagnostics = validate_pool_state_for_version(pool, vt_version);
+    diagnostics.extend(validate_complete_pool_requirements(pool, vt_version));
+    diagnostics
+}
+
+/// Checks only whole-pool requirements and references whose ID 0 cannot be
+/// treated as an unresolved authoring placeholder.
+pub(crate) fn validate_complete_pool_requirements(
+    pool: &ObjectPool,
+    vt_version: VtVersion,
+) -> Vec<ValidationDiagnostic> {
+    use ag_iso_stack::object_pool::{object::Object, ObjectType};
+
+    let mut diagnostics = Vec::new();
+    for object in pool.objects() {
+        let mut reported = HashSet::new();
+        for referenced_id in references_for_validation(object, vt_version) {
+            if referenced_id.value() == 0
+                && reported.insert(referenced_id)
+                && pool.object_by_id(referenced_id).is_none()
+            {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: "Object not found in pool".into(),
+                    affected_objects: Some(vec![0]),
+                    code: "E007_OBJECT_NOT_FOUND".into(),
+                });
+            }
+        }
+    }
+    let working_sets: Vec<_> = pool
+        .objects()
+        .iter()
+        .filter(|object| object.object_type() == ObjectType::WorkingSet)
+        .collect();
+    if working_sets.len() != 1 {
+        diagnostics.push(ValidationDiagnostic {
+            severity: ValidationSeverity::Error,
+            message: format!(
+                "Object pool must contain exactly one Working Set (found {})",
+                working_sets.len()
+            ),
+            affected_objects: working_sets.first().map(|object| vec![object.id().value()]),
+            code: "WORKING_SET_CARDINALITY".into(),
+        });
+    }
+    for object in &working_sets {
+        if matches!(object, Object::WorkingSet(ws) if ws.object_refs.is_empty()) {
+            diagnostics.push(ValidationDiagnostic {
+                severity: ValidationSeverity::Error,
+                message: "Working Set must contain at least one identifier object".into(),
+                affected_objects: Some(vec![object.id().value()]),
+                code: "WORKING_SET_IDENTIFIER_MISSING".into(),
+            });
+        }
+    }
+    let special_controls: Vec<_> = pool
+        .objects()
+        .iter()
+        .filter(|object| object.object_type() == ObjectType::WorkingSetSpecialControls)
+        .collect();
+    if special_controls.len() > 1 {
+        diagnostics.push(ValidationDiagnostic {
+            severity: ValidationSeverity::Error,
+            message: format!("Object pool may contain at most one Working Set Special Controls object (found {})", special_controls.len()),
+            affected_objects: Some(special_controls.iter().map(|object| object.id().value()).collect()),
+            code: "WORKING_SET_SPECIAL_CONTROLS_CARDINALITY".into(),
+        });
+    }
+
+    // Descriptor metadata is the authority for typed object properties. The
+    // version table also identifies attributes the target ignores (notably the
+    // pre-VT6 unselectable Working Set active mask).
+    for object in pool.objects() {
+        for descriptor in crate::object_properties::get_property_descriptors(object.object_type()) {
+            let crate::object_properties::PropertySemantic::ObjectReference { allowed_types } =
+                descriptor.semantic
+            else {
+                continue;
+            };
+            if allowed_types.is_empty()
+                || !crate::vt_compatibility::supported_property(
+                    object.object_type(),
+                    descriptor.name.as_str(),
+                    vt_version,
+                )
+                || (object.object_type() == ObjectType::WorkingSet
+                    && descriptor.name.as_str() == "active_mask"
+                    && vt_version < VtVersion::Version6
+                    && matches!(object, Object::WorkingSet(ws) if !ws.selectable))
+                || (object.object_type() == ObjectType::FillAttributes
+                    && descriptor.name.as_str() == "fill_pattern"
+                    && matches!(object, Object::FillAttributes(fill) if fill.fill_type != 3))
+            {
+                continue;
+            }
+            let Ok(value) = crate::object_properties::get_object_property(object, descriptor.name)
+            else {
+                continue;
+            };
+            let Some(id) = value.as_u64().and_then(|id| u16::try_from(id).ok()) else {
+                continue;
+            };
+            if id == u16::MAX {
+                continue;
+            }
+            if let Some(target) = pool.object_by_id(ObjectId::new(id).expect("u16 object ID")) {
+                let versioned_input_attributes = object.object_type() == ObjectType::InputString
+                    && descriptor.name.as_str() == "input_attributes"
+                    && target.object_type() == ObjectType::ExtendedInputAttributes;
+                if !allowed_types.contains(&target.object_type())
+                    || (versioned_input_attributes && vt_version < VtVersion::Version4)
+                {
+                    diagnostics.push(ValidationDiagnostic {
+                        severity: ValidationSeverity::Error,
+                        message: format!(
+                            "{} references {:?}, but this property requires {}",
+                            descriptor.name,
+                            target.object_type(),
+                            allowed_types
+                                .iter()
+                                .map(|t| format!("{t:?}"))
+                                .collect::<Vec<_>>()
+                                .join(" or ")
+                        ),
+                        affected_objects: Some(vec![object.id().value(), id]),
+                        code: "PROPERTY_REFERENCE_WRONG_TYPE".into(),
+                    });
+                }
+            }
+        }
+    }
+    diagnostics
+}
+
+fn references_for_validation(
+    object: &ag_iso_stack::object_pool::object::Object,
+    vt_version: VtVersion,
+) -> Vec<ObjectId> {
+    use ag_iso_stack::object_pool::object::Object;
+    let mut references = object.referenced_objects();
+    // Ignore reference attributes that the selected VT version or the owning
+    // attribute value tells the VT to ignore (ISO tables B.2/B.50).
+    if let Object::WorkingSet(ws) = object {
+        if vt_version < VtVersion::Version6 && !ws.selectable {
+            remove_reference_once(&mut references, ws.active_mask);
+        }
+    }
+    if let Object::FillAttributes(fill) = object {
+        if fill.fill_type != 3 {
+            if let Some(pattern) = fill.fill_pattern.0 {
+                remove_reference_once(&mut references, pattern);
+            }
+        }
+    }
+    references
+}
+
+fn remove_reference_once(references: &mut Vec<ObjectId>, ignored_id: ObjectId) {
+    if let Some(index) = references.iter().position(|id| *id == ignored_id) {
+        references.remove(index);
+    }
 }
 
 /// Return compatibility diagnostics whose violation is new or has worsened
@@ -434,6 +612,7 @@ mod tests {
 
     #[test]
     fn test_validate_object_id_valid() {
+        assert!(validate_object_id(0).is_ok());
         assert!(validate_object_id(1).is_ok());
         assert!(validate_object_id(100).is_ok());
         assert!(validate_object_id(65534).is_ok());
@@ -441,8 +620,206 @@ mod tests {
 
     #[test]
     fn test_validate_object_id_invalid() {
-        assert!(validate_object_id(0).is_err());
         assert!(validate_object_id(65535).is_err());
+    }
+
+    #[test]
+    fn complete_validation_checks_pool_scaffolding_and_typed_references() {
+        use ag_iso_stack::object_pool::{ObjectPool, ObjectType};
+        let mut pool = ObjectPool::new();
+        let mut ws = crate::default_object(ObjectType::WorkingSet);
+        *ws.mut_id() = ObjectId::new(1).unwrap();
+        let mut ws2 = crate::default_object(ObjectType::WorkingSet);
+        *ws2.mut_id() = ObjectId::new(2).unwrap();
+        pool.add(ws);
+        pool.add(ws2);
+        let mut rect = crate::default_object(ObjectType::OutputRectangle);
+        *rect.mut_id() = ObjectId::new(3).unwrap();
+        let wrong_type_target = crate::default_object(ObjectType::OutputString);
+        let mut wrong_type_target = wrong_type_target;
+        *wrong_type_target.mut_id() = ObjectId::new(4).unwrap();
+        if let ag_iso_stack::object_pool::object::Object::OutputRectangle(rect) = &mut rect {
+            rect.line_attributes = ObjectId::new(4).unwrap().into();
+        }
+        pool.add(rect);
+        pool.add(wrong_type_target);
+        for id in [5, 6] {
+            let mut controls = crate::default_object(ObjectType::WorkingSetSpecialControls);
+            *controls.mut_id() = ObjectId::new(id).unwrap();
+            pool.add(controls);
+        }
+
+        let incremental = validate_pool_state_for_version(&pool, VtVersion::Version6);
+        assert!(!incremental.iter().any(|d| {
+            matches!(
+                d.code.as_str(),
+                "WORKING_SET_CARDINALITY"
+                    | "WORKING_SET_IDENTIFIER_MISSING"
+                    | "WORKING_SET_SPECIAL_CONTROLS_CARDINALITY"
+                    | "PROPERTY_REFERENCE_WRONG_TYPE"
+            )
+        }));
+        let complete = validate_complete_pool_state_for_version(&pool, VtVersion::Version6);
+        let codes: HashSet<_> = complete.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains("WORKING_SET_CARDINALITY"));
+        assert!(codes.contains("WORKING_SET_IDENTIFIER_MISSING"));
+        assert!(codes.contains("WORKING_SET_SPECIAL_CONTROLS_CARDINALITY"));
+        assert!(codes.contains("PROPERTY_REFERENCE_WRONG_TYPE"));
+    }
+
+    #[test]
+    fn object_id_zero_is_valid_and_resolved_as_a_pool_reference() {
+        use ag_iso_stack::object_pool::{object::Object, ObjectPool, ObjectType};
+        let mut pool = ObjectPool::new();
+        let mut target = crate::default_object(ObjectType::NumberVariable);
+        *target.mut_id() = ObjectId::new(0).unwrap();
+        pool.add(target);
+        let mut reference = crate::default_object(ObjectType::OutputNumber);
+        *reference.mut_id() = ObjectId::new(1).unwrap();
+        if let Object::OutputNumber(number) = &mut reference {
+            number.variable_reference = ObjectId::new(0).unwrap().into();
+        }
+        pool.add(reference);
+        let diagnostics = validate_pool_state_for_version(&pool, VtVersion::Version6);
+        assert!(!diagnostics
+            .iter()
+            .any(|d| d.code == "E007_OBJECT_NOT_FOUND"));
+
+        let diagnostics = validate_complete_pool_state_for_version(&pool, VtVersion::Version6);
+        assert!(!diagnostics
+            .iter()
+            .any(|d| d.code == "E007_OBJECT_NOT_FOUND"));
+
+        let mut missing_pool = ObjectPool::new();
+        let mut missing = crate::default_object(ObjectType::OutputNumber);
+        *missing.mut_id() = ObjectId::new(2).unwrap();
+        if let Object::OutputNumber(number) = &mut missing {
+            number.variable_reference = ObjectId::new(0).unwrap().into();
+        }
+        missing_pool.add(missing);
+        let diagnostics = validate_pool_state_for_version(&missing_pool, VtVersion::Version6);
+        assert!(!diagnostics
+            .iter()
+            .any(|d| d.code == "E007_OBJECT_NOT_FOUND"));
+        let diagnostics =
+            validate_complete_pool_state_for_version(&missing_pool, VtVersion::Version6);
+        assert!(diagnostics
+            .iter()
+            .any(|d| { d.code == "E007_OBJECT_NOT_FOUND" && d.affected_objects == Some(vec![0]) }));
+    }
+
+    #[test]
+    fn reference_type_check_respects_ignored_unselectable_working_set_mask() {
+        use ag_iso_stack::object_pool::{object::Object, ObjectPool, ObjectType};
+        let mut pool = ObjectPool::new();
+        let mut ws = crate::default_object(ObjectType::WorkingSet);
+        *ws.mut_id() = ObjectId::new(1).unwrap();
+        if let Object::WorkingSet(ws) = &mut ws {
+            ws.selectable = false;
+            ws.active_mask = ObjectId::new(2).unwrap();
+        }
+        let mut wrong_type_target = crate::default_object(ObjectType::OutputString);
+        *wrong_type_target.mut_id() = ObjectId::new(2).unwrap();
+        pool.add(ws);
+        pool.add(wrong_type_target);
+
+        let legacy = validate_complete_pool_state_for_version(&pool, VtVersion::Version5);
+        assert!(!legacy
+            .iter()
+            .any(|d| d.code == "PROPERTY_REFERENCE_WRONG_TYPE"));
+        let current = validate_complete_pool_state_for_version(&pool, VtVersion::Version6);
+        assert!(current
+            .iter()
+            .any(|d| d.code == "PROPERTY_REFERENCE_WRONG_TYPE"));
+
+        let mut missing_target_pool = ObjectPool::new();
+        let mut ws = crate::default_object(ObjectType::WorkingSet);
+        *ws.mut_id() = ObjectId::new(1).unwrap();
+        if let Object::WorkingSet(ws) = &mut ws {
+            ws.selectable = false;
+            ws.active_mask = ObjectId::new(2).unwrap();
+        }
+        missing_target_pool.add(ws);
+        let legacy = validate_pool_state_for_version(&missing_target_pool, VtVersion::Version5);
+        assert!(!legacy.iter().any(|d| d.code == "E007_OBJECT_NOT_FOUND"));
+        let current = validate_pool_state_for_version(&missing_target_pool, VtVersion::Version6);
+        assert!(current.iter().any(|d| d.code == "E007_OBJECT_NOT_FOUND"));
+    }
+
+    #[test]
+    fn unused_fill_pattern_reference_is_ignored() {
+        use ag_iso_stack::object_pool::{object::Object, ObjectPool, ObjectType};
+        let mut pool = ObjectPool::new();
+        let mut fill = crate::default_object(ObjectType::FillAttributes);
+        *fill.mut_id() = ObjectId::new(1).unwrap();
+        if let Object::FillAttributes(fill) = &mut fill {
+            fill.fill_type = 1;
+            fill.fill_pattern = ObjectId::new(2).unwrap().into();
+        }
+        pool.add(fill);
+        let diagnostics = validate_pool_state_for_version(&pool, VtVersion::Version6);
+        assert!(!diagnostics
+            .iter()
+            .any(|d| d.code == "E007_OBJECT_NOT_FOUND"));
+    }
+
+    #[test]
+    fn extended_input_attributes_reference_is_version_gated() {
+        use ag_iso_stack::object_pool::{object::Object, ObjectPool, ObjectType};
+        let mut pool = ObjectPool::new();
+        let mut input = crate::default_object(ObjectType::InputString);
+        *input.mut_id() = ObjectId::new(1).unwrap();
+        if let Object::InputString(input) = &mut input {
+            input.input_attributes = ObjectId::new(2).unwrap().into();
+        }
+        let mut attributes = crate::default_object(ObjectType::ExtendedInputAttributes);
+        *attributes.mut_id() = ObjectId::new(2).unwrap();
+        pool.add(input);
+        pool.add(attributes);
+
+        let vt3 = validate_complete_pool_state_for_version(&pool, VtVersion::Version3);
+        assert!(vt3
+            .iter()
+            .any(|d| d.code == "PROPERTY_REFERENCE_WRONG_TYPE"));
+        let vt4 = validate_complete_pool_state_for_version(&pool, VtVersion::Version4);
+        assert!(!vt4
+            .iter()
+            .any(|d| d.code == "PROPERTY_REFERENCE_WRONG_TYPE"));
+    }
+
+    #[test]
+    fn window_and_key_group_accept_all_standard_label_reference_types() {
+        use ag_iso_stack::object_pool::{object::Object, ObjectPool, ObjectType};
+        let mut pool = ObjectPool::new();
+        let mut window = crate::default_object(ObjectType::WindowMask);
+        *window.mut_id() = ObjectId::new(1).unwrap();
+        if let Object::WindowMask(window) = &mut window {
+            window.name = ObjectId::new(2).unwrap();
+            window.window_title = ObjectId::new(2).unwrap().into();
+            window.window_icon = ObjectId::new(3).unwrap().into();
+        }
+        let mut pointer = crate::default_object(ObjectType::ObjectPointer);
+        *pointer.mut_id() = ObjectId::new(2).unwrap();
+        let mut output = crate::default_object(ObjectType::OutputNumber);
+        *output.mut_id() = ObjectId::new(3).unwrap();
+        let mut key_group = crate::default_object(ObjectType::KeyGroup);
+        *key_group.mut_id() = ObjectId::new(4).unwrap();
+        if let Object::KeyGroup(key_group) = &mut key_group {
+            key_group.name = ObjectId::new(2).unwrap();
+            key_group.key_group_icon = ObjectId::new(5).unwrap().into();
+        }
+        let mut scaled = crate::default_object(ObjectType::ScaledGraphic);
+        *scaled.mut_id() = ObjectId::new(5).unwrap();
+        pool.add(window);
+        pool.add(pointer);
+        pool.add(output);
+        pool.add(key_group);
+        pool.add(scaled);
+
+        let diagnostics = validate_complete_pool_state_for_version(&pool, VtVersion::Version6);
+        assert!(!diagnostics
+            .iter()
+            .any(|d| d.code == "PROPERTY_REFERENCE_WRONG_TYPE"));
     }
 
     #[test]

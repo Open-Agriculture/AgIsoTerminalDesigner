@@ -231,69 +231,6 @@ fn render_object_refs(ui: &mut egui::Ui, pool: &ObjectPool, object_refs: &Vec<Ob
     }
 }
 
-fn fill_polygon_even_odd(
-    painter: &egui::Painter,
-    polygon_points: &[egui::Pos2],
-    fill_color: Color32,
-    clip_rect: egui::Rect,
-) {
-    if polygon_points.len() < 3 || fill_color == Color32::TRANSPARENT {
-        return;
-    }
-
-    let mut min_y = f32::INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    for p in polygon_points {
-        min_y = min_y.min(p.y);
-        max_y = max_y.max(p.y);
-    }
-
-    min_y = min_y.max(clip_rect.top());
-    max_y = max_y.min(clip_rect.bottom());
-    if max_y <= min_y {
-        return;
-    }
-
-    let y_start = min_y.floor() as i32;
-    let y_end = max_y.ceil() as i32;
-
-    for y in y_start..y_end {
-        let y_sample = y as f32 + 0.5;
-        let mut x_intersections: Vec<f32> = Vec::new();
-
-        for idx in 0..polygon_points.len() {
-            let p0 = polygon_points[idx];
-            let p1 = polygon_points[(idx + 1) % polygon_points.len()];
-
-            let y0 = p0.y;
-            let y1 = p1.y;
-
-            if (y0 <= y_sample && y_sample < y1) || (y1 <= y_sample && y_sample < y0) {
-                let t = (y_sample - y0) / (y1 - y0);
-                let x = p0.x + t * (p1.x - p0.x);
-                x_intersections.push(x);
-            }
-        }
-
-        if x_intersections.len() < 2 {
-            continue;
-        }
-
-        x_intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        for pair in x_intersections.chunks_exact(2) {
-            let x0 = pair[0].max(clip_rect.left());
-            let x1 = pair[1].min(clip_rect.right());
-            if x1 > x0 {
-                painter.line_segment(
-                    [egui::pos2(x0, y_sample), egui::pos2(x1, y_sample)],
-                    egui::Stroke::new(1.0, fill_color),
-                );
-            }
-        }
-    }
-}
-
 impl RenderableObject for WorkingSet {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, _: Point<i16>) {
         ui.painter().rect_filled(
@@ -827,68 +764,33 @@ impl RenderableObject for OutputLine {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::vec2(self.width as f32, self.height as f32),
         );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let line_attributes = match pool.object_by_nullable_id(self.line_attributes) {
-                Some(Object::LineAttributes(attr)) => attr,
-                _ => {
-                    // If we don't have valid line attributes, just show an error and return
-                    ui.colored_label(
-                        Color32::RED,
-                        format!(
-                            "Missing or invalid LineAttributes ID: {:?}",
-                            self.line_attributes
-                        ),
-                    );
-                    return;
-                }
-            };
-
-            if line_attributes.line_width == 0 {
-                return;
-            }
-
-            let colour =
-                crate::effective_colour::colour(pool, line_attributes.line_colour).convert();
-            let stroke_width = line_attributes.line_width as f32;
-            let stroke = egui::Stroke::new(stroke_width, colour);
-            // TODO: implement line art
-
-            let (start, end) = match self.line_direction {
-                LineDirection::TopLeftToBottomRight => {
-                    let start = rect.min;
-                    let mut end = rect.max - egui::vec2(stroke_width, stroke_width);
-
-                    // Clamp end to start
-                    if end.x < start.x {
-                        end.x = start.x;
-                    }
-                    if end.y < start.y {
-                        end.y = start.y;
-                    }
-
-                    (start, end)
-                }
-                LineDirection::BottomLeftToTopRight => {
-                    let mut start = egui::pos2(rect.left(), rect.bottom() + stroke_width);
-                    let mut end = egui::pos2(rect.right() - stroke_width, rect.top());
-
-                    // Clamping start and end
-                    if end.x < start.x {
-                        end.x = start.x;
-                    }
-                    if start.y < end.y {
-                        start.y = end.y;
-                    }
-
-                    (start, end)
-                }
-            };
-
-            ui.painter().line_segment([start, end], stroke);
-        });
+        let Some(Object::LineAttributes(line)) = pool.object_by_nullable_id(self.line_attributes)
+        else {
+            return;
+        };
+        let width = f32::from(line.line_width);
+        // Table B.27 coordinates locate the top-left corner of the square brush.
+        let right = (rect.right() - width).max(rect.left());
+        let bottom = (rect.bottom() - width).max(rect.top());
+        let (start, end) = match self.line_direction {
+            LineDirection::TopLeftToBottomRight => (rect.min, egui::pos2(right, bottom)),
+            LineDirection::BottomLeftToTopRight => (
+                egui::pos2(rect.left(), bottom),
+                egui::pos2(right, rect.top()),
+            ),
+        };
+        let offset = egui::vec2(width * 0.5, width * 0.5);
+        paint_shape(
+            ui,
+            pool,
+            rect.intersect(ui.clip_rect()),
+            &[start + offset, end + offset],
+            line,
+            None,
+            0,
+        );
     }
 }
 
@@ -897,48 +799,243 @@ impl RenderableObject for OutputRectangle {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::vec2(self.width as f32, self.height as f32),
         );
-
-        // Paint the border of the rectangle
-        let line_attributes = match pool.object_by_nullable_id(self.line_attributes) {
-            Some(Object::LineAttributes(l)) => l,
-            _ => {
-                ui.colored_label(
-                    Color32::RED,
-                    format!("Missing line attributes: {:?}", self.line_attributes),
-                );
-                return;
-            }
+        let Some(Object::LineAttributes(line)) = pool.object_by_nullable_id(self.line_attributes)
+        else {
+            return;
         };
-        // Paint the fill of the rectangle
-        if let Some(fill) = self.fill_attributes.into() {
-            let fill_attributes = match pool.object_by_id(fill) {
-                Some(Object::FillAttributes(f)) => f,
-                _ => {
-                    ui.colored_label(Color32::RED, format!("Missing fill attributes: {:?}", fill));
-                    return;
+        let width = f32::from(line.line_width);
+        let offset = egui::vec2(width * 0.5, width * 0.5);
+        let start = rect.min + offset;
+        let end = egui::pos2(
+            (rect.right() - width).max(rect.left()),
+            (rect.bottom() - width).max(rect.top()),
+        ) + offset;
+        let points = [
+            start,
+            egui::pos2(end.x, start.y),
+            end,
+            egui::pos2(start.x, end.y),
+            start,
+        ];
+        paint_shape(
+            ui,
+            pool,
+            rect.intersect(ui.clip_rect()),
+            &points,
+            line,
+            pool.object_by_nullable_id(self.fill_attributes),
+            self.line_suppression,
+        );
+    }
+}
+
+/// Paint square-brush borders and even-odd interiors. All border footprints,
+/// including skipped and suppressed strokes, are excluded from the fill.
+fn paint_shape(
+    ui: &egui::Ui,
+    pool: &ObjectPool,
+    clip: egui::Rect,
+    points: &[egui::Pos2],
+    line: &LineAttributes,
+    fill: Option<&Object>,
+    suppressed_edges: u8,
+) {
+    if !clip.is_positive() {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(clip);
+    let line_colour = crate::effective_colour::colour(pool, line.line_colour).convert();
+    let y_start = clip.top().floor() as i32;
+    let y_end = clip.bottom().ceil() as i32;
+    // Keep all brush footprints, including skipped line-art bits, so fill
+    // never leaks into the border (4.6.21). Restrict work to visible rows.
+    let mut borders = vec![Vec::<(f32, f32, bool)>::new(); (y_end - y_start) as usize];
+    let width = f32::from(line.line_width);
+    let mut distance = 0.0;
+    if width > 0.0 {
+        for (edge_index, pair) in points.windows(2).enumerate() {
+            let delta = pair[1] - pair[0];
+            let length = delta.length();
+            if !egui::Rect::from_two_pos(pair[0], pair[1])
+                .expand(width)
+                .intersects(clip)
+            {
+                distance += length;
+                continue;
+            }
+            let edge_visible = suppressed_edges & (1 << (edge_index % 4)) == 0;
+            let mut stamp = |point: egui::Pos2, visible: bool| {
+                let brush = egui::Rect::from_center_size(point, egui::vec2(width, width));
+                for y in (brush.top().floor() as i32).max(y_start)
+                    ..(brush.bottom().ceil() as i32).min(y_end)
+                {
+                    if y as f32 + 0.5 >= brush.top() && (y as f32 + 0.5) < brush.bottom() {
+                        borders[(y - y_start) as usize].push((
+                            brush.left(),
+                            brush.right(),
+                            visible,
+                        ));
+                    }
                 }
             };
-            ui.painter().rect_filled(
-                rect,
-                0.0,
-                crate::effective_colour::colour(pool, fill_attributes.fill_colour).convert(),
-            );
-            // TODO: implement fill type for infill
-            // TODO: implement fill pattern for infill
+            // The hypothetical solid border bounds the fill even for skipped
+            // line-art spots. Dense sampling also keeps solid curves smooth.
+            let count = (length / 0.75).ceil().max(1.0) as usize;
+            for i in 0..=count {
+                stamp(
+                    pair[0] + delta * (i as f32 / count as f32),
+                    edge_visible && line.line_art == 0xffff,
+                );
+            }
+            if edge_visible && line.line_art != 0xffff {
+                // Each bit is one square brush spot, not a swept segment.
+                // Carry the pattern phase across edges (4.6.21).
+                let first = (distance / width).ceil() as usize;
+                let last = ((distance + length) / width).floor() as usize;
+                for spot in first..=last {
+                    if line.line_art & (0x8000 >> (spot % 16)) != 0 {
+                        let t = if length > 0.0 {
+                            (spot as f32 * width - distance) / length
+                        } else {
+                            0.0
+                        };
+                        stamp(pair[0] + delta * t, true);
+                    }
+                }
+            }
+            distance += length;
         }
+    }
 
-        ui.painter().rect_stroke(
-            rect,
-            0.0,
-            egui::Stroke::new(
-                line_attributes.line_width,
-                crate::effective_colour::colour(pool, line_attributes.line_colour).convert(),
-            ),
-            egui::StrokeKind::Inside,
-        );
-        // TODO: implement line art for border
+    let pattern = match fill {
+        Some(Object::FillAttributes(fill)) if fill.fill_type == 3 => {
+            if let Some(Object::PictureGraphic(picture)) =
+                pool.object_by_nullable_id(fill.fill_pattern)
+            {
+                if picture.actual_width > 0 && picture.actual_height > 0 {
+                    let mut picture = picture.clone();
+                    picture.options.transparent = false;
+                    Some(crate::graphics::preview::decode_picture(&picture, pool))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let solid = match fill {
+        Some(Object::FillAttributes(fill)) if fill.fill_type == 1 => Some(line_colour),
+        Some(Object::FillAttributes(fill)) if fill.fill_type == 2 => {
+            Some(crate::effective_colour::colour(pool, fill.fill_colour).convert())
+        }
+        _ => None,
+    };
+    let anchor = ui
+        .ctx()
+        .data(|data| data.get_temp::<egui::Pos2>(egui::Id::new("vt_pattern_origin")))
+        .unwrap_or(egui::Pos2::ZERO);
+    for y in y_start..y_end {
+        let row = &borders[(y - y_start) as usize];
+        if solid.is_some() || pattern.is_some() {
+            let sample_y = y as f32 + 0.5;
+            let mut crossings = Vec::new();
+            for edge in points.windows(2) {
+                let (a, b) = (edge[0], edge[1]);
+                if (a.y <= sample_y && sample_y < b.y) || (b.y <= sample_y && sample_y < a.y) {
+                    crossings.push(a.x + (sample_y - a.y) * (b.x - a.x) / (b.y - a.y));
+                }
+            }
+            crossings.sort_by(f32::total_cmp);
+            for interval in crossings.chunks_exact(2) {
+                let mut cuts: Vec<_> = row.iter().map(|(a, b, _)| (*a, *b)).collect();
+                cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let mut left = interval[0].max(clip.left());
+                let right = interval[1].min(clip.right());
+                cuts.push((right, right));
+                for (a, b) in cuts {
+                    let end = a.min(right);
+                    if end > left {
+                        if let Some(colour) = solid {
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(left, y as f32),
+                                    egui::pos2(end, y as f32 + 1.0),
+                                ),
+                                0.0,
+                                colour,
+                            );
+                        } else if let Some(pattern) = &pattern {
+                            let py = ((y as f32 - anchor.y).floor() as i64)
+                                .rem_euclid(pattern.size[1] as i64)
+                                as usize;
+                            let mut x = left.ceil() as i32;
+                            let stop = end.ceil() as i32;
+                            while x < stop {
+                                let px = ((x as f32 - anchor.x).floor() as i64)
+                                    .rem_euclid(pattern.size[0] as i64)
+                                    as usize;
+                                let colour = pattern.pixels[py * pattern.size[0] + px];
+                                let start = x;
+                                x += 1;
+                                while x < stop {
+                                    let px = ((x as f32 - anchor.x).floor() as i64)
+                                        .rem_euclid(pattern.size[0] as i64)
+                                        as usize;
+                                    if pattern.pixels[py * pattern.size[0] + px] != colour {
+                                        break;
+                                    }
+                                    x += 1;
+                                }
+                                painter.rect_filled(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(start as f32, y as f32),
+                                        egui::vec2((x - start) as f32, 1.0),
+                                    ),
+                                    0.0,
+                                    colour,
+                                );
+                            }
+                        }
+                    }
+                    left = left.max(b);
+                    if left >= right {
+                        break;
+                    }
+                }
+            }
+        }
+        // Coalesce brush footprints into runs to keep the shape count small.
+        let mut visible: Vec<_> = row
+            .iter()
+            .filter(|(_, _, visible)| *visible)
+            .map(|(a, b, _)| (*a, *b))
+            .collect();
+        visible.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut run: Option<(f32, f32)> = None;
+        for (a, b) in visible
+            .into_iter()
+            .chain(std::iter::once((f32::INFINITY, f32::INFINITY)))
+        {
+            match run {
+                Some((left, right)) if a <= right => run = Some((left, right.max(b))),
+                Some((left, right)) => {
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(left, y as f32),
+                            egui::pos2(right, y as f32 + 1.0),
+                        ),
+                        0.0,
+                        line_colour,
+                    );
+                    run = Some((a, b));
+                }
+                None => run = Some((a, b)),
+            }
+        }
     }
 }
 
@@ -1008,8 +1105,6 @@ impl RenderableObject for OutputEllipse {
             );
             return;
         };
-        let line_colour = crate::effective_colour::colour(pool, line.line_colour).convert();
-        let painter = ui.painter().with_clip_rect(clip);
         // Output shape dimensions include the complete square brush footprint.
         let inset = (f32::from(line.line_width) * 0.5)
             .min((rect.width().min(rect.height()) * 0.5 - 0.001).max(0.0));
@@ -1019,180 +1114,20 @@ impl RenderableObject for OutputEllipse {
             self.start_angle,
             self.end_angle,
         );
-        let y_start = clip.top().floor() as i32;
-        let y_end = clip.bottom().ceil() as i32;
-        // Keep all brush footprints, including skipped line-art bits, so fill
-        // never leaks into the border (4.6.21). Restrict work to visible rows.
-        let mut borders = vec![Vec::<(f32, f32, bool)>::new(); (y_end - y_start) as usize];
-        let width = f32::from(line.line_width);
-        let mut distance = 0.0;
-        if width > 0.0 {
-            for pair in points.windows(2) {
-                let delta = pair[1] - pair[0];
-                let length = delta.length();
-                if !egui::Rect::from_two_pos(pair[0], pair[1])
-                    .expand(width)
-                    .intersects(clip)
-                {
-                    distance += length;
-                    continue;
-                }
-                let count = (length / 0.75).ceil().max(1.0) as usize;
-                for i in 0..=count {
-                    let t = i as f32 / count as f32;
-                    let point = pair[0] + delta * t;
-                    let bit = ((distance + length * t) / width).floor() as usize % 16;
-                    let visible = line.line_art & (0x8000 >> bit) != 0;
-                    let brush = egui::Rect::from_center_size(point, egui::vec2(width, width));
-                    for y in (brush.top().floor() as i32).max(y_start)
-                        ..(brush.bottom().ceil() as i32).min(y_end)
-                    {
-                        if y as f32 + 0.5 >= brush.top() && (y as f32 + 0.5) < brush.bottom() {
-                            borders[(y - y_start) as usize].push((
-                                brush.left(),
-                                brush.right(),
-                                visible,
-                            ));
-                        }
-                    }
-                }
-                distance += length;
-            }
-        }
         let closed = self.ellipse_type != 1 || self.start_angle == self.end_angle;
-        let fill = if closed {
-            pool.object_by_nullable_id(self.fill_attributes)
-        } else {
-            None
-        };
-        let pattern = match fill {
-            Some(Object::FillAttributes(fill)) if fill.fill_type == 3 => {
-                if let Some(Object::PictureGraphic(picture)) =
-                    pool.object_by_nullable_id(fill.fill_pattern)
-                {
-                    if picture.actual_width > 0 && picture.actual_height > 0 {
-                        let mut picture = picture.clone();
-                        picture.options.transparent = false;
-                        Some(crate::graphics::preview::decode_picture(&picture, pool))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        };
-        let solid = match fill {
-            Some(Object::FillAttributes(fill)) if fill.fill_type == 1 => Some(line_colour),
-            Some(Object::FillAttributes(fill)) if fill.fill_type == 2 => {
-                Some(crate::effective_colour::colour(pool, fill.fill_colour).convert())
-            }
-            _ => None,
-        };
-        let anchor = ui
-            .ctx()
-            .data(|data| data.get_temp::<egui::Pos2>(egui::Id::new("vt_pattern_origin")))
-            .unwrap_or(egui::Pos2::ZERO);
-        for y in y_start..y_end {
-            let row = &borders[(y - y_start) as usize];
-            if solid.is_some() || pattern.is_some() {
-                let sample_y = y as f32 + 0.5;
-                let mut crossings = Vec::new();
-                for edge in points.windows(2) {
-                    let (a, b) = (edge[0], edge[1]);
-                    if (a.y <= sample_y && sample_y < b.y) || (b.y <= sample_y && sample_y < a.y) {
-                        crossings.push(a.x + (sample_y - a.y) * (b.x - a.x) / (b.y - a.y));
-                    }
-                }
-                crossings.sort_by(f32::total_cmp);
-                for interval in crossings.chunks_exact(2) {
-                    let mut cuts: Vec<_> = row.iter().map(|(a, b, _)| (*a, *b)).collect();
-                    cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    let mut left = interval[0].max(clip.left());
-                    let right = interval[1].min(clip.right());
-                    cuts.push((right, right));
-                    for (a, b) in cuts {
-                        let end = a.min(right);
-                        if end > left {
-                            if let Some(colour) = solid {
-                                painter.rect_filled(
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(left, y as f32),
-                                        egui::pos2(end, y as f32 + 1.0),
-                                    ),
-                                    0.0,
-                                    colour,
-                                );
-                            } else if let Some(pattern) = &pattern {
-                                let py = ((y as f32 - anchor.y).floor() as i64)
-                                    .rem_euclid(pattern.size[1] as i64)
-                                    as usize;
-                                let mut x = left.ceil() as i32;
-                                let stop = end.ceil() as i32;
-                                while x < stop {
-                                    let px = ((x as f32 - anchor.x).floor() as i64)
-                                        .rem_euclid(pattern.size[0] as i64)
-                                        as usize;
-                                    let colour = pattern.pixels[py * pattern.size[0] + px];
-                                    let start = x;
-                                    x += 1;
-                                    while x < stop {
-                                        let px = ((x as f32 - anchor.x).floor() as i64)
-                                            .rem_euclid(pattern.size[0] as i64)
-                                            as usize;
-                                        if pattern.pixels[py * pattern.size[0] + px] != colour {
-                                            break;
-                                        }
-                                        x += 1;
-                                    }
-                                    painter.rect_filled(
-                                        egui::Rect::from_min_size(
-                                            egui::pos2(start as f32, y as f32),
-                                            egui::vec2((x - start) as f32, 1.0),
-                                        ),
-                                        0.0,
-                                        colour,
-                                    );
-                                }
-                            }
-                        }
-                        left = left.max(b);
-                        if left >= right {
-                            break;
-                        }
-                    }
-                }
-            }
-            // Coalesce brush footprints into runs to keep the shape count small.
-            let mut visible: Vec<_> = row
-                .iter()
-                .filter(|(_, _, visible)| *visible)
-                .map(|(a, b, _)| (*a, *b))
-                .collect();
-            visible.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let mut run: Option<(f32, f32)> = None;
-            for (a, b) in visible
-                .into_iter()
-                .chain(std::iter::once((f32::INFINITY, f32::INFINITY)))
-            {
-                match run {
-                    Some((left, right)) if a <= right => run = Some((left, right.max(b))),
-                    Some((left, right)) => {
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(left, y as f32),
-                                egui::pos2(right, y as f32 + 1.0),
-                            ),
-                            0.0,
-                            line_colour,
-                        );
-                        run = Some((a, b));
-                    }
-                    None => run = Some((a, b)),
-                }
-            }
-        }
+        paint_shape(
+            ui,
+            pool,
+            clip,
+            &points,
+            line,
+            if closed {
+                pool.object_by_nullable_id(self.fill_attributes)
+            } else {
+                None
+            },
+            0,
+        );
     }
 }
 
@@ -1201,77 +1136,37 @@ impl RenderableObject for OutputPolygon {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::vec2(self.width as f32, self.height as f32),
         );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let line_attributes = match pool.object_by_nullable_id(self.line_attributes) {
-                Some(Object::LineAttributes(attr)) => attr,
-                _ => {
-                    ui.colored_label(
-                        Color32::RED,
-                        format!(
-                            "Missing or invalid LineAttributes ID: {:?}",
-                            self.line_attributes
-                        ),
-                    );
-                    return;
-                }
-            };
-
-            if self.points.len() < 2 {
-                return;
-            }
-
-            let points: Vec<egui::Pos2> = self
-                .points
-                .iter()
-                .map(|point| rect.min + egui::vec2(point.x as f32, point.y as f32))
-                .collect();
-
-            let is_open_polygon = self.polygon_type == 3;
-
-            if !is_open_polygon && self.points.len() >= 3 {
-                if let Some(fill_id) = self.fill_attributes.into() {
-                    let fill_attributes = match pool.object_by_id(fill_id) {
-                        Some(Object::FillAttributes(f)) => f,
-                        _ => {
-                            ui.colored_label(
-                                Color32::RED,
-                                format!("Missing fill attributes: {:?}", fill_id),
-                            );
-                            return;
-                        }
-                    };
-
-                    fill_polygon_even_odd(
-                        ui.painter(),
-                        &points,
-                        crate::effective_colour::colour(pool, fill_attributes.fill_colour)
-                            .convert(),
-                        rect,
-                    );
-                    // TODO: implement fill type for infill
-                    // TODO: implement fill pattern for infill
-                }
-            }
-
-            if line_attributes.line_width == 0 {
-                return;
-            }
-
-            let stroke = egui::Stroke::new(
-                line_attributes.line_width,
-                crate::effective_colour::colour(pool, line_attributes.line_colour).convert(),
-            );
-
-            if is_open_polygon {
-                ui.painter().add(egui::Shape::line(points, stroke));
+        let Some(Object::LineAttributes(line)) = pool.object_by_nullable_id(self.line_attributes)
+        else {
+            return;
+        };
+        if self.points.len() < 2 {
+            return;
+        }
+        let mut points: Vec<_> = self
+            .points
+            .iter()
+            .map(|point| rect.min + egui::vec2(point.x as f32, point.y as f32))
+            .collect();
+        let closed = self.polygon_type != 3;
+        if closed {
+            points.push(points[0]);
+        }
+        paint_shape(
+            ui,
+            pool,
+            rect.intersect(ui.clip_rect()),
+            &points,
+            line,
+            if closed {
+                pool.object_by_nullable_id(self.fill_attributes)
             } else {
-                ui.painter().add(egui::Shape::closed_line(points, stroke));
-            }
-            // TODO: implement line art for border
-        });
+                None
+            },
+            0,
+        );
     }
 }
 
@@ -1572,6 +1467,306 @@ mod rendering_tests {
         assert!(render(ObjectId::new(12).unwrap().into(), 0) > blank);
         assert_eq!(render(NullableObjectId(None), 255), blank);
         assert_eq!(render(NullableObjectId(None), 2), blank);
+    }
+
+    // Sample the emitted rectangles after applying egui's painter clip, so these
+    // assertions exercise previews rather than the scanline implementation.
+    fn shape_samples(
+        object: &Object,
+        pool: &ObjectPool,
+        samples: &[(f32, f32)],
+    ) -> Vec<Option<Color32>> {
+        let ctx = egui::Context::default();
+        let mut origin = egui::Pos2::ZERO;
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                origin = ui.max_rect().min;
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(egui::Id::new("vt_pattern_origin"), origin));
+                ui.set_clip_rect(egui::Rect::from_min_size(origin, egui::vec2(24.0, 24.0)));
+                object.render(ui, pool, Point::default());
+            });
+        });
+        samples
+            .iter()
+            .map(|(x, y)| {
+                let point = origin + egui::vec2(x + 0.5, y + 0.5);
+                output
+                    .shapes
+                    .iter()
+                    .skip(1)
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(rect)
+                            if rect.rect.contains(point) && shape.clip_rect.contains(point) =>
+                        {
+                            Some(rect.fill)
+                        }
+                        _ => None,
+                    })
+                    .last()
+            })
+            .collect()
+    }
+
+    fn shape_pool(width: u8, art: u16) -> ObjectPool {
+        let mut pool = ObjectPool::new();
+        let Object::LineAttributes(mut line) = crate::default_object(ObjectType::LineAttributes)
+        else {
+            unreachable!()
+        };
+        line.id = ObjectId::new(11).unwrap();
+        line.line_width = width;
+        line.line_art = art;
+        line.line_colour = 2;
+        pool.add(Object::LineAttributes(line));
+        pool
+    }
+
+    #[test]
+    fn rectangle_fill_modes_and_suppression_preserve_unfilled_border_footprints() {
+        let mut pool = shape_pool(2, 0xffff);
+        let Object::OutputRectangle(mut rect) = crate::default_object(ObjectType::OutputRectangle)
+        else {
+            unreachable!()
+        };
+        rect.width = 20;
+        rect.height = 16;
+        rect.line_attributes = ObjectId::new(11).unwrap().into();
+        rect.fill_attributes = ObjectId::new(12).unwrap().into();
+        let Object::FillAttributes(mut fill) = crate::default_object(ObjectType::FillAttributes)
+        else {
+            unreachable!()
+        };
+        fill.id = ObjectId::new(12).unwrap();
+        fill.fill_colour = 4;
+        let line_colour = crate::effective_colour::colour(&pool, 2).convert();
+        let fill_colour = crate::effective_colour::colour(&pool, 4).convert();
+        for (mode, expected) in [
+            (0, None),
+            (1, Some(line_colour)),
+            (2, Some(fill_colour)),
+            (3, None),
+        ] {
+            fill.fill_type = mode;
+            fill.fill_pattern = NullableObjectId(None);
+            let mut candidate = pool.clone();
+            candidate.add(Object::FillAttributes(fill.clone()));
+            assert_eq!(
+                shape_samples(
+                    &Object::OutputRectangle(rect.clone()),
+                    &candidate,
+                    &[(10.0, 8.0)]
+                ),
+                vec![expected]
+            );
+        }
+        fill.fill_type = 2;
+        pool.add(Object::FillAttributes(fill.clone()));
+        for (suppression, sample) in [
+            (1, (10.0, 0.0)),
+            (2, (19.0, 8.0)),
+            (4, (10.0, 15.0)),
+            (8, (0.0, 8.0)),
+        ] {
+            rect.line_suppression = suppression;
+            assert_eq!(
+                shape_samples(
+                    &Object::OutputRectangle(rect.clone()),
+                    &pool,
+                    &[sample, (10.0, 8.0)]
+                ),
+                vec![None, Some(fill_colour)]
+            );
+        }
+        let Object::PictureGraphic(mut picture) = crate::default_object(ObjectType::PictureGraphic)
+        else {
+            unreachable!()
+        };
+        picture.id = ObjectId::new(13).unwrap();
+        picture.actual_width = 2;
+        picture.actual_height = 1;
+        picture.width = 200; // Pattern uses raw dimensions, ignoring display scaling.
+        picture.format =
+            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::EightBit;
+        picture.data = vec![2, 4];
+        picture.options.transparent = true;
+        picture.transparency_colour = 2;
+        pool.add(Object::PictureGraphic(picture));
+        fill.fill_type = 3;
+        fill.fill_pattern = ObjectId::new(13).unwrap().into();
+        pool.remove(fill.id);
+        pool.add(Object::FillAttributes(fill));
+        assert_eq!(
+            shape_samples(
+                &Object::OutputRectangle(rect),
+                &pool,
+                &[(10.0, 8.0), (11.0, 8.0)]
+            ),
+            vec![Some(line_colour), Some(fill_colour)]
+        );
+    }
+
+    #[test]
+    fn lines_and_polygons_use_line_art_square_brushes_and_declared_clipping() {
+        for width in [1, 2, 4] {
+            let pool = shape_pool(width, 0xaaaa);
+            let colour = crate::effective_colour::colour(&pool, 2).convert();
+            let Object::OutputLine(mut line) = crate::default_object(ObjectType::OutputLine) else {
+                unreachable!()
+            };
+            line.width = 48;
+            line.height = u16::from(width);
+            line.line_attributes = ObjectId::new(11).unwrap().into();
+            let samples: Vec<_> = (0..24).map(|x| (x as f32, f32::from(width - 1))).collect();
+            let expected: Vec<_> = (0..24)
+                .map(|x| {
+                    if (x / width) % 2 == 0 {
+                        Some(colour)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                shape_samples(&Object::OutputLine(line), &pool, &samples),
+                expected
+            );
+        }
+        let pool = shape_pool(2, 0xff00);
+        let colour = crate::effective_colour::colour(&pool, 2).convert();
+        let Object::OutputLine(mut line) = crate::default_object(ObjectType::OutputLine) else {
+            unreachable!()
+        };
+        line.width = 40;
+        line.height = 2;
+        line.line_attributes = ObjectId::new(11).unwrap().into();
+        assert_eq!(
+            shape_samples(
+                &Object::OutputLine(line.clone()),
+                &pool,
+                &[(0.0, 0.0), (10.0, 1.0), (20.0, 0.0), (25.0, 0.0)]
+            ),
+            vec![Some(colour), Some(colour), None, None]
+        );
+        let Object::OutputRectangle(mut rectangle) =
+            crate::default_object(ObjectType::OutputRectangle)
+        else {
+            unreachable!()
+        };
+        rectangle.width = 24;
+        rectangle.height = 12;
+        rectangle.line_attributes = ObjectId::new(11).unwrap().into();
+        assert_eq!(
+            shape_samples(
+                &Object::OutputRectangle(rectangle),
+                &pool,
+                &[(4.0, 0.0), (20.0, 0.0)]
+            ),
+            vec![Some(colour), None]
+        );
+        let solid_pool = shape_pool(2, 0xffff);
+        line.width = 12;
+        line.height = 10;
+        line.line_direction = LineDirection::BottomLeftToTopRight;
+        assert_eq!(
+            shape_samples(
+                &Object::OutputLine(line),
+                &solid_pool,
+                &[(0.0, 8.0), (10.0, 0.0), (0.0, 10.0)]
+            ),
+            vec![Some(colour), Some(colour), None]
+        );
+        let Object::OutputPolygon(mut polygon) = crate::default_object(ObjectType::OutputPolygon)
+        else {
+            unreachable!()
+        };
+        polygon.width = 12;
+        polygon.height = 12;
+        polygon.line_attributes = ObjectId::new(11).unwrap().into();
+        polygon.points = vec![
+            Point { x: 0, y: 0 },
+            Point { x: 40, y: 0 },
+            Point { x: 40, y: 40 },
+            Point { x: 0, y: 40 },
+        ];
+        polygon.polygon_type = 3;
+        assert_eq!(
+            shape_samples(
+                &Object::OutputPolygon(polygon.clone()),
+                &pool,
+                &[(4.0, 0.0), (14.0, 0.0), (0.0, 6.0)]
+            ),
+            vec![Some(colour), None, None]
+        );
+        polygon.width = 24;
+        assert_eq!(
+            shape_samples(
+                &Object::OutputPolygon(polygon.clone()),
+                &pool,
+                &[(4.0, 0.0), (20.0, 0.0)]
+            ),
+            vec![Some(colour), None]
+        );
+        polygon.width = 12;
+        let mut filled_pool = solid_pool;
+        let Object::FillAttributes(mut fill) = crate::default_object(ObjectType::FillAttributes)
+        else {
+            unreachable!()
+        };
+        fill.id = ObjectId::new(12).unwrap();
+        fill.fill_type = 1;
+        filled_pool.add(Object::FillAttributes(fill));
+        polygon.fill_attributes = ObjectId::new(12).unwrap().into();
+        assert_eq!(
+            shape_samples(
+                &Object::OutputPolygon(polygon.clone()),
+                &filled_pool,
+                &[(6.0, 6.0)]
+            ),
+            vec![None]
+        );
+        polygon.polygon_type = 2;
+        assert_eq!(
+            shape_samples(
+                &Object::OutputPolygon(polygon),
+                &filled_pool,
+                &[(6.0, 6.0), (14.0, 6.0)]
+            ),
+            vec![Some(colour), None]
+        );
+        let mut pool = shape_pool(0, 0);
+        let Object::FillAttributes(mut fill) = crate::default_object(ObjectType::FillAttributes)
+        else {
+            unreachable!()
+        };
+        fill.id = ObjectId::new(12).unwrap();
+        fill.fill_type = 2;
+        fill.fill_colour = 4;
+        let fill_colour = crate::effective_colour::colour(&pool, 4).convert();
+        pool.add(Object::FillAttributes(fill));
+        let Object::OutputPolygon(mut polygon) = crate::default_object(ObjectType::OutputPolygon)
+        else {
+            unreachable!()
+        };
+        polygon.width = 20;
+        polygon.height = 20;
+        polygon.line_attributes = ObjectId::new(11).unwrap().into();
+        polygon.fill_attributes = ObjectId::new(12).unwrap().into();
+        polygon.polygon_type = 2;
+        polygon.points = vec![
+            Point { x: 0, y: 0 },
+            Point { x: 20, y: 20 },
+            Point { x: 0, y: 20 },
+            Point { x: 20, y: 0 },
+        ];
+        assert_eq!(
+            shape_samples(
+                &Object::OutputPolygon(polygon),
+                &pool,
+                &[(10.0, 2.0), (2.0, 10.0), (10.0, 18.0)]
+            ),
+            vec![Some(fill_colour), None, Some(fill_colour)]
+        );
     }
 
     #[test]

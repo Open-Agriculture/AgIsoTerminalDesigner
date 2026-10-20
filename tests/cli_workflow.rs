@@ -19,6 +19,31 @@ fn incompatible_project_bytes() -> Vec<u8> {
     let mut unsupported = default_object(ObjectType::OutputList);
     unsupported.mut_id().set_value(100).unwrap();
     pool.add(unsupported);
+    for (kind, id) in [
+        (ObjectType::WorkingSet, 200),
+        (ObjectType::DataMask, 201),
+        (ObjectType::PictureGraphic, 202),
+    ] {
+        let mut object = default_object(kind);
+        object.mut_id().set_value(id).unwrap();
+        match &mut object {
+            ag_iso_stack::object_pool::object::Object::WorkingSet(ws) => {
+                ws.active_mask = ag_iso_stack::object_pool::ObjectId::new(201).unwrap();
+                ws.object_refs.push(ag_iso_stack::object_pool::ObjectRef {
+                    id: ag_iso_stack::object_pool::ObjectId::new(202).unwrap(),
+                    offset: Default::default(),
+                });
+            }
+            ag_iso_stack::object_pool::object::Object::PictureGraphic(picture) => {
+                picture.width = 8;
+                picture.actual_width = 8;
+                picture.actual_height = 1;
+                picture.data = vec![0];
+            }
+            _ => {}
+        }
+        pool.add(object);
+    }
     let project = EditorProject::from(pool);
     let mut saved: Value = serde_json::from_slice(&project.save_project().unwrap()).unwrap();
     saved["settings"]["vt_version"] = 2.into();
@@ -68,6 +93,31 @@ fn temp_dir(prefix: &str) -> std::path::PathBuf {
 
 fn new_session(cwd: &Path) {
     success(cli(cwd, &["project", "new", "--discard"]));
+}
+
+fn add_identifier(cwd: &Path, working_set: &str) {
+    success(cli(
+        cwd,
+        &["object", "create", "OutputString", "Identifier"],
+    ));
+    success(cli(
+        cwd,
+        &["object", "create", "FontAttributes", "IdentifierFont"],
+    ));
+    success(cli(
+        cwd,
+        &[
+            "reference",
+            "set",
+            "Identifier",
+            "font_attributes",
+            "IdentifierFont",
+        ],
+    ));
+    success(cli(
+        cwd,
+        &["placement", "add", working_set, "Identifier", "0", "0"],
+    ));
 }
 
 fn get(cwd: &Path, target: &str) -> Value {
@@ -860,6 +910,7 @@ fn resource_imports_and_exports_use_local_files() {
         &["reference", "set", "Pool", "active_mask", "Screen"],
     ));
     success(cli(&cwd, &["placement", "add", "Screen", "Host", "0", "0"]));
+    add_identifier(&cwd, "Pool");
     std::fs::write(
         inputs.join("changes.aitcmd"),
         "object set Label value='007 {plain text}'\n\
@@ -1006,6 +1057,13 @@ fn project_export_publishes_validated_artifacts_and_refuses_existing_outputs() {
         .unwrap_or_else(|error| error.into_inner());
     let cwd = temp_dir("aitd-project-export");
     new_session(&cwd);
+    success(cli(&cwd, &["object", "create", "WorkingSet", "Pool"]));
+    success(cli(&cwd, &["object", "create", "DataMask", "Screen"]));
+    success(cli(
+        &cwd,
+        &["reference", "set", "Pool", "active_mask", "Screen"],
+    ));
+    add_identifier(&cwd, "Pool");
     success(cli(
         &cwd,
         &[

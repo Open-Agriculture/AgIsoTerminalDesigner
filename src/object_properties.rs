@@ -10,7 +10,10 @@
 //! For whole-object operations (CreateObject, DeleteObject, copy/paste),
 //! use Object::serialize/deserialize directly via Serde.
 
-use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool, ObjectType};
+use ag_iso_stack::object_pool::{
+    object::Object, object_attributes::ObjectLabel, vt_version::VtVersion, ObjectId, ObjectPool,
+    ObjectType,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -453,6 +456,14 @@ macro_rules! object_reference {
     };
 }
 
+macro_rules! object_label_graphic_reference {
+    () => {
+        PropertySemantic::ObjectReference {
+            allowed_types: <ObjectLabel as crate::allowed_object_relationships::AllowedChildRefs>::get_allowed_child_refs(VtVersion::Version6),
+        }
+    };
+}
+
 // Unit variants come from Serde metadata. Payload enums and ISO-defined raw
 // byte fields supply explicit choices.
 macro_rules! property_enum_choices {
@@ -692,7 +703,7 @@ ag_iso_stack::object_pool::object::InputString {
     Height: height,
     BackgroundColour: background_colour => PropertySemantic::Colour,
     FontAttributes: font_attributes => object_reference!(FontAttributes),
-    InputAttributes: input_attributes => object_reference!(InputAttributes),
+    InputAttributes: input_attributes => object_reference!(InputAttributes, ExtendedInputAttributes),
     Options: options => PropertySemantic::Bitflags,
     VariableReference: variable_reference => object_reference!(StringVariable),
     Value: value,
@@ -948,16 +959,16 @@ ag_iso_stack::object_pool::object::WindowMask {
     WindowType: window_type => PropertySemantic::Enum,
     BackgroundColour: background_colour => PropertySemantic::Colour,
     Options: options => PropertySemantic::Bitflags,
-    Name: name => object_reference!(OutputString),
-    WindowTitle: window_title => object_reference!(OutputString),
-    WindowIcon: window_icon => object_reference!(PictureGraphic)
+    Name: name => object_reference!(OutputString, ObjectPointer),
+    WindowTitle: window_title => object_reference!(OutputString, ObjectPointer),
+    WindowIcon: window_icon => object_label_graphic_reference!()
 }}
 
 impl_properties! {
 ag_iso_stack::object_pool::object::KeyGroup {
     Options: options => PropertySemantic::Bitflags,
-    Name: name => object_reference!(OutputString),
-    KeyGroupIcon: key_group_icon => object_reference!(PictureGraphic)
+    Name: name => object_reference!(OutputString, ObjectPointer),
+    KeyGroupIcon: key_group_icon => object_label_graphic_reference!()
 }}
 
 impl_properties! {

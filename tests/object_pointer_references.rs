@@ -16,6 +16,31 @@ fn fixture() -> (EditorProject, u16, u16, u16) {
         object.mut_id().set_value(id).unwrap();
         pool.add(object);
     }
+    for (kind, id) in [
+        (ObjectType::WorkingSet, 65000),
+        (ObjectType::DataMask, 65001),
+        (ObjectType::PictureGraphic, 65002),
+    ] {
+        let mut object = default_object(kind);
+        *object.mut_id() = object_id(id);
+        match &mut object {
+            Object::WorkingSet(ws) => {
+                ws.active_mask = object_id(65001);
+                ws.object_refs.push(ag_iso_stack::object_pool::ObjectRef {
+                    id: object_id(65002),
+                    offset: Default::default(),
+                });
+            }
+            Object::PictureGraphic(picture) => {
+                picture.width = 8;
+                picture.actual_width = 8;
+                picture.actual_height = 1;
+                picture.data = vec![0];
+            }
+            _ => {}
+        }
+        pool.add(object);
+    }
     (EditorProject::from(pool), 10, 20, 30)
 }
 

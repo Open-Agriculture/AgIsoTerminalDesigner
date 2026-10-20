@@ -331,12 +331,8 @@ pub fn execute(
             "object_id_ranges":state.object_id_ranges.iter().map(|(object_type, range)| json!({"object_type":format!("{object_type:?}"),"start":range.start,"end":range.end})).collect::<Vec<_>>(),
         }})),
         AutomationAction::ValidateDesign => {
-            let materialized = project.materialize_shared();
-            let mut diagnostics = match &materialized {
-                Ok(materialized) => crate::pool_validation::validate_pool_state_for_version(
-                    &materialized.pool,
-                    state.vt_version,
-                ),
+            let mut diagnostics = match project.compatibility_diagnostics() {
+                Ok(diagnostics) => diagnostics,
                 Err(error) => vec![crate::pool_validation::ValidationDiagnostic {
                     severity: crate::pool_validation::ValidationSeverity::Error,
                     message: error.message.clone(),
@@ -344,15 +340,6 @@ pub fn execute(
                     code: error.code.clone(),
                 }],
             };
-            let compatibility_pool = materialized
-                .as_ref()
-                .map(|materialized| &materialized.pool)
-                .unwrap_or(&state.pool);
-            let compatibility = crate::vt_compatibility::validate_pool_compatibility(
-                compatibility_pool,
-                state.vt_version,
-            );
-            diagnostics.extend(compatibility);
             if let Err(error) = project.export_iop() {
                 if !diagnostics
                     .iter()

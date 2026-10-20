@@ -33,6 +33,7 @@ fn signed_numeric_offsets_survive_project_and_iop_round_trips() {
         }
         pool.add(object);
     }
+    add_pool_scaffolding(&mut pool);
     let mut project = EditorProject::from(pool);
     let mut transaction = OperationTransaction::new(None);
     for id in [2, 3] {
@@ -164,11 +165,39 @@ fn versioned_records_match_specification_bytes_and_round_trip() {
     );
 }
 
+// Export tests need a complete Working Set even when the record under test
+// is otherwise independent of the mask tree.
+fn add_pool_scaffolding(pool: &mut ObjectPool) {
+    for (kind, id) in [
+        (ObjectType::WorkingSet, 65000),
+        (ObjectType::DataMask, 65001),
+        (ObjectType::PictureGraphic, 65002),
+    ] {
+        let mut object = default_object(kind);
+        *object.mut_id() = object_id(id);
+        if let Object::WorkingSet(ws) = &mut object {
+            ws.active_mask = object_id(65001);
+            ws.object_refs.push(ag_iso_stack::object_pool::ObjectRef {
+                id: object_id(65002),
+                offset: Default::default(),
+            });
+        }
+        if let Object::PictureGraphic(picture) = &mut object {
+            picture.width = 8;
+            picture.actual_width = 8;
+            picture.actual_height = 1;
+            picture.data = vec![0];
+        }
+        pool.add(object);
+    }
+}
+
 fn with_object(object_type: ObjectType, id: u16) -> ObjectPool {
     let mut pool = ObjectPool::default();
     let mut object = default_object(object_type);
     object.mut_id().set_value(id).unwrap();
     pool.add(object);
+    add_pool_scaffolding(&mut pool);
     pool
 }
 
@@ -307,6 +336,7 @@ fn legacy_strings_accept_ascii_and_reject_unrepresentable_edits() {
         id: object_id(10),
         value: VtString::Text("A".repeat(200)),
     }));
+    add_pool_scaffolding(&mut pool);
     let project = EditorProject::from(pool);
     let mut saved: Value = serde_json::from_slice(&project.save_project().unwrap()).unwrap();
     saved["settings"]["vt_version"] = json!(2);
@@ -329,6 +359,7 @@ fn v1_encoded_string_bytes_and_v2_repair_drafts_round_trip() {
             encoded_bytes: vec![0x41, 0xE9],
         },
     }));
+    add_pool_scaffolding(&mut pool);
     let legacy_iop = pool.as_iop();
     let mut legacy: Value =
         serde_json::from_slice(&EditorProject::from(pool).save_project().unwrap()).unwrap();
@@ -349,7 +380,7 @@ fn v1_encoded_string_bytes_and_v2_repair_drafts_round_trip() {
     legacy.as_object_mut().unwrap().remove("objects");
     let loaded = EditorProject::load_project(serde_json::to_vec(&legacy).unwrap()).unwrap();
     assert_eq!(
-        loaded.export_iop().unwrap(),
+        loaded.get_pool().as_iop(),
         [11, 0, 47, 5, 0, 255, 255, 255, 255, 0]
     );
 }
@@ -517,6 +548,12 @@ fn hierarchy_checks_allow_key_labels_and_follow_container_and_pointer_chains() {
     pool.add(key);
     let mut label = default_object(ObjectType::OutputString);
     label.mut_id().set_value(12).unwrap();
+    if let Object::OutputString(label) = &mut label {
+        label.font_attributes = object_id(13).into();
+    }
+    let mut font = default_object(ObjectType::FontAttributes);
+    *font.mut_id() = object_id(13);
+    pool.add(font);
     pool.add(label);
     let mut project = EditorProject::from(pool);
     project.set_vt_version(VtVersion::Version2).unwrap();
