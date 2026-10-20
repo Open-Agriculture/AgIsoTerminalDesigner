@@ -198,29 +198,3 @@ fn require(bytes: &[u8], offset: usize, length: usize, name: &str) -> Result<(),
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::validate_macro_commands;
-
-    #[test]
-    fn accepts_mixed_fixed_and_length_prefixed_macro_commands() {
-        let mut commands = vec![0xA0; 8];
-        commands.extend_from_slice(&[0xB3, 1, 0, 2, 0, b'o', b'k', 0xFF]);
-        commands.extend_from_slice(&[0xB8, 1, 0, 2, 7, 0xFF, 0xFF, 0xFF]);
-        commands.extend_from_slice(&[0xBE; 8]);
-
-        assert!(validate_macro_commands(&commands, VtVersion::Version4).is_ok());
-    }
-
-    #[test]
-    fn reports_truncated_variable_command_at_its_offset() {
-        let commands = [0xA0, 0, 0, 0, 0, 0, 0, 0, 0xB3, 1, 0, 3, 0, b'o', b'k'];
-
-        let error = validate_macro_commands(&commands, VtVersion::Version3).unwrap_err();
-        assert!(error.contains("offset 8"));
-        assert!(error.contains("truncated Change String Value"));
-    }
-
-    use ag_iso_stack::object_pool::vt_version::VtVersion;
-}

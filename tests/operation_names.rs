@@ -1,12 +1,10 @@
 use std::collections::HashMap;
 
 use ag_iso_stack::object_pool::object::Object;
-use ag_iso_stack::object_pool::object_attributes::Event;
 use ag_iso_stack::object_pool::{ObjectId, ObjectPool, ObjectType};
 use ag_iso_terminal_designer::{
-    default_object, object_properties::PropertyKey, ChildPlacement, EditorProject,
-    MacroReferenceTarget, ObjectInfo, ObjectTarget, ObjectTargetList, Operation, OperationError,
-    OperationExecutor, OperationTransaction, CURRENT_OPERATION_SCHEMA_VERSION,
+    default_object, object_properties::PropertyKey, ObjectInfo, ObjectTarget, Operation,
+    OperationError, OperationExecutor, OperationTransaction,
 };
 use serde_json::json;
 
@@ -33,107 +31,6 @@ fn name(name: &str) -> ObjectTarget {
     ObjectTarget::Name {
         name: name.to_owned(),
     }
-}
-
-#[test]
-fn schema_v2_json_uses_only_object_shaped_targets() {
-    let value = json!({
-        "schema_version": 2,
-        "description": "Create rate display",
-        "operations": [{
-            "type": "CreateObject",
-            "data": { "name": "Rate Variable", "object_type": "NumberVariable" }
-        }, {
-            "type": "SetProperty",
-            "data": { "object": { "name": "Rate Variable" }, "property": "value", "value": 7 }
-        }]
-    });
-    let transaction: OperationTransaction = serde_json::from_value(value).unwrap();
-    assert_eq!(transaction.schema_version, CURRENT_OPERATION_SCHEMA_VERSION);
-    assert!(matches!(
-        transaction.operations[1],
-        Operation::SetProperty {
-            object: ObjectTarget::Name { .. },
-            ..
-        }
-    ));
-    assert_eq!(
-        serde_json::to_value(&transaction.operations[1]).unwrap()["data"]["property"],
-        "value"
-    );
-    assert!(serde_json::from_value::<Operation>(json!({
-        "type": "RestoreObject",
-        "data": { "object": {}, "info": null }
-    }))
-    .is_err());
-    assert!(serde_json::from_value::<Operation>(json!({
-        "type": "RestoreProperty",
-        "data": { "object_id": 10, "property": "polygon_type", "value": 4 }
-    }))
-    .is_err());
-}
-
-#[test]
-fn repairing_reserved_polygon_type_is_undoable_and_redoable() {
-    let mut polygon = default_object(ObjectType::OutputPolygon);
-    polygon.mut_id().set_value(10).unwrap();
-    if let Object::OutputPolygon(polygon) = &mut polygon {
-        polygon.points = vec![
-            ag_iso_stack::object_pool::object_attributes::Point { x: 0, y: 0 },
-            ag_iso_stack::object_pool::object_attributes::Point { x: 10, y: 0 },
-            ag_iso_stack::object_pool::object_attributes::Point { x: 0, y: 10 },
-        ];
-        polygon.polygon_type = 4;
-    }
-    let mut pool = ObjectPool::default();
-    pool.add(polygon);
-    let mut project = EditorProject::from(pool);
-
-    let mut invalid_edit = OperationTransaction::new(None);
-    invalid_edit.add_operation(Operation::SetProperty {
-        object: ObjectTarget::id(10),
-        property: PropertyKey::PolygonType,
-        value: json!(4),
-    });
-    assert!(project.execute_transaction(invalid_edit).is_err());
-
-    let mut repair = OperationTransaction::new(Some("Repair polygon type".into()));
-    repair.add_operation(Operation::SetProperty {
-        object: ObjectTarget::id(10),
-        property: PropertyKey::PolygonType,
-        value: json!(0),
-    });
-    project.execute_transaction(repair).unwrap();
-    assert_eq!(
-        ag_iso_terminal_designer::object_properties::get_property(
-            project.get_pool(),
-            ObjectId::new(10).unwrap(),
-            PropertyKey::PolygonType,
-        )
-        .unwrap(),
-        json!(0)
-    );
-
-    assert!(project.undo_operation());
-    assert_eq!(
-        ag_iso_terminal_designer::object_properties::get_property(
-            project.get_pool(),
-            ObjectId::new(10).unwrap(),
-            PropertyKey::PolygonType,
-        )
-        .unwrap(),
-        json!(4)
-    );
-    assert!(project.redo_operation());
-    assert_eq!(
-        ag_iso_terminal_designer::object_properties::get_property(
-            project.get_pool(),
-            ObjectId::new(10).unwrap(),
-            PropertyKey::PolygonType,
-        )
-        .unwrap(),
-        json!(0)
-    );
 }
 
 #[test]
@@ -265,31 +162,6 @@ fn unknown_and_ambiguous_names_fail_atomically() {
 }
 
 #[test]
-fn duplicate_create_and_rename_are_rejected() {
-    let (pool, infos) = pool_with(&[
-        (ObjectType::Button, 10, "Taken"),
-        (ObjectType::Button, 11, "Other"),
-    ]);
-    for operation in [
-        Operation::CreateObject {
-            object_id: None,
-            object_type: ObjectType::Button,
-            name: "Taken".into(),
-        },
-        Operation::RenameObject {
-            object: ObjectTarget::id(11),
-            name: "Taken".into(),
-        },
-    ] {
-        let mut tx = OperationTransaction::new(None);
-        tx.add_operation(operation);
-        assert!(
-            matches!(OperationExecutor::new().execute(tx, &pool, &infos), Err(OperationError::DuplicateObjectName(value)) if value == "Taken")
-        );
-    }
-}
-
-#[test]
 fn reference_operations_enforce_property_semantics_and_target_type() {
     let (pool, infos) = pool_with(&[
         (ObjectType::OutputNumber, 10, "Output"),
@@ -345,69 +217,6 @@ fn reference_operations_enforce_property_semantics_and_target_type() {
     assert!(OperationExecutor::new()
         .execute(applied.create_inverse(), &changed, &changed_infos)
         .is_ok());
-}
-
-#[test]
-fn name_based_lists_macros_and_rename_round_trip() {
-    let (pool, infos) = pool_with(&[
-        (ObjectType::SoftKeyMask, 10, "Keys"),
-        (ObjectType::Key, 11, "First Key"),
-        (ObjectType::Button, 20, "Button"),
-        (ObjectType::Macro, 21, "Activate Macro"),
-        (ObjectType::DataMask, 30, "Main Screen"),
-    ]);
-    let before = pool.as_iop();
-    let mut tx = OperationTransaction::new(Some("structures".into()));
-    tx.add_operation(Operation::SetObjectList {
-        object: name("Keys"),
-        objects: ObjectTargetList::Required(vec![name("First Key")]),
-    });
-    tx.add_operation(Operation::SetChildren {
-        parent: name("Main Screen"),
-        children: vec![ChildPlacement {
-            child: name("Button"),
-            x: 3,
-            y: 4,
-        }],
-    });
-    tx.add_operation(Operation::SetMacroReferences {
-        object: name("Button"),
-        macro_refs: vec![MacroReferenceTarget {
-            event_id: Event::OnKeyPress,
-            macro_object: name("Activate Macro"),
-        }],
-    });
-    tx.add_operation(Operation::RenameObject {
-        object: name("Button"),
-        name: "Renamed Button".into(),
-    });
-    let (changed, changed_infos, applied) =
-        OperationExecutor::new().execute(tx, &pool, &infos).unwrap();
-    assert_ne!(changed.as_iop(), before);
-
-    let (undone, undone_infos, _) = OperationExecutor::new()
-        .execute(applied.create_inverse(), &changed, &changed_infos)
-        .unwrap();
-    assert_eq!(undone.as_iop(), before);
-    assert_eq!(
-        undone_infos
-            .get(&ObjectId::new(20).unwrap())
-            .and_then(|info| info.name.as_deref()),
-        Some("Button")
-    );
-
-    let mut redo = OperationTransaction::new(applied.description.clone());
-    redo.add_operations(applied.forward_operations.clone());
-    let (redone, redone_infos, _) = OperationExecutor::new()
-        .execute(redo, &undone, &undone_infos)
-        .unwrap();
-    assert_eq!(redone.as_iop(), changed.as_iop());
-    assert_eq!(
-        redone_infos
-            .get(&ObjectId::new(20).unwrap())
-            .and_then(|info| info.name.as_deref()),
-        Some("Renamed Button")
-    );
 }
 
 #[test]

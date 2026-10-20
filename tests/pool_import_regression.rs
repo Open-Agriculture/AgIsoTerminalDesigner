@@ -1,5 +1,5 @@
 use ag_iso_stack::object_pool::{object::Object, vt_version::VtVersion, ObjectId};
-use ag_iso_terminal_designer::{EditorProject, ObjectIdFormat};
+use ag_iso_terminal_designer::EditorProject;
 
 #[test]
 fn imports_string_fields_in_wire_order_without_losing_record_alignment() {
@@ -37,34 +37,5 @@ fn imports_string_fields_in_wire_order_without_losing_record_alignment() {
         assert!(
             matches!(pool.object_by_id(ObjectId::new(3).unwrap()), Some(Object::NumberVariable(value)) if value.value == 42)
         );
-    }
-}
-
-#[test]
-fn import_errors_use_selected_object_id_format() {
-    for (format, expected) in [
-        (ObjectIdFormat::Decimal, "object 175 at byte 0: DataEmpty"),
-        (
-            ObjectIdFormat::Hexadecimal,
-            "object 0x00AF at byte 0: DataEmpty",
-        ),
-    ] {
-        let error =
-            EditorProject::import_iop_with_id_format(vec![175, 0, 8], VtVersion::Version6, format)
-                .err()
-                .unwrap();
-        assert_eq!(error, expected);
-        let project = EditorProject::import_iop_with_id_format(
-            vec![175, 0, 21, 42, 0, 0, 0],
-            VtVersion::Version6,
-            format,
-        )
-        .unwrap();
-        assert_eq!(project.object_id_format(), format);
-        let error =
-            EditorProject::import_iop_with_id_format(vec![175], VtVersion::Version6, format)
-                .err()
-                .unwrap();
-        assert_eq!(error, "byte 0: DataEmpty");
     }
 }

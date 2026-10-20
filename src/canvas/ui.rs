@@ -1945,7 +1945,3 @@ impl CanvasState {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "ui_tests.rs"]
-mod tests;

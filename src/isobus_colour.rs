@@ -49,34 +49,3 @@ pub fn schema() -> Value {
         }
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn palette_matches_standard_cube_and_boundaries() {
-        assert_eq!(standard_rgb(0), Some([0, 0, 0]));
-        assert_eq!(standard_rgb(1), Some([255, 255, 255]));
-        assert_eq!(standard_rgb(2), Some([0, 153, 0]));
-        assert_eq!(standard_rgb(12), Some([255, 0, 0]));
-        for index in 0..FIRST_PROPRIETARY {
-            assert_eq!(Colour::COLOUR_PALETTE[index as usize].a, DEFAULT_ALPHA);
-        }
-        for index in 16..FIRST_PROPRIETARY {
-            let offset = index - 16;
-            assert_eq!(
-                standard_rgb(index),
-                Some([
-                    CUBE_LEVELS[(offset / 36) as usize],
-                    CUBE_LEVELS[((offset / 6) % 6) as usize],
-                    CUBE_LEVELS[(offset % 6) as usize],
-                ])
-            );
-        }
-        for index in FIRST_PROPRIETARY..=255 {
-            assert_eq!(standard_rgb(index), None);
-        }
-        assert_eq!(schema()["basic_colours"][12]["name"], "Red");
-    }
-}

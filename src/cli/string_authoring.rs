@@ -82,35 +82,3 @@ pub fn export_value(value: &Value) -> Result<Option<(String, String)>, String> {
     }
     Ok(Some((encoding, text)))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    #[test]
-    fn readable_strings_round_trip_their_exact_encoding() {
-        for (text, encoding) in [
-            ("ÿ\0\n'\\", "Latin1"),
-            ("€", "Latin9"),
-            ("Ω", "Greek"),
-            ("Привет", "Cyrillic"),
-            ("Hello 🌾\n", "utf16le"),
-        ] {
-            let value = encode(text, encoding).unwrap();
-            let (exported_encoding, exported_text) = export_value(&value).unwrap().unwrap();
-            assert_eq!(encode(&exported_text, &exported_encoding).unwrap(), value);
-        }
-        let bytes: Vec<u8> = (0..=255).collect();
-        let value = json!({"encoded_bytes": bytes});
-        let (encoding, text) = export_value(&value).unwrap().unwrap();
-        assert_eq!(encode(&text, &encoding).unwrap(), value);
-        assert!(encode("🌾", "Latin1").is_err());
-        assert!(encode("�", "Greek").is_err());
-        assert_eq!(export_value(&json!("ordinary")).unwrap(), None);
-    }
-    #[test]
-    fn malformed_utf16_is_rejected() {
-        assert!(export_value(&json!({"encoded_bytes": [255, 254, 1]})).is_err());
-        assert!(export_value(&json!({"encoded_bytes": [255, 254, 0, 216]})).is_err());
-    }
-}

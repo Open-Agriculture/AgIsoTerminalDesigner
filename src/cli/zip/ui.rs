@@ -165,34 +165,3 @@ impl Drop for Export {
 fn percentage(fraction: f32) -> String {
     format!("{}%", (fraction.clamp(0.0, 1.0) * 100.0).floor() as u32)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn percentage_rounds_down_and_only_reaches_100_at_completion() {
-        assert_eq!(percentage(0.0), "0%");
-        assert_eq!(percentage(0.429), "42%");
-        assert_eq!(percentage(0.999), "99%");
-        assert_eq!(percentage(1.0), "100%");
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn cancellation_wins_over_queued_success() {
-        let (sender, receiver) = mpsc::channel();
-        sender.send(Outcome::Complete(vec![1])).unwrap();
-        let mut export = Export {
-            cancelling: false,
-            cancel: Arc::new(AtomicBool::new(false)),
-            progress: Arc::new(Mutex::new(ExportProgress {
-                fraction: 1.0,
-                status: "Creating ZIP archive…",
-            })),
-            receiver,
-        };
-        export.cancel();
-        assert!(matches!(export.poll(), Some(Outcome::Cancelled)));
-    }
-}

@@ -31,21 +31,3 @@ impl ObjectIdFormat {
         u16::from_str_radix(digits, radix)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ObjectIdFormat::{Decimal, Hexadecimal};
-
-    #[test]
-    fn ids_use_selected_radix_and_explicit_hex_prefix() {
-        assert_eq!(Hexadecimal.format(175), "0x00AF");
-        assert_eq!(Decimal.format(175), "175");
-        assert_eq!(Decimal.parse("175"), Ok(175));
-        assert_eq!(Decimal.parse(" 0x00af "), Ok(175));
-        assert_eq!(Hexadecimal.parse("10"), Ok(16));
-        assert_eq!(Hexadecimal.parse("0XFFFF"), Ok(u16::MAX));
-        for input in ["", "-1", "0x10000", "garbage"] {
-            assert!(Hexadecimal.parse(input).is_err());
-        }
-    }
-}

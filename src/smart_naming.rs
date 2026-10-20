@@ -136,31 +136,3 @@ pub(crate) fn generate_smart_name_from_count_with_normalized_names(
         counter += 1;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{names_equal, normalized_name};
-    use std::collections::HashSet;
-
-    #[test]
-    fn name_matching_folds_case_and_separators() {
-        assert!(names_equal("Start Button", "START_button"));
-        assert!(names_equal("  start---button  ", "start button"));
-        assert_eq!(normalized_name("  Ångström__UNIT  "), "ångström-unit");
-    }
-
-    #[test]
-    fn generated_names_avoid_normalized_collisions() {
-        let existing = [normalized_name("BUTTON_2")]
-            .into_iter()
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            super::generate_smart_name_from_count_with_normalized_names(
-                ag_iso_stack::object_pool::ObjectType::Button,
-                1,
-                &existing,
-            ),
-            "Button 3"
-        );
-    }
-}

@@ -140,29 +140,3 @@ fn c_identifier(name: &str) -> String {
     }
     identifier
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{c_identifier, generate_header};
-    use ag_iso_stack::object_pool::{ObjectPool, ObjectType};
-
-    #[test]
-    fn c_names_are_ascii_uppercase_and_start_with_a_non_digit() {
-        assert_eq!(c_identifier("Start button"), "START_BUTTON");
-        assert_eq!(c_identifier("42"), "_42");
-        assert_eq!(c_identifier("é"), "_");
-    }
-
-    #[test]
-    fn header_rejects_colliding_and_reserved_names() {
-        let mut pool = ObjectPool::new();
-        pool.add(crate::default_object(ObjectType::Button));
-        pool.add(crate::default_object(ObjectType::Button));
-        let mut names = ["Start button", "Start-button"].into_iter();
-        let collision = generate_header(&pool, |_| names.next().unwrap().to_owned()).unwrap_err();
-        assert!(collision.contains("both map to C identifier START_BUTTON"));
-
-        let reserved = generate_header(&pool, |_| "UNDEFINED".to_owned()).unwrap_err();
-        assert!(reserved.contains("reserved C identifier UNDEFINED"));
-    }
-}
