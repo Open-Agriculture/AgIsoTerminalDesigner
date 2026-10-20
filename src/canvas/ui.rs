@@ -252,17 +252,75 @@ impl CanvasState {
         dest_parent_path: &[usize],
         new_parent: u16,
     ) -> Result<PlacementTarget, String> {
+        self.reparent_in_hierarchy_at(
+            project,
+            target,
+            source_root,
+            source_parent_path,
+            dest_root,
+            dest_parent_path,
+            new_parent,
+            None,
+        )
+    }
+
+    /// Reparent an occurrence at a displayed sibling slot while preserving its
+    /// mask-local position. Parent paths use `[0, ...]` for the mask branch,
+    /// `[slot + 1, ...]` for soft keys, `usize::MAX` for pointer targets, and
+    /// canonical primitive child indexes. Soft-key branch paths use the linked
+    /// mask's slot indexes. `Some(index)` selects a slot in the combined
+    /// primitive/component order before source removal; `None`
+    /// appends. Same-parent reorders keep their coordinates, while cross-parent
+    /// moves retain the existing position-preservation and clamping rules.
+    pub fn reparent_in_hierarchy_at(
+        &self,
+        project: &mut EditorProject,
+        target: &PlacementTarget,
+        source_root: u16,
+        source_parent_path: &[usize],
+        dest_root: u16,
+        dest_parent_path: &[usize],
+        new_parent: u16,
+        insertion_index: Option<usize>,
+    ) -> Result<PlacementTarget, String> {
         let source = self.hierarchy_child_origin(project, source_root, source_parent_path)?;
         let dest = self.hierarchy_child_origin(project, dest_root, dest_parent_path)?;
         let (x, y) = position(project, target).ok_or("Missing source occurrence")?;
         let local = source + egui::vec2(f32::from(x), f32::from(y)) - dest;
-        edits::reparent_at(
+        edits::reparent_at_index(
             project,
             target,
             new_parent,
             local.x.round() as i32,
             local.y.round() as i32,
+            insertion_index,
         )
+    }
+
+    /// Validate a hierarchy drop against a lightweight disposable project copy.
+    pub fn validate_hierarchy_drop(
+        &self,
+        project: &EditorProject,
+        target: &PlacementTarget,
+        source_root: u16,
+        source_parent_path: &[usize],
+        dest_root: u16,
+        dest_parent_path: &[usize],
+        new_parent: u16,
+        insertion_index: Option<usize>,
+    ) -> Result<(), String> {
+        let mut candidate = project.canvas_preview_copy();
+        self.reparent_in_hierarchy_at(
+            &mut candidate,
+            target,
+            source_root,
+            source_parent_path,
+            dest_root,
+            dest_parent_path,
+            new_parent,
+            insertion_index,
+        )
+        .map(|_| ())
     }
 
     /// Resolve a visible hierarchy path to its exact editable placement.
@@ -343,6 +401,92 @@ impl CanvasState {
         self.selected = vec![item.path.clone()];
         self.sync_selection(project, &scene);
         true
+    }
+
+    /// Select a placement beneath the exact hierarchy occurrence identified
+    /// by its canonical path. This disambiguates shared parents placed more
+    /// than once in the same mask and reveals the page containing a soft-key
+    /// branch when needed.
+    pub fn select_hierarchy_placement(
+        &mut self,
+        project: &EditorProject,
+        root: u16,
+        parent_path: &[usize],
+        target: PlacementTarget,
+    ) -> bool {
+        if let Some(&tree_slot) = parent_path.first().filter(|slot| **slot > 0) {
+            self.select_softkey_slot(project, root, tree_slot - 1);
+        }
+        let Ok(materialized) = project.materialize() else {
+            return false;
+        };
+        let page = self.pages.get(&root).map_or(0, |page| page.1);
+        let scene = geometry::build_page(project, &materialized, root, page);
+
+        let (mut object_id, mut scene_path, remaining) = match parent_path.first() {
+            Some(0) => (root, Vec::new(), &parent_path[1..]),
+            Some(tree_slot) => {
+                let slot = *tree_slot - 1;
+                let path = vec![super::softkeys::PATH_PREFIX, slot];
+                let Some(object_id) = softkey_object_id(project, root, slot) else {
+                    return false;
+                };
+                if !scene.items.iter().any(|item| item.path == path) {
+                    return false;
+                }
+                (object_id, path, &parent_path[1..])
+            }
+            None => return false,
+        };
+
+        for &index in remaining {
+            if index == usize::MAX {
+                let Ok(pointer_id) = ag_iso_stack::object_pool::ObjectId::new(object_id) else {
+                    return false;
+                };
+                let Some(ag_iso_stack::object_pool::object::Object::ObjectPointer(pointer)) =
+                    project.get_pool().object_by_id(pointer_id)
+                else {
+                    return false;
+                };
+                let Some(pointer_target) = pointer.value.0 else {
+                    return false;
+                };
+                object_id = pointer_target.value();
+                continue;
+            }
+
+            let Some(materialized_index) =
+                canonical_to_materialized_index(&materialized, object_id, index)
+            else {
+                return false;
+            };
+            scene_path.push(materialized_index);
+            if !scene.items.iter().any(|item| item.path == scene_path) {
+                return false;
+            }
+            let Ok(parent_object_id) = ObjectId::new(object_id) else {
+                return false;
+            };
+            let Some(parent) = materialized.pool.object_by_id(parent_object_id) else {
+                return false;
+            };
+            let Some(reference) = crate::operations::object_refs(parent)
+                .and_then(|refs| refs.get(materialized_index))
+            else {
+                return false;
+            };
+            object_id = reference.id.value();
+        }
+
+        let Some(item) = scene.items.iter().find(|item| {
+            item.target.as_ref() == Some(&target)
+                && item.path.len() == scene_path.len() + 1
+                && item.path.starts_with(&scene_path)
+        }) else {
+            return false;
+        };
+        self.select_occurrence(project, root, &item.path)
     }
 
     /// Duplicate the selected placement through the canvas's undoable copy operation.
@@ -1943,5 +2087,114 @@ impl CanvasState {
         if nudge != Vec2::ZERO {
             commands.extend(move_edits(project, &items, nudge, false));
         }
+    }
+}
+
+fn canonical_to_materialized_index(
+    materialized: &MaterializedProject,
+    parent_id: u16,
+    canonical_index: usize,
+) -> Option<usize> {
+    let parent_id = ObjectId::new(parent_id).ok()?;
+    let parent = materialized.pool.object_by_id(parent_id)?;
+    let mut canonical_index_at = 0;
+    for (materialized_index, reference) in
+        crate::operations::object_refs(parent)?.iter().enumerate()
+    {
+        if matches!(
+            materialized
+                .source_map
+                .by_object_id
+                .get(&reference.id.value()),
+            Some(crate::components::MaterializedSource::ComponentNode { .. })
+        ) {
+            continue;
+        }
+        if canonical_index_at == canonical_index {
+            return Some(materialized_index);
+        }
+        canonical_index_at += 1;
+    }
+    None
+}
+
+fn softkey_object_id(project: &EditorProject, root: u16, slot: usize) -> Option<u16> {
+    use ag_iso_stack::object_pool::object::Object;
+    let root = project.get_pool().object_by_id(ObjectId::new(root).ok()?)?;
+    let softkey_mask_id = match root {
+        Object::DataMask(mask) => mask.soft_key_mask.0?.value(),
+        Object::AlarmMask(mask) => mask.soft_key_mask.0?.value(),
+        _ => return None,
+    };
+    let softkey_mask = project
+        .get_pool()
+        .object_by_id(ObjectId::new(softkey_mask_id).ok()?)?;
+    let Object::SoftKeyMask(mask) = softkey_mask else {
+        return None;
+    };
+    mask.objects.get(slot).map(|id| id.value())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ag_iso_stack::object_pool::{
+        object::Object, object_attributes::Point, ObjectPool, ObjectRef, ObjectType,
+    };
+
+    fn repeated_parent_project() -> EditorProject {
+        let mut pool = ObjectPool::default();
+        for (id, kind) in [
+            (2, ObjectType::DataMask),
+            (100, ObjectType::Container),
+            (101, ObjectType::OutputString),
+            (104, ObjectType::ObjectPointer),
+        ] {
+            let mut object = crate::default_object(kind);
+            object.mut_id().set_value(id).unwrap();
+            pool.add(object);
+        }
+        if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(2).unwrap()) {
+            for (id, x) in [(100, 0), (100, 100), (104, 200)] {
+                mask.object_refs.push(ObjectRef {
+                    id: ObjectId::new(id).unwrap(),
+                    offset: Point { x, y: 0 },
+                });
+            }
+        }
+        if let Some(Object::Container(container)) =
+            pool.object_mut_by_id(ObjectId::new(100).unwrap())
+        {
+            container.width = 80;
+            container.height = 40;
+            container.object_refs.push(ObjectRef {
+                id: ObjectId::new(101).unwrap(),
+                offset: Point { x: 4, y: 4 },
+            });
+        }
+        if let Some(Object::ObjectPointer(pointer)) =
+            pool.object_mut_by_id(ObjectId::new(104).unwrap())
+        {
+            pointer.value = ObjectId::new(100).unwrap().into();
+        }
+        let mut project = EditorProject::from(pool);
+        project.mask_size = 500;
+        project
+    }
+
+    #[test]
+    fn hierarchy_selection_keeps_repeated_parent_and_pointer_alias_occurrences() {
+        let project = repeated_parent_project();
+        let target = PlacementTarget::Primitive {
+            parent_id: 100,
+            child_index: 0,
+        };
+        let mut canvas = CanvasState::default();
+
+        assert!(canvas.select_hierarchy_placement(&project, 2, &[0, 1], target.clone()));
+        assert_eq!(canvas.selected, vec![vec![1, 0]]);
+
+        assert!(canvas.select_hierarchy_placement(&project, 2, &[0, 2, usize::MAX], target,));
+        assert_eq!(canvas.selected, vec![vec![2, 0]]);
     }
 }

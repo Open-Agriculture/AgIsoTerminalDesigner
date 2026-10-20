@@ -22,6 +22,12 @@ pub enum PlacementTarget {
     Component { instance_id: ComponentInstanceId },
 }
 
+#[derive(Clone)]
+enum DisplayedSibling {
+    Primitive(ChildPlacement),
+    Component(crate::components::ComponentInstance),
+}
+
 /// An edit to a placed object or its dimensions.
 /// Positions are signed parent-relative pool pixels. Dimensions belong to the
 /// shared object definition; omitted dimensions remain unchanged.
@@ -210,6 +216,85 @@ pub fn hierarchy_child_origin(
     Ok(origin)
 }
 
+/// Adjust a synthetic hierarchy parent path for the canonical child-index
+/// shift caused by removing `target`. Paths start with `[0]` for the mask or
+/// `[soft_key_slot + 1]` for soft keys; `usize::MAX` follows a pointer alias.
+/// Component removal does not affect primitive indexes.
+pub fn hierarchy_path_after_removal(
+    project: &EditorProject,
+    root: u16,
+    path: &[usize],
+    target: &PlacementTarget,
+) -> Result<Vec<usize>, String> {
+    use ag_iso_stack::object_pool::object::Object;
+
+    let mut adjusted = path.to_vec();
+    let PlacementTarget::Primitive {
+        parent_id: source_parent,
+        child_index: source_index,
+    } = target
+    else {
+        return Ok(adjusted);
+    };
+    let Some(first) = path.first() else {
+        return Err("Empty hierarchy path".into());
+    };
+    let (mut parent_id, start) = if *first == 0 {
+        (root, 1)
+    } else {
+        let root_object = project
+            .get_pool()
+            .object_by_id(object_id(root).map_err(|e| e.to_string())?)
+            .ok_or("Missing hierarchy root")?;
+        let softkey_mask_id = match root_object {
+            Object::DataMask(mask) => mask.soft_key_mask.0.ok_or("Missing soft-key mask")?.value(),
+            Object::AlarmMask(mask) => mask.soft_key_mask.0.ok_or("Missing soft-key mask")?.value(),
+            _ => return Err("Invalid soft-key hierarchy root".into()),
+        };
+        let softkey_mask = project
+            .get_pool()
+            .object_by_id(object_id(softkey_mask_id).map_err(|e| e.to_string())?)
+            .ok_or("Missing soft-key mask")?;
+        let Object::SoftKeyMask(softkey_mask) = softkey_mask else {
+            return Err("Invalid soft-key mask".into());
+        };
+        let slot = *first - 1;
+        let object_id = softkey_mask
+            .objects
+            .get(slot)
+            .ok_or("Invalid soft-key slot")?
+            .value();
+        (object_id, 1)
+    };
+
+    for (path_index, segment) in path.iter().copied().enumerate().skip(start) {
+        if segment == usize::MAX {
+            let pointer = project
+                .get_pool()
+                .object_by_id(object_id(parent_id).map_err(|e| e.to_string())?)
+                .ok_or("Missing hierarchy object")?;
+            let Object::ObjectPointer(pointer) = pointer else {
+                return Err("Invalid pointer hierarchy path".into());
+            };
+            parent_id = pointer.value.0.ok_or("Empty pointer target")?.value();
+            continue;
+        }
+        if parent_id == *source_parent && segment > *source_index {
+            adjusted[path_index] = segment - 1;
+        }
+        let parent = project
+            .get_pool()
+            .object_by_id(object_id(parent_id).map_err(|e| e.to_string())?)
+            .ok_or("Missing hierarchy object")?;
+        parent_id = object_refs(parent)
+            .and_then(|children| children.get(segment))
+            .ok_or("Invalid hierarchy path")?
+            .id
+            .value();
+    }
+    Ok(adjusted)
+}
+
 /// Reparent a tree occurrence while preserving its mask-local canvas position.
 /// Source and destination paths identify primitive parent occurrences, avoiding
 /// ambiguity when the same parent is placed more than once. Between masks, the
@@ -223,16 +308,42 @@ pub fn reparent_in_hierarchy(
     dest_parent_path: &[usize],
     new_parent: u16,
 ) -> Result<PlacementTarget, String> {
+    reparent_in_hierarchy_at(
+        project,
+        target,
+        source_root,
+        source_parent_path,
+        dest_root,
+        dest_parent_path,
+        new_parent,
+        None,
+    )
+}
+
+/// Reparent an occurrence at a combined primitive/component sibling slot.
+/// `insertion_index` is a slot in the destination's displayed order before the
+/// source is removed; `None` appends. Canvas position is preserved.
+pub fn reparent_in_hierarchy_at(
+    project: &mut EditorProject,
+    target: &PlacementTarget,
+    source_root: u16,
+    source_parent_path: &[usize],
+    dest_root: u16,
+    dest_parent_path: &[usize],
+    new_parent: u16,
+    insertion_index: Option<usize>,
+) -> Result<PlacementTarget, String> {
     let source_origin = hierarchy_child_origin(project, source_root, source_parent_path)?;
     let destination_origin = hierarchy_child_origin(project, dest_root, dest_parent_path)?;
     let (x, y) = position(project, target).ok_or("Missing source occurrence")?;
     let local = source_origin + egui::vec2(f32::from(x), f32::from(y)) - destination_origin;
-    reparent_at(
+    reparent_at_index(
         project,
         target,
         new_parent,
         local.x.round() as i32,
         local.y.round() as i32,
+        insertion_index,
     )
 }
 
@@ -259,6 +370,21 @@ pub fn reparent_at(
     new_parent: u16,
     x: i32,
     y: i32,
+) -> Result<PlacementTarget, String> {
+    reparent_at_index(project, target, new_parent, x, y, None)
+}
+
+/// Move an occurrence and place it at a combined primitive/component sibling
+/// slot. `insertion_index` is measured before source removal; `None` appends.
+/// Same-parent moves retain their coordinates, while parent changes preserve
+/// the existing clamping behavior.
+pub fn reparent_at_index(
+    project: &mut EditorProject,
+    target: &PlacementTarget,
+    new_parent: u16,
+    x: i32,
+    y: i32,
+    insertion_index: Option<usize>,
 ) -> Result<PlacementTarget, String> {
     use ag_iso_stack::object_pool::object::Object;
     let materialized = project.materialize().map_err(|error| error.to_string())?;
@@ -292,9 +418,23 @@ pub fn reparent_at(
             (child, parent)
         }
     };
-    if old_parent == new_parent {
-        return Ok(target.clone());
-    }
+    let same_parent = old_parent == new_parent;
+    let old_display_index = if same_parent {
+        Some(match target {
+            PlacementTarget::Primitive { parent_id, child_index } => {
+                primitive_display_index(project.get_pool(), project.component_source(), *parent_id, *child_index)
+                    .map_err(|e| e.to_string())?
+            }
+            PlacementTarget::Component { instance_id } => displayed_siblings(
+                project.get_pool(), project.component_source(), new_parent,
+            ).map_err(|error| error.to_string())?
+            .iter()
+            .position(|sibling| matches!(sibling, DisplayedSibling::Component(instance) if instance.id == *instance_id))
+            .ok_or("Missing component occurrence")?,
+        })
+    } else {
+        None
+    };
     let parent = project
         .get_pool()
         .object_by_id(object_id(new_parent).map_err(|e| e.to_string())?)
@@ -320,58 +460,90 @@ pub fn reparent_at(
         .object_by_id(object_id(child_id).map_err(|e| e.to_string())?)
         .ok_or("Missing source object")?;
     let (child_width, child_height) = materialized.pool.content_size(child);
-    if child_width > width || child_height > height {
+    if !same_parent && (child_width > width || child_height > height) {
         return Err(format!(
             "Object {} (ID {child_id}) is too large for destination {} (ID {new_parent})",
             project.get_object_info(child).get_name(child),
             project.get_object_info(parent).get_name(parent)
         ));
     }
-    let x = x
-        .clamp(0, i32::from(width - child_width))
-        .min(i32::from(i16::MAX)) as i16;
-    let y = y
-        .clamp(0, i32::from(height - child_height))
-        .min(i32::from(i16::MAX)) as i16;
+    let (x, y) = if same_parent {
+        position(project, target).ok_or("Missing source occurrence")?
+    } else {
+        (
+            x.clamp(0, i32::from(width - child_width))
+                .min(i32::from(i16::MAX)) as i16,
+            y.clamp(0, i32::from(height - child_height))
+                .min(i32::from(i16::MAX)) as i16,
+        )
+    };
+    if same_parent {
+        let sibling_count =
+            displayed_siblings(project.get_pool(), project.component_source(), new_parent)
+                .map_err(|error| error.to_string())?
+                .len();
+        let requested_slot = insertion_index.unwrap_or(sibling_count).min(sibling_count);
+        let effective_slot = if old_display_index.is_some_and(|source| source < requested_slot) {
+            requested_slot - 1
+        } else {
+            requested_slot
+        }
+        .min(sibling_count.saturating_sub(1));
+        if old_display_index == Some(effective_slot) {
+            return Ok(target.clone());
+        }
+    }
     let version = project.vt_version;
     let mut result = target.clone();
     project
         .edit_source(
             "Move placement to parent",
             |pool, source, _graphics, _info| {
-                match target {
-                    PlacementTarget::Primitive { .. } => {
-                        remove_target(pool, source, target, version)?;
-                        let mut children = child_placements(pool, new_parent)?;
-                        let index = children.len();
-                        children.push(ChildPlacement {
-                            child: ObjectTarget::id(child_id),
-                            x,
-                            y,
-                        });
-                        set_child_placements(pool, new_parent, children, version)?;
-                        result = PlacementTarget::Primitive {
-                            parent_id: new_parent,
-                            child_index: index,
-                        };
+                let destination_count = displayed_siblings(pool, source, new_parent)?.len();
+                let moved = match target {
+                    PlacementTarget::Primitive {
+                        parent_id,
+                        child_index,
+                    } => {
+                        let placement = child_placements(pool, *parent_id)?
+                            .get(*child_index)
+                            .cloned()
+                            .ok_or_else(invalid_placement)?;
+                        DisplayedSibling::Primitive(ChildPlacement { x, y, ..placement })
                     }
                     PlacementTarget::Component { instance_id } => {
-                        let instance = source
+                        let mut instance = source
                             .instances
                             .iter()
                             .find(|instance| instance.id == *instance_id)
                             .cloned()
                             .ok_or_else(invalid_placement)?;
-                        remove_target(pool, source, target, version)?;
-                        let mut moved = instance;
-                        moved.parent = EditorParentRef::Primitive(new_parent);
-                        moved.child_index =
-                            Some(insertion_index(pool, source, moved.parent.clone()));
-                        moved.x = i32::from(x);
-                        moved.y = i32::from(y);
-                        source.instances.push(moved);
+                        instance.x = i32::from(x);
+                        instance.y = i32::from(y);
+                        DisplayedSibling::Component(instance)
                     }
-                }
+                };
+                remove_target(pool, source, target, version)?;
+                let mut siblings = displayed_siblings(pool, source, new_parent)?;
+                let slot = insertion_index.unwrap_or(destination_count);
+                let slot = if same_parent && old_display_index.is_some_and(|source| source < slot) {
+                    slot - 1
+                } else {
+                    slot
+                };
+                let slot = slot.min(siblings.len());
+                siblings.insert(slot, moved);
+                set_displayed_siblings(pool, source, new_parent, siblings, version)?;
+                result = match target {
+                    PlacementTarget::Primitive { .. } => PlacementTarget::Primitive {
+                        parent_id: new_parent,
+                        child_index: displayed_siblings(pool, source, new_parent)?[..slot]
+                            .iter()
+                            .filter(|sibling| matches!(sibling, DisplayedSibling::Primitive(_)))
+                            .count(),
+                    },
+                    PlacementTarget::Component { .. } => target.clone(),
+                };
                 Ok(())
             },
         )
@@ -815,6 +987,63 @@ fn primitive_display_index(
         .iter()
         .position(|primitive| *primitive == Some(child_index))
         .ok_or_else(invalid_placement)
+}
+
+fn displayed_siblings(
+    pool: &ObjectPool,
+    source: &ComponentSource,
+    parent_id: u16,
+) -> ComponentResult<Vec<DisplayedSibling>> {
+    let mut siblings: Vec<_> = child_placements(pool, parent_id)?
+        .into_iter()
+        .map(DisplayedSibling::Primitive)
+        .collect();
+    let mut instances: Vec<_> = source
+        .instances
+        .iter()
+        .filter(|instance| instance.parent == EditorParentRef::Primitive(parent_id))
+        .collect();
+    instances.sort_by_key(|instance| (instance.child_index.unwrap_or(usize::MAX), instance.id));
+    for instance in instances {
+        let index = instance
+            .child_index
+            .unwrap_or(siblings.len())
+            .min(siblings.len());
+        siblings.insert(index, DisplayedSibling::Component(instance.clone()));
+    }
+    Ok(siblings)
+}
+
+fn set_displayed_siblings(
+    pool: &mut ObjectPool,
+    source: &mut ComponentSource,
+    parent_id: u16,
+    siblings: Vec<DisplayedSibling>,
+    version: VtVersion,
+) -> ComponentResult<()> {
+    let mut placements = Vec::new();
+    for (display_index, sibling) in siblings.into_iter().enumerate() {
+        match sibling {
+            DisplayedSibling::Primitive(placement) => placements.push(placement),
+            DisplayedSibling::Component(moved) => {
+                let instance = if let Some(instance) = source
+                    .instances
+                    .iter_mut()
+                    .find(|instance| instance.id == moved.id)
+                {
+                    instance
+                } else {
+                    source.instances.push(moved.clone());
+                    source.instances.last_mut().ok_or_else(invalid_placement)?
+                };
+                instance.parent = EditorParentRef::Primitive(parent_id);
+                instance.child_index = Some(display_index);
+                instance.x = moved.x;
+                instance.y = moved.y;
+            }
+        }
+    }
+    set_child_placements(pool, parent_id, placements, version)
 }
 
 fn compare_removals(left: &CanvasEdit, right: &CanvasEdit) -> std::cmp::Ordering {

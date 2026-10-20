@@ -7,6 +7,8 @@ mod app_persistence;
 #[path = "cli/zip/ui.rs"]
 mod cli_zip_export;
 mod designer_settings;
+#[cfg(test)]
+mod hierarchy_tests;
 mod shared_attributes;
 mod workspace;
 use workspace::{Pane, Workspace};
@@ -17,7 +19,10 @@ use ag_iso_stack::object_pool::NullableObjectId;
 use ag_iso_stack::object_pool::ObjectId;
 use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectType;
-use ag_iso_terminal_designer::canvas::{mask_view::MaskViewState, CanvasState};
+use ag_iso_terminal_designer::canvas::{
+    edits::PlacementTarget, mask_view::MaskViewState, CanvasState,
+};
+use ag_iso_terminal_designer::components::{EditorParentRef, EditorSelection};
 use ag_iso_terminal_designer::render_property_editor;
 use ag_iso_terminal_designer::{ui_style, EditorProject, Operation};
 #[cfg(not(target_arch = "wasm32"))]
@@ -43,7 +48,81 @@ const SELECTED_ANCESTRY_HIERARCHY_ID: &str = "selected_ancestry_hierarchy_ui";
 struct TreeDragPayload {
     root: u16,
     source_parent_path: Vec<usize>,
-    target: ag_iso_terminal_designer::canvas::edits::PlacementTarget,
+    target: PlacementTarget,
+    sibling_index: usize,
+    parent_id: u16,
+    occurrence_id: egui::Id,
+    label: String,
+}
+
+#[derive(Clone)]
+struct TreeDropCandidate {
+    source: TreeDragPayload,
+    root: u16,
+    parent_id: u16,
+    parent_path: Vec<usize>,
+    insertion_index: Option<usize>,
+    rect: egui::Rect,
+    layer: egui::LayerId,
+    clip_rect: egui::Rect,
+    edge_y: Option<f32>,
+}
+
+/// Collect one geometric destination; validation and commit share the same edit path.
+fn hierarchy_drag_row(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    source: Option<&TreeDragPayload>,
+    inside: Option<(u16, u16, Vec<usize>)>,
+) {
+    if let Some(source) = source {
+        response.dnd_set_drag_payload(source.clone());
+    }
+    let Some(dragged) = egui::DragAndDrop::payload::<TreeDragPayload>(ui.ctx()) else {
+        return;
+    };
+    if !response.contains_pointer() {
+        return;
+    }
+    let Some(pointer) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    let edge = if pointer.y < response.rect.top() + response.rect.height() * 0.25 {
+        Some(false)
+    } else if pointer.y > response.rect.bottom() - response.rect.height() * 0.25 {
+        Some(true)
+    } else {
+        None
+    };
+    let destination = if let (Some(after), Some(source)) = (edge, source) {
+        Some((
+            source.root,
+            source.parent_id,
+            source.source_parent_path.clone(),
+            Some(source.sibling_index + usize::from(after)),
+            Some(if after {
+                response.rect.bottom()
+            } else {
+                response.rect.top()
+            }),
+        ))
+    } else {
+        inside.map(|(root, parent, path)| (root, parent, path, None, None))
+    };
+    if let Some((root, parent_id, parent_path, insertion_index, edge_y)) = destination {
+        let candidate = TreeDropCandidate {
+            source: (*dragged).clone(),
+            root,
+            parent_id,
+            parent_path,
+            insertion_index,
+            rect: response.rect,
+            layer: ui.layer_id(),
+            clip_rect: ui.clip_rect(),
+            edge_y,
+        };
+        ui.data_mut(|data| data.insert_temp(egui::Id::new("tree_drop_candidate"), candidate));
+    }
 }
 
 fn clone_tree_path(path: &[usize]) -> Vec<usize> {
@@ -1203,10 +1282,13 @@ fn render_selectable_object(
     } else {
         let is_selected = project.get_selected() == object.id().into();
         let label_text = project.object_display_name(object);
-        let response = tree_row(ui, is_selected, label_text);
-        if let Some(payload) = drag_payload {
-            response.dnd_set_drag_payload(payload);
-        }
+        let response = tree_row_with_id(
+            ui,
+            ui.id().with(("object_row", object.id().value())),
+            is_selected,
+            label_text,
+        );
+        hierarchy_drag_row(ui, &response, drag_payload.as_ref(), drop_destination);
 
         if response.clicked() {
             project
@@ -1236,25 +1318,6 @@ fn render_selectable_object(
                 ui.close();
             }
         });
-        if response.contains_pointer() && ui.input(|input| input.pointer.any_released()) {
-            if let Some(payload) = egui::DragAndDrop::take_payload::<TreeDragPayload>(ui.ctx()) {
-                if let Some((dest_root, parent_id, dest_path)) = drop_destination {
-                    ui.data_mut(|data| {
-                        data.insert_temp(
-                            egui::Id::new("pending_tree_reparent"),
-                            (
-                                payload.root,
-                                payload.target.clone(),
-                                payload.source_parent_path.clone(),
-                                dest_root,
-                                dest_path,
-                                parent_id,
-                            ),
-                        )
-                    });
-                }
-            }
-        }
         response.clicked()
     }
 }
@@ -1308,6 +1371,44 @@ fn render_mask_object_hierarchy(
     open_selection: bool,
     placement_source: Option<TreeDragPayload>,
 ) {
+    let occurrence_id = parent_id.with((root, path.clone()));
+    ui.push_id(occurrence_id, |ui| {
+        if egui::DragAndDrop::payload::<TreeDragPayload>(ui.ctx())
+            .is_some_and(|source| source.occurrence_id == occurrence_id)
+        {
+            ui.multiply_opacity(0.4);
+        }
+        render_mask_object_hierarchy_inner(
+            ui,
+            parent_id,
+            root,
+            object,
+            project,
+            mask_view,
+            canvas,
+            path,
+            visiting,
+            softkey_slot,
+            open_selection,
+            placement_source,
+        );
+    });
+}
+
+fn render_mask_object_hierarchy_inner(
+    ui: &mut egui::Ui,
+    parent_id: egui::Id,
+    root: u16,
+    object: &Object,
+    project: &EditorProject,
+    mask_view: &mut MaskViewState,
+    canvas: &mut CanvasState,
+    path: &mut Vec<usize>,
+    visiting: &mut HashSet<u16>,
+    softkey_slot: Option<usize>,
+    open_selection: bool,
+    placement_source: Option<TreeDragPayload>,
+) {
     let id_value = object.id().value();
     if !visiting.insert(id_value) {
         ui_style::error_text(
@@ -1320,10 +1421,7 @@ fn render_mask_object_hierarchy(
         .component_source()
         .instances
         .iter()
-        .filter(|instance| {
-            instance.parent
-                == ag_iso_terminal_designer::components::EditorParentRef::Primitive(id_value)
-        })
+        .filter(|instance| instance.parent == EditorParentRef::Primitive(id_value))
         .collect();
     let placed = ag_iso_terminal_designer::operations::object_refs(object).unwrap_or_default();
     let pointer_target = match object {
@@ -1342,13 +1440,8 @@ fn render_mask_object_hierarchy(
         });
 
     if has_children {
-        let selected_in_header = std::cell::Cell::new(
-            None::<(
-                u16,
-                Option<usize>,
-                Option<ag_iso_terminal_designer::canvas::edits::PlacementTarget>,
-            )>,
-        );
+        let selected_in_header =
+            std::cell::Cell::new(None::<(u16, Option<usize>, Option<PlacementTarget>)>);
         let header_path = path.clone();
         if expand {
             let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -1381,31 +1474,150 @@ fn render_mask_object_hierarchy(
                 }
             },
             |ui| {
-                for (index, reference) in placed.iter().enumerate() {
-                    let source_parent_path = clone_tree_path(path);
-                    path.push(index);
-                    if let Some(child) = project.get_pool().object_by_id(reference.id) {
-                        render_mask_object_hierarchy(
-                            ui,
-                            occurrence_id.with(index),
+                let mut children: Vec<_> =
+                    (0..placed.len()).map(|index| (Some(index), None)).collect();
+                let mut instances = component_instances;
+                instances.sort_by_key(|instance| {
+                    (instance.child_index.unwrap_or(usize::MAX), instance.id)
+                });
+                for instance in instances {
+                    let index = instance
+                        .child_index
+                        .unwrap_or(children.len())
+                        .min(children.len());
+                    children.insert(index, (None, Some(instance)));
+                }
+                for (sibling_index, (primitive_index, instance)) in children.into_iter().enumerate()
+                {
+                    if let Some(index) = primitive_index {
+                        let reference = &placed[index];
+                        let source_parent_path = clone_tree_path(path);
+                        path.push(index);
+                        if let Some(child) = project.get_pool().object_by_id(reference.id) {
+                            render_mask_object_hierarchy(
+                                ui,
+                                occurrence_id.with(index),
+                                root,
+                                child,
+                                project,
+                                mask_view,
+                                canvas,
+                                path,
+                                visiting,
+                                softkey_slot,
+                                open_selection,
+                                Some(TreeDragPayload {
+                                    root,
+                                    source_parent_path,
+                                    sibling_index,
+                                    parent_id: id_value,
+                                    occurrence_id: occurrence_id
+                                        .with(index)
+                                        .with((root, path.clone())),
+                                    label: project.object_display_name(child),
+                                    target: PlacementTarget::Primitive {
+                                        parent_id: id_value,
+                                        child_index: index,
+                                    },
+                                }),
+                            );
+                        } else {
+                            ui_style::error_text(
+                                ui,
+                                &format!("Missing placed object: {}", reference.id.value()),
+                            );
+                        }
+                        path.pop();
+                    } else if let Some(instance) = instance {
+                        let definition =
+                            &project.component_source().definitions[&instance.component_id];
+                        let component_id = occurrence_id.with(("component", instance.id));
+                        let payload = TreeDragPayload {
                             root,
-                            child,
-                            project,
-                            mask_view,
-                            canvas,
-                            path,
-                            visiting,
-                            softkey_slot,
-                            open_selection,
-                            Some(TreeDragPayload { root, source_parent_path, target: ag_iso_terminal_designer::canvas::edits::PlacementTarget::Primitive { parent_id: id_value, child_index: index } }),
-                        );
-                    } else {
-                        ui_style::error_text(
-                            ui,
-                            &format!("Missing placed object: {}", reference.id.value()),
-                        );
+                            source_parent_path: path.clone(),
+                            sibling_index,
+                            parent_id: id_value,
+                            occurrence_id: component_id,
+                            label: definition.name.clone(),
+                            target: PlacementTarget::Component {
+                                instance_id: instance.id,
+                            },
+                        };
+                        let opens_component = open_selection
+                            && selected_id.is_some_and(|selected| {
+                                instance.compiled_ids.values().any(|id| *id == selected)
+                            });
+                        if opens_component {
+                            let mut state =
+                                egui::collapsing_header::CollapsingState::load_with_default_open(
+                                    ui.ctx(),
+                                    component_id,
+                                    true,
+                                );
+                            state.set_open(true);
+                            state.store(ui.ctx());
+                        }
+                        ui.push_id(component_id, |ui| {
+                            if egui::DragAndDrop::payload::<TreeDragPayload>(ui.ctx())
+                                .is_some_and(|source| source.occurrence_id == component_id)
+                            {
+                                ui.multiply_opacity(0.4);
+                            }
+                            let header_clicked = std::cell::Cell::new(false);
+                            ag_iso_terminal_designer::ui_style::collapsing_section(
+                                ui,
+                                component_id,
+                                opens_component,
+                                |ui| {
+                                    let selected =
+                                        matches!(project.editor_selection(),
+                                            Some(EditorSelection::ComponentInstance(id))
+                                            | Some(EditorSelection::ComponentNode { instance_id: id, .. })
+                                            if id == instance.id);
+                                    let row = tree_row_with_id(
+                                        ui,
+                                        component_id.with("row"),
+                                        selected,
+                                        &definition.name,
+                                    );
+                                    hierarchy_drag_row(ui, &row, Some(&payload), None);
+                                    header_clicked.set(row.clicked());
+                                },
+                                |ui| {
+                                    for node in &definition.nodes {
+                                        let node_id = instance.compiled_ids[&node.id];
+                                        let row = tree_row_with_id(
+                                            ui,
+                                            component_id.with(node.id),
+                                            project.get_selected().0.is_some_and(|selected| {
+                                                selected.value() == node_id
+                                            }),
+                                            &node.name,
+                                        );
+                                        // A compiled node still drags its complete owning instance.
+                                        row.dnd_set_drag_payload(payload.clone());
+                                        if row.clicked() {
+                                            project
+                                                .get_mut_selected()
+                                                .set(NullableObjectId::new(node_id));
+                                            if let Some(slot) = softkey_slot {
+                                                canvas.select_softkey_slot(project, root, slot);
+                                            }
+                                            canvas.select_hierarchy_placement(
+                                                project, root, &payload.source_parent_path, payload.target.clone(),
+                                            );
+                                        }
+                                    }
+                                },
+                            );
+                            if header_clicked.get() {
+                                if let Some(slot) = softkey_slot {
+                                    canvas.select_softkey_slot(project, root, slot);
+                                }
+                                canvas.select_hierarchy_placement(project, root, &payload.source_parent_path, payload.target.clone());
+                            }
+                        });
                     }
-                    path.pop();
                 }
                 if let Some(target_id) = pointer_target {
                     let pointer_branch = occurrence_id.with("pointer-target");
@@ -1414,45 +1626,22 @@ fn render_mask_object_hierarchy(
                         .and_then(|id| project.get_pool().object_by_id(id));
                     match target {
                         Some(target) => {
-                            let opens_target = open_selection
-                                && selected_id.is_some_and(|selected| {
-                                    mask_branch_contains(
-                                        project,
-                                        target,
-                                        selected,
-                                        &mut HashSet::new(),
-                                    )
-                                });
-                            let target_header_id = ui.make_persistent_id(pointer_branch);
-                            if opens_target {
-                                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                                    ui.ctx(),
-                                    target_header_id,
-                                    true,
-                                );
-                                state.set_open(true);
-                                state.store(ui.ctx());
-                            }
-                            egui::CollapsingHeader::new("Active pointer target")
-                                .id_salt(pointer_branch)
-                                .show(ui, |ui| {
-                                    path.push(usize::MAX);
-                                    render_mask_object_hierarchy(
-                                        ui,
-                                        pointer_branch,
-                                        root,
-                                        target,
-                                        project,
-                                        mask_view,
-                                        canvas,
-                                        path,
-                                        visiting,
-                                        softkey_slot,
-                                        open_selection,
-                                        None,
-                                    );
-                                    path.pop();
-                                });
+                            path.push(usize::MAX);
+                            render_mask_object_hierarchy(
+                                ui,
+                                pointer_branch,
+                                root,
+                                target,
+                                project,
+                                mask_view,
+                                canvas,
+                                path,
+                                visiting,
+                                softkey_slot,
+                                open_selection,
+                                None,
+                            );
+                            path.pop();
                         }
                         None => {
                             ui_style::error_text(
@@ -1462,57 +1651,6 @@ fn render_mask_object_hierarchy(
                         }
                     };
                 }
-                for instance in component_instances {
-                    let definition =
-                        &project.component_source().definitions[&instance.component_id];
-                    let component_salt = (root, instance.id, path.clone());
-                    let opens_component = open_selection
-                        && selected_id.is_some_and(|selected| {
-                            instance.compiled_ids.values().any(|id| *id == selected)
-                        });
-                    let component_header_id = ui.make_persistent_id(component_salt.clone());
-                    if opens_component {
-                        let mut state =
-                            egui::collapsing_header::CollapsingState::load_with_default_open(
-                                ui.ctx(),
-                                component_header_id,
-                                true,
-                            );
-                        state.set_open(true);
-                        state.store(ui.ctx());
-                    }
-                    egui::CollapsingHeader::new(&definition.name)
-                        .id_salt(component_salt)
-                        .show(ui, |ui| {
-                            for node in &definition.nodes {
-                                let node_id = instance.compiled_ids[&node.id];
-                                let row = tree_row(
-                                    ui,
-                                    project.get_selected().0.is_some_and(|selected| selected.value() == node_id),
-                                    &node.name,
-                                );
-                                row.dnd_set_drag_payload(TreeDragPayload {
-                                    root,
-                                    source_parent_path: clone_tree_path(path),
-                                    target: ag_iso_terminal_designer::canvas::edits::PlacementTarget::Component { instance_id: instance.id },
-                                });
-                                if row.contains_pointer() && ui.input(|input| input.pointer.any_released()) {
-                                    if let Some(payload) = egui::DragAndDrop::take_payload::<TreeDragPayload>(ui.ctx()) {
-                                        ui.data_mut(|data| data.insert_temp(egui::Id::new("pending_tree_reparent"), (payload.root, payload.target.clone(), payload.source_parent_path.clone(), root, clone_tree_path(path), id_value)));
-                                    }
-                                }
-                                if row.clicked() {
-                                    project
-                                        .get_mut_selected()
-                                        .set(NullableObjectId::new(node_id));
-                                    if let Some(slot) = softkey_slot {
-                                        canvas.select_softkey_slot(project, root, slot);
-                                    }
-                                    canvas.select_placement(project, root, ag_iso_terminal_designer::canvas::edits::PlacementTarget::Component { instance_id: instance.id });
-                                }
-                            }
-                        });
-                }
             },
         );
         if let Some((selected, slot, target)) = selected_in_header.take() {
@@ -1520,8 +1658,13 @@ fn render_mask_object_hierarchy(
             if let Some(slot) = slot {
                 canvas.select_softkey_slot(project, root, slot);
             }
-            if let Some(target) = target {
-                canvas.select_placement(project, root, target);
+            if let (Some(target), Some(source)) = (target, placement_source.as_ref()) {
+                canvas.select_hierarchy_placement(
+                    project,
+                    root,
+                    &source.source_parent_path,
+                    target,
+                );
             }
         }
     } else if render_selectable_object(
@@ -1536,7 +1679,12 @@ fn render_mask_object_hierarchy(
             canvas.select_softkey_slot(project, root, slot);
         }
         if let Some(source) = placement_source.as_ref() {
-            canvas.select_placement(project, root, source.target.clone());
+            canvas.select_hierarchy_placement(
+                project,
+                root,
+                &source.source_parent_path,
+                source.target.clone(),
+            );
         }
     }
     visiting.remove(&id_value);
@@ -1559,9 +1707,7 @@ fn mask_branch_contains(
         .component_source()
         .instances
         .iter()
-        .filter(|instance| {
-            instance.parent == ag_iso_terminal_designer::components::EditorParentRef::Primitive(id)
-        })
+        .filter(|instance| instance.parent == EditorParentRef::Primitive(id))
         .any(|instance| {
             instance
                 .compiled_ids
@@ -2794,12 +2940,10 @@ impl DesignerApp {
                         }
                     }
                 }
-                if let Some(
-                    ag_iso_terminal_designer::components::EditorSelection::ComponentNode {
-                        instance_id,
-                        node_id,
-                    },
-                ) = pool.editor_selection()
+                if let Some(EditorSelection::ComponentNode {
+                    instance_id,
+                    node_id,
+                }) = pool.editor_selection()
                 {
                     ag_iso_terminal_designer::components::ui::inspector(
                         ui,
@@ -2975,7 +3119,109 @@ impl DesignerApp {
             }
         }
     }
+    fn finish_hierarchy_drag(&mut self, ctx: &egui::Context) {
+        let Some(payload) = egui::DragAndDrop::payload::<TreeDragPayload>(ctx) else {
+            return;
+        };
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            egui::DragAndDrop::clear_payload(ctx);
+            return;
+        }
+        let candidate = ctx
+            .data(|data| data.get_temp::<TreeDropCandidate>(egui::Id::new("tree_drop_candidate")));
+        let valid = candidate.as_ref().is_some_and(|candidate| {
+            let Some(project) = self.project.as_ref() else {
+                return false;
+            };
+            self.canvas
+                .validate_hierarchy_drop(
+                    project,
+                    &candidate.source.target,
+                    candidate.source.root,
+                    &candidate.source.source_parent_path,
+                    candidate.root,
+                    &candidate.parent_path,
+                    candidate.parent_id,
+                    candidate.insertion_index,
+                )
+                .is_ok()
+        });
+        if valid {
+            let candidate = candidate.as_ref().unwrap();
+            let painter = ctx
+                .layer_painter(candidate.layer)
+                .with_clip_rect(candidate.clip_rect);
+            let stroke = egui::Stroke::new(2.0, ctx.style().visuals.selection.stroke.color);
+            if let Some(y) = candidate.edge_y {
+                painter.line_segment(
+                    [
+                        egui::pos2(candidate.rect.left(), y),
+                        egui::pos2(candidate.rect.right(), y),
+                    ],
+                    stroke,
+                );
+            } else {
+                painter.rect_stroke(candidate.rect, 2, stroke, egui::StrokeKind::Inside);
+            }
+        }
+        ctx.set_cursor_icon(if valid {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::NotAllowed
+        });
+        if let Some(position) = ctx.pointer_interact_pos() {
+            egui::Area::new(egui::Id::new("hierarchy_drag_preview"))
+                .order(egui::Order::Tooltip)
+                .interactable(false)
+                .fixed_pos(position + egui::vec2(14.0, 14.0))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.label(&payload.label);
+                    });
+                });
+        }
+        if ctx.input(|input| input.pointer.any_released()) {
+            if valid {
+                let candidate = candidate.unwrap();
+                if let Some(project) = self.project.as_mut() {
+                    let parent_path =
+                        ag_iso_terminal_designer::canvas::edits::hierarchy_path_after_removal(
+                            project,
+                            candidate.root,
+                            &candidate.parent_path,
+                            &payload.target,
+                        );
+                    match self.canvas.reparent_in_hierarchy_at(
+                        project,
+                        &payload.target,
+                        payload.root,
+                        &payload.source_parent_path,
+                        candidate.root,
+                        &candidate.parent_path,
+                        candidate.parent_id,
+                        candidate.insertion_index,
+                    ) {
+                        Ok(moved) => {
+                            if let Ok(parent_path) = parent_path {
+                                self.canvas.select_hierarchy_placement(
+                                    project,
+                                    candidate.root,
+                                    &parent_path,
+                                    moved,
+                                );
+                            }
+                        }
+                        Err(error) => self.error_message = Some(error),
+                    }
+                }
+            }
+            egui::DragAndDrop::clear_payload(ctx);
+            ctx.request_repaint();
+        }
+    }
+
     fn render_workspace(&mut self, ctx: &egui::Context) {
+        ctx.data_mut(|data| data.remove::<TreeDropCandidate>(egui::Id::new("tree_drop_candidate")));
         let mut dock =
             std::mem::replace(&mut self.workspace.dock, egui_dock::DockState::new(vec![]));
         self.canvas_visible = false;
@@ -2990,50 +3236,7 @@ impl DesignerApp {
                     .show_inside(ui, &mut PaneViewer { app: self });
             });
         self.workspace.dock = dock;
-        if let Some((
-            source_root,
-            target,
-            source_parent_path,
-            dest_root,
-            dest_parent_path,
-            new_parent,
-        )) = ctx.data_mut(|data| {
-            let id = egui::Id::new("pending_tree_reparent");
-            let payload = data.get_temp::<(
-                u16,
-                ag_iso_terminal_designer::canvas::edits::PlacementTarget,
-                Vec<usize>,
-                u16,
-                Vec<usize>,
-                u16,
-            )>(id);
-            data.remove::<(
-                u16,
-                ag_iso_terminal_designer::canvas::edits::PlacementTarget,
-                Vec<usize>,
-                u16,
-                Vec<usize>,
-                u16,
-            )>(id);
-            payload
-        }) {
-            if let Some(project) = self.project.as_mut() {
-                match self.canvas.reparent_in_hierarchy(
-                    project,
-                    &target,
-                    source_root,
-                    &source_parent_path,
-                    dest_root,
-                    &dest_parent_path,
-                    new_parent,
-                ) {
-                    Ok(moved) => {
-                        self.canvas.select_placement(project, dest_root, moved);
-                    }
-                    Err(error) => self.error_message = Some(error),
-                }
-            }
-        }
+        self.finish_hierarchy_drag(ctx);
         if !self.canvas_visible {
             self.canvas.cancel_interaction();
         }
@@ -3179,7 +3382,12 @@ impl egui_dock::TabViewer for PaneViewer<'_> {
 }
 
 /// Draw a tree selection across the pane while retaining the indented label and arrow.
-fn tree_row(ui: &mut egui::Ui, selected: bool, label: impl Into<String>) -> egui::Response {
+fn tree_row_with_id(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    selected: bool,
+    label: impl Into<String>,
+) -> egui::Response {
     let background = ui
         .data_mut(|data| {
             let key = egui::Id::new("tree_row_background");
@@ -3192,17 +3400,14 @@ fn tree_row(ui: &mut egui::Ui, selected: bool, label: impl Into<String>) -> egui
         .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("tree_row_bounds")))
         .unwrap_or(ui.clip_rect());
     let height = ui.spacing().interact_size.y;
-    let (label_rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width().max(0.0), height),
-        egui::Sense::hover(),
-    );
+    let (_, label_rect) = ui.allocate_space(egui::vec2(ui.available_width().max(0.0), height));
 
     let row_rect = egui::Rect::from_min_max(
         egui::pos2(bounds.left(), label_rect.top()),
         egui::pos2(bounds.right(), label_rect.bottom()),
     );
     // The expand arrow owns its hit area; row selection starts at the label.
-    let response = ui.interact(label_rect, ui.next_auto_id(), egui::Sense::click_and_drag());
+    let response = ui.interact(label_rect, id, egui::Sense::click_and_drag());
     if response.has_focus() {
         ui.data_mut(|data| data.insert_temp(egui::Id::new("tree_row_had_focus"), true));
     }

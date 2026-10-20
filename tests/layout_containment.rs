@@ -72,6 +72,61 @@ fn diagnostics_code(project: &EditorProject, transaction: &OperationTransaction)
 }
 
 #[test]
+fn hierarchy_parent_moves_preserve_position_and_reject_invalid_destinations_atomically() {
+    use ag_iso_terminal_designer::canvas::{
+        edits::{position, PlacementTarget},
+        CanvasState,
+    };
+
+    let mut pool = ObjectPool::default();
+    pool.add(object_with_id(ObjectType::DataMask, 1));
+    pool.add(sized_container(2, 100, 60));
+    pool.add(sized_button(3, 20, 20));
+    pool.add(sized_container(4, 10, 10));
+    add_child(&mut pool, 1, 2, 100, 50);
+    add_child(&mut pool, 1, 3, 120, 70);
+    add_child(&mut pool, 1, 4, 200, 200);
+    let mut project = EditorProject::from(pool);
+    let canvas = CanvasState::default();
+    let source = PlacementTarget::Primitive {
+        parent_id: 1,
+        child_index: 1,
+    };
+    let before_preview = project.save_project().unwrap();
+    canvas
+        .validate_hierarchy_drop(&project, &source, 1, &[0], 1, &[0, 0], 2, Some(0))
+        .unwrap();
+    assert_eq!(project.save_project().unwrap(), before_preview);
+    assert!(!project.undo_available());
+
+    let moved = canvas
+        .reparent_in_hierarchy_at(&mut project, &source, 1, &[0], 1, &[0, 0], 2, Some(0))
+        .unwrap();
+    assert_eq!(position(&project, &moved), Some((20, 20)));
+    let before_invalid = project.save_project().unwrap();
+    // The destination is too small; neither the source nor history may change.
+    assert!(canvas
+        .reparent_in_hierarchy_at(&mut project, &moved, 1, &[0, 0], 1, &[0, 1], 4, None)
+        .is_err());
+    assert_eq!(project.save_project().unwrap(), before_invalid);
+    // A parent cannot become its own child.
+    let container = PlacementTarget::Primitive {
+        parent_id: 1,
+        child_index: 0,
+    };
+    assert!(canvas
+        .reparent_in_hierarchy_at(&mut project, &container, 1, &[0], 1, &[0, 0], 2, None)
+        .is_err());
+    assert_eq!(project.save_project().unwrap(), before_invalid);
+
+    assert!(project.undo_operation());
+    assert_eq!(project.save_project().unwrap(), before_preview);
+    assert!(!project.undo_available());
+    assert!(project.redo_operation());
+    assert_eq!(project.save_project().unwrap(), before_invalid);
+}
+
+#[test]
 fn property_resize_rejects_overflow_atomically_during_execution_and_preparation() {
     let mut pool = ObjectPool::default();
     pool.add(object_with_id(ObjectType::DataMask, 1));
