@@ -45,7 +45,9 @@ pub use object_defaults::{default_object, default_object_for_version};
 pub use object_id_format::ObjectIdFormat;
 pub use object_id_ranges::{ObjectIdRange, ObjectIdRanges};
 pub use object_info::ObjectInfo;
-pub use object_rendering::{render_object_with_version, RenderableObject};
+pub use object_rendering::{
+    render_object_with_settings, render_object_with_version, RenderableObject,
+};
 pub use soft_key_layout::{SoftKeyArrangement, SoftKeyLayout};
 
 // Operation system exports

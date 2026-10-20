@@ -96,12 +96,45 @@ fn save_reload_keeps_only_unconsumed_uploads() {
 
 #[test]
 fn deleting_picture_recovers_current_image_and_is_one_undo_step() {
+    use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
     use ag_iso_terminal_designer::graphics::preview;
-    let mut project = fixture();
-    let asset = upload(&mut project, "Warning.png");
-    GraphicService::convert_asset_into_picture_graphic(&mut project, asset, 120).unwrap();
+    let mut pool = fixture().get_pool().clone();
+    let Object::PictureGraphic(source) =
+        pool.object_mut_by_id(ObjectId::new(120).unwrap()).unwrap()
+    else {
+        unreachable!()
+    };
+    source.width = 2;
+    source.actual_width = 2;
+    source.actual_height = 1;
+    source.format = PictureGraphicFormat::EightBit;
+    source.options.transparent = true;
+    source.transparency_colour = 2;
+    source.data = vec![2, 3];
+    let mut map = default_object(ObjectType::ColourMap);
+    *map.mut_id() = ObjectId::new(600).unwrap();
+    if let Object::ColourMap(map) = &mut map {
+        map.colour_map = (0..=255).collect();
+        map.colour_map[3] = 2;
+    }
+    pool.add(map);
+    let mut controls = default_object(ObjectType::WorkingSetSpecialControls);
+    *controls.mut_id() = ObjectId::new(601).unwrap();
+    if let Object::WorkingSetSpecialControls(controls) = &mut controls {
+        controls.id_of_colour_map = ObjectId::new(600).unwrap().into();
+    }
+    pool.add(controls);
+    let mut project = EditorProject::from(pool);
+    assert!(project.rename_object(ObjectId::new(120).unwrap(), "Warning".into()));
     let before = picture(&project, 120);
+    // Equal resolved colours retain distinct transparency by source index.
+    let decoded = preview::decode_picture(&before, project.get_pool());
+    assert_eq!(decoded.pixels[0].a(), 0);
+    assert_eq!(decoded.pixels[1].a(), 255);
     let expected = preview::picture_png(&before, project.get_pool()).unwrap();
+    let png = image::load_from_memory(&expected).unwrap().to_rgba8();
+    assert_eq!(png.get_pixel(0, 0).0[3], 0);
+    assert_eq!(png.get_pixel(1, 0).0[3], 255);
     let other = upload(&mut project, "Keep.png");
     assert!(project.delete_object(ObjectId::new(120).unwrap()));
     assert!(project

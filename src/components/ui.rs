@@ -108,6 +108,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
                                 &preview,
                                 definition.root_node,
                                 project.vt_version,
+                                project.soft_key_size(),
                             )
                         },
                     ) {
@@ -136,6 +137,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
                     &preview,
                     definition.root_node,
                     project.vt_version,
+                    project.soft_key_size(),
                 )
             });
             true
@@ -173,13 +175,21 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
         }
         let preview = definition_preview(ui.ctx(), project, &definition);
         let vt_version = project.vt_version;
+        let soft_key_size = project.soft_key_size();
         crate::ui_style::collapsing_section(
             ui,
             ui.id().with(definition.id),
             false,
             |ui| {
                 crate::object_picker::preview(ui, |ui, rect| {
-                    paint_definition_preview(ui, rect, &preview, definition.root_node, vt_version)
+                    paint_definition_preview(
+                        ui,
+                        rect,
+                        &preview,
+                        definition.root_node,
+                        vt_version,
+                        soft_key_size,
+                    )
                 });
                 ui.vertical(|ui| {
                     ui.label(format!("{} / {}", category, definition.name));
@@ -311,6 +321,7 @@ fn paint_definition_preview(
     preview: &DefinitionPreview,
     node: ComponentNodeId,
     version: ag_iso_stack::object_pool::vt_version::VtVersion,
+    soft_key_size: (u16, u16),
 ) {
     match preview {
         Ok(preview) => {
@@ -320,7 +331,14 @@ fn paint_definition_preview(
                 .and_then(|id| ag_iso_stack::object_pool::ObjectId::new(*id).ok())
                 .and_then(|id| pool.object_by_id(id))
             {
-                crate::object_picker::object_preview_with_version(ui, rect, pool, object, version);
+                crate::object_picker::object_preview_with_settings(
+                    ui,
+                    rect,
+                    pool,
+                    object,
+                    version,
+                    soft_key_size,
+                );
             }
         }
         Err(_) => {
@@ -974,6 +992,7 @@ fn manual_parameter_form(
                                     &preview,
                                     node.id,
                                     project.vt_version,
+                                    project.soft_key_size(),
                                 );
                             },
                         ) {
@@ -993,7 +1012,14 @@ fn manual_parameter_form(
                 ui.label(node.id.to_string());
                 let preview = definition_preview(ui.ctx(), project, definition);
                 crate::object_picker::review_preview(ui, |ui, rect| {
-                    paint_definition_preview(ui, rect, &preview, *id, project.vt_version)
+                    paint_definition_preview(
+                        ui,
+                        rect,
+                        &preview,
+                        *id,
+                        project.vt_version,
+                        project.soft_key_size(),
+                    )
                 });
                 true
             },

@@ -2,7 +2,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use std::{cell::RefCell, collections::HashSet};
+use std::{cell::RefCell, collections::HashSet, time::Duration};
 
 use ag_iso_stack::object_pool::object::*;
 use ag_iso_stack::object_pool::object_attributes::ButtonState;
@@ -24,10 +24,9 @@ fn render_version_id() -> egui::Id {
     egui::Id::new("vt_render_version")
 }
 
-/// Render a pool object using the requested target VT version. The version is
-/// scoped to this egui context for the duration of rendering, including child
-/// objects. Direct legacy `RenderableObject::render` calls use VT6, the safe
-/// default for the designer's historical previews.
+/// Render a pool object using the requested target VT version and the legacy
+/// 60 × 60 pixel Soft Key size. The settings apply to nested object rendering
+/// and restore any enclosing render settings when this call returns.
 pub fn render_object_with_version(
     ui: &mut egui::Ui,
     pool: &ObjectPool,
@@ -35,9 +34,30 @@ pub fn render_object_with_version(
     position: Point<i16>,
     version: VtVersion,
 ) {
+    render_object_with_settings(ui, pool, object, position, version, (60, 60));
+}
+
+/// Render an object with project VT and Soft Key settings. Soft Key dimensions
+/// are in terminal pixels and bound auxiliary designator previews. Settings
+/// are scoped to this call, inherited by nested rendering, then restored to
+/// the previous values.
+pub fn render_object_with_settings(
+    ui: &mut egui::Ui,
+    pool: &ObjectPool,
+    object: &Object,
+    position: Point<i16>,
+    version: VtVersion,
+    soft_key_size: (u16, u16),
+) {
     let previous = ui.ctx().data_mut(|data| {
         let previous = data.get_temp::<VtVersion>(render_version_id());
         data.insert_temp(render_version_id(), version);
+        previous
+    });
+    let settings_key = egui::Id::new("vt_render_soft_key_size");
+    let previous_settings = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<(u16, u16)>(settings_key);
+        data.insert_temp(settings_key, soft_key_size);
         previous
     });
     let origin_key = egui::Id::new("vt_pattern_origin");
@@ -60,6 +80,18 @@ pub fn render_object_with_version(
             data.remove_temp::<VtVersion>(render_version_id());
         }
     });
+    ui.ctx().data_mut(|data| match previous_settings {
+        Some(previous) => data.insert_temp(settings_key, previous),
+        None => {
+            data.remove_temp::<(u16, u16)>(settings_key);
+        }
+    });
+}
+
+fn soft_key_size(ui: &egui::Ui) -> (u16, u16) {
+    ui.ctx()
+        .data(|data| data.get_temp::<(u16, u16)>(egui::Id::new("vt_render_soft_key_size")))
+        .unwrap_or((60, 60))
 }
 
 fn render_version(ui: &egui::Ui) -> VtVersion {
@@ -1221,6 +1253,18 @@ impl RenderableObject for PictureGraphic {
         );
 
         let texture = crate::graphics::preview::picture_texture(ui.ctx(), self, pool);
+        let phase = ui.input(|input| input.time).rem_euclid(1.0);
+        if self.options.flashing {
+            ui.ctx()
+                .request_repaint_after(Duration::from_secs_f64(if phase < 0.5 {
+                    0.5 - phase
+                } else {
+                    1.0 - phase
+                }));
+            if phase >= 0.5 {
+                return;
+            }
+        }
 
         // Use image dimensions, but clip to the available rect
         let image_size = egui::Vec2::new(self.width as f32, self.height() as f32);
@@ -1236,9 +1280,11 @@ impl RenderableObject for PictureGraphic {
 
 impl RenderableObject for AuxiliaryFunctionType2 {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
+        let (width, height) = soft_key_size(ui);
+        let rect = create_relative_rect(ui, position, egui::vec2(width as f32, height as f32));
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(rect));
             // Draw background colour
             let background_colour =
                 crate::effective_colour::colour(pool, self.background_colour).convert();
@@ -1252,9 +1298,11 @@ impl RenderableObject for AuxiliaryFunctionType2 {
 
 impl RenderableObject for AuxiliaryInputType2 {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
+        let (width, height) = soft_key_size(ui);
+        let rect = create_relative_rect(ui, position, egui::vec2(width as f32, height as f32));
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(rect));
             // Draw background colour
             let background_colour =
                 crate::effective_colour::colour(pool, self.background_colour).convert();
@@ -1268,9 +1316,14 @@ impl RenderableObject for AuxiliaryInputType2 {
 
 impl RenderableObject for AuxiliaryControlDesignatorType2 {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
+        let (width, height) = soft_key_size(ui);
+        let rect = create_relative_rect(ui, position, egui::vec2(width as f32, height as f32));
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(rect));
+            if self.pointer_type != 2 && self.auxiliary_object_id.0.is_none() {
+                return;
+            }
             // Determine what to display based on pointer_type
             match self.pointer_type {
                 0 => {
@@ -1278,13 +1331,9 @@ impl RenderableObject for AuxiliaryControlDesignatorType2 {
                     // Display the auxiliary object designator
                     if let Some(aux_obj_id) = self.auxiliary_object_id.0 {
                         match pool.object_by_id(aux_obj_id) {
-                            Some(Object::AuxiliaryFunctionType2(aux_func)) => {
-                                // Render the auxiliary function designator
-                                render_object_refs(ui, pool, &aux_func.object_refs);
-                            }
-                            Some(Object::AuxiliaryInputType2(aux_input)) => {
-                                // Render the auxiliary input designator
-                                render_object_refs(ui, pool, &aux_input.object_refs);
+                            Some(aux @ Object::AuxiliaryFunctionType2(_))
+                            | Some(aux @ Object::AuxiliaryInputType2(_)) => {
+                                aux.render(ui, pool, Point { x: 0, y: 0 });
                             }
                             Some(_) => {
                                 ui.colored_label(
@@ -1341,5 +1390,113 @@ impl RenderableObject for AuxiliaryControlDesignatorType2 {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod rendering_tests {
+    use super::*;
+    use ag_iso_stack::object_pool::{NullableObjectId, ObjectType};
+
+    fn frame(pool: &ObjectPool, object: Option<&Object>, time: f64) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(100.0, 100.0),
+                )),
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(object) = object {
+                        render_object_with_settings(
+                            ui,
+                            pool,
+                            object,
+                            Point::default(),
+                            VtVersion::Version6,
+                            (20, 15),
+                        );
+                    }
+                });
+            },
+        )
+    }
+
+    #[test]
+    fn picture_flashing_and_auxiliary_designators_respect_render_settings() {
+        let mut picture = crate::default_object(ObjectType::PictureGraphic);
+        if let Object::PictureGraphic(picture) = &mut picture {
+            picture.id = ag_iso_stack::object_pool::ObjectId::new(1).unwrap();
+            picture.width = 1;
+            picture.actual_width = 1;
+            picture.actual_height = 1;
+            picture.data = vec![0];
+            picture.options.flashing = true;
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(picture.clone());
+        let visible = frame(&pool, Some(&picture), 0.25);
+        let hidden = frame(&pool, Some(&picture), 0.75);
+        assert!(visible.shapes.len() > hidden.shapes.len());
+
+        let mut auxiliary = crate::default_object(ObjectType::AuxiliaryFunctionType2);
+        if let Object::AuxiliaryFunctionType2(auxiliary) = &mut auxiliary {
+            auxiliary.id = ag_iso_stack::object_pool::ObjectId::new(2).unwrap();
+            auxiliary.object_refs = vec![ObjectRef {
+                id: ag_iso_stack::object_pool::ObjectId::new(4).unwrap(),
+                offset: Point { x: 0, y: 0 },
+            }];
+        }
+        let mut button = crate::default_object(ObjectType::Button);
+        if let Object::Button(button) = &mut button {
+            button.id = ag_iso_stack::object_pool::ObjectId::new(4).unwrap();
+            button.width = 50;
+            button.height = 40;
+        }
+        let mut direct_pool = ObjectPool::default();
+        direct_pool.add(button.clone());
+        let direct = frame(&direct_pool, Some(&auxiliary), 0.25);
+        let mut pointer = crate::default_object(ObjectType::AuxiliaryControlDesignatorType2);
+        if let Object::AuxiliaryControlDesignatorType2(pointer) = &mut pointer {
+            pointer.id = ag_iso_stack::object_pool::ObjectId::new(3).unwrap();
+            pointer.auxiliary_object_id = NullableObjectId::new(2);
+        }
+        let mut aux_pool = ObjectPool::default();
+        aux_pool.add(button);
+        aux_pool.add(auxiliary.clone());
+        aux_pool.add(pointer.clone());
+        let referenced = frame(&aux_pool, Some(&pointer), 0.25);
+        let rect_shapes = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) => Some((shape.clip_rect, rect.rect, rect.fill)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rect_shapes(&direct), rect_shapes(&referenced));
+        assert!(referenced.shapes.iter().any(|shape| match &shape.shape {
+            egui::Shape::Rect(rect) => {
+                rect.rect.size() == egui::vec2(50.0, 40.0)
+                    && shape.clip_rect.size() == egui::vec2(20.0, 15.0)
+            }
+            _ => false,
+        }));
+
+        let empty = frame(&aux_pool, None, 0.25);
+        for pointer_type in [0, 1, 3] {
+            if let Object::AuxiliaryControlDesignatorType2(pointer) = &mut pointer {
+                pointer.pointer_type = pointer_type;
+                pointer.auxiliary_object_id = NullableObjectId::NULL;
+            }
+            let null_pointer = frame(&aux_pool, Some(&pointer), 0.25);
+            assert_eq!(null_pointer.shapes.len(), empty.shapes.len());
+        }
     }
 }

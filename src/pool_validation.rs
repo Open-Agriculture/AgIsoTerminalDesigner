@@ -365,8 +365,9 @@ pub fn validate_complete_pool_state_for_version(
     diagnostics
 }
 
-/// Checks only whole-pool requirements and references whose ID 0 cannot be
-/// treated as an unresolved authoring placeholder.
+/// Checks complete-pool cardinalities, collection constraints, imported
+/// property ranges, and references whose ID 0 cannot be treated as an
+/// unresolved authoring placeholder.
 pub(crate) fn validate_complete_pool_requirements(
     pool: &ObjectPool,
     vt_version: VtVersion,
@@ -374,6 +375,82 @@ pub(crate) fn validate_complete_pool_requirements(
     use ag_iso_stack::object_pool::{object::Object, ObjectType};
 
     let mut diagnostics = Vec::new();
+    for object in pool.objects() {
+        // Property ranges also validate imported records that bypassed the
+        // authoring operation path.
+        for descriptor in crate::object_properties::get_property_descriptors(object.object_type()) {
+            let Some((minimum, maximum)) = descriptor.valid_range else {
+                continue;
+            };
+            let Ok(value) = crate::object_properties::get_object_property(object, descriptor.name)
+            else {
+                continue;
+            };
+            let number = value.as_f64();
+            let min = minimum.as_f64();
+            let max = maximum.as_f64();
+            if !matches!((number, min, max), (Some(value), Some(min), Some(max)) if value >= min && value <= max)
+            {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "{} is outside the allowed range {} through {}",
+                        descriptor.name, minimum, maximum
+                    ),
+                    affected_objects: Some(vec![object.id().value()]),
+                    code: "PROPERTY_OUT_OF_RANGE".into(),
+                });
+            }
+        }
+
+        match object {
+            Object::OutputPolygon(polygon) if polygon.points.len() < 3 => {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: "Output Polygon must contain at least three points".into(),
+                    affected_objects: Some(vec![object.id().value()]),
+                    code: "POLYGON_TOO_FEW_POINTS".into(),
+                });
+            }
+            Object::ColourMap(colour_map)
+                if colour_map.colour_map.len() <= u16::MAX as usize
+                    && !matches!(colour_map.colour_map.len(), 2 | 16 | 256) =>
+            {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: "Colour Map must contain 2, 16 or 256 entries".into(),
+                    affected_objects: Some(vec![object.id().value()]),
+                    code: "COLOUR_MAP_INVALID_SIZE".into(),
+                });
+            }
+            Object::ColourPalette(palette)
+                if (257..=u16::MAX as usize).contains(&palette.colours.len()) =>
+            {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: "Colour Palette may contain at most 256 entries".into(),
+                    affected_objects: Some(vec![object.id().value()]),
+                    code: "COLOUR_PALETTE_TOO_LARGE".into(),
+                });
+            }
+            Object::KeyGroup(group) => {
+                if group.objects.len() <= u8::MAX as usize
+                    && !(1..=4).contains(&group.objects.len())
+                {
+                    diagnostics.push(ValidationDiagnostic {
+                        severity: ValidationSeverity::Error,
+                        message: "Key Group must list between one and four objects".into(),
+                        affected_objects: Some(vec![object.id().value()]),
+                        code: "KEY_GROUP_INVALID_SIZE".into(),
+                    });
+                }
+                // Object Pointer has one target, so the entry limit also
+                // limits the number of Keys after resolving pointers.
+            }
+            _ => {}
+        }
+    }
+
     for object in pool.objects() {
         let mut reported = HashSet::new();
         for referenced_id in references_for_validation(object, vt_version) {

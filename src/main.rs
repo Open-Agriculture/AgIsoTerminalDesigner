@@ -3047,12 +3047,13 @@ impl DesignerApp {
                             ui.separator();
                             let desired_size = egui::Vec2::new(width as f32, height as f32);
                             ui.allocate_ui(desired_size, |ui| {
-                                ag_iso_terminal_designer::render_object_with_version(
+                                ag_iso_terminal_designer::render_object_with_settings(
                                     ui,
                                     effective,
                                     rendered,
                                     Point::default(),
                                     pool.vt_version(),
+                                    pool.soft_key_size(),
                                 );
                             });
                         });

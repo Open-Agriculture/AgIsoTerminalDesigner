@@ -1263,8 +1263,26 @@ pub fn set_property(
     })
 }
 
-pub fn get_property_descriptors(object_type: ObjectType) -> Vec<PropertyDescriptor> {
+fn property_descriptors_for_type(object_type: ObjectType) -> Vec<PropertyDescriptor> {
     supported_property_objects!(property_descriptors_impl, object_type)
+}
+
+/// Return property metadata shared by editor controls and assignment validation.
+/// Numeric field ranges also describe constraints checked during complete-pool validation.
+pub fn get_property_descriptors(object_type: ObjectType) -> Vec<PropertyDescriptor> {
+    let mut descriptors = property_descriptors_for_type(object_type);
+    if matches!(
+        object_type,
+        ObjectType::InputNumber | ObjectType::OutputNumber
+    ) {
+        if let Some(descriptor) = descriptors
+            .iter_mut()
+            .find(|descriptor| descriptor.name == PropertyKey::NrOfDecimals)
+        {
+            descriptor.valid_range = Some((Value::from(0), Value::from(7)));
+        }
+    }
+    descriptors
 }
 
 /// Remap all property-backed object references simultaneously. Structural

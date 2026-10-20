@@ -89,6 +89,25 @@ fn signed_numeric_offsets_survive_project_and_iop_round_trips() {
     }
     add_pool_scaffolding(&mut pool);
     let mut project = EditorProject::from(pool);
+    let mut valid_decimals = OperationTransaction::new(None);
+    for id in [2, 3] {
+        valid_decimals.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(id),
+            property: PropertyKey::NrOfDecimals,
+            value: json!(7),
+        });
+    }
+    project.execute_transaction(valid_decimals).unwrap();
+    for id in [2, 3] {
+        let mut invalid_decimals = OperationTransaction::new(None);
+        invalid_decimals.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(id),
+            property: PropertyKey::NrOfDecimals,
+            value: json!(8),
+        });
+        assert!(project.execute_transaction(invalid_decimals).is_err());
+    }
+
     let mut transaction = OperationTransaction::new(None);
     for id in [2, 3] {
         for (property, value) in [

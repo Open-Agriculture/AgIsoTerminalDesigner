@@ -16,7 +16,6 @@ fn converted_palette(pool: &ObjectPool) -> [Color32; 256] {
 }
 
 fn decode_picture_with_palette(picture: &PictureGraphic, palette: &[Color32; 256]) -> ColorImage {
-    let transparent = palette[picture.transparency_colour as usize];
     let mut image = ColorImage::filled(
         [picture.actual_width.into(), picture.actual_height.into()],
         Color32::TRANSPARENT,
@@ -40,7 +39,7 @@ fn decode_picture_with_palette(picture: &PictureGraphic, palette: &[Color32; 256
                 PictureGraphicFormat::EightBit => raw,
             };
             let color = palette[colour_index as usize];
-            if !picture.options.transparent || color != transparent {
+            if !picture.options.transparent || colour_index != picture.transparency_colour {
                 image.pixels[pixel_index] = color;
             }
             pixel_index += 1;

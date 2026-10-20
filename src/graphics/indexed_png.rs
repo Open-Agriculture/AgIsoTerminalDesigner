@@ -82,13 +82,10 @@ fn palette(pool: &ObjectPool) -> Vec<u8> {
         .collect()
 }
 
-fn transparency(picture: &PictureGraphic, pool: &ObjectPool) -> Vec<u8> {
-    let colours = crate::effective_colour::colours(pool);
-    let transparent = colours[picture.transparency_colour as usize];
-    colours
-        .iter()
-        .map(|colour| {
-            if picture.options.transparent && colour.as_rgb() == transparent.as_rgb() {
+fn transparency(picture: &PictureGraphic) -> Vec<u8> {
+    (0..=255u8)
+        .map(|index| {
+            if picture.options.transparent && index == picture.transparency_colour {
                 0
             } else {
                 255
@@ -110,7 +107,7 @@ pub fn picture_png(picture: &PictureGraphic, pool: &ObjectPool) -> Result<Vec<u8
         encoder.set_color(png::ColorType::Indexed);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_palette(palette(pool));
-        encoder.set_trns(transparency(picture, pool));
+        encoder.set_trns(transparency(picture));
         let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
         writer
             .write_image_data(&indices)
@@ -133,7 +130,7 @@ fn indices_from_png(
     if info.palette.as_deref() != Some(palette(pool).as_slice()) {
         return Err("Indexed PNG palette does not match the project's effective VT palette".into());
     }
-    let expected_transparency = transparency(picture, pool);
+    let expected_transparency = transparency(picture);
     let encoded_transparency = info.trns.as_deref().unwrap_or(&[]);
     if !transparency_matches(encoded_transparency, &expected_transparency) {
         return Err("Indexed PNG transparency does not match the PictureGraphic".into());

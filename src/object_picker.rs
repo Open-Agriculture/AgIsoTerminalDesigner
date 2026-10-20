@@ -170,7 +170,14 @@ pub fn review_object(
             return false;
         };
         review_preview(ui, |ui, rect| {
-            object_preview_with_version(ui, rect, project.get_pool(), object, project.vt_version)
+            object_preview_with_settings(
+                ui,
+                rect,
+                project.get_pool(),
+                object,
+                project.vt_version,
+                project.soft_key_size(),
+            )
         });
     } else {
         ui.label("Clear this selection.");
@@ -232,13 +239,24 @@ pub fn object_preview_with_version(
     object: &Object,
     version: VtVersion,
 ) {
-    if let Object::PictureGraphic(picture) = object {
-        if let Some(image) = crate::graphics::preview::picture_texture(ui.ctx(), picture, pool) {
-            texture(ui, rect, &image);
-        }
-        return;
-    }
-    let (width, height) = pool.content_size(object);
+    object_preview_with_settings(ui, rect, pool, object, version, (60, 60));
+}
+
+/// Project-aware fitted preview, including project Soft Key dimensions.
+pub fn object_preview_with_settings(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    pool: &ObjectPool,
+    object: &Object,
+    version: VtVersion,
+    soft_key_size: (u16, u16),
+) {
+    let (width, height) = match object {
+        Object::AuxiliaryFunctionType2(_)
+        | Object::AuxiliaryInputType2(_)
+        | Object::AuxiliaryControlDesignatorType2(_) => soft_key_size,
+        _ => pool.content_size(object),
+    };
     if width == 0 || height == 0 {
         ui.painter().text(
             rect.center(),
@@ -261,12 +279,13 @@ pub fn object_preview_with_version(
     );
     preview.set_clip_rect(transform.inverse().mul_rect(rect.intersect(ui.clip_rect())));
     preview.with_visual_transform(transform, |ui| {
-        crate::object_rendering::render_object_with_version(
+        crate::object_rendering::render_object_with_settings(
             ui,
             pool,
             object,
             Point::default(),
             version,
+            soft_key_size,
         );
     });
 }
@@ -343,12 +362,13 @@ pub fn objects(
                 &format!("{:?}", object.object_type()),
                 selected == Some(object.id()),
                 |ui, rect| {
-                    object_preview_with_version(
+                    object_preview_with_settings(
                         ui,
                         rect,
                         project.get_pool(),
                         object,
                         project.vt_version,
+                        project.soft_key_size(),
                     )
                 },
             ) {

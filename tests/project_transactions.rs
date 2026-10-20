@@ -20,8 +20,13 @@ fn incomplete_draft_round_trips_but_complete_diagnostics_and_iop_export_reject_i
     let mut create = OperationTransaction::new(None);
     create.add_operation(Operation::CreateObject {
         object_id: Some(1),
-        object_type: ObjectType::OutputRectangle,
-        name: "Draft rectangle".into(),
+        object_type: ObjectType::OutputPolygon,
+        name: "Draft polygon".into(),
+    });
+    create.add_operation(Operation::SetProperty {
+        object: ObjectTarget::id(1),
+        property: PropertyKey::Points,
+        value: json!([]),
     });
     project.execute_transaction(create).unwrap();
     let restored = EditorProject::load_project(project.save_project().unwrap()).unwrap();
@@ -34,6 +39,9 @@ fn incomplete_draft_round_trips_but_complete_diagnostics_and_iop_export_reject_i
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "E007_OBJECT_NOT_FOUND" && diagnostic.affected_objects == Some(vec![0])
     }));
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "POLYGON_TOO_FEW_POINTS"));
 
     let mut edit_width = OperationTransaction::new(None);
     edit_width.add_operation(Operation::SetProperty {

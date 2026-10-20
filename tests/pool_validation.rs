@@ -31,6 +31,49 @@ fn complete_validation_checks_pool_scaffolding_and_typed_references() {
         pool.add(controls);
     }
 
+    let mut polygon = default_object(ObjectType::OutputPolygon);
+    *polygon.mut_id() = ObjectId::new(7).unwrap();
+    if let ag_iso_stack::object_pool::object::Object::OutputPolygon(polygon) = &mut polygon {
+        polygon.polygon_type = 3;
+        polygon.points = vec![Default::default(); 2];
+    }
+    pool.add(polygon);
+    let mut colour_map = default_object(ObjectType::ColourMap);
+    *colour_map.mut_id() = ObjectId::new(8).unwrap();
+    if let ag_iso_stack::object_pool::object::Object::ColourMap(map) = &mut colour_map {
+        map.colour_map = vec![0; 3];
+    }
+    pool.add(colour_map);
+    let mut palette = default_object(ObjectType::ColourPalette);
+    *palette.mut_id() = ObjectId::new(9).unwrap();
+    if let ag_iso_stack::object_pool::object::Object::ColourPalette(palette) = &mut palette {
+        palette.colours = vec![Default::default(); 257];
+    }
+    pool.add(palette);
+    let mut key_group = default_object(ObjectType::KeyGroup);
+    *key_group.mut_id() = ObjectId::new(10).unwrap();
+    if let ag_iso_stack::object_pool::object::Object::KeyGroup(group) = &mut key_group {
+        group.objects = (20..25).map(|id| ObjectId::new(id).unwrap()).collect();
+    }
+    pool.add(key_group);
+    for id in 20..25 {
+        let mut key = default_object(ObjectType::Key);
+        *key.mut_id() = ObjectId::new(id).unwrap();
+        pool.add(key);
+    }
+    let mut input_number = default_object(ObjectType::InputNumber);
+    *input_number.mut_id() = ObjectId::new(12).unwrap();
+    if let ag_iso_stack::object_pool::object::Object::InputNumber(number) = &mut input_number {
+        number.nr_of_decimals = 8;
+    }
+    pool.add(input_number);
+    let mut number = default_object(ObjectType::OutputNumber);
+    *number.mut_id() = ObjectId::new(11).unwrap();
+    if let ag_iso_stack::object_pool::object::Object::OutputNumber(number) = &mut number {
+        number.nr_of_decimals = 8;
+    }
+    pool.add(number);
+
     let incremental = validate_pool_state_for_version(&pool, VtVersion::Version6);
     assert!(!incremental.iter().any(|d| {
         matches!(
@@ -47,6 +90,62 @@ fn complete_validation_checks_pool_scaffolding_and_typed_references() {
     assert!(codes.contains("WORKING_SET_IDENTIFIER_MISSING"));
     assert!(codes.contains("WORKING_SET_SPECIAL_CONTROLS_CARDINALITY"));
     assert!(codes.contains("PROPERTY_REFERENCE_WRONG_TYPE"));
+    assert!(codes.contains("POLYGON_TOO_FEW_POINTS"));
+    assert!(codes.contains("COLOUR_MAP_INVALID_SIZE"));
+    assert!(codes.contains("COLOUR_PALETTE_TOO_LARGE"));
+    assert!(codes.contains("KEY_GROUP_INVALID_SIZE"));
+    assert!(codes.contains("PROPERTY_OUT_OF_RANGE"));
+
+    let has_code = |pool: &ObjectPool, code: &str| {
+        validate_complete_pool_state_for_version(pool, VtVersion::Version6)
+            .iter()
+            .any(|diagnostic| diagnostic.code == code)
+    };
+    for size in [2, 16, 256] {
+        if let Some(ag_iso_stack::object_pool::object::Object::ColourMap(map)) =
+            pool.object_mut_by_id(ObjectId::new(8).unwrap())
+        {
+            map.colour_map = vec![0; size];
+        }
+        assert!(!has_code(&pool, "COLOUR_MAP_INVALID_SIZE"));
+    }
+    for size in [0, 256] {
+        if let Some(ag_iso_stack::object_pool::object::Object::ColourPalette(palette)) =
+            pool.object_mut_by_id(ObjectId::new(9).unwrap())
+        {
+            palette.colours = vec![Default::default(); size];
+        }
+        assert!(!has_code(&pool, "COLOUR_PALETTE_TOO_LARGE"));
+    }
+    if let Some(ag_iso_stack::object_pool::object::Object::KeyGroup(group)) =
+        pool.object_mut_by_id(ObjectId::new(10).unwrap())
+    {
+        group.objects.clear();
+    }
+    assert!(has_code(&pool, "KEY_GROUP_INVALID_SIZE"));
+    for count in [1, 4] {
+        if let Some(ag_iso_stack::object_pool::object::Object::KeyGroup(group)) =
+            pool.object_mut_by_id(ObjectId::new(10).unwrap())
+        {
+            group.objects = (20..20 + count)
+                .map(|id| ObjectId::new(id).unwrap())
+                .collect();
+        }
+        assert!(!has_code(&pool, "KEY_GROUP_INVALID_SIZE"));
+    }
+    if let Some(ag_iso_stack::object_pool::object::Object::OutputPolygon(polygon)) =
+        pool.object_mut_by_id(ObjectId::new(7).unwrap())
+    {
+        polygon.polygon_type = 3;
+        polygon.points = vec![Default::default(); 2];
+    }
+    assert!(has_code(&pool, "POLYGON_TOO_FEW_POINTS"));
+    if let Some(ag_iso_stack::object_pool::object::Object::OutputPolygon(polygon)) =
+        pool.object_mut_by_id(ObjectId::new(7).unwrap())
+    {
+        polygon.points = vec![Default::default(); 3];
+    }
+    assert!(!has_code(&pool, "POLYGON_TOO_FEW_POINTS"));
 }
 
 #[test]

@@ -1569,12 +1569,13 @@ impl CanvasState {
                 .ok()
                 .and_then(|id| display.pool.object_by_id(id))
             {
-                crate::object_rendering::render_object_with_version(
+                crate::object_rendering::render_object_with_settings(
                     child,
                     &display.pool,
                     object,
                     Point::default(),
                     project.vt_version,
+                    project.soft_key_size(),
                 );
             }
         });
@@ -1611,12 +1612,13 @@ impl CanvasState {
                             .ok()
                             .and_then(|id| display.pool.object_by_id(id))
                         {
-                            crate::object_rendering::render_object_with_version(
+                            crate::object_rendering::render_object_with_settings(
                                 key_ui,
                                 &display.pool,
                                 object,
                                 Point::default(),
                                 project.vt_version,
+                                project.soft_key_size(),
                             );
                         }
                     });
