@@ -146,6 +146,128 @@ pub fn palette(ui: &Ui) -> Palette {
     })
 }
 
+/// Show selectable, wrapped error text with a compact button to copy the full message.
+pub fn error_text(ui: &mut Ui, message: &str) -> egui::Response {
+    let color = ui.visuals().error_fg_color;
+    error_text_with_color(ui, message, color)
+}
+
+/// Show selectable, wrapped status text with a compact button to copy the full message.
+pub fn error_text_with_color(ui: &mut Ui, message: &str, color: Color32) -> egui::Response {
+    ui.horizontal_top(|ui| {
+        let response = ui.add_sized(egui::vec2(20.0, 20.0), egui::Button::new(""));
+        let rect = response.rect;
+        if ui.is_rect_visible(rect) {
+            let stroke = ui.style().interact(&response).fg_stroke;
+            let width = 8.0;
+            let back = egui::Rect::from_min_size(
+                rect.min + egui::vec2(6.0, 3.0),
+                egui::vec2(width, width),
+            );
+            let front = egui::Rect::from_min_size(
+                rect.min + egui::vec2(3.0, 6.0),
+                egui::vec2(width, width),
+            );
+            ui.painter()
+                .rect_stroke(back, 0.0, stroke, egui::StrokeKind::Middle);
+            ui.painter()
+                .rect_stroke(front, 0.0, stroke, egui::StrokeKind::Middle);
+        }
+        let response = response.on_hover_text("Copy error");
+        if response.clicked() {
+            ui.ctx().copy_text(message.to_owned());
+        }
+        ui.add(
+            egui::Label::new(egui::RichText::new(message).color(color))
+                .selectable(true)
+                .wrap(),
+        );
+        response
+    })
+    .inner
+}
+
+#[cfg(test)]
+mod error_text_tests {
+    use super::*;
+
+    fn render_error(
+        ctx: &egui::Context,
+        message: &str,
+        screen_rect: egui::Rect,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, egui::Rect) {
+        let mut copy_button = egui::Rect::NOTHING;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen_rect),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    copy_button = error_text(ui, message).rect;
+                });
+            },
+        );
+        (output, copy_button)
+    }
+
+    #[test]
+    fn copy_button_copies_the_complete_multiline_error() {
+        let message =
+            "Export failed\nObject 42: invalid reference\nDetails: target was unavailable";
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(360.0, 180.0));
+        let ctx = egui::Context::default();
+        let (_, button_rect) = render_error(&ctx, message, screen, vec![]);
+        let position = button_rect.center();
+        render_error(
+            &ctx,
+            message,
+            screen,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (output, _) = render_error(
+            &ctx,
+            message,
+            screen,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+
+        assert!(output
+            .platform_output
+            .commands
+            .contains(&egui::OutputCommand::CopyText(message.to_owned())));
+    }
+
+    #[test]
+    fn copy_button_stays_visible_with_a_long_message_in_a_narrow_viewport() {
+        let message = "A very long diagnostic with a multiline detail\n".repeat(80);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 90.0));
+        let ctx = egui::Context::default();
+        let (_, button_rect) = render_error(&ctx, &message, screen, vec![]);
+
+        assert!(button_rect.is_positive());
+        assert!(screen.contains_rect(button_rect));
+    }
+}
+
 /// Register the application light and dark styles on a context.
 /// Call once during app startup; changing the selected theme then uses egui's
 /// normal theme preference mechanism.

@@ -24,20 +24,110 @@ mod native {
     struct Client {
         session: RefCell<Session>,
         check: bool,
+        machine: bool,
     }
     impl Client {
-        fn request(&self, action: AutomationAction, args: Value) -> Result<Value, Value> {
+        fn request(&self, action: AutomationAction, mut args: Value) -> Result<Value, Value> {
             let session = self.session.borrow();
             let project = session
                 .project()
                 .map_err(|e| error("PROJECT_NOT_OPEN", e))?;
+            use ag_iso_terminal_designer::cli::names;
+            use AutomationAction as A;
+            let object_field = match action {
+                A::GetDesignContext | A::InspectDesignRegion => Some("root_id"),
+                A::PreviewDesign => Some("mask_id"),
+                A::ListObjects => Some("parent_id"),
+                _ => None,
+            };
+            if let Some(field) = object_field {
+                if let Some(name) = args[field].as_str() {
+                    args[field] = json!(names::object_id(
+                        project,
+                        name.strip_prefix("name:").unwrap_or(name)
+                    )
+                    .map_err(|e| error("OBJECT_NOT_FOUND", e))?);
+                }
+            }
+            match action {
+                A::GetComponent => {
+                    if let Some(name) = args["component_id"].as_str() {
+                        args["component_id"] = json!(names::component_id(project, name)
+                            .map_err(|e| error("COMPONENT_NOT_FOUND", e))?);
+                    }
+                }
+                A::GetComponentInstances => {
+                    if let Some(name) = args["instance_id"].as_str() {
+                        args["instance_id"] = json!(names::instance_id(project, name)
+                            .map_err(|e| error("INSTANCE_NOT_FOUND", e))?);
+                    }
+                }
+                A::GetGraphic => {
+                    if let Some(name) = args["id"].as_str() {
+                        let asset = names::graphic_asset_id(project, name);
+                        let picture = names::picture_graphic_id(project, name);
+                        args["id"] = match (asset, picture) {
+                            (Ok(_), Ok(_)) => {
+                                return Err(error(
+                                    "AMBIGUOUS_GRAPHIC_NAME",
+                                    format!(
+                                    "Both a graphic asset and PictureGraphic are named '{name}'"
+                                ),
+                                ))
+                            }
+                            (Ok(id), Err(e)) if !e.starts_with("Ambiguous") => {
+                                json!(id.to_string())
+                            }
+                            (Err(e), Ok(id)) if !e.starts_with("Ambiguous") => {
+                                json!(id.to_string())
+                            }
+                            (Err(e), _) if e.starts_with("Ambiguous") => {
+                                return Err(error("AMBIGUOUS_GRAPHIC_NAME", e))
+                            }
+                            (_, Err(e)) if e.starts_with("Ambiguous") => {
+                                return Err(error("AMBIGUOUS_GRAPHIC_NAME", e))
+                            }
+                            _ => {
+                                return Err(error(
+                                    "GRAPHIC_NOT_FOUND",
+                                    format!("No graphic named '{name}'"),
+                                ))
+                            }
+                        };
+                    }
+                }
+                _ => (),
+            }
             let result =
                 ag_iso_terminal_designer::cli::automation_service::execute(project, action, args)
                     .map_err(|e| error(e.code, e.message))?;
+            let result = if self.machine {
+                result
+            } else {
+                readable_result(project, result, Default::default())
+            };
             Ok(json!({"success":true,"result":result}))
         }
         fn edit(&self, actions: Vec<EditAction>) -> Result<Value, Value> {
             let mut session = self.session.borrow_mut();
+            let previous_names = if self.machine {
+                Default::default()
+            } else {
+                let project = session
+                    .project()
+                    .map_err(|e| error("PROJECT_NOT_OPEN", e))?;
+                project
+                    .get_pool()
+                    .objects()
+                    .iter()
+                    .map(|object| {
+                        (
+                            object.id().value().to_string(),
+                            project.get_object_info(object).get_name(object),
+                        )
+                    })
+                    .collect()
+            };
             let result = ag_iso_terminal_designer::cli::editing::execute_batch(
                 session
                     .project_mut()
@@ -48,6 +138,17 @@ mod native {
             if !self.check {
                 session.persist().map_err(|e| error("SESSION_FAILED", e))?;
             }
+            let result = if self.machine {
+                result
+            } else {
+                readable_result(
+                    session
+                        .project()
+                        .map_err(|e| error("PROJECT_NOT_OPEN", e))?,
+                    result,
+                    previous_names,
+                )
+            };
             Ok(json!({"success":true,"result":result}))
         }
         fn output(
@@ -66,6 +167,116 @@ mod native {
         }
     }
 
+    /// Present authoring identities as names while retaining numeric protocol
+    /// details in JSON output and explicit ID configuration commands.
+    fn readable_result(
+        project: &ag_iso_terminal_designer::EditorProject,
+        mut value: Value,
+        mut identities: std::collections::HashMap<String, String>,
+    ) -> Value {
+        for object in project.get_pool().objects() {
+            identities.insert(
+                object.id().value().to_string(),
+                project.get_object_info(object).get_name(object),
+            );
+        }
+        for definition in project.component_source().definitions.values() {
+            identities.insert(definition.id.to_string(), definition.name.clone());
+            for node in &definition.nodes {
+                identities.insert(node.id.to_string(), node.name.clone());
+            }
+            for parameter in &definition.parameters {
+                identities.insert(parameter.id.to_string(), parameter.name.clone());
+            }
+        }
+        for instance in &project.component_source().instances {
+            identities.insert(instance.id.to_string(), instance.name.clone());
+        }
+        for asset in project.graphic_library().assets.values() {
+            identities.insert(asset.id.to_string(), asset.name.clone());
+        }
+        fn identity(value: &mut Value, names: &std::collections::HashMap<String, String>) {
+            let key = match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                _ => return,
+            };
+            if let Some(name) = names.get(&key) {
+                *value = json!(name);
+            }
+        }
+        fn visit(value: &mut Value, names: &std::collections::HashMap<String, String>) {
+            match value {
+                Value::Array(items) => items.iter_mut().for_each(|item| visit(item, names)),
+                Value::Object(fields) => {
+                    fields.remove("transaction_id");
+                    fields.remove("compiled_ids");
+                    if fields.get("kind").and_then(Value::as_str) == Some("Graphic") {
+                        if let Some(default) = fields.get_mut("default_value") {
+                            identity(default, names);
+                        }
+                    }
+                    if let Some(Value::Object(overrides)) = fields.get_mut("overrides") {
+                        let old = std::mem::take(overrides);
+                        for (key, value) in old {
+                            overrides.insert(names.get(&key).cloned().unwrap_or(key), value);
+                        }
+                    }
+                    if fields.get("name").is_some_and(|name| !name.is_null()) {
+                        fields.remove("id");
+                    }
+                    if fields.get("macro_name").is_some_and(|name| !name.is_null()) {
+                        fields.remove("macro_id");
+                    }
+                    for (key, item) in fields.iter_mut() {
+                        // Property values and schema defaults are literal data.
+                        if matches!(key.as_str(), "properties" | "schema" | "object_id_ranges") {
+                            continue;
+                        }
+                        if matches!(
+                            key.as_str(),
+                            "id" | "object_id"
+                                | "component_id"
+                                | "instance_id"
+                                | "node_id"
+                                | "root_node"
+                                | "target_node"
+                                | "parameter_id"
+                                | "asset_id"
+                                | "macro_id"
+                                | "root_id"
+                                | "materialized_object_id"
+                                | "Primitive"
+                                | "Internal"
+                                | "Parameter"
+                                | "Id"
+                        ) {
+                            identity(item, names);
+                        } else if matches!(
+                            key.as_str(),
+                            "changed_ids" | "allocated_ids" | "affected_objects" | "path"
+                        ) {
+                            if let Some(items) = item.as_array_mut() {
+                                items.iter_mut().for_each(|item| identity(item, names));
+                            }
+                        } else {
+                            visit(item, names);
+                        }
+                    }
+                    if let Some(allocated) = fields.remove("allocated_ids") {
+                        fields.insert("allocated_objects".into(), allocated);
+                    }
+                    if let Some(changed) = fields.remove("changed_ids") {
+                        fields.insert("changed_objects".into(), changed);
+                    }
+                }
+                _ => (),
+            }
+        }
+        visit(&mut value, &identities);
+        value
+    }
+
     fn execute(cli: Cli) -> Result<Value, Value> {
         use AutomationAction as A;
         if cli.check
@@ -82,7 +293,7 @@ mod native {
         match &cli.command {
             Command::Capabilities => {
                 return Ok(json!({"success":true,"result":{
-                    "cli_api_version":4,"json_input":false,"atomic_command_files":true,"max_edit_actions":MAX_EDIT_ACTIONS,
+                    "cli_api_version":5,"json_input":false,"atomic_command_files":true,"max_edit_actions":MAX_EDIT_ACTIONS,
                     "commands":Cli::command().get_subcommands().map(|c|json!({"name":c.get_name(),"description":c.get_about().map(ToString::to_string),"subcommands":c.get_subcommands().map(|s|s.get_name()).collect::<Vec<_>>()})).collect::<Vec<_>>()
                 }}))
             }
@@ -162,6 +373,7 @@ mod native {
         let client = Client {
             session: RefCell::new(session),
             check: cli.check,
+            machine: cli.json,
         };
         let base = std::env::current_dir().map_err(|e| error("INPUT_FAILED", e.to_string()))?;
         if let Some(actions) = command_edit_actions(&cli.command, &base, &|path| {

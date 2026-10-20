@@ -397,7 +397,7 @@ pub fn component_catalog(state: &AiDesignState) -> Value {
 pub fn component_instances(state: &AiDesignState) -> Value {
     json!(state.components.instances.iter().map(|i| {
         let d = &state.components.definitions[&i.component_id];
-        json!({"instance_id":i.id,"component_id":d.id,"component":d.name,"parent":i.parent,"x":i.x,"y":i.y,"parameters":d.parameters.iter().map(|p| json!({"id":p.id,"name":p.name,"value":i.overrides.get(&p.id).unwrap_or(&p.default_value),"overridden":i.overrides.contains_key(&p.id)})).collect::<Vec<_>>()})
+        json!({"name":i.name,"instance_id":i.id,"component_id":d.id,"component":d.name,"parent":i.parent,"x":i.x,"y":i.y,"parameters":d.parameters.iter().map(|p| json!({"id":p.id,"name":p.name,"value":i.overrides.get(&p.id).unwrap_or(&p.default_value),"overridden":i.overrides.contains_key(&p.id)})).collect::<Vec<_>>()})
     }).collect::<Vec<_>>())
 }
 

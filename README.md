@@ -203,7 +203,7 @@ aitd validate
 aitd project save machine.aitp
 ```
 
-See the [CLI guide](docs/cli.md) for project lifecycle, backups, command files, validation, exports, and exit codes. The [standalone example](examples/standalone/README.md) runs the complete workflow without a desktop editor or display. Browser-based editing remains available through the [Web Application](https://open-agriculture.github.io/AgIsoTerminalDesigner/).
+See the [CLI guide](docs/cli.md) for project lifecycle, backups, command files, validation, exports, and exit codes. CLI entity targets use case-insensitive names, with spaces, hyphens, and underscores treated equivalently; fixed protocol IDs can be set with `--override-id`. The [standalone example](examples/standalone/README.md) runs the complete workflow without a desktop editor or display. Browser-based editing remains available through the [Web Application](https://open-agriculture.github.io/AgIsoTerminalDesigner/).
 
 ### Running the Web Application
 

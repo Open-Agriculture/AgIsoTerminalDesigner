@@ -117,6 +117,7 @@ pub enum ComponentAuthoringAction {
     InstanceCreate {
         id: ComponentInstanceId,
         component_id: ComponentId,
+        name: String,
         parent: u16,
         x: i32,
         y: i32,
@@ -255,6 +256,7 @@ pub fn export_actions(
         actions.push(ComponentAuthoringAction::InstanceCreate {
             id: instance.id,
             component_id: instance.component_id,
+            name: instance.name.clone(),
             parent: *parent,
             x: instance.x,
             y: instance.y,
@@ -266,28 +268,227 @@ pub fn export_actions(
     Ok(actions)
 }
 
-/// Render one typed action as ordinary `aitd component ...` command tokens.
-/// The caller should quote each token with the shared CLI shell serializer.
-pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<String>, String> {
+fn definition_name(project: &EditorProject, id: ComponentId) -> Result<String, String> {
+    project
+        .component_source()
+        .definitions
+        .get(&id)
+        .map(|d| d.name.clone())
+        .ok_or_else(|| format!("Unknown component definition {id}"))
+}
+
+fn node_name(
+    project: &EditorProject,
+    component: ComponentId,
+    id: ComponentNodeId,
+) -> Result<String, String> {
+    project
+        .component_source()
+        .definitions
+        .get(&component)
+        .and_then(|d| d.nodes.iter().find(|n| n.id == id))
+        .map(|n| n.name.clone())
+        .ok_or_else(|| format!("Unknown node {id} in component {component}"))
+}
+
+fn parameter_name(
+    project: &EditorProject,
+    component: ComponentId,
+    id: ComponentParameterId,
+) -> Result<String, String> {
+    project
+        .component_source()
+        .definitions
+        .get(&component)
+        .and_then(|d| d.parameters.iter().find(|p| p.id == id))
+        .map(|p| p.name.clone())
+        .ok_or_else(|| format!("Unknown parameter {id} in component {component}"))
+}
+
+fn named_object_target(
+    project: &EditorProject,
+    target: &crate::operations::ObjectTarget,
+) -> Result<crate::operations::ObjectTarget, String> {
+    match target {
+        crate::operations::ObjectTarget::Name { name } => {
+            Ok(crate::operations::ObjectTarget::Name { name: name.clone() })
+        }
+        crate::operations::ObjectTarget::Id { id } => Ok(crate::operations::ObjectTarget::Name {
+            name: crate::cli::zip::object_name(project, *id),
+        }),
+    }
+}
+
+fn named_macro_references(
+    project: &EditorProject,
+    refs: &[crate::components::ComponentMacroReference],
+) -> Result<Vec<crate::components::ComponentMacroReference>, String> {
+    refs.iter()
+        .map(|r| {
+            Ok(crate::components::ComponentMacroReference {
+                event: r.event,
+                target: named_object_target(project, &r.target)?,
+            })
+        })
+        .collect()
+}
+
+fn named_object_list(
+    project: &EditorProject,
+    list: &Option<crate::components::ComponentObjectList>,
+) -> Result<Option<crate::components::ComponentObjectList>, String> {
+    use crate::components::ComponentObjectList as L;
+    list.as_ref()
+        .map(|list| match list {
+            L::Required(items) => items
+                .iter()
+                .map(|t| named_object_target(project, t))
+                .collect::<Result<Vec<_>, _>>()
+                .map(L::Required),
+            L::Nullable(items) => items
+                .iter()
+                .map(|t| {
+                    t.as_ref()
+                        .map(|t| named_object_target(project, t))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(L::Nullable),
+        })
+        .transpose()
+}
+
+fn named_parameter_value(
+    project: &EditorProject,
+    kind: crate::components::ComponentParameterKind,
+    value: &Value,
+) -> Result<Value, String> {
+    use crate::components::ComponentParameterKind as K;
+    match kind {
+        K::Graphic => {
+            let id: crate::graphics::GraphicAssetId =
+                serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+            let asset = project
+                .graphic_library()
+                .assets
+                .get(&id)
+                .ok_or_else(|| format!("Unknown graphic asset {id}"))?;
+            Ok(Value::String(asset.name.clone()))
+        }
+        K::ObjectReference if !value.is_null() => {
+            let target: crate::operations::ObjectTarget = if let Some(id) = value.as_u64() {
+                let id = u16::try_from(id).map_err(|_| "Object reference ID is out of range")?;
+                crate::operations::ObjectTarget::Name {
+                    name: crate::cli::zip::object_name(project, id),
+                }
+            } else {
+                serde_json::from_value(value.clone()).map_err(|e| e.to_string())?
+            };
+            serde_json::to_value(named_object_target(project, &target)?).map_err(|e| e.to_string())
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+fn parameter_default_token(
+    project: &EditorProject,
+    parameter: &ComponentParameter,
+) -> Result<String, String> {
+    use crate::components::ComponentParameterKind as K;
+    match parameter.kind {
+        K::Graphic => Ok(
+            named_parameter_value(project, parameter.kind, &parameter.default_value)?
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        ),
+        K::ObjectReference if !parameter.default_value.is_null() => {
+            let named = named_parameter_value(project, parameter.kind, &parameter.default_value)?;
+            let name = named
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Ok(if name == "null" {
+                "name:null".into()
+            } else {
+                name.to_owned()
+            })
+        }
+        K::ObjectReference => Ok("null".into()),
+        _ => serde_json::to_string(&parameter.default_value).map_err(|e| e.to_string()),
+    }
+}
+
+fn named_overrides(
+    project: &EditorProject,
+    component: ComponentId,
+    overrides: &BTreeMap<ComponentParameterId, Value>,
+) -> Result<BTreeMap<String, Value>, String> {
+    let definition = project
+        .component_source()
+        .definitions
+        .get(&component)
+        .ok_or_else(|| format!("Unknown component definition {component}"))?;
+    overrides
+        .iter()
+        .map(|(id, value)| {
+            let parameter = definition
+                .parameters
+                .iter()
+                .find(|p| p.id == *id)
+                .ok_or_else(|| format!("Unknown parameter {id}"))?;
+            Ok((
+                parameter.name.clone(),
+                named_parameter_value(project, parameter.kind, value)?,
+            ))
+        })
+        .collect()
+}
+
+fn named_reference(
+    project: &EditorProject,
+    component: ComponentId,
+    target: &ComponentReference,
+) -> Result<Value, String> {
+    Ok(match target {
+        ComponentReference::Internal(id) => {
+            serde_json::json!({"Internal": node_name(project, component, *id)?})
+        }
+        ComponentReference::Parameter(id) => {
+            serde_json::json!({"Parameter": parameter_name(project, component, *id)?})
+        }
+        ComponentReference::ExternalObject(target) => {
+            serde_json::json!({"ExternalObject": named_object_target(project, target)?})
+        }
+        ComponentReference::Null => serde_json::json!("Null"),
+    })
+}
+
+/// Render a typed authoring action as ordinary name-based CLI command tokens.
+/// The supplied project resolves internal component, instance, and object
+/// identities to their persisted authoring names. The caller should quote each
+/// token with the shared CLI shell serializer.
+pub fn export_command_tokens(
+    action: &ComponentAuthoringAction,
+    project: &EditorProject,
+) -> Result<Vec<String>, String> {
     use ComponentAuthoringAction as A;
     let mut tokens = vec!["component".to_owned()];
     match action {
         A::DefinitionCreate {
-            id,
+            id: _,
             name,
             description,
             category_path,
             tags,
-            root_node,
+            root_node: _,
             root_name,
             root_type,
             ..
         } => {
             tokens.extend([
                 "definition-create".into(),
-                id.to_string(),
                 name.clone(),
-                root_node.to_string(),
                 root_name.clone(),
                 format!("{root_type:?}"),
             ]);
@@ -309,7 +510,10 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
             tags,
             revision,
         } => {
-            tokens.extend(["definition-metadata".into(), component_id.to_string()]);
+            tokens.extend([
+                "definition-metadata".into(),
+                definition_name(project, *component_id)?,
+            ]);
             if let Some(value) = name {
                 tokens.extend(["--name".into(), value.clone()]);
             }
@@ -332,13 +536,12 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
         }
         A::NodeCreate {
             component_id,
-            id,
+            id: _,
             name,
             object_type,
         } => tokens.extend([
             "node-create".into(),
-            component_id.to_string(),
-            id.to_string(),
+            definition_name(project, *component_id)?,
             name.clone(),
             format!("{object_type:?}"),
         ]),
@@ -346,8 +549,16 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
             component_id,
             nodes,
         } => {
-            tokens.extend(["node-order-set".into(), component_id.to_string()]);
-            tokens.extend(nodes.iter().map(ToString::to_string));
+            tokens.extend([
+                "node-order-set".into(),
+                definition_name(project, *component_id)?,
+            ]);
+            tokens.extend(
+                nodes
+                    .iter()
+                    .map(|id| node_name(project, *component_id, *id))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
         A::NodeMetadata {
             component_id,
@@ -355,8 +566,8 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
             name,
         } => tokens.extend([
             "node-rename".into(),
-            component_id.to_string(),
-            node_id.to_string(),
+            definition_name(project, *component_id)?,
+            node_name(project, *component_id, *node_id)?,
             name.clone(),
         ]),
         A::NodePropertySet {
@@ -366,8 +577,8 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
             value,
         } => tokens.extend([
             "node-property-set".into(),
-            component_id.to_string(),
-            node_id.to_string(),
+            definition_name(project, *component_id)?,
+            node_name(project, *component_id, *node_id)?,
             property.to_string(),
             serde_json::to_string(value).map_err(|error| error.to_string())?,
         ]),
@@ -385,8 +596,8 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
         } => {
             tokens.extend([
                 "node-macro-append".into(),
-                component_id.to_string(),
-                node_id.to_string(),
+                definition_name(project, *component_id)?,
+                node_name(project, *component_id, *node_id)?,
                 instruction.clone(),
             ]);
             tokens.extend(arguments.iter().cloned());
@@ -396,8 +607,8 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
             node_id,
         } => tokens.extend([
             "node-macro-clear".into(),
-            component_id.to_string(),
-            node_id.to_string(),
+            definition_name(project, *component_id)?,
+            node_name(project, *component_id, *node_id)?,
         ]),
         A::NodeReferenceSet {
             component_id,
@@ -406,10 +617,11 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
             target,
         } => tokens.extend([
             "node-reference-set".into(),
-            component_id.to_string(),
-            node_id.to_string(),
+            definition_name(project, *component_id)?,
+            node_name(project, *component_id, *node_id)?,
             property.to_string(),
-            serde_json::to_string(target).map_err(|error| error.to_string())?,
+            serde_json::to_string(&named_reference(project, *component_id, target)?)
+                .map_err(|error| error.to_string())?,
         ]),
         A::NodeChildrenSet {
             component_id,
@@ -418,11 +630,16 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
         } => {
             tokens.extend([
                 "node-children-set".into(),
-                component_id.to_string(),
-                node_id.to_string(),
+                definition_name(project, *component_id)?,
+                node_name(project, *component_id, *node_id)?,
             ]);
             for child in children {
-                tokens.push(format!("{}:{}:{}", child.child, child.x, child.y));
+                tokens.push(format!(
+                    "{}:{}:{}",
+                    node_name(project, *component_id, child.child)?,
+                    child.x,
+                    child.y
+                ));
             }
         }
         A::NodeMacroReferencesSet {
@@ -431,9 +648,10 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
             references,
         } => tokens.extend([
             "node-macro-references-set".into(),
-            component_id.to_string(),
-            node_id.to_string(),
-            serde_json::to_string(references).map_err(|error| error.to_string())?,
+            definition_name(project, *component_id)?,
+            node_name(project, *component_id, *node_id)?,
+            serde_json::to_string(&named_macro_references(project, references)?)
+                .map_err(|error| error.to_string())?,
         ]),
         A::NodeObjectListSet {
             component_id,
@@ -441,9 +659,10 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
             object_list,
         } => tokens.extend([
             "node-object-list-set".into(),
-            component_id.to_string(),
-            node_id.to_string(),
-            serde_json::to_string(object_list).map_err(|error| error.to_string())?,
+            definition_name(project, *component_id)?,
+            node_name(project, *component_id, *node_id)?,
+            serde_json::to_string(&named_object_list(project, object_list)?)
+                .map_err(|error| error.to_string())?,
         ]),
         A::ParameterAdd {
             component_id,
@@ -451,14 +670,12 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
         } => {
             tokens.extend([
                 "parameter-add-typed".into(),
-                component_id.to_string(),
-                parameter.id.to_string(),
+                definition_name(project, *component_id)?,
                 parameter.name.clone(),
-                parameter.target_node.to_string(),
+                node_name(project, *component_id, parameter.target_node)?,
                 parameter.property.as_str().into(),
                 format!("{:?}", parameter.kind),
-                serde_json::to_string(&parameter.default_value)
-                    .map_err(|error| error.to_string())?,
+                parameter_default_token(project, parameter)?,
             ]);
             if let Some(description) = &parameter.description {
                 tokens.extend(["--description".into(), description.clone()]);
@@ -470,22 +687,22 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
         } => {
             tokens.extend([
                 "parameter-set-typed".into(),
-                component_id.to_string(),
-                parameter.id.to_string(),
+                definition_name(project, *component_id)?,
+                parameter_name(project, *component_id, parameter.id)?,
                 parameter.name.clone(),
-                parameter.target_node.to_string(),
+                node_name(project, *component_id, parameter.target_node)?,
                 parameter.property.as_str().into(),
                 format!("{:?}", parameter.kind),
-                serde_json::to_string(&parameter.default_value)
-                    .map_err(|error| error.to_string())?,
+                parameter_default_token(project, parameter)?,
             ]);
             if let Some(description) = &parameter.description {
                 tokens.extend(["--description".into(), description.clone()]);
             }
         }
         A::InstanceCreate {
-            id,
+            id: _,
             component_id,
+            name,
             parent,
             x,
             y,
@@ -495,9 +712,9 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
         } => {
             tokens.extend([
                 "instance-create".into(),
-                id.to_string(),
-                component_id.to_string(),
-                parent.to_string(),
+                name.clone(),
+                definition_name(project, *component_id)?,
+                crate::cli::zip::object_token(project, *parent),
                 x.to_string(),
                 y.to_string(),
             ]);
@@ -507,36 +724,53 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
             if !overrides.is_empty() {
                 tokens.extend([
                     "--overrides".into(),
-                    serde_json::to_string(overrides).map_err(|error| error.to_string())?,
+                    serde_json::to_string(&named_overrides(project, *component_id, overrides)?)
+                        .map_err(|error| error.to_string())?,
                 ]);
             }
-            for (node, object) in compiled_ids {
-                tokens.extend(["--compiled-id".into(), format!("{node}={object}")]);
-            }
+            let _ = compiled_ids;
         }
         A::InstanceMetadata {
             instance_id,
             child_index,
             compiled_ids,
         } => {
-            tokens.extend(["instance-metadata".into(), instance_id.to_string()]);
+            let instance = project
+                .component_source()
+                .instances
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .ok_or_else(|| format!("Unknown component instance {instance_id}"))?;
+            tokens.extend(["instance-metadata".into(), instance.name.clone()]);
             if let Some(index) = child_index {
                 tokens.extend(["--child-index".into(), index.to_string()]);
             }
-            for (node, object) in compiled_ids {
-                tokens.extend(["--compiled-id".into(), format!("{node}={object}")]);
-            }
+            let _ = compiled_ids;
         }
         A::OverrideSet {
             instance_id,
             parameter_id,
             value,
-        } => tokens.extend([
-            "override-set".into(),
-            instance_id.to_string(),
-            parameter_id.to_string(),
-            serde_json::to_string(value).map_err(|error| error.to_string())?,
-        ]),
+        } => {
+            let instance = project
+                .component_source()
+                .instances
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .ok_or_else(|| format!("Unknown component instance {instance_id}"))?;
+            let parameter = project.component_source().definitions[&instance.component_id]
+                .parameters
+                .iter()
+                .find(|p| p.id == *parameter_id)
+                .ok_or_else(|| format!("Unknown parameter {parameter_id}"))?;
+            let value = named_parameter_value(project, parameter.kind, value)?;
+            tokens.extend([
+                "override-set".into(),
+                instance.name.clone(),
+                parameter.name.clone(),
+                serde_json::to_string(&value).map_err(|error| error.to_string())?,
+            ]);
+        }
     }
     Ok(tokens)
 }
@@ -544,6 +778,7 @@ pub fn export_command_tokens(action: &ComponentAuthoringAction) -> Result<Vec<St
 pub fn apply(project: &mut EditorProject, action: ComponentAuthoringAction) -> Result<(), String> {
     let pool = project.get_pool().clone();
     let version = project.vt_version();
+    let original_source = project.component_source().clone();
     project
         .edit_components("CLI component authoring", |_, source| {
             match action {
@@ -875,6 +1110,7 @@ pub fn apply(project: &mut EditorProject, action: ComponentAuthoringAction) -> R
                 ComponentAuthoringAction::InstanceCreate {
                     id,
                     component_id,
+                    name,
                     parent,
                     x,
                     y,
@@ -888,9 +1124,20 @@ pub fn apply(project: &mut EditorProject, action: ComponentAuthoringAction) -> R
                             format!("Component instance {id} already exists"),
                         ));
                     }
+                    if crate::smart_naming::normalized_name(&name).is_empty()
+                        || source.instances.iter().any(|instance| {
+                            crate::smart_naming::names_equal(&instance.name, &name)
+                        })
+                    {
+                        return Err(crate::components::ComponentError::new(
+                            "COMPONENT_INSTANCE_NAME_CONFLICT",
+                            format!("Component instance name is empty or already exists: {name}"),
+                        ));
+                    }
                     source.instances.push(ComponentInstance {
                         id,
                         component_id,
+                        name,
                         parent: EditorParentRef::Primitive(parent),
                         child_index,
                         x,
@@ -936,6 +1183,9 @@ pub fn apply(project: &mut EditorProject, action: ComponentAuthoringAction) -> R
                         })?;
                     instance.overrides.insert(parameter_id, value);
                 }
+            }
+            for definition in source.definitions.values() {
+                crate::components::validate_definition_names(&original_source, definition)?;
             }
             Ok(())
         })
@@ -1031,9 +1281,16 @@ mod tests {
 
         let actions = export_actions(&source).unwrap();
         assert!(actions.len() >= 3);
+        let mut project = EditorProject::new_pool();
+        project
+            .edit_components("test source", |_, current| {
+                *current = source.clone();
+                Ok(())
+            })
+            .unwrap();
         for action in &actions {
             let mut tokens = vec!["aitd".to_owned()];
-            tokens.extend(export_command_tokens(action).unwrap());
+            tokens.extend(export_command_tokens(action, &project).unwrap());
             let parsed = crate::cli::commands::Cli::try_parse_from(tokens).unwrap();
             assert!(matches!(
                 parsed.command,

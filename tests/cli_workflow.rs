@@ -34,6 +34,14 @@ fn cli(cwd: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn cli_readable(cwd: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_aitd"))
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
 fn success(output: Output) -> Value {
     assert!(
         output.status.success(),
@@ -125,7 +133,7 @@ fn direct_edits_are_typed_and_check_does_not_commit() {
             "create",
             "NumberVariable",
             "Explicit",
-            "--id",
+            "--override-id",
             "6100",
         ],
     ));
@@ -137,7 +145,7 @@ fn direct_edits_are_typed_and_check_does_not_commit() {
             "create",
             "NumberVariable",
             "Duplicate",
-            "--id",
+            "--override-id",
             "6100",
         ],
     ));
@@ -161,6 +169,482 @@ fn direct_edits_are_typed_and_check_does_not_commit() {
         get(&cwd, "Counter")["result"]["objects"][0]["properties"]["value"],
         42
     );
+    std::fs::remove_dir_all(cwd).unwrap();
+}
+
+#[test]
+fn entity_targets_normalize_names_and_numeric_looking_names_stay_names() {
+    let _session = CLI_SESSION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cwd = temp_dir("aitd-name-targets");
+    new_session(&cwd);
+
+    success(cli(
+        &cwd,
+        &["object", "create", "NumberVariable", "Start Button"],
+    ));
+    success(cli(&cwd, &["object", "set", "START_BUTTON", "value=17"]));
+    assert_eq!(
+        get(&cwd, "start-button")["result"]["objects"][0]["properties"]["value"],
+        17
+    );
+    let normalized_duplicate = failure(cli(
+        &cwd,
+        &["object", "create", "NumberVariable", "start_button"],
+    ));
+    assert!(normalized_duplicate["error"]["message"].as_str().is_some());
+
+    success(cli(&cwd, &["object", "create", "NumberVariable", "123"]));
+    success(cli(&cwd, &["object", "set", "123", "value=23"]));
+    assert_eq!(
+        get(&cwd, "123")["result"]["objects"][0]["properties"]["value"],
+        23
+    );
+
+    success(cli(&cwd, &["object", "create", "Container", "name:Root"]));
+    assert_eq!(
+        get(&cwd, "name:name:root")["result"]["objects"][0]["name"],
+        "name:Root"
+    );
+    success(cli(&cwd, &["tree", "name:name:root"]));
+
+    success(cli(
+        &cwd,
+        &[
+            "object",
+            "create",
+            "NumberVariable",
+            "Fixed Counter",
+            "--override-id",
+            "6100",
+        ],
+    ));
+    assert_eq!(
+        get(&cwd, "fixed-counter")["result"]["objects"][0]["id"],
+        6100
+    );
+    success(cli(
+        &cwd,
+        &["object", "override-id", "FIXED_COUNTER", "automatic"],
+    ));
+    assert_ne!(
+        get(&cwd, "Fixed Counter")["result"]["objects"][0]["id"],
+        6100
+    );
+
+    std::fs::write(
+        cwd.join("sequential.aitcmd"),
+        "object create NumberVariable 'Later Name'\nobject set LATER_NAME value=31\n",
+    )
+    .unwrap();
+    success(cli(&cwd, &["run", "--file", "sequential.aitcmd"]));
+    assert_eq!(
+        get(&cwd, "later-name")["result"]["objects"][0]["properties"]["value"],
+        31
+    );
+    std::fs::remove_dir_all(cwd).unwrap();
+}
+
+#[test]
+fn readable_cli_reports_names_when_creating_listing_and_deleting() {
+    let _session = CLI_SESSION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cwd = temp_dir("aitd-readable-names");
+    new_session(&cwd);
+
+    let created = cli_readable(
+        &cwd,
+        &["object", "create", "NumberVariable", "Friendly Counter"],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created = String::from_utf8(created.stdout).unwrap();
+    assert!(created.contains("Friendly Counter"), "{created}");
+    assert!(!created.contains("allocated_ids"), "{created}");
+    assert!(!created.contains("changed_ids"), "{created}");
+
+    let listed = cli_readable(&cwd, &["object", "list"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains("Friendly Counter"), "{listed}");
+    assert!(!listed.contains("allocated_ids"), "{listed}");
+    assert!(!listed.contains("changed_ids"), "{listed}");
+
+    let deleted = cli_readable(&cwd, &["object", "delete", "friendly-counter"]);
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    let deleted = String::from_utf8(deleted.stdout).unwrap();
+    assert!(deleted.contains("Friendly Counter"), "{deleted}");
+    assert!(!deleted.contains("allocated_ids"), "{deleted}");
+    assert!(!deleted.contains("changed_ids"), "{deleted}");
+
+    std::fs::remove_dir_all(cwd).unwrap();
+}
+
+#[test]
+fn component_node_and_parameter_names_are_scoped_to_their_definition() {
+    let _session = CLI_SESSION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cwd = temp_dir("aitd-component-name-scopes");
+    new_session(&cwd);
+
+    for (component, root) in [
+        ("First Component", "First Root"),
+        ("Second Component", "Second Root"),
+    ] {
+        success(cli(
+            &cwd,
+            &[
+                "component",
+                "definition-create",
+                component,
+                root,
+                "Container",
+            ],
+        ));
+        success(cli(
+            &cwd,
+            &[
+                "component",
+                "node-create",
+                component,
+                "Shared Node",
+                "OutputNumber",
+            ],
+        ));
+        success(cli(
+            &cwd,
+            &[
+                "component",
+                "parameter-add-typed",
+                component,
+                "Shared Parameter",
+                "shared_node",
+                "value",
+                "Number",
+                "0",
+            ],
+        ));
+    }
+
+    let duplicate_node = failure(cli(
+        &cwd,
+        &[
+            "component",
+            "node-create",
+            "first_component",
+            "shared_node",
+            "OutputNumber",
+        ],
+    ));
+    assert!(duplicate_node["error"]["message"].as_str().is_some());
+    let duplicate_parameter = failure(cli(
+        &cwd,
+        &[
+            "component",
+            "parameter-add-typed",
+            "FIRST COMPONENT",
+            "shared_parameter",
+            "Shared Node",
+            "value",
+            "Number",
+            "0",
+        ],
+    ));
+    assert!(duplicate_parameter["error"]["message"].as_str().is_some());
+
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "parameter-remove",
+            "first_component",
+            "SHARED_PARAMETER",
+        ],
+    ));
+    let first = success(cli(
+        &cwd,
+        &["component", "get", "First Component", "--nodes"],
+    ));
+    let second = success(cli(
+        &cwd,
+        &["component", "get", "second_component", "--nodes"],
+    ));
+    assert_eq!(
+        first["result"]["component"]["parameters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(
+        second["result"]["component"]["parameters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    std::fs::remove_dir_all(cwd).unwrap();
+}
+
+#[test]
+fn component_reference_and_graphic_parameters_roundtrip_names() {
+    let _session = CLI_SESSION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cwd = temp_dir("aitd-component-typed-names");
+    let image_path = cwd.join("pixel.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([20, 180, 70, 255]))
+        .save(&image_path)
+        .unwrap();
+    new_session(&cwd);
+
+    for (object_type, name) in [
+        ("DataMask", "Screen"),
+        ("NumberVariable", "Default Counter"),
+        ("NumberVariable", "Override Counter"),
+    ] {
+        success(cli(&cwd, &["object", "create", object_type, name]));
+    }
+    for name in ["Default Artwork", "Override Artwork"] {
+        success(cli(
+            &cwd,
+            &[
+                "graphic",
+                "import",
+                image_path.to_str().unwrap(),
+                "--name",
+                name,
+            ],
+        ));
+    }
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "definition-create",
+            "Name Card",
+            "Root",
+            "Container",
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "node-create",
+            "Name Card",
+            "Input Node",
+            "InputNumber",
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "node-create",
+            "Name Card",
+            "Image Node",
+            "PictureGraphic",
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "node-children-set",
+            "Name Card",
+            "Root",
+            "Input_Node:0:0",
+            "Image_Node:0:0",
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "parameter-add-typed",
+            "Name Card",
+            "Counter Reference",
+            "Input Node",
+            "variable_reference",
+            "ObjectReference",
+            "Default Counter",
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "parameter-add-typed",
+            "Name Card",
+            "Artwork",
+            "Image Node",
+            "graphic",
+            "Graphic",
+            "Default Artwork",
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "instance-create",
+            "Current Card",
+            "Name Card",
+            "Screen",
+            "10",
+            "10",
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "override-set",
+            "current_card",
+            "counter_reference",
+            r#"{"name":"Override Counter"}"#,
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "override-set",
+            "Current Card",
+            "ARTWORK",
+            r#""Override Artwork""#,
+        ],
+    ));
+
+    let definition = success(cli(&cwd, &["component", "get", "NAME_CARD", "--nodes"]));
+    let parameters = definition["result"]["component"]["parameters"]
+        .as_array()
+        .unwrap();
+    assert!(parameters.iter().any(|parameter| {
+        parameter["name"] == "Counter Reference"
+            && parameter["default_value"]["name"] == "Default Counter"
+    }));
+    let graphic_id = success(cli(&cwd, &["graphic", "get", "override_artwork"]))["result"]
+        ["graphic"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let instance = success(cli(&cwd, &["instance", "get", "CURRENT CARD"]));
+    let instances = instance["result"]["instances"].as_array().unwrap();
+    assert_eq!(instances.len(), 1);
+    let overrides = instances[0]["overrides"].as_object().unwrap();
+    let reference_parameter = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "Counter Reference")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let artwork_parameter = parameters
+        .iter()
+        .find(|parameter| parameter["name"] == "Artwork")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(overrides[reference_parameter]["name"], "Override Counter");
+    assert_eq!(overrides[artwork_parameter], graphic_id);
+    std::fs::remove_dir_all(cwd).unwrap();
+}
+
+#[test]
+fn component_nested_object_targets_reject_numeric_ids() {
+    let _session = CLI_SESSION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cwd = temp_dir("aitd-component-nested-targets");
+    new_session(&cwd);
+    success(cli(&cwd, &["object", "create", "DataMask", "Screen"]));
+    success(cli(&cwd, &["object", "create", "Macro", "Press"]));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "definition-create",
+            "References",
+            "Root",
+            "WorkingSet",
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "node-create",
+            "References",
+            "Macro Node",
+            "Macro",
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "component",
+            "node-create",
+            "References",
+            "List Node",
+            "InputList",
+        ],
+    ));
+
+    for (args, detail) in [
+        (
+            vec![
+                "component",
+                "node-reference-set",
+                "References",
+                "Root",
+                "active_mask",
+                r#"{"ExternalObject":{"id":42}}"#,
+            ],
+            "ExternalObject",
+        ),
+        (
+            vec![
+                "component",
+                "node-macro-references-set",
+                "References",
+                "Macro Node",
+                r#"[{"event":"OnKeyPress","target":{"id":42}}]"#,
+            ],
+            "component macro references",
+        ),
+        (
+            vec![
+                "component",
+                "node-object-list-set",
+                "References",
+                "List Node",
+                r#"{"Required":[{"id":42}]}"#,
+            ],
+            "name",
+        ),
+    ] {
+        let failed = failure(cli(&cwd, &args));
+        let message = failed["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(detail) || message.contains("name"),
+            "unexpected rejection: {message}"
+        );
+    }
     std::fs::remove_dir_all(cwd).unwrap();
 }
 
@@ -376,10 +860,6 @@ fn resource_imports_and_exports_use_local_files() {
         &["reference", "set", "Pool", "active_mask", "Screen"],
     ));
     success(cli(&cwd, &["placement", "add", "Screen", "Host", "0", "0"]));
-    let screen_id = get(&cwd, "Screen")["result"]["objects"][0]["id"]
-        .as_u64()
-        .unwrap()
-        .to_string();
     std::fs::write(
         inputs.join("changes.aitcmd"),
         "object set Label value='007 {plain text}'\n\
@@ -387,8 +867,21 @@ fn resource_imports_and_exports_use_local_files() {
          graphic import pixel.png --name Pixel\n",
     )
     .unwrap();
+    let absolute_pixel = inputs.join("pixel.png").canonicalize().unwrap();
+    std::fs::write(
+        inputs.join("absolute-import.aitcmd"),
+        format!(
+            "graphic import {} --name 'Absolute Pixel'\n",
+            absolute_pixel.display()
+        ),
+    )
+    .unwrap();
 
     success(cli(&cwd, &["run", "--file", "inputs/changes.aitcmd"]));
+    success(cli(
+        &cwd,
+        &["run", "--file", "inputs/absolute-import.aitcmd"],
+    ));
     assert_eq!(
         get(&cwd, "Label")["result"]["objects"][0]["properties"]["value"],
         "007 {plain text}"
@@ -421,12 +914,19 @@ fn resource_imports_and_exports_use_local_files() {
             "available",
         ],
     ));
-    let asset_id = graphics["result"]["graphics"]["graphics"][0]["asset_id"]
-        .as_str()
-        .unwrap();
+    assert!(graphics["result"]["graphics"]["graphics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|graphic| graphic["name"] == "Pixel"));
+    let absolute_graphic = success(cli(&cwd, &["graphic", "get", "absolute-pixel"]));
+    assert_eq!(
+        absolute_graphic["result"]["graphic"]["name"],
+        "Absolute Pixel"
+    );
     success(cli(
         &cwd,
-        &["graphic", "export", asset_id, "--output", "graphic.png"],
+        &["graphic", "export", "pixel", "--output", "graphic.png"],
     ));
     assert!(std::fs::read(cwd.join("graphic.png"))
         .unwrap()
@@ -434,7 +934,7 @@ fn resource_imports_and_exports_use_local_files() {
 
     success(cli(
         &cwd,
-        &["preview", "--mask", &screen_id, "--output", "preview.png"],
+        &["preview", "--mask", "SCREEN", "--output", "preview.png"],
     ));
     assert!(std::fs::read(cwd.join("preview.png"))
         .unwrap()
@@ -501,30 +1001,61 @@ fn separate_shells_have_independent_sessions() {
 
 #[test]
 fn project_export_publishes_validated_artifacts_and_refuses_existing_outputs() {
-    let _session = CLI_SESSION.lock().unwrap_or_else(|error| error.into_inner());
+    let _session = CLI_SESSION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let cwd = temp_dir("aitd-project-export");
     new_session(&cwd);
-    success(cli(&cwd, &["object", "create", "NumberVariable", "Counter", "--id", "6100"]));
+    success(cli(
+        &cwd,
+        &[
+            "object",
+            "create",
+            "NumberVariable",
+            "Counter",
+            "--override-id",
+            "6100",
+        ],
+    ));
     success(cli(&cwd, &["object", "set", "Counter", "value=42"]));
     success(cli(&cwd, &["export", "project", "--output-dir", "build"]));
     let saved = std::fs::read(cwd.join("build/project.aitp")).unwrap();
     let restored = EditorProject::load_project(saved.clone()).unwrap();
-    assert_eq!(std::fs::read(cwd.join("build/project.iop")).unwrap(), restored.export_iop().unwrap());
+    assert_eq!(
+        std::fs::read(cwd.join("build/project.iop")).unwrap(),
+        restored.export_iop().unwrap()
+    );
     let rejected = failure(cli(&cwd, &["export", "project", "--output-dir", "build"]));
     assert_eq!(rejected["error"]["code"], "OUTPUT_EXISTS");
-    assert_eq!(std::fs::read(cwd.join("build/project.aitp")).unwrap(), saved);
+    assert_eq!(
+        std::fs::read(cwd.join("build/project.aitp")).unwrap(),
+        saved
+    );
     std::fs::create_dir(cwd.join("empty")).unwrap();
-    assert_eq!(failure(cli(&cwd, &["export", "project", "--output-dir", "empty"]))["error"]["code"], "OUTPUT_EXISTS");
+    assert_eq!(
+        failure(cli(&cwd, &["export", "project", "--output-dir", "empty"]))["error"]["code"],
+        "OUTPUT_EXISTS"
+    );
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink("missing", cwd.join("link")).unwrap();
-        assert_eq!(failure(cli(&cwd, &["export", "project", "--output-dir", "link"]))["error"]["code"], "OUTPUT_EXISTS");
+        assert_eq!(
+            failure(cli(&cwd, &["export", "project", "--output-dir", "link"]))["error"]["code"],
+            "OUTPUT_EXISTS"
+        );
     }
     std::fs::write(cwd.join("invalid.aitp"), incompatible_project_bytes()).unwrap();
     success(cli(&cwd, &["project", "load", "invalid.aitp", "--discard"]));
-    assert_eq!(failure(cli(&cwd, &["export", "project", "--output-dir", "failed"]))["error"]["code"], "VALIDATION_FAILED");
+    assert_eq!(
+        failure(cli(&cwd, &["export", "project", "--output-dir", "failed"]))["error"]["code"],
+        "VALIDATION_FAILED"
+    );
     assert!(!cwd.join("failed").exists());
-    assert!(std::fs::read_dir(&cwd).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".aitd-export-")));
+    assert!(std::fs::read_dir(&cwd).unwrap().all(|entry| !entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".aitd-export-")));
     success(cli(&cwd, &["project", "close", "--discard"]));
     std::fs::remove_dir_all(cwd).unwrap();
 }

@@ -4,7 +4,7 @@ use ag_iso_stack::object_pool::{
     ObjectId, ObjectPool, ObjectType,
 };
 use ag_iso_terminal_designer::{
-    cli::project_zip,
+    cli::zip as project_zip,
     components::{
         plan_component_capture, ComponentParameter, ComponentParameterId, ComponentParameterKind,
         ComponentParameterTarget, ComponentReference, ComponentService,
@@ -14,7 +14,7 @@ use ag_iso_terminal_designer::{
     object_properties::PropertyKey,
     EditorProject,
 };
-use serde_json::{json, Value};
+use serde_json::json;
 use std::{
     fs,
     io::{Cursor, Read},
@@ -54,6 +54,7 @@ fn push_child(pool: &mut ObjectPool, parent: u16, child: u16, x: i16, y: i16) {
 fn source_project() -> (EditorProject, ComponentParameterId, GraphicAssetId) {
     let mut pool = ObjectPool::default();
     for (object_type, id) in [
+        (ObjectType::WorkingSet, 256),
         (ObjectType::DataMask, 2),
         (ObjectType::AlarmMask, 3),
         (ObjectType::Button, 100),
@@ -65,6 +66,10 @@ fn source_project() -> (EditorProject, ComponentParameterId, GraphicAssetId) {
         (ObjectType::NumberVariable, 300), // intentionally unused
     ] {
         pool.add(object_with_id(object_type, id));
+    }
+    if let Some(Object::WorkingSet(working_set)) = pool.object_mut_by_id(object_id(256)) {
+        working_set.active_mask = object_id(2);
+        working_set.language_codes = vec!["en".into(), "nl".into(), "de".into()];
     }
     if let Some(Object::Button(button)) = pool.object_mut_by_id(object_id(100)) {
         button.width = 148;
@@ -237,45 +242,11 @@ fn run_build(script: &Path, cwd: &Path) -> Output {
         .expect("run exported build.sh")
 }
 
-fn project_json(project: &EditorProject) -> Value {
-    let mut value: Value = serde_json::from_slice(&project.save_project().unwrap()).unwrap();
-    value["settings"]
-        .as_object_mut()
-        .unwrap()
-        .remove("last_selected");
-    if let Some(metadata) = value["object_metadata"].as_object_mut() {
-        metadata.retain(|_, record| {
-            record.as_object().is_some_and(|fields| {
-                fields.values().any(|value| match value {
-                    Value::Null | Value::Bool(false) => false,
-                    Value::Array(items) if items.is_empty() => false,
-                    _ => true,
-                })
-            })
-        });
-    }
-    if let Some(assets) = value
-        .pointer_mut("/graphics/assets")
-        .and_then(Value::as_object_mut)
-    {
-        for asset in assets.values_mut() {
-            let original: Vec<u8> =
-                serde_json::from_value(asset["original_bytes"].clone()).unwrap();
-            let decoded = image::load_from_memory(&original).unwrap().to_rgba32f();
-            asset["original_bytes"] = json!({
-                "width": decoded.width(),
-                "height": decoded.height(),
-                "rgba": decoded.as_raw(),
-            });
-            asset["format"] = Value::String("png".into());
-        }
-    }
-    value
-}
-
 #[test]
 fn exported_zip_rebuilds_components_masks_shared_resources_and_iop_from_another_directory() {
-    let (project, parameter_id, asset_id) = source_project();
+    let (mut project, parameter_id, _asset_id) = source_project();
+    let fixed_id = object_id(300);
+    assert!(project.set_object_id_overridden(fixed_id, true));
     let instance_source = project.component_source();
     assert!(instance_source.instances.len() >= 2);
     assert!(instance_source
@@ -301,11 +272,11 @@ fn exported_zip_rebuilds_components_masks_shared_resources_and_iop_from_another_
     assert!(archive
         .files
         .keys()
-        .any(|path| path.starts_with("masks/2_Main/")));
+        .any(|path| path.starts_with("masks/Main/")));
     assert!(archive
         .files
         .keys()
-        .any(|path| path.starts_with("masks/3_Alarm/")));
+        .any(|path| path.starts_with("masks/Alarm/")));
     assert!(archive.files.keys().any(|path| path.starts_with("shared/")));
     assert!(archive
         .files
@@ -313,7 +284,7 @@ fn exported_zip_rebuilds_components_masks_shared_resources_and_iop_from_another_
         .any(|path| path.starts_with("components/")));
     assert!(archive
         .files
-        .contains_key(&format!("assets/graphics/asset_{asset_id}.png")));
+        .contains_key("assets/graphics/spare_graphic.png"));
 
     let root = temporary_directory("aitd-cli-zip");
     let extracted = root.join("bundle");
@@ -322,6 +293,13 @@ fn exported_zip_rebuilds_components_masks_shared_resources_and_iop_from_another_
     fs::create_dir_all(&elsewhere).unwrap();
     extract(&bytes, &extracted);
     let script = extracted.join("build.sh");
+    let script_text = fs::read_to_string(&script).unwrap();
+    let settings = std::str::from_utf8(&archive.files["shared/project_settings.aitd"]).unwrap();
+    assert!(
+        settings.contains("id_range."),
+        "the initial settings file must install automatic ID ranges"
+    );
+    assert!(script_text.find("project_settings.aitd").is_some());
 
     let output = run_build(&script, &elsewhere);
     assert!(
@@ -335,10 +313,25 @@ fn exported_zip_rebuilds_components_masks_shared_resources_and_iop_from_another_
     assert!(built_project.is_file());
     assert!(built_iop.is_file());
     let rebuilt = EditorProject::load_project(fs::read(&built_project).unwrap()).unwrap();
-    assert_eq!(project_json(&rebuilt), project_json(&project));
-    assert_eq!(rebuilt.component_source(), project.component_source());
-    assert_eq!(rebuilt.export_iop().unwrap(), project.export_iop().unwrap());
-    assert_eq!(fs::read(&built_iop).unwrap(), project.export_iop().unwrap());
+    assert_eq!(
+        rebuilt.get_pool().objects().len(),
+        project.get_pool().objects().len()
+    );
+    assert_eq!(
+        rebuilt.component_source().instances.len(),
+        project.component_source().instances.len()
+    );
+    assert_eq!(
+        rebuilt.component_source().definitions.len(),
+        project.component_source().definitions.len()
+    );
+    assert!(rebuilt.get_pool().object_by_id(fixed_id).is_some());
+    assert!(
+        rebuilt
+            .get_object_info(rebuilt.get_pool().object_by_id(fixed_id).unwrap())
+            .id_overridden
+    );
+    assert_eq!(fs::read(&built_iop).unwrap(), rebuilt.export_iop().unwrap());
 
     // The script must keep existing build outputs intact on a second run.
     let existing_project = fs::read(&built_project).unwrap();

@@ -124,10 +124,7 @@ pub fn review_change(
             true
         }
         Err(error) => {
-            ui.colored_label(
-                egui::Color32::RED,
-                format!("This change cannot be applied: {error}"),
-            );
+            crate::ui_style::error_text(ui, &format!("This change cannot be applied: {error}"));
             false
         }
     }

@@ -97,6 +97,11 @@ pub struct EditAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EditActionKind {
+    DeferredCommand {
+        command: serde_json::Value,
+        base: std::path::PathBuf,
+        assets: BTreeMap<String, Vec<u8>>,
+    },
     Operation {
         operation: Operation,
     },
@@ -122,8 +127,25 @@ pub enum EditActionKind {
         edit: RelationshipEdit,
     },
     ObjectDuplicate {
-        object_id: u16,
+        object: ObjectTarget,
         name: Option<String>,
+    },
+    ObjectCreate {
+        object_type: ObjectType,
+        name: String,
+        override_id: Option<u16>,
+    },
+    ObjectRename {
+        object: ObjectTarget,
+        name: String,
+    },
+    ObjectIdOverride {
+        object: ObjectTarget,
+        id_overridden: bool,
+        new_id: Option<u16>,
+    },
+    ObjectOrder {
+        names: Vec<String>,
     },
     ObjectIdAuto {
         object_id: u16,
@@ -451,6 +473,19 @@ use ag_iso_stack::object_pool::{
 fn apply_kind(project: &mut EditorProject, action: EditActionKind) -> Result<(), String> {
     use EditActionKind as A;
     match action {
+        A::DeferredCommand {
+            command,
+            base,
+            assets,
+        } => {
+            let actions =
+                crate::cli::commands::apply_deferred_command(project, command, base, assets)
+                    .map_err(|error| error.to_string())?;
+            for action in actions {
+                apply_kind(project, action.kind)?;
+            }
+            Ok(())
+        }
         A::ComponentCapture {
             root,
             name,
@@ -521,8 +556,52 @@ fn apply_kind(project: &mut EditorProject, action: EditActionKind) -> Result<(),
             instance_id,
             parameter,
         } => component_reset(project, instance_id, &parameter),
-        A::ObjectDuplicate { object_id, name } => {
-            object_duplicate(project, object_id, name.as_deref())
+        A::ObjectDuplicate { object, name } => object_duplicate(project, &object, name.as_deref()),
+        A::ObjectCreate {
+            object_type,
+            name,
+            override_id,
+        } => {
+            validate_object_name(project, &name, None)?;
+            operation(
+                project,
+                &Operation::CreateObject {
+                    object_id: override_id,
+                    object_type,
+                    name,
+                },
+            )
+        }
+        A::ObjectRename { object, name } => {
+            let object_id = resolve_object(project, &object)?;
+            validate_object_name(project, &name, Some(object_id))?;
+            operation(project, &Operation::RenameObject { object, name })
+        }
+        A::ObjectIdOverride {
+            object,
+            id_overridden,
+            new_id,
+        } => {
+            let object_id = resolve_object(project, &object)?;
+            if let Some(new_id) = new_id {
+                operation(
+                    project,
+                    &Operation::SetObjectIdAssignment {
+                        object_id,
+                        new_id,
+                        overridden: id_overridden,
+                    },
+                )
+            } else {
+                object_id_auto(project, object_id)
+            }
+        }
+        A::ObjectOrder { names } => {
+            let object_ids = names
+                .iter()
+                .map(|name| resolve_object(project, &ObjectTarget::Name { name: name.clone() }))
+                .collect::<Result<Vec<_>, _>>()?;
+            operation(project, &Operation::ReorderObjects { object_ids })
         }
         A::ObjectIdAuto { object_id } => object_id_auto(project, object_id),
         A::ObjectIdReassign {
@@ -733,14 +812,19 @@ fn component_node_reference(
     }
     let reference = if target == "null" {
         ComponentReference::Null
-    } else if let Some(id) = target.strip_prefix("node:") {
-        let id = ComponentNodeId(uuid::Uuid::parse_str(id).map_err(|e| e.to_string())?);
-        if !definition.nodes.iter().any(|node| node.id == id) {
-            return Err("Unknown internal target node".into());
-        }
-        ComponentReference::Internal(id)
     } else {
-        ComponentReference::ExternalObject(object_target(project, target)?)
+        let node_name = target.strip_prefix("node:").unwrap_or(target);
+        let matches: Vec<_> = definition
+            .nodes
+            .iter()
+            .filter(|candidate| crate::smart_naming::names_equal(&candidate.name, node_name))
+            .map(|candidate| candidate.id)
+            .collect();
+        match matches.as_slice() {
+            [id] => ComponentReference::Internal(*id),
+            [] => ComponentReference::ExternalObject(object_target(project, target)?),
+            _ => return Err(format!("Ambiguous component node name '{node_name}'")),
+        }
     };
     let bound = definition.parameters.iter_mut().find(|parameter| {
         parameter.target_node == node_id
@@ -840,9 +924,10 @@ fn macro_append(
     arguments: &[String],
 ) -> Result<(), String> {
     let object_id = resolve_object(project, target)?;
+    let arguments = resolve_macro_object_arguments(project, instruction, arguments)?;
     let encoded = crate::macro_authoring::encode_macro_instruction(
         instruction,
-        arguments,
+        &arguments,
         project.vt_version,
     )?;
     let version = project.vt_version;
@@ -868,6 +953,120 @@ fn macro_append(
         .map_err(|error| error.to_string())
 }
 
+pub(crate) fn resolve_macro_object_arguments(
+    project: &EditorProject,
+    instruction: &str,
+    arguments: &[String],
+) -> Result<Vec<String>, String> {
+    let mut indexes: Vec<(usize, bool)> = match instruction {
+        "hide-show-object"
+        | "enable-disable-object"
+        | "select-input-object"
+        | "change-size"
+        | "change-background-colour"
+        | "change-numeric-value"
+        | "change-end-point"
+        | "change-font-attributes"
+        | "change-attribute"
+        | "change-priority"
+        | "change-string-value"
+        | "change-string-value-wide"
+        | "change-polygon-point"
+        | "change-polygon-scale" => vec![(0, false)],
+        "change-child-location" | "change-child-position" => vec![(0, false), (1, false)],
+        "change-line-attributes" => vec![(0, false)],
+        "change-fill-attributes" => vec![(0, false), (3, true)],
+        "change-active-mask" => vec![(0, false), (1, true)],
+        "change-soft-key-mask" => vec![(1, true), (2, true)],
+        "change-list-item" => vec![(0, false), (2, true)],
+        "change-object-label" => vec![(0, false), (1, true), (3, true)],
+        "select-colour-map-or-palette" => vec![(0, true)],
+        "execute-extended-macro" => vec![(0, false)],
+        "execute-macro" => vec![(0, false)],
+        "lock-unlock-mask" => vec![(1, false)],
+        "graphics-context" => {
+            let mut result = vec![(0, false)];
+            if matches!(
+                arguments.get(1).map(String::as_str),
+                Some("set-line-attributes" | "set-fill-attributes" | "set-font-attributes")
+            ) {
+                result.push((2, true));
+            } else if matches!(
+                arguments.get(1).map(String::as_str),
+                Some(
+                    "draw-vt-object"
+                        | "copy-canvas-to-picture-graphic"
+                        | "copy-viewport-to-picture-graphic"
+                )
+            ) {
+                result.push((2, false));
+            }
+            result
+        }
+        _ => Vec::new(),
+    };
+    indexes.sort_unstable();
+    let mut resolved = arguments.to_vec();
+    for (index, nullable) in indexes {
+        let Some(value) = resolved.get_mut(index) else {
+            continue;
+        };
+        if nullable && value == "null" {
+            continue;
+        }
+        let literal_name = value.strip_prefix("name:").unwrap_or(value);
+        *value = crate::cli::names::object_id(project, literal_name)?.to_string();
+    }
+    let value_index = match instruction {
+        "change-attribute" => Some(2),
+        "change-numeric-value" => Some(1),
+        _ => None,
+    };
+    if let Some(value_index) = value_index {
+        let target_id = resolved
+            .first()
+            .and_then(|value| value.parse::<u16>().ok())
+            .ok_or_else(|| "Macro attribute target is missing or invalid".to_owned())?;
+        let target = project
+            .get_pool()
+            .object_by_id(
+                ObjectId::new(target_id).map_err(|e| format!("Invalid macro target ID: {e:?}"))?,
+            )
+            .ok_or_else(|| format!("Macro target object {target_id} not found"))?;
+        let aid = if instruction == "change-attribute" {
+            Some(
+                arguments
+                    .get(1)
+                    .ok_or("Change Attribute requires an AID")?
+                    .parse::<u8>()
+                    .map_err(|_| "Change Attribute AID must be an integer")?,
+            )
+        } else {
+            None
+        };
+        if let crate::macro_id_remap::MacroAttributeValueKind::LocalObjectId16 { value_offset } =
+            crate::macro_id_remap::macro_attribute_value_kind(
+                target.object_type(),
+                aid,
+                project.vt_version(),
+            )
+        {
+            if let Some(value) = resolved.get_mut(value_index) {
+                let id = if value == "null" {
+                    u16::MAX
+                } else {
+                    crate::cli::names::object_id(
+                        project,
+                        value.strip_prefix("name:").unwrap_or(value),
+                    )?
+                };
+                *value = (u32::from(id) << (value_offset * 8)).to_string();
+            }
+        }
+    }
+    Ok(resolved)
+}
+
 fn object_metadata_set(
     project: &mut EditorProject,
     target: &ObjectTarget,
@@ -878,6 +1077,18 @@ fn object_metadata_set(
     id_overridden: Option<bool>,
 ) -> Result<(), String> {
     let object_id = resolve_object(project, target)?;
+    if let Some(requested) = &name {
+        let id =
+            ObjectId::new(object_id).map_err(|error| format!("Invalid object ID: {error:?}"))?;
+        let object = project
+            .get_pool()
+            .object_by_id(id)
+            .ok_or_else(|| format!("Object {object_id} not found"))?;
+        let effective = requested
+            .clone()
+            .unwrap_or_else(|| project.get_object_info(object).get_name(object));
+        validate_object_name(project, &effective, Some(object_id))?;
+    }
     project
         .edit_source("Edit object metadata", |pool, _, _, object_info| {
             let id = ObjectId::new(object_id).map_err(|_| {
@@ -950,19 +1161,10 @@ fn find_parameter<'a>(
     definition: &'a ComponentDefinition,
     token: &str,
 ) -> Result<&'a ComponentParameter, String> {
-    if let Ok(id) = uuid::Uuid::parse_str(token).map(ComponentParameterId) {
-        if let Some(parameter) = definition
-            .parameters
-            .iter()
-            .find(|parameter| parameter.id == id)
-        {
-            return Ok(parameter);
-        }
-    }
     let matches: Vec<_> = definition
         .parameters
         .iter()
-        .filter(|parameter| parameter.name == token)
+        .filter(|parameter| crate::smart_naming::names_equal(&parameter.name, token))
         .collect();
     match matches.as_slice() {
         [parameter] => Ok(parameter),
@@ -986,10 +1188,10 @@ fn coerce_parameter_value(
             "false" => Ok(Value::Bool(false)),
             _ => Err(format!("'{lexical}' must be true or false")),
         },
-        ComponentParameterKind::Graphic => lexical
-            .parse::<u16>()
-            .map(|id| json!(id))
-            .map_err(|_| format!("'{lexical}' must be a graphic ID")),
+        ComponentParameterKind::Graphic => {
+            let id = crate::cli::names::graphic_asset_id(project, lexical)?;
+            serde_json::to_value(id).map_err(|error| error.to_string())
+        }
         ComponentParameterKind::ObjectReference => {
             if lexical == "null" {
                 Ok(Value::Null)
@@ -1027,9 +1229,10 @@ fn parse_node_property_value(
 
 fn object_duplicate(
     project: &mut EditorProject,
-    source_id: u16,
+    source_target: &ObjectTarget,
     requested_name: Option<&str>,
 ) -> Result<(), String> {
+    let source_id = resolve_object(project, source_target)?;
     let source = project
         .get_pool()
         .object_by_id(ObjectId::new(source_id).map_err(|e| format!("Invalid object ID: {e:?}"))?)
@@ -1051,12 +1254,14 @@ fn object_duplicate(
         .get_pool()
         .objects()
         .iter()
-        .map(|object| project.get_object_info(object).get_name(object))
+        .map(|object| {
+            crate::smart_naming::normalized_name(&project.get_object_info(object).get_name(object))
+        })
         .collect();
     let mut name = base_name.clone();
     let mut suffix = 2_u32;
-    while names.contains(&name) {
-        name = format!("{base_name} ({suffix})");
+    while names.contains(&crate::smart_naming::normalized_name(&name)) {
+        name = format!("{base_name}-{suffix}");
         suffix += 1;
     }
     let id = ObjectId::new(id).map_err(|e| format!("Invalid object ID: {e:?}"))?;
@@ -1078,6 +1283,43 @@ fn object_duplicate(
             info: Some(info),
         },
     )?;
+    Ok(())
+}
+
+fn validate_object_name(
+    project: &EditorProject,
+    candidate: &str,
+    exclude_id: Option<u16>,
+) -> Result<(), String> {
+    let normalized = crate::smart_naming::normalized_name(candidate);
+    if normalized.is_empty() {
+        return Err("Object name cannot be empty".into());
+    }
+    if let Some(id) = exclude_id {
+        if project
+            .get_pool()
+            .object_by_id(
+                ObjectId::new(id).map_err(|error| format!("Invalid object ID: {error:?}"))?,
+            )
+            .is_some_and(|object| {
+                crate::smart_naming::names_equal(
+                    &project.get_object_info(object).get_name(object),
+                    candidate,
+                )
+            })
+        {
+            return Ok(());
+        }
+    }
+    if project.get_pool().objects().iter().any(|object| {
+        Some(object.id().value()) != exclude_id
+            && crate::smart_naming::names_equal(
+                &project.get_object_info(object).get_name(object),
+                candidate,
+            )
+    }) {
+        return Err(format!("An object named '{candidate}' already exists"));
+    }
     Ok(())
 }
 
@@ -1589,20 +1831,8 @@ fn find_placement_index(
 }
 
 fn object_target(project: &EditorProject, value: &str) -> Result<ObjectTarget, String> {
-    let target = if let Some(name) = value.strip_prefix("name:") {
-        ObjectTarget::Name {
-            name: name.to_owned(),
-        }
-    } else if let Some(hex) = value.strip_prefix("0x") {
-        ObjectTarget::id(
-            u16::from_str_radix(hex, 16).map_err(|_| format!("Invalid object ID '{value}'"))?,
-        )
-    } else if let Ok(id) = value.parse::<u16>() {
-        ObjectTarget::id(id)
-    } else {
-        ObjectTarget::Name {
-            name: value.to_owned(),
-        }
+    let target = ObjectTarget::Name {
+        name: value.strip_prefix("name:").unwrap_or(value).to_owned(),
     };
     // Resolve names now so callers get useful ambiguity and missing-name errors
     // before the lower-level operation validator reports a generic target error.
@@ -1671,27 +1901,7 @@ fn get_path<'a>(value: &'a Value, path: &str) -> Result<&'a Value, String> {
 fn resolve_object(project: &EditorProject, target: &ObjectTarget) -> Result<u16, String> {
     match target {
         ObjectTarget::Id { id } => Ok(*id),
-        ObjectTarget::Name { name } => {
-            let matches: Vec<_> = project
-                .get_pool()
-                .objects()
-                .iter()
-                .filter(|object| project.get_object_info(object).get_name(object) == *name)
-                .map(|object| object.id().value())
-                .collect();
-            match matches.as_slice() {
-                [id] => Ok(*id),
-                [] => Err(format!("Unknown object name '{name}'")),
-                _ => Err(format!(
-                    "Ambiguous object name '{name}': {}",
-                    matches
-                        .iter()
-                        .map(u16::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )),
-            }
-        }
+        ObjectTarget::Name { name } => crate::cli::names::object_id(project, name),
     }
 }
 

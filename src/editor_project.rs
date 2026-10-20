@@ -982,7 +982,12 @@ impl EditorProject {
                 info.description.is_some() || info.notes.is_some() || !info.tags.is_empty()
             })
             .map(|(id, info)| {
-                (id.value(), info.description.clone(), info.notes.clone(), info.tags.clone())
+                (
+                    id.value(),
+                    info.description.clone(),
+                    info.notes.clone(),
+                    info.tags.clone(),
+                )
             })
             .collect();
         object_annotations.sort_by_key(|(id, ..)| *id);
@@ -1264,10 +1269,14 @@ impl EditorProject {
 
     pub fn set_object_name(&self, object: &Object, name: String) {
         let mut object_info = self.mut_object_info.borrow_mut();
-        if !name.is_empty()
-            && object_info
-                .iter()
-                .any(|(id, info)| *id != object.id() && info.name.as_deref() == Some(name.as_str()))
+        if !smart_naming::normalized_name(&name).is_empty()
+            && self.pool.objects().iter().any(|existing_object| {
+                existing_object.id() != object.id()
+                    && object_info
+                        .get(&existing_object.id())
+                        .map(|info| info.get_name(existing_object))
+                        .is_some_and(|existing| smart_naming::names_equal(&existing, &name))
+            })
         {
             self.last_operation_error
                 .replace(Some(format!("Object name already exists: {name}")));
@@ -1419,7 +1428,10 @@ impl EditorProject {
         let base_name = format!("Copy of {source_name}");
         let mut name = base_name.clone();
         let mut suffix = 2u32;
-        while names.contains_key(&name) {
+        while names
+            .keys()
+            .any(|existing| smart_naming::names_equal(existing, &name))
+        {
             name = format!("{base_name} ({suffix})");
             suffix += 1;
         }
@@ -1789,6 +1801,10 @@ impl EditorProject {
         }
 
         let mut type_counts = [0usize; 256];
+        let mut normalized_names: HashSet<_> = existing_names
+            .keys()
+            .map(|name| smart_naming::normalized_name(name))
+            .collect();
         for object_type in existing_names.values() {
             type_counts[u8::from(*object_type) as usize] += 1;
         }
@@ -1802,16 +1818,17 @@ impl EditorProject {
             {
                 continue;
             }
-            let new_name = smart_naming::generate_smart_name_from_count(
+            let new_name = smart_naming::generate_smart_name_from_count_with_normalized_names(
                 object_type,
-                &existing_names,
                 type_counts[u8::from(object_type) as usize],
+                &normalized_names,
             );
 
             // Update the count for the new name to ensure uniqueness
             existing_names
                 .entry(new_name.clone())
                 .or_insert(object_type);
+            normalized_names.insert(smart_naming::normalized_name(&new_name));
             type_counts[u8::from(object_type) as usize] += 1;
 
             let info = object_info
@@ -1990,6 +2007,7 @@ impl EditorProject {
         }
 
         editor_project.components = project.components.clone();
+        crate::components::ensure_instance_names(&mut editor_project.components);
         editor_project.graphics = project.graphics.clone();
         materialize_project(&editor_project).map_err(|e| e.to_string())?;
         editor_project.sync_component_selection();
@@ -3605,6 +3623,66 @@ mod tests {
     }
 
     #[test]
+    fn object_names_match_without_case_or_separator_differences() {
+        let mut project = EditorProject::from(ObjectPool::default());
+        let id = project
+            .create_object(ObjectType::Button, "Start Button".into())
+            .expect("button should be created");
+
+        let resolved = crate::operations::resolve_target(
+            &ObjectTarget::Name {
+                name: "START_button".into(),
+            },
+            &project.pool,
+            &project.object_info.borrow(),
+        )
+        .expect("normalized name should resolve");
+        assert_eq!(resolved, id);
+
+        assert!(project
+            .create_object(ObjectType::Button, "start-button".into())
+            .is_none());
+        assert!(project
+            .take_operation_error()
+            .is_some_and(|error| error.contains("already in use")));
+        assert_eq!(
+            project.object_info.borrow()[&id].name.as_deref(),
+            Some("Start Button")
+        );
+    }
+
+    #[test]
+    fn legacy_unnamed_objects_use_the_same_names_for_lookup_and_uniqueness() {
+        let mut project = EditorProject::from(ObjectPool::default());
+        let id = project
+            .create_object(ObjectType::Button, "Old button".into())
+            .unwrap();
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&project.save_project().unwrap()).unwrap();
+        saved["object_metadata"][id.value().to_string()]["name"] = serde_json::Value::Null;
+        let mut loaded = EditorProject::load_project(serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(
+            crate::cli::names::object_id(&loaded, "BUTTON").unwrap(),
+            id.value()
+        );
+        assert_eq!(
+            crate::operations::resolve_target(
+                &ObjectTarget::Name {
+                    name: "button".into()
+                },
+                &loaded.pool,
+                &loaded.object_info.borrow(),
+            )
+            .unwrap(),
+            id
+        );
+        assert!(loaded
+            .create_object(ObjectType::Button, "button".into())
+            .is_none());
+        assert!(loaded.object_info.borrow()[&id].name.is_none());
+    }
+
+    #[test]
     fn operation_transaction_object_clone_check() {
         // Test to verify that Object implements Clone
         let obj = default_object(ObjectType::WorkingSet);
@@ -3907,7 +3985,7 @@ mod tests {
         let mut project = EditorProject::from(pool);
         project.mark_saved();
         let actions = crate::cli::commands::parse_commands(
-            "object metadata 27 --notes 'Review after field testing\nkeep the alarm label'",
+            "object metadata Button --notes 'Review after field testing\nkeep the alarm label'",
             std::path::Path::new("."),
             &|_| unreachable!(),
         )

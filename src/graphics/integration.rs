@@ -75,6 +75,7 @@ impl GraphicService {
             .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))?;
         let id = asset.id;
         project.edit_source("Upload graphic", |_, _, graphics, _| {
+            validate_graphic_name(graphics, &asset.name, None)?;
             graphics.assets.insert(id, asset);
             Ok(())
         })?;
@@ -126,6 +127,7 @@ impl GraphicService {
                     format!("Graphic asset UUID {id} already exists"),
                 ));
             }
+            validate_graphic_name(graphics, &asset.name, None)?;
             graphics.assets.insert(id, asset);
             Ok(())
         })?;
@@ -163,6 +165,7 @@ impl GraphicService {
         name: String,
     ) -> crate::components::ComponentResult<()> {
         project.edit_source("Rename available graphic", |_, _, graphics, _| {
+            validate_graphic_name(graphics, &name, Some(id))?;
             graphics
                 .assets
                 .get_mut(&id)
@@ -193,6 +196,13 @@ impl GraphicService {
         project.edit_source(
             "Convert graphic into PictureGraphic",
             |pool, _, graphics, info| {
+                let target = ObjectId::new(object_id).ok().ok_or_else(|| {
+                    ComponentError::new("GRAPHIC_TARGET_INVALID", "Invalid PictureGraphic ID")
+                })?;
+                let asset = graphics.assets.get(&asset_id).ok_or_else(|| {
+                    ComponentError::new("GRAPHIC_ASSET_NOT_FOUND", "Unknown graphic")
+                })?;
+                validate_pool_graphic_name(pool, info, &asset.name, Some(target))?;
                 let asset = consume_into_picture_graphic(pool, graphics, asset_id, object_id)?;
                 let object = pool
                     .object_by_id(ObjectId::new(object_id).unwrap())
@@ -220,6 +230,7 @@ impl GraphicService {
                 let asset = graphics.assets.get(&asset_id).cloned().ok_or_else(|| {
                     ComponentError::new("GRAPHIC_ASSET_NOT_FOUND", "Unknown graphic")
                 })?;
+                validate_pool_graphic_name(pool, info, &asset.name, None)?;
                 let range = ranges.range_for(ObjectType::PictureGraphic);
                 let id = (range.start..=range.end)
                     .find(|id| {
@@ -267,6 +278,60 @@ impl GraphicService {
         )?;
         Ok(created_id.expect("successful conversion creates an object ID"))
     }
+}
+
+fn validate_graphic_name(
+    graphics: &GraphicLibrary,
+    name: &str,
+    except: Option<GraphicAssetId>,
+) -> crate::components::ComponentResult<()> {
+    let normalized = crate::smart_naming::normalized_name(name);
+    if normalized.is_empty() {
+        return Err(ComponentError::new(
+            "GRAPHIC_NAME_INVALID",
+            "Graphic names must not be empty",
+        ));
+    }
+    if graphics.assets.values().any(|asset| {
+        Some(asset.id) != except && crate::smart_naming::normalized_name(&asset.name) == normalized
+    }) {
+        return Err(ComponentError::new(
+            "GRAPHIC_NAME_CONFLICT",
+            format!("Graphic name already exists: {name}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pool_graphic_name(
+    pool: &ObjectPool,
+    info: &HashMap<ObjectId, crate::ObjectInfo>,
+    name: &str,
+    except: Option<ObjectId>,
+) -> crate::components::ComponentResult<()> {
+    let normalized = crate::smart_naming::normalized_name(name);
+    if normalized.is_empty() {
+        return Err(ComponentError::new(
+            "GRAPHIC_NAME_INVALID",
+            "Graphic names must not be empty",
+        ));
+    }
+    if pool.objects().iter().any(|object| {
+        Some(object.id()) != except
+            && crate::smart_naming::normalized_name(
+                &info
+                    .get(&object.id())
+                    .cloned()
+                    .unwrap_or_else(|| crate::ObjectInfo::new(object))
+                    .get_name(object),
+            ) == normalized
+    }) {
+        return Err(ComponentError::new(
+            "GRAPHIC_NAME_CONFLICT",
+            format!("An object already uses graphic name: {name}"),
+        ));
+    }
+    Ok(())
 }
 
 pub fn catalog(

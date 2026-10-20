@@ -1662,6 +1662,7 @@ pub fn property_array_element_schemas(
     let mut schemas = std::collections::BTreeMap::new();
     let element = match property {
         PropertyKey::Points => serde_json::json!({"x":0,"y":0}),
+        PropertyKey::LanguageCodes => serde_json::json!(""),
         PropertyKey::ColourMap | PropertyKey::Data => serde_json::json!(0u8),
         PropertyKey::Colours => serde_json::to_value(ag_iso_stack::object_pool::Colour::BLACK)
             .expect("colours serialize"),

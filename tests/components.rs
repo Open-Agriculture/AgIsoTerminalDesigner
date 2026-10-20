@@ -378,6 +378,7 @@ fn shared_visual_dependencies_are_copied_and_internal_sharing_is_preserved() {
         .unwrap()
         .clone();
     second_label.id = ComponentNodeId::default();
+    second_label.name = format!("Second {}", second_label.name);
     master
         .nodes
         .iter_mut()

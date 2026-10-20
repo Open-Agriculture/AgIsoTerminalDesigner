@@ -550,9 +550,9 @@ impl CanvasState {
             pairs.push((root, offset, rect));
             x += rect.width() + 32.0;
             if let Some(error) = keys.error {
-                ui.colored_label(
-                    crate::ui_style::palette(ui).error,
-                    format!("{}: {error}", project.format_object_id(root)),
+                crate::ui_style::error_text(
+                    ui,
+                    &format!("{}: {error}", project.format_object_id(root)),
                 );
             }
         }
@@ -656,7 +656,7 @@ impl CanvasState {
         let mut commands = vec![];
         self.toolbar(ui, project, &scene, &items, &mut commands);
         if let Some(error) = &self.error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
+            crate::ui_style::error_text(ui, error);
         }
         let size = ui.available_size().max(egui::vec2(100.0, 100.0));
         let (viewport, _) = ui.allocate_exact_size(size, egui::Sense::hover());

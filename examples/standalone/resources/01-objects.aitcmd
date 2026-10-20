@@ -1,8 +1,8 @@
 # Define a minimal working set, screen, font, and status label.
-object create WorkingSet Pool --id 256
-object create DataMask MainScreen --id 1000
-object create FontAttributes TextFont --id 23000
-object create OutputString StatusLabel --id 11000
+object create WorkingSet Pool --override-id 256
+object create DataMask MainScreen --override-id 1000
+object create FontAttributes TextFont --override-id 23000
+object create OutputString StatusLabel --override-id 11000
 object set StatusLabel width=160 height=32
 object set StatusLabel value=READY
 reference set StatusLabel font_attributes TextFont

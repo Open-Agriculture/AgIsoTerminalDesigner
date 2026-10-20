@@ -419,6 +419,7 @@ mod tests {
         source.instances.push(ComponentInstance {
             id: instance_id,
             component_id: component,
+            name: "Test instance".into(),
             parent: EditorParentRef::Primitive(10),
             child_index: None,
             x: 0,

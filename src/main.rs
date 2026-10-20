@@ -4,6 +4,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 mod app_persistence;
+#[path = "cli/zip/ui.rs"]
+mod cli_zip_export;
 mod designer_settings;
 mod shared_attributes;
 mod workspace;
@@ -17,7 +19,7 @@ use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectType;
 use ag_iso_terminal_designer::canvas::{mask_view::MaskViewState, CanvasState};
 use ag_iso_terminal_designer::render_property_editor;
-use ag_iso_terminal_designer::{EditorProject, Operation};
+use ag_iso_terminal_designer::{ui_style, EditorProject, Operation};
 #[cfg(not(target_arch = "wasm32"))]
 use app_persistence::RecentProject;
 use app_persistence::{AppPersistence, RecoveryRecord};
@@ -136,6 +138,7 @@ pub struct DesignerApp {
     discard_on_replace: bool,
     open_in_progress: bool,
     save_in_progress: bool,
+    cli_zip_export: Option<cli_zip_export::Export>,
     persistence: AppPersistence,
     recovery: Option<RecoveryRecord>,
     recovery_load_error: bool,
@@ -299,7 +302,7 @@ impl DesignerApp {
                         }
                     }
                     Err(error) => {
-                        ui.colored_label(ui.visuals().error_fg_color, error);
+                        ui_style::error_text(ui, &error);
                     }
                 }
                 if ui.button("Cancel").clicked() {
@@ -479,6 +482,7 @@ impl DesignerApp {
             discard_on_replace: false,
             open_in_progress: false,
             save_in_progress: false,
+            cli_zip_export: None,
             persistence,
             recovery,
             recovery_load_error,
@@ -975,17 +979,17 @@ impl DesignerApp {
     }
 
     fn save_cli_zip(&mut self, ctx: &egui::Context) {
-        let Some(project) = &self.project else { return; };
-        // Generate and preflight before asking for a destination. Generation
-        // uses its own project copy and never edits the open authoring state.
-        let contents = match ag_iso_terminal_designer::cli::project_zip::generate(project)
-            .and_then(|archive| archive.to_zip()) {
-            Ok(contents) => contents,
-            Err(error) => {
-                self.error_message = Some(format!("Could not generate CLI ZIP: {error}"));
-                return;
-            }
+        if self.cli_zip_export.is_some() {
+            return;
+        }
+        let Some(project) = &self.project else {
+            return;
         };
+        self.cli_zip_export = Some(cli_zip_export::Export::new(project.clone(), ctx));
+        ctx.request_repaint();
+    }
+
+    fn save_cli_zip_contents(&mut self, contents: Vec<u8>, ctx: &egui::Context) {
         let sender = self.file_channel.0.clone();
         let ctx = ctx.clone();
         let task = rfd::AsyncFileDialog::new()
@@ -995,7 +999,9 @@ impl DesignerApp {
         execute(async move {
             if let Some(file) = task.await {
                 if let Err(error) = file.write(&contents).await {
-                    let _ = sender.send(FileEvent::Failed(format!("Failed to save CLI ZIP: {error}")));
+                    let _ = sender.send(FileEvent::Failed(format!(
+                        "Failed to save CLI ZIP: {error}"
+                    )));
                     ctx.request_repaint();
                 }
             }
@@ -1304,9 +1310,9 @@ fn render_mask_object_hierarchy(
 ) {
     let id_value = object.id().value();
     if !visiting.insert(id_value) {
-        ui.colored_label(
-            ui.visuals().error_fg_color,
-            format!("Cycle detected at {}", project.format_object_id(id_value)),
+        ui_style::error_text(
+            ui,
+            &format!("Cycle detected at {}", project.format_object_id(id_value)),
         );
         return;
     }
@@ -1394,9 +1400,9 @@ fn render_mask_object_hierarchy(
                             Some(TreeDragPayload { root, source_parent_path, target: ag_iso_terminal_designer::canvas::edits::PlacementTarget::Primitive { parent_id: id_value, child_index: index } }),
                         );
                     } else {
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            format!("Missing placed object: {}", reference.id.value()),
+                        ui_style::error_text(
+                            ui,
+                            &format!("Missing placed object: {}", reference.id.value()),
                         );
                     }
                     path.pop();
@@ -1449,9 +1455,9 @@ fn render_mask_object_hierarchy(
                                 });
                         }
                         None => {
-                            ui.colored_label(
-                                ui.visuals().error_fg_color,
-                                format!("Missing active pointer target: {target_id}"),
+                            ui_style::error_text(
+                                ui,
+                                &format!("Missing active pointer target: {target_id}"),
                             );
                         }
                     };
@@ -1689,9 +1695,9 @@ fn render_focused_mask_hierarchy(
                                 }
                                 Some(key) => visit(ui, key, slot + 1, Some(slot)),
                                 None => {
-                                    ui.colored_label(
-                                        ui.visuals().error_fg_color,
-                                        format!(
+                                    ui_style::error_text(
+                                        ui,
+                                        &format!(
                                             "Missing key in slot {}: {}",
                                             slot + 1,
                                             key_id.value()
@@ -1707,16 +1713,10 @@ fn render_focused_mask_hierarchy(
                 }
             }
             Some(_) => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!("Object {softkey_id} is not a SoftKeyMask"),
-                );
+                ui_style::error_text(ui, &format!("Object {softkey_id} is not a SoftKeyMask"));
             }
             None => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!("Missing linked soft-key mask: {softkey_id}"),
-                );
+                ui_style::error_text(ui, &format!("Missing linked soft-key mask: {softkey_id}"));
             }
         };
     }
@@ -1889,9 +1889,9 @@ fn render_selected_ancestry_hierarchy(
     let row_background = ui.painter().add(egui::Shape::Noop);
     ui.data_mut(|data| data.insert_temp(egui::Id::new("tree_row_background"), row_background));
     let Some(object) = project.get_pool().object_by_id(object_id) else {
-        ui.colored_label(
-            ui.visuals().error_fg_color,
-            format!(
+        ui_style::error_text(
+            ui,
+            &format!(
                 "Missing object: {}",
                 project.format_object_id(object_id.value())
             ),
@@ -1923,9 +1923,9 @@ fn render_selected_ancestry_hierarchy(
         |ui| {
             for (idx, parent) in parents.iter().enumerate() {
                 if path_guard.contains(parent) {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!(
+                    ui_style::error_text(
+                        ui,
+                        &format!(
                             "Cycle detected in ancestry at {}",
                             project.format_object_id(parent.value())
                         ),
@@ -1961,9 +1961,9 @@ fn render_selected_ancestry_panel(ui: &mut egui::Ui, project: &EditorProject) {
     };
 
     if project.get_pool().object_by_id(selected_id).is_none() {
-        ui.colored_label(
-            ui.visuals().error_fg_color,
-            format!(
+        ui_style::error_text(
+            ui,
+            &format!(
                 "Selected object not found: {}",
                 project.format_object_id(selected_id.value())
             ),
@@ -2013,7 +2013,9 @@ impl eframe::App for DesignerApp {
         }
         #[cfg(not(target_arch = "wasm32"))]
         if ctx.input(|input| input.viewport().close_requested()) {
-            if self.project.as_ref().is_some_and(EditorProject::is_dirty) {
+            if self.cli_zip_export.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            } else if self.project.as_ref().is_some_and(EditorProject::is_dirty) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 if self.save_in_progress {
                     self.save_then_continue = Some(PendingAction::Exit);
@@ -2023,13 +2025,35 @@ impl eframe::App for DesignerApp {
             }
         }
 
+        if let Some(export) = &mut self.cli_zip_export {
+            export.show(ctx);
+            let outcome = export.poll();
+            if let Some(outcome) = outcome {
+                self.cli_zip_export = None;
+                match outcome {
+                    cli_zip_export::Outcome::Complete(contents) => {
+                        self.save_cli_zip_contents(contents, ctx);
+                    }
+                    cli_zip_export::Outcome::Cancelled => (),
+                    cli_zip_export::Outcome::Failed(error) => {
+                        self.error_message = Some(format!("Could not generate CLI ZIP: {error}"));
+                    }
+                }
+            }
+            ctx.request_repaint();
+            #[cfg(target_arch = "wasm32")]
+            self.browser_dirty
+                .set(self.project.as_ref().is_some_and(EditorProject::is_dirty));
+            return;
+        }
+
         if let Some(error) = self.error_message.clone() {
             egui::Window::new("Something went wrong")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label(error);
+                    ui_style::error_text(ui, &error);
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
                             self.error_message = None;
@@ -2889,9 +2913,9 @@ impl DesignerApp {
                             });
                         });
                     } else {
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            format!(
+                        ui_style::error_text(
+                            ui,
+                            &format!(
                                 "Selected object not found: {}",
                                 pool.format_object_id(u16::from(id))
                             ),
@@ -2913,7 +2937,7 @@ impl DesignerApp {
                             .show_masks(ui, pool, materialized, &mut self.mask_view);
                     }
                     Err(error) => {
-                        ui.colored_label(ui.visuals().error_fg_color, error.to_string());
+                        ui_style::error_text(ui, &error.to_string());
                     }
                 }
             }

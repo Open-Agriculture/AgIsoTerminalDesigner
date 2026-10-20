@@ -1,19 +1,20 @@
 //! Standalone CLI editing, inspection, exports, and session persistence.
 pub mod automation_service;
 pub mod commands;
-pub mod string_authoring;
 pub mod component_authoring;
 pub mod design_inspection;
 pub mod editing;
 pub mod export;
+pub mod names;
 pub mod preview;
-pub mod project_zip;
 pub mod protocol;
 pub mod schema;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod session;
 pub mod snapshot;
+pub mod string_authoring;
 pub mod tools;
+pub mod zip;
 
 use crate::ObjectInfo;
 use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectId, ObjectPool};

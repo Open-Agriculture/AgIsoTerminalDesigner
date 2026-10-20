@@ -3,6 +3,7 @@
 
 use crate::object_info::ObjectInfo;
 use crate::object_properties::PropertyKey;
+use crate::smart_naming::{names_equal, normalized_name};
 use ag_iso_stack::object_pool::object::Object;
 use ag_iso_stack::object_pool::object_attributes::{MacroRef, ObjectLabel, Point};
 use ag_iso_stack::object_pool::{
@@ -154,8 +155,14 @@ pub enum Operation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ObjectTarget {
-    Id { id: u16 },
-    Name { name: String },
+    Id {
+        id: u16,
+    },
+    /// Authoring name matched without case or whitespace/hyphen/underscore differences.
+    /// Resolution fails when multiple live objects have the same matching name.
+    Name {
+        name: String,
+    },
 }
 
 impl ObjectTarget {
@@ -317,10 +324,18 @@ pub fn resolve_target(
                 .ok_or(OperationError::ObjectNotFound(id.value()))
         }
         ObjectTarget::Name { name } => {
-            let matches: Vec<_> = object_info
+            let matches: Vec<_> = pool
+                .objects()
                 .iter()
-                .filter_map(|(id, info)| {
-                    (info.name.as_deref() == Some(name.as_str())).then_some(*id)
+                .filter_map(|object| {
+                    let candidate = object_info
+                        .get(&object.id())
+                        .map(|info| info.get_name(object))
+                        .unwrap_or_else(|| {
+                            crate::smart_naming::get_object_type_name(object.object_type())
+                                .to_owned()
+                        });
+                    names_equal(&candidate, name).then_some(object.id())
                 })
                 .collect();
             match matches.as_slice() {
@@ -339,11 +354,17 @@ fn ensure_unique_name(
     name: &str,
     except: Option<ObjectId>,
     object_info: &HashMap<ObjectId, ObjectInfo>,
+    pool: &ObjectPool,
 ) -> Result<(), OperationError> {
-    if !name.is_empty()
-        && object_info
-            .iter()
-            .any(|(id, info)| Some(*id) != except && info.name.as_deref() == Some(name))
+    let normalized = normalized_name(name);
+    if !normalized.is_empty()
+        && pool.objects().iter().any(|object| {
+            Some(object.id()) != except
+                && object_info
+                    .get(&object.id())
+                    .map(|info| info.get_name(object))
+                    .is_some_and(|existing| names_equal(&existing, name))
+        })
     {
         return Err(OperationError::DuplicateObjectName(name.to_owned()));
     }
@@ -451,7 +472,7 @@ impl Operation {
                 if pool.object_by_id(target_id).is_some() {
                     return Err(OperationError::ObjectAlreadyExists(target_id.value()));
                 }
-                ensure_unique_name(name, None, object_info)?;
+                ensure_unique_name(name, None, object_info, pool)?;
 
                 let mut obj = crate::default_object_for_version(*object_type, context.vt_version)
                     .ok_or_else(|| OperationError::OperationContextError {
@@ -493,7 +514,7 @@ impl Operation {
                     return Err(OperationError::ObjectAlreadyExists(id.value()));
                 }
                 if let Some(name) = info.as_ref().and_then(|info| info.name.as_deref()) {
-                    ensure_unique_name(name, None, object_info)?;
+                    ensure_unique_name(name, None, object_info, pool)?;
                 }
                 pool.add(object.clone());
                 if let Some(info) = info {
@@ -1482,7 +1503,7 @@ impl Operation {
             Operation::RenameObject { object, name } => {
                 let id = resolve_target(object, pool, object_info)?;
                 let object_id = id.value();
-                ensure_unique_name(name, Some(id), object_info)?;
+                ensure_unique_name(name, Some(id), object_info, pool)?;
 
                 // Get old name for inverse operation
                 let old_name = if let Some(info) = object_info.get(&id) {

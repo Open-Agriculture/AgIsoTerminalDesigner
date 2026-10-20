@@ -94,6 +94,7 @@ pub(crate) fn preview_definition(
     source.instances.push(ComponentInstance {
         id: ComponentInstanceId::default(),
         component_id: definition.id,
+        name: "Preview".into(),
         parent: EditorParentRef::Primitive(0),
         child_index: None,
         x: 0,
@@ -348,6 +349,7 @@ pub fn materialize_source_with_graphics(
         probe.instances.push(ComponentInstance {
             id: ComponentInstanceId::default(),
             component_id: definition.id,
+            name: "Validation preview".into(),
             parent: EditorParentRef::Primitive(0),
             child_index: None,
             x: 0,
@@ -829,7 +831,9 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
 }
 fn validate_value(parameter: &ComponentParameter, value: &Value) -> ComponentResult<()> {
     let valid = match parameter.kind {
-        ComponentParameterKind::Graphic => value.as_u64().is_some_and(|id| id < 65535),
+        ComponentParameterKind::Graphic => {
+            serde_json::from_value::<crate::graphics::GraphicAssetId>(value.clone()).is_ok()
+        }
         ComponentParameterKind::Text => {
             serde_json::from_value::<ag_iso_stack::object_pool::object::VtString>(value.clone())
                 .is_ok()
@@ -956,6 +960,7 @@ mod preview_tests {
             instances: vec![ComponentInstance {
                 id: ComponentInstanceId::default(),
                 component_id,
+                name: "Test instance".into(),
                 parent: EditorParentRef::Primitive(0),
                 child_index: None,
                 x: 0,

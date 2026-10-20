@@ -386,8 +386,8 @@ pub fn object_window(
                 project.get_pool().object_by_id(id).is_some_and(&eligible)
             });
             if !valid {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
+                crate::ui_style::error_text(
+                    ui,
                     "This selection is no longer available here. Go back and choose another.",
                 );
             }

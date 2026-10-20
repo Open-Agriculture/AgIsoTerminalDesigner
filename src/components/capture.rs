@@ -231,6 +231,7 @@ pub fn plan_component_capture(
         instance: ComponentInstance {
             id: ComponentInstanceId::default(),
             component_id,
+            name: String::new(),
             child_index,
             parent: EditorParentRef::Primitive(placements[0].0),
             x: placements[0].1.into(),
@@ -280,10 +281,13 @@ impl ComponentService {
         let info = project.component_object_info();
         let ranges = project.object_id_ranges().clone();
         project.edit_components("Create component from selection", |pool, source| {
+            validate_definition_names(source, &plan.definition)?;
             Operation::RemoveChild { parent_id: parent, child_id: root }.apply(pool, &mut Default::default(), &mut Default::default()).map_err(|e| ComponentError::new("COMPONENT_CAPTURE_INVALID", e.to_string()))?;
             for id in plan.remove_ids { pool.remove(ObjectId::new(id).unwrap()); }
             source.definitions.insert(plan.definition.id, plan.definition);
-            source.instances.push(plan.instance);
+            let mut instance = plan.instance;
+            instance.name = unique_instance_name(source, instance.component_id);
+            source.instances.push(instance);
             prepare_compiled_ids(pool, source, &ranges)?;
             let materialized = materialize_source(pool, source, version, &info, &ranges)?;
             let instance = source.instances.iter().find(|i| i.id == id).unwrap();

@@ -238,7 +238,7 @@ impl SharedAttributes {
                                 }
                             }
                             if let Some(error) = uses.error {
-                                ui.colored_label(ui.visuals().warn_fg_color, format!("Component usage is unavailable; deletion is disabled: {error}"));
+                                ag_iso_terminal_designer::ui_style::error_text_with_color(ui, &format!("Component usage is unavailable; deletion is disabled: {error}"), ui.visuals().warn_fg_color);
                             }
                         });
                     });

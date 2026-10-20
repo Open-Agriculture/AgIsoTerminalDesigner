@@ -69,7 +69,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
     ui.spacing_mut().interact_size.y = 26.0;
     ui.heading("Components");
     if let Some(error) = ui.data_mut(|d| d.get_temp::<String>(egui::Id::new("component_error"))) {
-        ui.colored_label(ui.visuals().error_fg_color, error);
+        crate::ui_style::error_text(ui, &error);
         if ui.button("Dismiss error").clicked() {
             ui.data_mut(|d| d.remove::<String>(egui::Id::new("component_error")));
         }
@@ -231,7 +231,10 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
     for instance in instances {
         let definition = &project.component_source().definitions[&instance.component_id];
         let root = instance.compiled_ids[&definition.root_node];
-        let label = format!("{} ({}, {})", definition.name, instance.x, instance.y);
+        let label = format!(
+            "{} · {} ({}, {})",
+            instance.name, definition.name, instance.x, instance.y
+        );
         egui::CollapsingHeader::new(label)
             .id_salt(instance.id)
             .icon(crate::ui_style::collapsing_icon)
@@ -763,10 +766,7 @@ fn value_editor_with_font(
                 }
             }
             Err(error) => {
-                ui.colored_label(
-                    ui.visuals().error_fg_color,
-                    format!("Cannot edit encoded string: {error}"),
-                );
+                crate::ui_style::error_text(ui, &format!("Cannot edit encoded string: {error}"));
             }
         }
         return;
@@ -1292,9 +1292,9 @@ pub fn inspector(
                     response = Some(ui.text_edit_singleline(&mut draft));
                 }
                 Err(error) => {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!("Cannot edit encoded string: {error}"),
+                    crate::ui_style::error_text(
+                        ui,
+                        &format!("Cannot edit encoded string: {error}"),
                     );
                 }
             }
@@ -1387,7 +1387,7 @@ pub fn inspector(
 fn report_error(ui: &mut egui::Ui, message: impl Into<String>) {
     let message = message.into();
     ui.data_mut(|d| d.insert_temp(egui::Id::new("component_error"), message.clone()));
-    ui.colored_label(ui.visuals().error_fg_color, message);
+    crate::ui_style::error_text(ui, &message);
 }
 
 #[cfg(test)]

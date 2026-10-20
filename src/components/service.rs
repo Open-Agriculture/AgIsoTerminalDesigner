@@ -45,7 +45,7 @@ impl ComponentService {
         project: &mut EditorProject,
         intents: &[ComponentIntent],
     ) -> ComponentResult<()> {
-        project.edit_source("Component actions", |pool, source, graphics, _| {
+        project.edit_source("Component actions", |pool, source, _graphics, _| {
             for intent in intents {
                 match intent {
                     ComponentIntent::InstantiateComponent {
@@ -55,16 +55,20 @@ impl ComponentService {
                         x,
                         y,
                         overrides,
-                    } => source.instances.push(ComponentInstance {
-                        id: instance_id.unwrap_or_default(),
-                        component_id: *component_id,
-                        child_index: Some(insertion_index(pool, source, *parent)),
-                        parent: EditorParentRef::Primitive(*parent),
-                        x: *x,
-                        y: *y,
-                        overrides: overrides.clone(),
-                        compiled_ids: Default::default(),
-                    }),
+                    } => {
+                        let name = unique_instance_name(source, *component_id);
+                        source.instances.push(ComponentInstance {
+                            id: instance_id.unwrap_or_default(),
+                            component_id: *component_id,
+                            name,
+                            child_index: Some(insertion_index(pool, source, *parent)),
+                            parent: EditorParentRef::Primitive(*parent),
+                            x: *x,
+                            y: *y,
+                            overrides: overrides.clone(),
+                            compiled_ids: Default::default(),
+                        });
+                    }
                     ComponentIntent::SetComponentOverride {
                         instance_id,
                         parameter,
@@ -135,9 +139,11 @@ impl ComponentService {
     ) -> ComponentResult<ComponentInstanceId> {
         let id = ComponentInstanceId::default();
         project.edit_components("Instantiate component", |pool, source| {
+            let name = unique_instance_name(source, component);
             source.instances.push(ComponentInstance {
                 id,
                 component_id: component,
+                name,
                 child_index: Some(insertion_index(pool, source, parent)),
                 parent: EditorParentRef::Primitive(parent),
                 x,
@@ -154,6 +160,7 @@ impl ComponentService {
         mut definition: ComponentDefinition,
     ) -> ComponentResult<()> {
         project.edit_components("Edit component definition", |_, source| {
+            validate_definition_names(source, &definition)?;
             definition.revision = source
                 .definitions
                 .get(&definition.id)
@@ -302,6 +309,7 @@ impl ComponentService {
         project.edit_components("Duplicate component instance", |pool, source| {
             let mut copy = instance_mut(source, id)?.clone();
             copy.id = new_id;
+            copy.name = unique_instance_name(source, copy.component_id);
             let EditorParentRef::Primitive(parent) = copy.parent;
             copy.child_index = Some(insertion_index(pool, source, parent));
             copy.x = x;
@@ -382,11 +390,108 @@ impl ComponentService {
     ) -> ComponentResult<ComponentId> {
         let mut copy = definition(project, id)?;
         copy.id = ComponentId::default();
-        copy.name.push_str(" copy");
+        copy.name = unique_component_name(project.component_source(), &copy.name);
         let id = copy.id;
         Self::edit_component_definition(project, copy)?;
         Ok(id)
     }
+}
+fn unique_component_name(source: &ComponentSource, name: &str) -> String {
+    let base = format!("{name} copy");
+    if !source
+        .definitions
+        .values()
+        .any(|definition| crate::smart_naming::names_equal(&definition.name, &base))
+    {
+        return base;
+    }
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{base} {suffix}");
+        if !source
+            .definitions
+            .values()
+            .any(|definition| crate::smart_naming::names_equal(&definition.name, &candidate))
+        {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+/// Validate new or changed labels while allowing unchanged legacy collisions to
+/// be repaired one at a time.
+pub(crate) fn validate_definition_names(
+    source: &ComponentSource,
+    definition: &ComponentDefinition,
+) -> ComponentResult<()> {
+    let previous = source.definitions.get(&definition.id);
+    let component_name_changed = previous.is_none_or(|previous| {
+        crate::smart_naming::normalized_name(&previous.name)
+            != crate::smart_naming::normalized_name(&definition.name)
+    });
+    if component_name_changed && crate::smart_naming::normalized_name(&definition.name).is_empty() {
+        return Err(ComponentError::new(
+            "COMPONENT_NAME_INVALID",
+            "Component names must not be empty",
+        ));
+    }
+    if component_name_changed
+        && source.definitions.values().any(|existing| {
+            existing.id != definition.id
+                && crate::smart_naming::names_equal(&existing.name, &definition.name)
+        })
+    {
+        return Err(ComponentError::new(
+            "COMPONENT_NAME_CONFLICT",
+            format!("Component name already exists: {}", definition.name),
+        ));
+    }
+    let changed_node_collides = definition.nodes.iter().any(|node| {
+        let unchanged = previous
+            .and_then(|previous| previous.nodes.iter().find(|old| old.id == node.id))
+            .is_some_and(|old| {
+                crate::smart_naming::normalized_name(&old.name)
+                    == crate::smart_naming::normalized_name(&node.name)
+            });
+        !unchanged
+            && (crate::smart_naming::normalized_name(&node.name).is_empty()
+                || definition.nodes.iter().any(|other| {
+                    other.id != node.id && crate::smart_naming::names_equal(&other.name, &node.name)
+                }))
+    });
+    if changed_node_collides {
+        return Err(ComponentError::new(
+            "COMPONENT_NODE_NAME_CONFLICT",
+            "Component node names must be non-empty and unique",
+        ));
+    }
+    let changed_parameter_collides = definition.parameters.iter().any(|parameter| {
+        let unchanged = previous
+            .and_then(|previous| {
+                previous
+                    .parameters
+                    .iter()
+                    .find(|old| old.id == parameter.id)
+            })
+            .is_some_and(|old| {
+                crate::smart_naming::normalized_name(&old.name)
+                    == crate::smart_naming::normalized_name(&parameter.name)
+            });
+        !unchanged
+            && (crate::smart_naming::normalized_name(&parameter.name).is_empty()
+                || definition.parameters.iter().any(|other| {
+                    other.id != parameter.id
+                        && crate::smart_naming::names_equal(&other.name, &parameter.name)
+                }))
+    });
+    if changed_parameter_collides {
+        return Err(ComponentError::new(
+            "COMPONENT_PARAMETER_NAME_CONFLICT",
+            "Component parameter names must be non-empty and unique",
+        ));
+    }
+    Ok(())
 }
 fn definition(project: &EditorProject, id: ComponentId) -> ComponentResult<ComponentDefinition> {
     project
@@ -420,4 +525,112 @@ fn insertion_index(
             .iter()
             .filter(|i| i.parent == EditorParentRef::Primitive(parent))
             .count()
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+    use ag_iso_stack::object_pool::ObjectType;
+
+    fn named_definition(
+        component_id: ComponentId,
+        name: &str,
+        node_names: &[&str],
+        parameter_names: &[&str],
+    ) -> ComponentDefinition {
+        let root_node = ComponentNodeId::default();
+        let nodes: Vec<_> = node_names
+            .iter()
+            .map(|name| ComponentNode {
+                id: ComponentNodeId::default(),
+                name: (*name).into(),
+                object_type: ObjectType::Button,
+                properties: BTreeMap::new(),
+                children: vec![],
+                references: BTreeMap::new(),
+                macro_references: vec![],
+                object_list: None,
+            })
+            .collect();
+        ComponentDefinition {
+            schema_version: 1,
+            id: component_id,
+            name: name.into(),
+            description: String::new(),
+            category_path: vec![],
+            tags: vec![],
+            revision: 1,
+            root_node,
+            nodes,
+            parameters: parameter_names
+                .iter()
+                .map(|name| ComponentParameter {
+                    id: ComponentParameterId::default(),
+                    name: (*name).into(),
+                    description: None,
+                    target_node: root_node,
+                    property: ComponentParameterTarget::Property(crate::PropertyKey::Value),
+                    kind: ComponentParameterKind::Text,
+                    default_value: Value::Null,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn duplicated_component_names_receive_unique_normalized_suffixes() {
+        let mut source = ComponentSource::default();
+        let first_id = ComponentId::default();
+        let first = ComponentDefinition {
+            schema_version: 1,
+            id: first_id,
+            name: "Start Button copy".into(),
+            description: String::new(),
+            category_path: vec![],
+            tags: vec![],
+            revision: 1,
+            root_node: ComponentNodeId::default(),
+            nodes: vec![],
+            parameters: vec![],
+        };
+        source.definitions.insert(first_id, first);
+
+        assert_eq!(
+            unique_component_name(&source, "Start Button"),
+            "Start Button copy 2"
+        );
+    }
+
+    #[test]
+    fn name_collisions_are_scoped_and_legacy_duplicates_can_be_repaired() {
+        let component_id = ComponentId::default();
+        let legacy = named_definition(
+            component_id,
+            "First",
+            &["Root", "root"],
+            &["Value", "value"],
+        );
+        let source = ComponentSource {
+            definitions: [(component_id, legacy.clone())].into_iter().collect(),
+            instances: vec![],
+        };
+
+        assert!(validate_definition_names(&source, &legacy).is_ok());
+        let mut repaired = legacy.clone();
+        repaired.nodes[0].name = "Primary".into();
+        repaired.parameters[0].name = "Text value".into();
+        assert!(validate_definition_names(&source, &repaired).is_ok());
+
+        let other_component_id = ComponentId::default();
+        let other = named_definition(other_component_id, "Second", &["Root"], &["Value"]);
+        assert!(validate_definition_names(&source, &other).is_ok());
+
+        let conflicting = named_definition(
+            ComponentId::default(),
+            "Third",
+            &["Root", "ROOT"],
+            &["Value"],
+        );
+        assert!(validate_definition_names(&source, &conflicting).is_err());
+    }
 }

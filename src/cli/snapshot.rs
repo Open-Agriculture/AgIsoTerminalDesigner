@@ -147,8 +147,10 @@ pub(crate) fn summary(
         id: id.value(),
         name: info
             .get(&id)
-            .and_then(|v| v.name.clone())
-            .unwrap_or_else(|| format!("Object_{}", id.value())),
+            .map(|info| info.get_name(object))
+            .unwrap_or_else(|| {
+                crate::smart_naming::get_object_type_name(object.object_type()).to_owned()
+            }),
         object_type: format!("{:?}", object.object_type()),
     })
 }

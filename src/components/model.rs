@@ -134,6 +134,9 @@ pub enum EditorParentRef {
 pub struct ComponentInstance {
     pub id: ComponentInstanceId,
     pub component_id: ComponentId,
+    /// Stable authoring name used by the CLI and project references.
+    #[serde(default)]
+    pub name: String,
     pub parent: EditorParentRef,
     /// Absolute display-list position, independent of VT ID and instance UUID.
     #[serde(default)]
@@ -147,6 +150,42 @@ pub struct ComponentInstance {
 pub struct ComponentSource {
     pub definitions: BTreeMap<ComponentId, ComponentDefinition>,
     pub instances: Vec<ComponentInstance>,
+}
+
+/// Generate a deterministic, collection-unique display name for an instance.
+pub fn unique_instance_name(source: &ComponentSource, component_id: ComponentId) -> String {
+    let base = source
+        .definitions
+        .get(&component_id)
+        .map(|definition| definition.name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Component");
+    let used: std::collections::HashSet<_> = source
+        .instances
+        .iter()
+        .map(|instance| crate::smart_naming::normalized_name(&instance.name))
+        .collect();
+    let mut suffix = 1usize;
+    loop {
+        let candidate = format!("{base} {suffix}");
+        if !used.contains(&crate::smart_naming::normalized_name(&candidate)) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+/// Fill names missing from older project files without changing authored names.
+/// Generated values are deterministic and unique against names seen so far.
+pub fn ensure_instance_names(source: &mut ComponentSource) {
+    for index in 0..source.instances.len() {
+        if !crate::smart_naming::normalized_name(&source.instances[index].name).is_empty() {
+            continue;
+        }
+        let component_id = source.instances[index].component_id;
+        let candidate = unique_instance_name(source, component_id);
+        source.instances[index].name = candidate;
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EditorSelection {
@@ -230,4 +269,50 @@ pub struct ComponentMacroReference {
 pub enum ComponentObjectList {
     Required(Vec<ObjectTarget>),
     Nullable(Vec<Option<ObjectTarget>>),
+}
+
+#[cfg(test)]
+mod instance_name_tests {
+    use super::*;
+
+    #[test]
+    fn missing_legacy_instance_names_are_generated_uniquely() {
+        let component_id = ComponentId::default();
+        let node_id = ComponentNodeId::default();
+        let definition = ComponentDefinition {
+            schema_version: 1,
+            id: component_id,
+            name: "Start Button".into(),
+            description: String::new(),
+            category_path: vec![],
+            tags: vec![],
+            revision: 1,
+            root_node: node_id,
+            nodes: vec![],
+            parameters: vec![],
+        };
+        let make_instance = || ComponentInstance {
+            id: ComponentInstanceId::default(),
+            component_id,
+            name: String::new(),
+            parent: EditorParentRef::Primitive(0),
+            child_index: None,
+            x: 0,
+            y: 0,
+            overrides: BTreeMap::new(),
+            compiled_ids: BTreeMap::new(),
+        };
+        let mut legacy = serde_json::to_value(make_instance()).unwrap();
+        legacy.as_object_mut().unwrap().remove("name");
+        let restored: ComponentInstance = serde_json::from_value(legacy).unwrap();
+
+        let mut source = ComponentSource {
+            definitions: [(component_id, definition)].into_iter().collect(),
+            instances: vec![restored, make_instance()],
+        };
+        ensure_instance_names(&mut source);
+
+        assert_eq!(source.instances[0].name, "Start Button 1");
+        assert_eq!(source.instances[1].name, "Start Button 2");
+    }
 }

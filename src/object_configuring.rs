@@ -376,7 +376,7 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                         });
                     }
                     Err(message) => {
-                        ui.colored_label(ui.visuals().error_fg_color, message);
+                        crate::ui_style::error_text(ui, &message);
                     }
                 }
                 continue;
@@ -908,7 +908,7 @@ fn render_positioned_children(
                         select_object(design, child.id());
                     }
                 } else {
-                    ui.colored_label(ui.visuals().error_fg_color, "Missing object");
+                    crate::ui_style::error_text(ui, "Missing object");
                 }
                 let position_key =
                     ui.make_persistent_id(("positioned_child_position", parent_id.value(), index));
@@ -1184,7 +1184,7 @@ fn render_reference_links(ui: &mut egui::Ui, design: &EditorProject, object_id: 
             select_object(design, object_id);
         }
     } else {
-        ui.colored_label(ui.visuals().error_fg_color, "Missing object");
+        crate::ui_style::error_text(ui, "Missing object");
         ui.label("");
     }
 }
@@ -1564,7 +1564,7 @@ fn render_identity(
             clear_draft(ui.ctx(), key);
         }
         if conflict {
-            ui.colored_label(ui.visuals().error_fg_color, "ID already in use");
+            crate::ui_style::error_text(ui, "ID already in use");
         }
         if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
             value = id.value();
@@ -1572,11 +1572,11 @@ fn render_identity(
             clear_draft(ui.ctx(), key);
         }
         if invalid_macro {
-            ui.colored_label(ui.visuals().error_fg_color, "VT2–4 macro IDs must be 0–255");
+            crate::ui_style::error_text(ui, "VT2–4 macro IDs must be 0–255");
         }
     });
     if let Some(error) = ui.data(|data| data.get_temp::<String>(key.with("error"))) {
-        ui.colored_label(ui.visuals().error_fg_color, error);
+        crate::ui_style::error_text(ui, &error);
     }
 }
 
@@ -2794,7 +2794,7 @@ fn render_json(
             ui.data_mut(|data| data.remove::<PendingValue>(key));
             clear_draft(ui.ctx(), key);
         } else {
-            ui.colored_label(ui.visuals().error_fg_color, "Invalid JSON");
+            crate::ui_style::error_text(ui, "Invalid JSON");
         }
     }
 }

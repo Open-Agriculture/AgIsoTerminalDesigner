@@ -137,12 +137,12 @@ pub fn show_project_settings(
                 values.soft_key_layout.keys_per_line = values.soft_key_layout.keys_per_line.min(values.soft_key_layout.physical_key_count).max(1);
                 values.soft_key_layout.navigation_key_count = values.soft_key_layout.navigation_key_count.min(2).min(values.soft_key_layout.physical_key_count.saturating_sub(1));
                 if values.soft_key_layout.validate().is_err() {
-                    ui.colored_label(ag_iso_terminal_designer::ui_style::palette(ui).error, "Choose 1–64 physical keys, a valid row/column size, and fewer navigation keys than physical keys.");
+                    ag_iso_terminal_designer::ui_style::error_text(ui, "Choose 1–64 physical keys, a valid row/column size, and fewer navigation keys than physical keys.");
                 } else if u8::from(values.vt_version) >= u8::from(VtVersion::Version4) && values.soft_key_layout.physical_key_count < 6 {
                     ui.colored_label(ui.visuals().warn_fg_color, "Terminal minimum advisory: VT4+ terminals require at least 6 physical softkeys.");
                 }
                 if values.mask == 0 || values.soft_key_width == 0 || values.soft_key_height == 0 {
-                    ui.colored_label(ag_iso_terminal_designer::ui_style::palette(ui).error, "Dimensions must be positive.");
+                    ag_iso_terminal_designer::ui_style::error_text(ui, "Dimensions must be positive.");
                 }
                 let (mask_minimum, key_minimum) = if values.vt_version == VtVersion::Version6 {
                     (480, (60, 60))
@@ -174,13 +174,14 @@ pub fn show_project_settings(
                 match project.compatibility_diagnostics() {
                     Ok(diagnostics) => {
                         for diagnostic in diagnostics {
-                            ui.colored_label(
+                            ag_iso_terminal_designer::ui_style::error_text_with_color(
+                                ui,
+                                &project.format_validation_diagnostic(&diagnostic),
                                 ui.visuals().warn_fg_color,
-                                project.format_validation_diagnostic(&diagnostic),
                             );
                         }
                     }
-                    Err(error) => { ui.colored_label(ui.visuals().warn_fg_color, error.to_string()); }
+                    Err(error) => { ag_iso_terminal_designer::ui_style::error_text_with_color(ui, &error.to_string(), ui.visuals().warn_fg_color); }
                 }
                 disabled_section(
                     ui,
@@ -249,7 +250,7 @@ pub fn show_project_settings(
                         ui.small("Ranges are inclusive, unique across types, and exclude reserved ID 65535. VT2–VT4 macro ranges must stay within 0–255.");
                     }
                     Err(error) => {
-                        ui.colored_label(ag_iso_terminal_designer::ui_style::palette(ui).error, error);
+                        ag_iso_terminal_designer::ui_style::error_text(ui, &error);
                     }
                 }
                 ui.small("Changing ranges affects future automatic assignments. Existing IDs are preserved.");

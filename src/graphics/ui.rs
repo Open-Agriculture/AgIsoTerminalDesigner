@@ -459,7 +459,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
         ui.data_mut(|data| data.insert_temp(key, error));
     }
     if let Some(error) = ui.data_mut(|data| data.get_temp::<String>(key)) {
-        ui.colored_label(ui.visuals().error_fg_color, error);
+        crate::ui_style::error_text(ui, &error);
         if ui.button("Dismiss graphic error").clicked() {
             ui.data_mut(|data| data.remove::<String>(key));
         }

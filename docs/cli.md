@@ -9,7 +9,7 @@ Sessions use the surviving parent process. `exec aitd ...` replaces the shell an
 ```bash
 aitd project load machine.aitp
 aitd run --file resources/labels.aitcmd
-aitd object create OutputString StatusLabel --id 11000
+aitd object create OutputString StatusLabel --override-id 11000
 aitd object set StatusLabel value=READY
 aitd validate
 aitd project save machine.aitp
@@ -44,23 +44,23 @@ aitd status
 aitd object list --type Button
 aitd object get Start --parents --children --macros
 aitd schema Button --properties width,height,options
-aitd tree 1000
+aitd tree MainScreen
 aitd context --scope pool --limit 20
-aitd region 1000 --region top --limit 10
+aitd region MainScreen --region top --limit 10
 aitd colours 6 dark_blue '#06162E'
 aitd capabilities
 aitd completions bash > aitd-completion.bash
 ```
 
-Object targets accept decimal IDs, hexadecimal `0x` IDs, and unambiguous names. Prefix a target with `name:` to force name interpretation, including for numeric-looking names. Newly created objects can be addressed by name later in the same command or command file. `object create TYPE NAME --id ID` uses the same explicit object-ID validation as the other ID editing commands. Inspections return bounded results and pagination information; request additional details only when needed. `object list --all` reads all pages, and `object get --style` adds factual descendant style examples.
+Entity targets use names and match case-insensitively. Spaces, hyphens, and underscores are equivalent, so `Start Button`, `start-button`, and `START_BUTTON` select the same entity. Names must be unique within their collection; ambiguous legacy names produce an error. Newly created entities can be addressed by name later in the same command or command file. Numeric-looking names are still names. Set an object's fixed protocol ID on creation with `--override-id ID`, or change it later with `object override-id NAME ID|automatic`. Inspections return bounded results and pagination information; request additional details only when needed. `object list --all` reads all pages, and `object get --style` adds factual descendant style examples.
 
 ## Properties, fields, and arrays
 
 ```bash
-aitd object create NumberVariable Counter --id 21001
+aitd object create NumberVariable Counter --override-id 21001
 aitd object set Counter value=42
-aitd object create StringVariable Caption --id 22001
-aitd object set Caption 'value=123'
+aitd object create StringVariable Caption --override-id 22001
+aitd object set Caption value=123
 aitd object rename Caption 'Display caption'
 ```
 
@@ -93,9 +93,9 @@ aitd event bind Start OnKeyPress=Pressed
 aitd event unbind Start OnKeyPress
 ```
 
-Incremental edits preserve other entries. Use `--occurrence INDEX` to disambiguate repeated placements of the same child (zero-based among matching children). Complete replacement uses `list set`, `pointer set`, or `event set` with positional targets or `EVENT=MACRO` bindings. `null` denotes an empty nullable reference/list slot. Reordering commands require every existing entry exactly once. Label commands accept `id=TARGET`, `string=TARGET`, `graphic=TARGET`, and `font=NUMBER`; use `label --help` for forms.
+Incremental edits preserve other entries. Use `--occurrence INDEX` to disambiguate repeated placements of the same child (zero-based among matching children). Complete replacement uses `list set`, `pointer set`, or `event set` with positional targets or `EVENT=MACRO` bindings. `null` denotes an empty nullable reference/list slot; `name:null` targets an object literally named `null`. Prefix names beginning with `name:` with another `name:` when using an object target token. Reordering commands require every existing entry exactly once. Label commands accept `id=TARGET`, `string=TARGET`, `graphic=TARGET`, and `font=NUMBER`; use `label --help` for forms.
 
-Components and graphics use their own command groups. `component capture ROOT NAME` creates a reusable definition; `component instantiate ID PARENT X Y` places an instance. `component node-set`, `component override`, and parameter defaults use the same metadata-based value parsing as object properties. Import images with `graphic import FILE --name NAME`. Use `component --help`, `instance --help`, and `graphic --help` for the remaining commands.
+Components, instances, nodes, parameters, and graphics are also addressed by names, using the same case-insensitive matching rule. Components and graphics use their own command groups. `component definition-create COMPONENT_NAME ROOT_NODE_NAME OBJECT_TYPE` creates a reusable definition; `component instance-create INSTANCE_NAME COMPONENT_NAME PARENT_OBJECT_NAME X Y` places a named instance. `component node-create COMPONENT_NAME NODE_NAME OBJECT_TYPE` creates a node. `component node-set`, `component override`, and parameter defaults use the same metadata-based value parsing as object properties. Import images with `graphic import FILE --name NAME`. Use `component --help`, `instance --help`, and `graphic --help` for the remaining commands.
 
 ## Atomic command files and checks
 
@@ -103,7 +103,7 @@ Command files use the `.aitcmd` extension and contain literal edit commands, one
 
 ```text
 # resources/labels.aitcmd
-object create NumberVariable Counter --id 21001
+object create NumberVariable Counter --override-id 21001
 object set Counter value=42
 project settings set mask_size=640
 ```
@@ -137,10 +137,10 @@ Readable text is the default. `--json` selects machine-readable output; successe
 
 ```bash
 aitd validate --json
-aitd preview --mask 1000 --output build/layout.png
+aitd preview --mask MainScreen --output build/layout.png
 aitd export bundle --iop build/pool.iop --header build/pool.h
 aitd export project --output-dir release
-aitd graphic export ASSET_ID --output build/image.png
+aitd graphic export Logo --output build/image.png
 ```
 
 Previews are schematic geometry images, not screenshots of the full VT renderer. Binary export applies its own target compatibility checks, independently of save-time validation. Existing output files require `--force`; bundle artifacts are generated and staged before publishing. C header export rejects colliding or reserved identifiers.
@@ -156,18 +156,31 @@ and component definitions live in `components/`. The root script runs global
 phases across these directories. Edit `.aitd` files and PNG assets to change
 the project, move the old `build/` directory aside, and rebuild.
 
-Object metadata is editable with `object metadata ID --name TEXT
---description TEXT --notes TEXT --tag TAG --id-policy automatic|manual`;
+Generated commands target objects and component entities by name. Safe tokens
+are written without quotes; tokens containing spaces or special characters
+remain quoted so the command file can reproduce their values. Fixed protocol
+IDs are written only for objects with explicit overrides. Automatic object and
+compiled-node IDs and internal UUIDs may change on rebuild; references and
+protocol object content are verified after remapping. Original display names
+remain in metadata, while object target tokens use lowercase hyphens.
+
+Object metadata is editable with `object metadata NAME --name TEXT
+--description TEXT --notes TEXT --tag TAG`;
 `--clear-name`, `--clear-description`, `--clear-notes`, and `--clear-tags`
 explicitly clear optional values. ID ranges can be updated together through
 `project settings set id_range.Button=6000:6999 id_range.Key=5000:5999`.
 `component --help` lists definition, node, parameter, and instance authoring
-commands with explicit UUIDs and compiled ID assignments.
+commands using names. Fixed protocol IDs are set with `--override-id` on
+creation or `object override-id NAME ID|automatic` for existing objects.
 
-`macro append ID change-numeric-value OBJECT VALUE` and other named
-instructions author Macro streams without byte payloads. `graphic assign-file
-ID FILE --format eight_bit --encoding raw` imports an indexed PNG into an
-existing PictureGraphic, retaining its palette indices. Four-bit and monochrome
+`macro append NAME change-numeric-value OBJECT VALUE` and other named
+instructions author Macro streams without byte payloads. Object-valued Macro
+arguments accept names; ordinary numeric values remain numeric. ZIP export
+rejects packed reference values with additional data that cannot be reproduced
+by a named argument. `graphic assign
+ASSET_NAME OBJECT_NAME` attaches an imported asset by name. Use the graphic
+authoring commands to import indexed PNG data into an existing PictureGraphic,
+retaining its palette indices. Four-bit and monochrome
 formats and run-length encoding are also supported. The PNG palette must match
 the project's effective palette. ZIP export compares regenerated picture bytes
 and rejects non-reproducible encodings, unsupported binary content, and invalid
