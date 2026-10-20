@@ -64,7 +64,7 @@ aitd object set Caption value=123
 aitd object rename Caption 'Display caption'
 ```
 
-Property metadata determines types: numbers accept numeric text, booleans accept `true` or `false`, enums accept their declared names, and text properties preserve literal text. Quotes are shell quoting, not value encoding. Schema discovery shows writable properties, defaults, enum choices, and constraints. Colour properties accept a palette index, colour name, or `#RRGGBB`; RGB resolves to the nearest effective palette entry.
+Property metadata determines types: numbers accept numeric text, booleans accept `true` or `false`, enums accept their declared names or numeric codes, and text properties preserve literal text. Quotes are shell quoting, not value encoding. Schema discovery shows writable properties, defaults, enum choices available for the selected project VT version, and constraints. Assignments reject unavailable enum choices. In the GUI, unavailable choices remain visible but disabled, with availability tooltips. Colour properties accept a palette index, colour name, or `#RRGGBB`; RGB resolves to the nearest effective palette entry.
 
 Use field assignments for records and flags. Unspecified fields retain their values. Use dotted paths for nested records and zero-based array indices:
 

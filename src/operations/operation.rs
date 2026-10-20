@@ -45,6 +45,15 @@ pub enum Operation {
         value: Value,
     },
 
+    /// Internal inverse that restores a non-reference property without authoring-domain
+    /// validation. The property setter still enforces the serialized field type.
+    #[serde(skip)]
+    RestoreProperty {
+        object_id: u16,
+        property: PropertyKey,
+        value: Value,
+    },
+
     /// Set a property whose declared semantic is an object reference.
     SetObjectReference {
         object: ObjectTarget,
@@ -609,12 +618,23 @@ impl Operation {
                     })?;
                 context.affected_objects.insert(id);
 
-                // Inverse: SetProperty with old value
-                Ok(Operation::SetProperty {
-                    object: ObjectTarget::id(object_id),
-                    property: *property,
-                    value: old_value,
-                })
+                // A repaired imported value can be outside the current authoring
+                // domain. Keep it restorable by undo without weakening normal edits.
+                if crate::object_properties::validate_property(pool, id, *property, &old_value)
+                    .is_err()
+                {
+                    Ok(Operation::RestoreProperty {
+                        object_id,
+                        property: *property,
+                        value: old_value,
+                    })
+                } else {
+                    Ok(Operation::SetProperty {
+                        object: ObjectTarget::id(object_id),
+                        property: *property,
+                        value: old_value,
+                    })
+                }
             }
 
             Operation::SetObjectReference {
@@ -692,6 +712,45 @@ impl Operation {
                 context.affected_objects.insert(id);
                 Ok(Operation::RestoreObjectReference {
                     object_id,
+                    property: *property,
+                    value: old_value,
+                })
+            }
+
+            Operation::RestoreProperty {
+                object_id,
+                property,
+                value,
+            } => {
+                let id = ObjectId::new(*object_id)
+                    .map_err(|_| OperationError::ObjectNotFound(*object_id))?;
+                let semantic = property_semantic(pool, id, *property)?;
+                if matches!(
+                    semantic,
+                    crate::object_properties::PropertySemantic::ObjectReference { .. }
+                ) {
+                    return Err(
+                        OperationError::ReferencePropertyRequiresReferenceOperation {
+                            object_id: *object_id,
+                            property: *property,
+                        },
+                    );
+                }
+                let old_value = crate::object_properties::get_property(pool, id, *property)
+                    .map_err(|e| OperationError::PropertyError {
+                        object_id: *object_id,
+                        property: *property,
+                        reason: e.to_string(),
+                    })?;
+                crate::object_properties::set_property(pool, id, *property, value.clone())
+                    .map_err(|e| OperationError::PropertyError {
+                        object_id: *object_id,
+                        property: *property,
+                        reason: e.to_string(),
+                    })?;
+                context.affected_objects.insert(id);
+                Ok(Operation::RestoreProperty {
+                    object_id: *object_id,
                     property: *property,
                     value: old_value,
                 })

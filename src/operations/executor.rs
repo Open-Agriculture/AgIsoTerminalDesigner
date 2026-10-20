@@ -634,6 +634,7 @@ fn operation_type(operation: &Operation) -> String {
         Operation::RestoreObject { .. } => "RestoreObject",
         Operation::DeleteObject { .. } => "DeleteObject",
         Operation::SetProperty { .. } => "SetProperty",
+        Operation::RestoreProperty { .. } => "RestoreProperty",
         Operation::SetObjectReference { .. } => "SetObjectReference",
         Operation::SetObjectPointerAllowedReferences { .. } => "SetObjectPointerAllowedReferences",
         Operation::RestoreObjectPointerAllowedReferences { .. } => {

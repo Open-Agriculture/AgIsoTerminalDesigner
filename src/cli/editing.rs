@@ -1983,23 +1983,35 @@ fn parse_property_value(
     if !descriptor.writable {
         return Err(format!("Property '{property}' is read-only"));
     }
+    let choices: Vec<_> = descriptor
+        .enum_choices
+        .iter()
+        .filter(|choice| {
+            crate::vt_compatibility::supported_enum_value(
+                ty,
+                property,
+                choice,
+                project.vt_version(),
+            )
+        })
+        .collect();
     match descriptor.semantic {
         PropertySemantic::Colour => colour_value(project, raw),
         PropertySemantic::ObjectReference { .. } => {
             Err("Use the reference command for object references".into())
         }
-        PropertySemantic::Enum => descriptor
-            .enum_choices
+        PropertySemantic::Enum => choices
             .iter()
+            .copied()
             .find(|choice| {
                 choice.as_str() == Some(raw) || (!choice.is_string() && choice.to_string() == raw)
             })
             .cloned()
             .ok_or_else(|| {
                 format!(
-                    "Invalid '{property}' value '{raw}'; choices: {}",
-                    descriptor
-                        .enum_choices
+                    "Invalid '{property}' value '{raw}' for VT{}; choices: {}",
+                    u8::from(project.vt_version()),
+                    choices
                         .iter()
                         .map(|v| v
                             .as_str()
@@ -2235,6 +2247,97 @@ fn settings(project: &mut EditorProject, values: BTreeMap<String, String>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enum_input_uses_numeric_domains_and_selected_project_version() {
+        use ag_iso_stack::object_pool::vt_version::VtVersion;
+        let mut project = EditorProject::default();
+        for raw in ["0", "1", "2", "3"] {
+            assert_eq!(
+                parse_property_value(
+                    &project,
+                    ObjectType::OutputPolygon,
+                    PropertyKey::PolygonType,
+                    &json!(0),
+                    raw
+                )
+                .unwrap(),
+                json!(raw.parse::<u8>().unwrap())
+            );
+        }
+        for raw in ["4", "-1", "256", "1.5", "open"] {
+            let error = parse_property_value(
+                &project,
+                ObjectType::OutputPolygon,
+                PropertyKey::PolygonType,
+                &json!(0),
+                raw,
+            )
+            .unwrap_err();
+            assert!(error.contains("choices: 0, 1, 2, 3"), "{error}");
+        }
+        project.vt_version = VtVersion::Version3;
+        let error = parse_property_value(
+            &project,
+            ObjectType::FontAttributes,
+            PropertyKey::FontType,
+            &json!("Latin1"),
+            "Greek",
+        )
+        .unwrap_err();
+        assert!(error.contains("choices: Latin1, Latin9"), "{error}");
+        assert!(!error.split("choices:").nth(1).unwrap().contains("Greek"));
+        project.vt_version = VtVersion::Version4;
+        assert_eq!(
+            parse_property_value(
+                &project,
+                ObjectType::FontAttributes,
+                PropertyKey::FontType,
+                &json!("Latin1"),
+                "Greek"
+            )
+            .unwrap(),
+            json!("Greek")
+        );
+        assert!(parse_property_value(
+            &project,
+            ObjectType::FontAttributes,
+            PropertyKey::FontType,
+            &json!("Latin1"),
+            "Unknown"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn component_node_enum_assignments_use_domain_and_version_rules() {
+        use ag_iso_stack::object_pool::vt_version::VtVersion;
+        let mut project = EditorProject::default();
+        let mut node = crate::components::ComponentNode {
+            id: ComponentNodeId::default(),
+            name: "Shape".into(),
+            object_type: ObjectType::OutputPolygon,
+            properties: BTreeMap::new(),
+            references: BTreeMap::new(),
+            children: vec![],
+            macro_references: vec![],
+            object_list: None,
+        };
+        assert_eq!(
+            parse_node_property_value(&project, &node, PropertyKey::PolygonType, "3").unwrap(),
+            json!(3)
+        );
+        assert!(parse_node_property_value(&project, &node, PropertyKey::PolygonType, "4").is_err());
+        node.object_type = ObjectType::ScaledGraphic;
+        project.vt_version = VtVersion::Version5;
+        assert!(parse_node_property_value(&project, &node, PropertyKey::ScaleType, "84").is_err());
+        project.vt_version = VtVersion::Version6;
+        assert_eq!(
+            parse_node_property_value(&project, &node, PropertyKey::ScaleType, "84").unwrap(),
+            json!(84)
+        );
+        assert!(parse_node_property_value(&project, &node, PropertyKey::ScaleType, "85").is_err());
+    }
 
     #[test]
     fn lexical_values_follow_schema_and_preserve_text() {

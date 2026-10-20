@@ -454,11 +454,7 @@ fn compile_nodes(
             apply(
                 pool,
                 version,
-                Operation::SetProperty {
-                    object: ObjectTarget::id(id),
-                    property: *property,
-                    value: value.clone(),
-                },
+                stored_property_operation(node.object_type, id, *property, value),
             )
             .map_err(|e| locate(e, definition, instance, node.id, Some(property.as_str())))?;
         }
@@ -553,11 +549,7 @@ fn compile_nodes(
                         .map(ObjectTarget::id),
                 }
             } else {
-                Operation::SetProperty {
-                    object: ObjectTarget::id(id),
-                    property: property,
-                    value: value.clone(),
-                }
+                stored_property_operation(node.object_type, id, property, value)
             };
             apply(pool, version, op).map_err(|e| {
                 locate(
@@ -648,6 +640,34 @@ fn compile_nodes(
         }
     }
     Ok(())
+}
+
+/// Materialization replays stored authoring data, including reserved numeric
+/// enum values from imported drafts that need repair.
+/// Keep scalar type checks in the property setter while bypassing edit-domain
+/// validation for enum fields only.
+fn stored_property_operation(
+    object_type: ag_iso_stack::object_pool::ObjectType,
+    object_id: u16,
+    property: crate::object_properties::PropertyKey,
+    value: &serde_json::Value,
+) -> Operation {
+    let is_enum = crate::object_properties::get_property_descriptors(object_type)
+        .into_iter()
+        .any(|descriptor| descriptor.name == property && !descriptor.enum_choices.is_empty());
+    if is_enum {
+        Operation::RestoreProperty {
+            object_id,
+            property,
+            value: value.clone(),
+        }
+    } else {
+        Operation::SetProperty {
+            object: ObjectTarget::id(object_id),
+            property,
+            value: value.clone(),
+        }
+    }
 }
 fn external_value(
     value: &Value,

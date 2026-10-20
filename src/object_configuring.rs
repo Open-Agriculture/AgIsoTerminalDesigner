@@ -435,9 +435,19 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                 }
             }
             EditorKind::Enum => {
-                if !enum_value_supported(object_type, property_key, &value, design.vt_version) {
+                if !crate::vt_compatibility::supported_enum_value(
+                    object_type,
+                    property_key,
+                    &value,
+                    design.vt_version,
+                ) {
                     repair_warning(ui, &label, design.vt_version, |version| {
-                        enum_value_supported(object_type, property_key, &value, version)
+                        crate::vt_compatibility::supported_enum_value(
+                            object_type,
+                            property_key,
+                            &value,
+                            version,
+                        )
                     });
                 }
                 ui.horizontal(|ui| {
@@ -447,28 +457,20 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                         .selected_text(enum_choice_label(&value))
                         .show_ui(ui, |ui| {
                             for choice in &property.enum_choices {
-                                if choice != &value
-                                    && !enum_value_supported(
-                                        object_type,
-                                        property_key,
-                                        choice,
-                                        design.vt_version,
-                                    )
-                                {
-                                    continue;
-                                }
-                                let valid = choice == &value
-                                    || (enum_value_supported(
-                                        object_type,
-                                        property_key,
-                                        choice,
-                                        design.vt_version,
-                                    ) && property_choice_is_valid(
-                                        design,
-                                        id,
-                                        property_key,
-                                        choice.clone(),
-                                    ));
+                                let supported = crate::vt_compatibility::supported_enum_value(
+                                    object_type,
+                                    property_key,
+                                    choice,
+                                    design.vt_version,
+                                );
+                                let valid = supported
+                                    && (choice == &value
+                                        || property_choice_is_valid(
+                                            design,
+                                            id,
+                                            property_key,
+                                            choice.clone(),
+                                        ));
                                 let response = ui.add_enabled(
                                     valid,
                                     egui::Button::selectable(
@@ -476,6 +478,22 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                                         enum_choice_label(choice),
                                     ),
                                 );
+                                if !supported && response.contains_pointer() {
+                                    if let Some(availability) =
+                                        crate::vt_compatibility::availability_description(
+                                            |version| {
+                                                crate::vt_compatibility::supported_enum_value(
+                                                    object_type,
+                                                    property_key,
+                                                    choice,
+                                                    version,
+                                                )
+                                            },
+                                        )
+                                    {
+                                        response.show_tooltip_text(availability);
+                                    }
+                                }
                                 if response.clicked() && choice != &value {
                                     queue(design, id, property_key, choice.clone());
                                 }
@@ -1623,31 +1641,6 @@ fn property_operation(
     }
 }
 
-fn enum_value_supported(
-    object_type: ObjectType,
-    property: PropertyKey,
-    value: &serde_json::Value,
-    version: VtVersion,
-) -> bool {
-    match property {
-        PropertyKey::FontSize => {
-            serde_json::from_value(value.clone())
-                .ok()
-                .is_some_and(|font_size| {
-                    crate::vt_compatibility::supported_font_size(font_size, version)
-                })
-        }
-        PropertyKey::FontType => {
-            serde_json::from_value(value.clone())
-                .ok()
-                .is_some_and(|font_type| {
-                    crate::vt_compatibility::supported_font_type(font_type, version)
-                })
-        }
-        _ => crate::vt_compatibility::supported_property(object_type, property.as_str(), version),
-    }
-}
-
 fn repair_warning(
     ui: &mut egui::Ui,
     label: &str,
@@ -1705,7 +1698,12 @@ fn unavailable_features(object: &Object, version: VtVersion) -> Vec<String> {
                             format!("{label}: {}", enum_choice_label(choice))
                         };
                         add(choice_label, &|v| {
-                            enum_value_supported(object_type, property_key, choice, v)
+                            compatibility::supported_enum_value(
+                                object_type,
+                                property_key,
+                                choice,
+                                v,
+                            )
                         });
                     }
                 }
@@ -2720,23 +2718,26 @@ fn render_justification(
                             ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Bottom
                         }
                     };
-                    if choice != vertical
-                        && !crate::vt_compatibility::supported_vertical_alignment(
-                            alignment,
-                            design.vt_version,
-                        )
-                    {
-                        continue;
+                    let supported = crate::vt_compatibility::supported_vertical_alignment(
+                        alignment,
+                        design.vt_version,
+                    );
+                    let response = ui.add_enabled(
+                        supported,
+                        egui::Button::selectable(vertical == choice, choice),
+                    );
+                    if !supported && response.contains_pointer() {
+                        if let Some(availability) =
+                            crate::vt_compatibility::availability_description(|version| {
+                                crate::vt_compatibility::supported_vertical_alignment(
+                                    alignment, version,
+                                )
+                            })
+                        {
+                            response.show_tooltip_text(availability);
+                        }
                     }
-                    let valid = choice == vertical
-                        || crate::vt_compatibility::supported_vertical_alignment(
-                            alignment,
-                            design.vt_version,
-                        );
-                    if ui
-                        .add_enabled(valid, egui::Button::selectable(vertical == choice, choice))
-                        .clicked()
-                    {
+                    if response.clicked() && choice != vertical {
                         let mut updated = fields.clone();
                         updated.insert("vertical".to_owned(), choice.into());
                         let updated = serde_json::Value::Object(updated);
@@ -2961,12 +2962,23 @@ mod tests {
         object_id: ObjectId,
         events: Vec<egui::Event>,
     ) -> Vec<(String, egui::Rect)> {
+        editor_frame_for_time(ctx, project, object_id, events, None)
+    }
+
+    fn editor_frame_for_time(
+        ctx: &egui::Context,
+        project: &EditorProject,
+        object_id: ObjectId,
+        events: Vec<egui::Event>,
+        time: Option<f64>,
+    ) -> Vec<(String, egui::Rect)> {
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(360.0, 1800.0),
                 )),
+                time,
                 events,
                 ..Default::default()
             },
@@ -2989,6 +3001,23 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn hover_editor_item(
+        ctx: &egui::Context,
+        project: &EditorProject,
+        object_id: ObjectId,
+        pos: egui::Pos2,
+    ) -> Vec<(String, egui::Rect)> {
+        let time = ctx.input(|input| input.time);
+        editor_frame_for_time(
+            ctx,
+            project,
+            object_id,
+            vec![egui::Event::PointerMoved(pos)],
+            Some(time + 0.01),
+        );
+        editor_frame_for_time(ctx, project, object_id, vec![], Some(time + 1.0))
     }
 
     fn click_editor_text(
@@ -3348,7 +3377,24 @@ mod tests {
             .iter()
             .any(|(text, _)| text.contains("Vertical alignment: incompatible with VT3")));
         let text = click_editor_text(&ctx, &project, "Middle");
-        assert!(!text.iter().any(|(text, _)| text == "Bottom"));
+        let bottom = text
+            .iter()
+            .find(|(text, _)| text == "Bottom")
+            .expect("VT4-only vertical choices remain visible")
+            .1
+            .center();
+        let hover_text = hover_editor_item(&ctx, &project, ObjectId::new(1).unwrap(), bottom);
+        assert!(
+            hover_text
+                .iter()
+                .any(|(text, _)| text == "Available from VT4"),
+            "{hover_text:?}"
+        );
+        let after_disabled_click = click_editor_at(&ctx, &project, bottom);
+        assert!(!project.commit_queued("Select unavailable vertical alignment"));
+        if !after_disabled_click.iter().any(|(text, _)| text == "Top") {
+            click_editor_text(&ctx, &project, "Middle");
+        }
         click_editor_text(&ctx, &project, "Top");
         assert!(project.commit_queued("Repair vertical alignment"));
         assert!(!editor_frame(&ctx, &project, vec![])
@@ -3386,18 +3432,64 @@ mod tests {
     }
 
     #[test]
-    fn font_dropdown_filters_encodings_and_retains_imported_current_value() {
+    fn font_dropdown_disables_incompatible_choices_and_keeps_them_repairable() {
         use ag_iso_stack::object_pool::object_attributes::FontType;
-        for (version, greek_visible) in [(3, false), (4, true)] {
+        let descriptor = get_property_descriptors(ObjectType::FontAttributes)
+            .into_iter()
+            .find(|descriptor| descriptor.name == PropertyKey::FontType)
+            .unwrap();
+        for (version, greek_supported) in [(3, false), (4, true)] {
             let ctx = egui::Context::default();
             let font = object(ObjectType::FontAttributes, 1);
-            let project = project_at_version(font, version);
+            let mut project = project_at_version(font, version);
             let text = click_editor_text(&ctx, &project, "Latin1");
-            assert_eq!(
-                text.iter().any(|(text, _)| text == "Greek"),
-                greek_visible,
-                "{text:?}"
-            );
+            assert!(text.iter().any(|(text, _)| text == "Greek"), "{text:?}");
+            if !greek_supported {
+                let current = get_object_property(
+                    project.get_pool().objects().first().unwrap(),
+                    PropertyKey::FontType,
+                )
+                .unwrap();
+                let greek_position = text
+                    .iter()
+                    .find(|(text, _)| text == "Greek")
+                    .unwrap()
+                    .1
+                    .center();
+                let hover_text =
+                    hover_editor_item(&ctx, &project, ObjectId::new(1).unwrap(), greek_position);
+                assert!(
+                    hover_text
+                        .iter()
+                        .any(|(text, _)| text == "Available from VT4"),
+                    "{hover_text:?}"
+                );
+                let after_disabled_click = click_editor_at(&ctx, &project, greek_position);
+                assert!(!project.commit_queued("Select unavailable font encoding"));
+
+                let compatible_choice = descriptor
+                    .enum_choices
+                    .iter()
+                    .find(|choice| {
+                        *choice != &current
+                            && crate::vt_compatibility::supported_enum_value(
+                                ObjectType::FontAttributes,
+                                PropertyKey::FontType,
+                                choice,
+                                VtVersion::Version3,
+                            )
+                    })
+                    .unwrap();
+                let compatible_label = enum_choice_label(compatible_choice);
+                if !after_disabled_click
+                    .iter()
+                    .any(|(text, _)| text == &compatible_label)
+                {
+                    click_editor_text(&ctx, &project, &enum_choice_label(&current));
+                }
+                click_editor_text(&ctx, &project, &compatible_label);
+                assert!(project.commit_queued("Select compatible font encoding"));
+            }
         }
         let mut font = object(ObjectType::FontAttributes, 1);
         let Object::FontAttributes(value) = &mut font else {
@@ -3410,7 +3502,8 @@ mod tests {
         assert!(text.iter().any(|(text, _)| {
             text.contains("Font Type: incompatible with VT3. Available from VT4")
         }));
-        click_editor_text(&ctx, &project, "Greek");
+        let text = click_editor_text(&ctx, &project, "Greek");
+        assert!(text.iter().any(|(text, _)| text == "Greek"));
         click_editor_text(&ctx, &project, "Latin1");
         assert!(project.commit_queued("Repair font encoding"));
         let text = editor_frame(&ctx, &project, vec![]);

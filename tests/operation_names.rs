@@ -4,9 +4,9 @@ use ag_iso_stack::object_pool::object::Object;
 use ag_iso_stack::object_pool::object_attributes::Event;
 use ag_iso_stack::object_pool::{ObjectId, ObjectPool, ObjectType};
 use ag_iso_terminal_designer::{
-    default_object, object_properties::PropertyKey, ChildPlacement, MacroReferenceTarget,
-    ObjectInfo, ObjectTarget, ObjectTargetList, Operation, OperationError, OperationExecutor,
-    OperationTransaction, CURRENT_OPERATION_SCHEMA_VERSION,
+    default_object, object_properties::PropertyKey, ChildPlacement, EditorProject,
+    MacroReferenceTarget, ObjectInfo, ObjectTarget, ObjectTargetList, Operation, OperationError,
+    OperationExecutor, OperationTransaction, CURRENT_OPERATION_SCHEMA_VERSION,
 };
 use serde_json::json;
 
@@ -66,6 +66,74 @@ fn schema_v2_json_uses_only_object_shaped_targets() {
         "data": { "object": {}, "info": null }
     }))
     .is_err());
+    assert!(serde_json::from_value::<Operation>(json!({
+        "type": "RestoreProperty",
+        "data": { "object_id": 10, "property": "polygon_type", "value": 4 }
+    }))
+    .is_err());
+}
+
+#[test]
+fn repairing_reserved_polygon_type_is_undoable_and_redoable() {
+    let mut polygon = default_object(ObjectType::OutputPolygon);
+    polygon.mut_id().set_value(10).unwrap();
+    if let Object::OutputPolygon(polygon) = &mut polygon {
+        polygon.points = vec![
+            ag_iso_stack::object_pool::object_attributes::Point { x: 0, y: 0 },
+            ag_iso_stack::object_pool::object_attributes::Point { x: 10, y: 0 },
+            ag_iso_stack::object_pool::object_attributes::Point { x: 0, y: 10 },
+        ];
+        polygon.polygon_type = 4;
+    }
+    let mut pool = ObjectPool::default();
+    pool.add(polygon);
+    let mut project = EditorProject::from(pool);
+
+    let mut invalid_edit = OperationTransaction::new(None);
+    invalid_edit.add_operation(Operation::SetProperty {
+        object: ObjectTarget::id(10),
+        property: PropertyKey::PolygonType,
+        value: json!(4),
+    });
+    assert!(project.execute_transaction(invalid_edit).is_err());
+
+    let mut repair = OperationTransaction::new(Some("Repair polygon type".into()));
+    repair.add_operation(Operation::SetProperty {
+        object: ObjectTarget::id(10),
+        property: PropertyKey::PolygonType,
+        value: json!(0),
+    });
+    project.execute_transaction(repair).unwrap();
+    assert_eq!(
+        ag_iso_terminal_designer::object_properties::get_property(
+            project.get_pool(),
+            ObjectId::new(10).unwrap(),
+            PropertyKey::PolygonType,
+        )
+        .unwrap(),
+        json!(0)
+    );
+
+    assert!(project.undo_operation());
+    assert_eq!(
+        ag_iso_terminal_designer::object_properties::get_property(
+            project.get_pool(),
+            ObjectId::new(10).unwrap(),
+            PropertyKey::PolygonType,
+        )
+        .unwrap(),
+        json!(4)
+    );
+    assert!(project.redo_operation());
+    assert_eq!(
+        ag_iso_terminal_designer::object_properties::get_property(
+            project.get_pool(),
+            ObjectId::new(10).unwrap(),
+            PropertyKey::PolygonType,
+        )
+        .unwrap(),
+        json!(0)
+    );
 }
 
 #[test]

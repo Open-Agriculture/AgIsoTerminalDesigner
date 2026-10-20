@@ -202,7 +202,8 @@ pub struct PropertyDescriptor {
     pub writable: bool,
     pub semantic: PropertySemantic,
     pub valid_range: Option<(Value, Value)>,
-    /// Serialized choices derived from the field type, shared by all editors.
+    /// Serialized choices derived from the field type or ISO-defined byte domain.
+    /// Contains all versions; callers apply project-version availability separately.
     pub enum_choices: Vec<Value>,
 }
 
@@ -267,18 +268,6 @@ fn default_editor(semantic: &PropertySemantic) -> EditorKind {
 /// Widgets whose presentation cannot be determined from their semantic alone.
 fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<EditorKind> {
     match (object_type, property) {
-        // These upstream fields are raw bytes, not Rust enums. Keep their numeric
-        // editor explicit until the stack exposes typed variants.
-        (
-            ObjectType::AuxiliaryFunctionType1 | ObjectType::AuxiliaryInputType1,
-            PropertyKey::FunctionType,
-        )
-        | (ObjectType::AuxiliaryControlDesignatorType2, PropertyKey::PointerType)
-        | (ObjectType::OutputEllipse, PropertyKey::EllipseType)
-        | (ObjectType::OutputPolygon, PropertyKey::PolygonType)
-        | (ObjectType::FillAttributes, PropertyKey::FillType)
-        | (ObjectType::GraphicData, PropertyKey::Format)
-        | (ObjectType::ScaledGraphic, PropertyKey::ScaleType) => Some(EditorKind::Auto),
         (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }
@@ -464,9 +453,12 @@ macro_rules! object_reference {
     };
 }
 
-// Special handling is limited to enums with payloads; unit variants are read
-// directly from Serde metadata, so adding a Rust variant updates the UI too.
+// Unit variants come from Serde metadata. Payload enums and ISO-defined raw
+// byte fields supply explicit choices.
 macro_rules! property_enum_choices {
+    ($field:ident, $owner:ty, $choices:expr) => {
+        $choices
+    };
     (font_size, $owner:ty) => {{
         use ag_iso_stack::object_pool::object_attributes::{FontSize, NonProportionalFontSize};
         let mut choices: Vec<Value> = enum_unit_choices::<NonProportionalFontSize>()
@@ -563,7 +555,7 @@ fn enum_unit_choices<T: serde::de::DeserializeOwned>() -> Vec<Value> {
 macro_rules! impl_properties {
     (
         $type:ty {
-            $( $key:ident : $field:ident $(=> $semantic:expr)? ),* $(,)?
+            $( $key:ident : $field:ident $(=> $semantic:expr)? $(; choices $choices:expr)? ),* $(,)?
         }
     ) => {
         impl PropertyAccess for $type {
@@ -610,7 +602,7 @@ macro_rules! impl_properties {
                 vec![
                     $(
                         {
-                            let enum_choices = property_enum_choices!($field, Self);
+                            let enum_choices: Vec<Value> = property_enum_choices!($field, Self $(, $choices)?);
                             let semantic = property_semantic!($($semantic)?);
                             let semantic = if semantic == PropertySemantic::Normal && !enum_choices.is_empty() {
                                 PropertySemantic::Enum
@@ -789,24 +781,26 @@ ag_iso_stack::object_pool::object::OutputRectangle {
     FillAttributes: fill_attributes => object_reference!(FillAttributes)
 }}
 
+// ISO 11783-6:2018, Table B.31: the type field is an enumerated byte.
 impl_properties! {
 ag_iso_stack::object_pool::object::OutputEllipse {
     LineAttributes: line_attributes => object_reference!(LineAttributes),
     Width: width,
     Height: height,
-    EllipseType: ellipse_type => PropertySemantic::Enum,
+    EllipseType: ellipse_type => PropertySemantic::Enum; choices (0..=3).map(Value::from).collect(),
     StartAngle: start_angle,
     EndAngle: end_angle,
     FillAttributes: fill_attributes => object_reference!(FillAttributes)
 }}
 
+// ISO 11783-6:2018, Table B.33: the type field is an enumerated byte.
 impl_properties! {
 ag_iso_stack::object_pool::object::OutputPolygon {
     Width: width,
     Height: height,
     LineAttributes: line_attributes => object_reference!(LineAttributes),
     FillAttributes: fill_attributes => object_reference!(FillAttributes),
-    PolygonType: polygon_type => PropertySemantic::Enum,
+    PolygonType: polygon_type => PropertySemantic::Enum; choices (0..=3).map(Value::from).collect(),
     Points: points
 }}
 
@@ -892,9 +886,10 @@ ag_iso_stack::object_pool::object::LineAttributes {
     LineArt: line_art => PropertySemantic::Bitflags
 }}
 
+// ISO 11783-6:2018, Table B.50: the type field is an enumerated byte.
 impl_properties! {
 ag_iso_stack::object_pool::object::FillAttributes {
-    FillType: fill_type => PropertySemantic::Enum,
+    FillType: fill_type => PropertySemantic::Enum; choices (0..=3).map(Value::from).collect(),
     FillColour: fill_colour => PropertySemantic::Colour,
     FillPattern: fill_pattern => object_reference!(PictureGraphic)
 }}
@@ -913,16 +908,18 @@ ag_iso_stack::object_pool::object::ObjectPointer {
 impl_properties! {
 ag_iso_stack::object_pool::object::Macro { Commands: commands }}
 
+// ISO 11783-6:2018, Table J.1: the type field is an enumerated byte.
 impl_properties! {
 ag_iso_stack::object_pool::object::AuxiliaryFunctionType1 {
     BackgroundColour: background_colour => PropertySemantic::Colour,
-    FunctionType: function_type => PropertySemantic::Enum
+    FunctionType: function_type => PropertySemantic::Enum; choices (0..=2).map(Value::from).collect()
 }}
 
+// ISO 11783-6:2018, Table J.3: the type field is an enumerated byte.
 impl_properties! {
 ag_iso_stack::object_pool::object::AuxiliaryInputType1 {
     BackgroundColour: background_colour => PropertySemantic::Colour,
-    FunctionType: function_type => PropertySemantic::Enum,
+    FunctionType: function_type => PropertySemantic::Enum; choices (0..=2).map(Value::from).collect(),
     InputId: input_id
 }}
 
@@ -938,9 +935,10 @@ ag_iso_stack::object_pool::object::AuxiliaryInputType2 {
     FunctionAttributes: function_attributes => PropertySemantic::Bitflags
 }}
 
+// ISO 11783-6:2018, Table J.6: the type field is an enumerated byte.
 impl_properties! {
 ag_iso_stack::object_pool::object::AuxiliaryControlDesignatorType2 {
-    PointerType: pointer_type => PropertySemantic::Enum,
+    PointerType: pointer_type => PropertySemantic::Enum; choices (0..=3).map(Value::from).collect(),
     AuxiliaryObjectId: auxiliary_object_id => object_reference!(AuxiliaryFunctionType2, AuxiliaryInputType2)
 }}
 
@@ -1036,7 +1034,8 @@ ag_iso_stack::object_pool::object::ColourPalette {
 
 impl_properties! {
 ag_iso_stack::object_pool::object::GraphicData {
-    Format: format => PropertySemantic::Enum,
+    // ISO 11783-6:2018, Table B.74: PNG is the only defined format.
+    Format: format => PropertySemantic::Enum; choices vec![Value::from(0)],
     Data: data
 }}
 
@@ -1051,7 +1050,11 @@ impl_properties! {
 ag_iso_stack::object_pool::object::ScaledGraphic {
     Width: width,
     Height: height,
-    ScaleType: scale_type => PropertySemantic::Enum,
+    // Table B.76: scaling 0–4, horizontal/vertical justification 0–2.
+    ScaleType: scale_type => PropertySemantic::Enum; choices (0..=2)
+        .flat_map(|vertical| (0..=2).flat_map(move |horizontal|
+            (0..=4).map(move |scaling| Value::from(scaling | (horizontal << 3) | (vertical << 5)))))
+        .collect(),
     Options: options => PropertySemantic::Bitflags,
     Value: value => object_reference!(PictureGraphic, GraphicData)
 }}
@@ -1361,6 +1364,18 @@ pub fn validate_property(
         });
     }
 
+    // Byte enums have no typed Rust deserializer enforcing their ISO domain.
+    if descriptor.semantic == PropertySemantic::Enum
+        && descriptor.enum_choices.iter().any(Value::is_number)
+        && !descriptor.enum_choices.contains(value)
+    {
+        return Err(PropertyError::InvalidValue {
+            object_id,
+            property,
+            reason: "value is outside the defined enum choices".into(),
+        });
+    }
+
     if let Some((min, max)) = descriptor.valid_range {
         let number = value.as_f64();
         let minimum = min.as_f64();
@@ -1455,13 +1470,6 @@ mod tests {
                     .find(|editor| editor.property == EditorTarget::Property(descriptor.name))
                     .unwrap();
                 let current = get_object_property(&object, descriptor.name).unwrap();
-                if matches!(editor.editor, EditorKind::Auto) {
-                    // Only explicitly overridden upstream byte fields may use numbers.
-                    assert!(editor_override(object_type, descriptor.name).is_some());
-                    assert!(current.is_u64());
-                    assert!(descriptor.enum_choices.is_empty());
-                    continue;
-                }
                 assert!(matches!(editor.editor, EditorKind::Enum));
                 assert!(
                     descriptor.enum_choices.contains(&current),
@@ -1477,6 +1485,77 @@ mod tests {
                         choice
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn byte_enum_domains_follow_part_6() {
+        for (object_type, property, maximum) in [
+            (ObjectType::OutputPolygon, PropertyKey::PolygonType, 3),
+            (ObjectType::OutputEllipse, PropertyKey::EllipseType, 3),
+            (ObjectType::FillAttributes, PropertyKey::FillType, 3),
+            (
+                ObjectType::AuxiliaryFunctionType1,
+                PropertyKey::FunctionType,
+                2,
+            ),
+            (
+                ObjectType::AuxiliaryInputType1,
+                PropertyKey::FunctionType,
+                2,
+            ),
+            (
+                ObjectType::AuxiliaryControlDesignatorType2,
+                PropertyKey::PointerType,
+                3,
+            ),
+            (ObjectType::GraphicData, PropertyKey::Format, 0),
+            (ObjectType::ScaledGraphic, PropertyKey::ScaleType, 84),
+        ] {
+            let choices = get_property_descriptors(object_type)
+                .into_iter()
+                .find(|descriptor| descriptor.name == property)
+                .unwrap()
+                .enum_choices;
+            let mut object = default_object(object_type);
+            object.mut_id().set_value(1).unwrap();
+            let mut pool = ObjectPool::default();
+            pool.add(object);
+            for value in 0..=255 {
+                let expected = if property == PropertyKey::ScaleType {
+                    value & 7 <= 4
+                        && (value >> 3) & 3 <= 2
+                        && (value >> 5) & 3 <= 2
+                        && value & 128 == 0
+                } else {
+                    value <= maximum
+                };
+                assert_eq!(
+                    choices.contains(&json!(value)),
+                    expected,
+                    "{object_type:?}: {value}"
+                );
+                assert_eq!(
+                    validate_property(&pool, ObjectId::new(1).unwrap(), property, &json!(value))
+                        .is_ok(),
+                    expected,
+                    "{object_type:?}: {value}"
+                );
+            }
+            assert_eq!(
+                choices.len(),
+                if property == PropertyKey::ScaleType {
+                    45
+                } else {
+                    maximum as usize + 1
+                }
+            );
+            for invalid in [json!(-1), json!(256), json!(1.5), json!("0")] {
+                assert!(
+                    validate_property(&pool, ObjectId::new(1).unwrap(), property, &invalid)
+                        .is_err()
+                );
             }
         }
     }

@@ -534,6 +534,91 @@ fn materialized_property_errors_map_back_to_component_instance_node_and_property
 }
 
 #[test]
+fn imported_component_reserved_enum_materializes_and_can_be_repaired() {
+    let mut pool = fixture().get_pool().clone();
+    let mut line = default_object(ObjectType::LineAttributes);
+    line.mut_id().set_value(104).unwrap();
+    pool.add(line);
+    let mut polygon = default_object(ObjectType::OutputPolygon);
+    polygon.mut_id().set_value(103).unwrap();
+    if let Object::OutputPolygon(polygon) = &mut polygon {
+        polygon.line_attributes = ObjectId::new(104).unwrap().into();
+        polygon.width = 40;
+        polygon.height = 30;
+        polygon.points = vec![
+            ag_iso_stack::object_pool::object_attributes::Point { x: 0, y: 0 },
+            ag_iso_stack::object_pool::object_attributes::Point { x: 40, y: 0 },
+            ag_iso_stack::object_pool::object_attributes::Point { x: 20, y: 30 },
+        ];
+    }
+    pool.add(polygon);
+    if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(2).unwrap()) {
+        mask.object_refs.push(ObjectRef {
+            id: ObjectId::new(103).unwrap(),
+            offset: ag_iso_stack::object_pool::object_attributes::Point { x: 30, y: 20 },
+        });
+    }
+    let mut project = EditorProject::from(pool);
+    let plan = plan_component_capture(&project, 103, "Polygon component".into()).unwrap();
+    let component = plan.definition.id;
+    ComponentService::create_component_from_selection(&mut project, plan, false).unwrap();
+
+    let mut invalid_edit = project.component_source().definitions[&component].clone();
+    invalid_edit
+        .nodes
+        .iter_mut()
+        .find(|node| node.object_type == ObjectType::OutputPolygon)
+        .unwrap()
+        .properties
+        .insert(property("polygon_type"), json!(4));
+    assert!(ComponentService::edit_component_definition(&mut project, invalid_edit).is_err());
+
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&project.save_project().unwrap()).unwrap();
+    let mut source = project.component_source().clone();
+    for node in &mut source.definitions.get_mut(&component).unwrap().nodes {
+        if node.object_type == ObjectType::OutputPolygon {
+            node.properties.insert(property("polygon_type"), json!(4));
+        }
+    }
+    saved["components"] = serde_json::to_value(source).unwrap();
+    let mut loaded = EditorProject::load_project(serde_json::to_vec(&saved).unwrap()).unwrap();
+
+    let instance = &loaded.component_source().instances[0];
+    let polygon_node = loaded.component_source().definitions[&component]
+        .nodes
+        .iter()
+        .find(|node| node.object_type == ObjectType::OutputPolygon)
+        .unwrap();
+    let polygon_node_id = polygon_node.id;
+    let polygon_id = instance.compiled_ids[&polygon_node_id];
+    let materialized = loaded.materialize().unwrap();
+    assert!(matches!(
+        materialized
+            .pool
+            .object_by_id(ObjectId::new(polygon_id).unwrap()),
+        Some(Object::OutputPolygon(polygon)) if polygon.polygon_type == 4
+    ));
+
+    let mut repaired = loaded.component_source().definitions[&component].clone();
+    repaired
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == polygon_node_id)
+        .unwrap()
+        .properties
+        .insert(property("polygon_type"), json!(0));
+    ComponentService::edit_component_definition(&mut loaded, repaired).unwrap();
+    let materialized = loaded.materialize().unwrap();
+    assert!(matches!(
+        materialized
+            .pool
+            .object_by_id(ObjectId::new(polygon_id).unwrap()),
+        Some(Object::OutputPolygon(polygon)) if polygon.polygon_type == 0
+    ));
+}
+
+#[test]
 fn primitive_edits_skip_reserved_ids_and_interleave_with_source_history() {
     let (mut p, component, a) = captured();
     ComponentService::instantiate_component(&mut p, component, 2, 170, 20, Default::default())

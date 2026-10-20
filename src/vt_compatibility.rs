@@ -159,6 +159,34 @@ pub fn supported_property_flag(
     !introduced_in_v4 || version >= VtVersion::Version4
 }
 
+/// Whether a declared enum choice is available for authoring at a VT version.
+///
+/// Callers supply a choice from the property's domain. This checks object and
+/// property availability as well as value-specific version restrictions; it
+/// does not check optional terminal capabilities or rewrite stored values.
+pub fn supported_enum_value(
+    object_type: ObjectType,
+    property: crate::object_properties::PropertyKey,
+    value: &serde_json::Value,
+    version: VtVersion,
+) -> bool {
+    use crate::object_properties::PropertyKey;
+    if !supported_object_type(object_type, version)
+        || !supported_property(object_type, property.as_str(), version)
+    {
+        return false;
+    }
+    match property {
+        PropertyKey::FontSize => serde_json::from_value(value.clone())
+            .ok()
+            .is_some_and(|size| supported_font_size(size, version)),
+        PropertyKey::FontType => serde_json::from_value(value.clone())
+            .ok()
+            .is_some_and(|font| supported_font_type(font, version)),
+        _ => true,
+    }
+}
+
 /// Whether a font encoding value is defined for the selected VT generation.
 pub fn supported_font_type(font_type: FontType, version: VtVersion) -> bool {
     match (version >= VtVersion::Version4, font_type) {
@@ -234,6 +262,31 @@ pub fn validate_pool_compatibility(
                 )
             };
             push(id, "VT_OBJECT_UNSUPPORTED", "object_type", requirement);
+        }
+
+        // Raw-byte enums must keep imported drafts inspectable while new edits
+        // and exports reject values outside the ISO-defined domain.
+        for descriptor in crate::object_properties::get_property_descriptors(object_type) {
+            if descriptor.semantic != crate::object_properties::PropertySemantic::Enum
+                || !descriptor
+                    .enum_choices
+                    .iter()
+                    .any(serde_json::Value::is_number)
+            {
+                continue;
+            }
+            if let Ok(value) =
+                crate::object_properties::get_object_property(object, descriptor.name)
+            {
+                if !descriptor.enum_choices.contains(&value) {
+                    push(
+                        id,
+                        "VT_ATTRIBUTE_VALUE_INVALID",
+                        descriptor.name.as_str(),
+                        format!("{value} is outside the defined enum choices"),
+                    );
+                }
+            }
         }
 
         if let Object::InputBoolean(value) = object {
