@@ -1,16 +1,170 @@
 use ag_iso_stack::object_pool::{
     object::{Object, StringVariable, VtString},
+    object_attributes::FontType,
     vt_version::VtVersion,
     ObjectId, ObjectPool, ObjectType,
 };
 use ag_iso_terminal_designer::{
-    default_object, EditorProject, ObjectTarget, Operation, OperationTransaction,
-    CURRENT_OPERATION_SCHEMA_VERSION,
+    default_object,
+    object_properties::{get_property, get_property_descriptors, validate_property, PropertyKey},
+    vt_compatibility::{supported_enum_value, supported_font_type},
+    EditorProject, ObjectTarget, Operation, OperationTransaction, CURRENT_OPERATION_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 
 fn object_id(value: u16) -> ObjectId {
     ObjectId::new(value).unwrap()
+}
+
+#[test]
+fn font_type_choices_authoring_and_export_follow_version_boundaries() {
+    let cases: Vec<_> = [(0, 2), (1, 2), (2, 4), (4, 4), (5, 4), (7, 4)]
+        .into_iter()
+        .chain((240..=254).map(|code| (code, 4)))
+        .chain([(255, 2)])
+        .map(|(code, since)| (FontType::from(code), since))
+        .collect();
+    let pool = with_object(ObjectType::FontAttributes, 10);
+    let choices = get_property_descriptors(ObjectType::FontAttributes)
+        .into_iter()
+        .find(|d| d.name == PropertyKey::FontType)
+        .unwrap()
+        .enum_choices;
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(font, _)| serde_json::to_value(font).unwrap())
+        .collect();
+    assert_eq!(choices, expected);
+    for (font, since) in cases {
+        let value = serde_json::to_value(font).unwrap();
+        validate_property(&pool, object_id(10), PropertyKey::FontType, &value).unwrap();
+        for number in 2..=6 {
+            let version = VtVersion::try_from(number).unwrap();
+            let available = number >= since;
+            assert_eq!(
+                supported_font_type(font, version),
+                available,
+                "{font:?} at VT{number}"
+            );
+            let mut project = EditorProject::from(pool.clone());
+            project.set_vt_version(version).unwrap();
+            let mut edit = OperationTransaction::new(None);
+            edit.add_operation(set_property(10, "font_type", value.clone()));
+            let applied = project.execute_transaction(edit);
+            assert_eq!(applied.is_ok(), available, "{font:?} at VT{number}");
+            if available {
+                // Valid edits retain serializable inverse transactions.
+                serde_json::to_value(applied.unwrap().create_inverse()).unwrap();
+                let imported =
+                    EditorProject::import_iop(project.export_iop().unwrap(), version).unwrap();
+                assert_eq!(
+                    get_property(imported.get_pool(), object_id(10), PropertyKey::FontType)
+                        .unwrap(),
+                    value
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_font_payloads_are_rejected_without_mutation() {
+    let pool = with_object(ObjectType::FontAttributes, 10);
+    for invalid in [
+        json!({"Reserved": 0}),
+        json!({"Reserved": 3}),
+        json!({"Reserved": 255}),
+        json!({"Proprietary": 0}),
+        json!({"Proprietary": 239}),
+        json!("Unknown"),
+        json!({"Proprietary": -1}),
+        json!({"Proprietary": 256}),
+        json!({"Proprietary": 1.5}),
+        json!(null),
+    ] {
+        assert!(validate_property(&pool, object_id(10), PropertyKey::FontType, &invalid).is_err());
+        for version in [VtVersion::Version2, VtVersion::Version6] {
+            assert!(!supported_enum_value(
+                ObjectType::FontAttributes,
+                PropertyKey::FontType,
+                &invalid,
+                version
+            ));
+        }
+        let mut project = EditorProject::from(pool.clone());
+        let before = project.save_project().unwrap();
+        assert!(!apply(
+            &mut project,
+            vec![set_property(10, "font_type", invalid)]
+        ));
+        assert_eq!(project.save_project().unwrap(), before);
+        assert!(!project.undo_available());
+    }
+}
+
+#[test]
+fn malformed_stored_font_payloads_are_rejected_on_load() {
+    let project = EditorProject::from(with_object(ObjectType::FontAttributes, 10));
+    let saved: Value = serde_json::from_slice(&project.save_project().unwrap()).unwrap();
+    for invalid in [
+        json!("Unknown"),
+        json!({"Proprietary": 256}),
+        json!({"Reserved": -1}),
+        json!({"Proprietary": 1.5}),
+    ] {
+        let mut malformed = saved.clone();
+        let font = malformed["objects"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|object| object["type"] == "FontAttributes")
+            .unwrap();
+        font["properties"]["font_type"] = invalid;
+        assert!(EditorProject::load_project(serde_json::to_vec(&malformed).unwrap()).is_err());
+    }
+}
+
+#[test]
+fn imported_font_repairs_preserve_loading_history_and_export_rules() {
+    for (font, version) in [
+        (FontType::Greek, 3),
+        (FontType::Reserved(3), 6),
+        (FontType::Proprietary(239), 6),
+        (FontType::Proprietary(240), 3),
+    ] {
+        let mut pool = with_object(ObjectType::FontAttributes, 10);
+        let Some(Object::FontAttributes(value)) = pool.object_mut_by_id(object_id(10)) else {
+            unreachable!()
+        };
+        value.font_type = font;
+        let project = EditorProject::from(pool);
+        let mut saved: Value = serde_json::from_slice(&project.save_project().unwrap()).unwrap();
+        saved["settings"]["vt_version"] = json!(version);
+        let mut loaded = EditorProject::load_project(serde_json::to_vec(&saved).unwrap()).unwrap();
+        let stored = serde_json::to_value(font).unwrap();
+        let read = |project: &EditorProject| {
+            get_property(project.get_pool(), object_id(10), PropertyKey::FontType).unwrap()
+        };
+        assert_eq!(read(&loaded), stored);
+        assert!(loaded.export_iop().is_err(), "{font:?} at VT{version}");
+        assert!(!apply(
+            &mut loaded,
+            vec![set_property(10, "font_type", stored.clone())]
+        ));
+        assert_eq!(read(&loaded), stored);
+        assert!(!loaded.undo_available());
+        assert!(apply(
+            &mut loaded,
+            vec![set_property(10, "font_type", json!("Latin1"))]
+        ));
+        assert!(loaded.export_iop().is_ok());
+        assert!(loaded.undo_operation());
+        assert_eq!(read(&loaded), stored);
+        assert!(loaded.export_iop().is_err());
+        assert!(loaded.redo_operation());
+        assert_eq!(read(&loaded), json!("Latin1"));
+        assert!(loaded.export_iop().is_ok());
+    }
 }
 
 #[test]

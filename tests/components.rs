@@ -619,6 +619,113 @@ fn imported_component_reserved_enum_materializes_and_can_be_repaired() {
 }
 
 #[test]
+fn imported_component_fonts_preserve_values_and_repair_history() {
+    for (font, version) in [
+        (FontType::Reserved(3), 6),
+        (FontType::Proprietary(239), 6),
+        (FontType::Greek, 3),
+    ] {
+        let (project, component, _) = captured();
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&project.save_project().unwrap()).unwrap();
+        saved["settings"]["vt_version"] = json!(version);
+        let mut project = EditorProject::load_project(serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut definition = project.component_source().definitions[&component].clone();
+        let font_node = definition
+            .nodes
+            .iter_mut()
+            .find(|node| node.object_type == ObjectType::FontAttributes)
+            .unwrap();
+        let node_id = font_node.id;
+        let stored = serde_json::to_value(font).unwrap();
+        font_node
+            .properties
+            .insert(property("font_type"), stored.clone());
+        assert!(
+            ComponentService::edit_component_definition(&mut project, definition.clone()).is_err()
+        );
+
+        let parameter = ComponentParameterId::default();
+        definition.parameters.push(ComponentParameter {
+            id: parameter,
+            name: "Encoding".into(),
+            description: None,
+            target_node: node_id,
+            property: ComponentParameterTarget::Property(property("font_type")),
+            kind: ComponentParameterKind::Enum,
+            default_value: stored.clone(),
+        });
+        let mut source = project.component_source().clone();
+        source.definitions.insert(component, definition.clone());
+        saved["components"] = serde_json::to_value(source).unwrap();
+        let mut loaded = EditorProject::load_project(serde_json::to_vec(&saved).unwrap()).unwrap();
+        let font_id = loaded.component_source().instances[0].compiled_ids[&node_id];
+        let read = |project: &EditorProject| {
+            let materialized = project.materialize().unwrap();
+            object_properties::get_property(
+                &materialized.pool,
+                ObjectId::new(font_id).unwrap(),
+                property("font_type"),
+            )
+            .unwrap()
+        };
+        assert_eq!(read(&loaded), stored);
+        let mut reloaded = EditorProject::load_project(loaded.save_project().unwrap()).unwrap();
+        assert_eq!(read(&reloaded), stored);
+        let mut unrelated = reloaded.component_source().definitions[&component].clone();
+        unrelated.description = "Unrelated edit retaining an imported font".into();
+        ComponentService::edit_component_definition(&mut reloaded, unrelated).unwrap();
+        assert_eq!(read(&reloaded), stored);
+        let instance_id = loaded.component_source().instances[0].id;
+        for mut intent in [
+            ComponentIntent::SetComponentMasterProperty {
+                component_id: component,
+                node_id,
+                property: property("font_type"),
+                value: stored.clone(),
+                scope: ComponentMasterScope::AllInstances,
+            },
+            ComponentIntent::SetComponentOverride {
+                instance_id,
+                parameter,
+                value: stored.clone(),
+            },
+        ] {
+            let before = loaded.save_project().unwrap();
+            assert!(ComponentService::apply_intents(&mut loaded, &[intent.clone()]).is_err());
+            assert_eq!(loaded.save_project().unwrap(), before);
+            assert!(!loaded.undo_available());
+            match &mut intent {
+                ComponentIntent::SetComponentMasterProperty { value, .. }
+                | ComponentIntent::SetComponentOverride { value, .. } => *value = json!("Latin1"),
+                _ => unreachable!(),
+            }
+            ComponentService::apply_intents(&mut loaded, &[intent]).unwrap();
+            assert_eq!(read(&loaded), json!("Latin1"));
+            assert!(loaded.undo_operation());
+            assert_eq!(read(&loaded), stored);
+            assert!(loaded.redo_operation());
+            assert_eq!(read(&loaded), json!("Latin1"));
+            assert!(loaded.undo_operation());
+        }
+        definition
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+            .unwrap()
+            .properties
+            .insert(property("font_type"), json!("Latin1"));
+        definition.parameters[0].default_value = json!("Latin1");
+        ComponentService::edit_component_definition(&mut loaded, definition).unwrap();
+        assert_eq!(read(&loaded), json!("Latin1"));
+        assert!(loaded.undo_operation());
+        assert_eq!(read(&loaded), stored);
+        assert!(loaded.redo_operation());
+        assert_eq!(read(&loaded), json!("Latin1"));
+    }
+}
+
+#[test]
 fn primitive_edits_skip_reserved_ids_and_interleave_with_source_history() {
     let (mut p, component, a) = captured();
     ComponentService::instantiate_component(&mut p, component, 2, 170, 20, Default::default())

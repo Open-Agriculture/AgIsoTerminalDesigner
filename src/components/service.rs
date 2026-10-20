@@ -45,6 +45,7 @@ impl ComponentService {
         project: &mut EditorProject,
         intents: &[ComponentIntent],
     ) -> ComponentResult<()> {
+        let version = project.vt_version();
         project.edit_source("Component actions", |pool, source, _graphics, _| {
             for intent in intents {
                 match intent {
@@ -74,6 +75,19 @@ impl ComponentService {
                         parameter,
                         value,
                     } => {
+                        let component = instance_mut(source, *instance_id)?.component_id;
+                        let target = source.definitions.get(&component).and_then(|definition| {
+                            let target =
+                                definition.parameters.iter().find(|p| p.id == *parameter)?;
+                            let node = definition
+                                .nodes
+                                .iter()
+                                .find(|n| n.id == target.target_node)?;
+                            Some((node, target.property))
+                        });
+                        if let Some((node, ComponentParameterTarget::Property(property))) = target {
+                            validate_font_edit(node, property, value, version)?;
+                        }
                         instance_mut(source, *instance_id)?
                             .overrides
                             .insert(*parameter, value.clone());
@@ -96,6 +110,7 @@ impl ComponentService {
                             .ok_or_else(|| {
                                 ComponentError::new("COMPONENT_NODE_INVALID", "Unknown master node")
                             })?;
+                        validate_font_edit(node, *property, value, version)?;
                         node.properties.insert(property.clone(), value.clone());
                         for parameter in definition.parameters.iter_mut().filter(|p| {
                             p.target_node == *node_id
@@ -395,6 +410,34 @@ impl ComponentService {
         Self::edit_component_definition(project, copy)?;
         Ok(id)
     }
+}
+
+// Explicit assignments enforce authoring availability; loading and full-definition
+// edits may retain incompatible fonts so unrelated fields remain repairable.
+fn validate_font_edit(
+    node: &ComponentNode,
+    property: crate::object_properties::PropertyKey,
+    value: &Value,
+    version: ag_iso_stack::object_pool::vt_version::VtVersion,
+) -> ComponentResult<()> {
+    if node.object_type == ag_iso_stack::object_pool::ObjectType::FontAttributes
+        && property == crate::object_properties::PropertyKey::FontType
+        && !crate::vt_compatibility::supported_enum_value(
+            node.object_type,
+            property,
+            value,
+            version,
+        )
+    {
+        return Err(ComponentError::new(
+            "VT_COMPONENT_INCOMPATIBLE",
+            format!(
+                "Font type {value} is invalid or unavailable in VT{}",
+                u8::from(version)
+            ),
+        ));
+    }
+    Ok(())
 }
 fn unique_component_name(source: &ComponentSource, name: &str) -> String {
     let base = format!("{name} copy");

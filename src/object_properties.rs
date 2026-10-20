@@ -11,8 +11,10 @@
 //! use Object::serialize/deserialize directly via Serde.
 
 use ag_iso_stack::object_pool::{
-    object::Object, object_attributes::ObjectLabel, vt_version::VtVersion, ObjectId, ObjectPool,
-    ObjectType,
+    object::Object,
+    object_attributes::{FontType, ObjectLabel},
+    vt_version::VtVersion,
+    ObjectId, ObjectPool, ObjectType,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -487,14 +489,14 @@ macro_rules! property_enum_choices {
         );
         choices
     }};
-    (font_type, $owner:ty) => {{
-        use ag_iso_stack::object_pool::object_attributes::FontType;
-        let mut choices = enum_unit_choices::<FontType>();
-        choices.extend(
-            (240..=255).map(|code| serde_json::to_value(FontType::Proprietary(code)).unwrap()),
-        );
-        choices
-    }};
+    (font_type, $owner:ty) => {
+        // Font Type support is monotonic: VT6 includes the complete defined domain.
+        (0..=u8::MAX)
+            .map(FontType::from)
+            .filter(|font| crate::vt_compatibility::supported_font_type(*font, VtVersion::Version6))
+            .map(|font| serde_json::to_value(font).unwrap())
+            .collect()
+    };
     ($field:ident, $owner:ty) => {
         field_enum_choices(|object: &$owner| &object.$field)
     };
@@ -1342,6 +1344,8 @@ fn property_access_supported(object_type: ObjectType) -> bool {
 /// A recognized key unsupported by the object's type returns
 /// [`PropertyError::PropertyNotFound`]. This checks a candidate edit; it does not
 /// discard or rewrite an existing value that needs repair.
+/// Target-version availability is checked by authoring operations, separately
+/// from this domain check. Loading and history use [`set_property`] directly.
 pub fn validate_property(
     pool: &ObjectPool,
     object_id: ObjectId,
@@ -1375,9 +1379,11 @@ pub fn validate_property(
         });
     }
 
-    // Byte enums have no typed Rust deserializer enforcing their ISO domain.
+    // Byte enums and Font Type payloads can deserialize outside their defined domain.
     if descriptor.semantic == PropertySemantic::Enum
-        && descriptor.enum_choices.iter().any(Value::is_number)
+        && (descriptor.enum_choices.iter().any(Value::is_number)
+            || (object.object_type() == ObjectType::FontAttributes
+                && property == PropertyKey::FontType))
         && !descriptor.enum_choices.contains(value)
     {
         return Err(PropertyError::InvalidValue {

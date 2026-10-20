@@ -602,6 +602,26 @@ impl Operation {
                     },
                 )?;
 
+                let is_font_type = *property == PropertyKey::FontType;
+                let font_value_supported = |value: &Value| {
+                    crate::vt_compatibility::supported_enum_value(
+                        ObjectType::FontAttributes,
+                        PropertyKey::FontType,
+                        value,
+                        context.vt_version,
+                    )
+                };
+                if is_font_type && !font_value_supported(value) {
+                    return Err(OperationError::PropertyError {
+                        object_id,
+                        property: *property,
+                        reason: format!(
+                            "font encoding is unavailable in VT{}",
+                            u8::from(context.vt_version)
+                        ),
+                    });
+                }
+
                 // Get old value for inverse, then set new value.
                 let old_value = crate::object_properties::get_property(pool, id, *property)
                     .map_err(|e| OperationError::PropertyError {
@@ -622,6 +642,7 @@ impl Operation {
                 // domain. Keep it restorable by undo without weakening normal edits.
                 if crate::object_properties::validate_property(pool, id, *property, &old_value)
                     .is_err()
+                    || (is_font_type && !font_value_supported(&old_value))
                 {
                     Ok(Operation::RestoreProperty {
                         object_id,

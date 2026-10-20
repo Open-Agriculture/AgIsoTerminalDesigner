@@ -188,12 +188,16 @@ pub fn supported_enum_value(
 }
 
 /// Whether a font encoding value is defined for the selected VT generation.
+/// Reserved values and proprietary payloads outside 240–255 are unsupported.
+/// Additional encodings were introduced at VT4 (ISO 11783-6:2018 Annex A.3).
 pub fn supported_font_type(font_type: FontType, version: VtVersion) -> bool {
-    match (version >= VtVersion::Version4, font_type) {
-        (_, FontType::Latin1 | FontType::Latin9) => true,
-        (true, FontType::Latin2 | FontType::Latin4 | FontType::Cyrillic | FontType::Greek) => true,
-        (true, FontType::Proprietary(_)) => true,
-        (false, FontType::Proprietary(255)) => true,
+    match font_type {
+        FontType::Latin1 | FontType::Latin9 | FontType::Proprietary(255) => true,
+        FontType::Latin2
+        | FontType::Latin4
+        | FontType::Cyrillic
+        | FontType::Greek
+        | FontType::Proprietary(240..=254) => version >= VtVersion::Version4,
         _ => false,
     }
 }
