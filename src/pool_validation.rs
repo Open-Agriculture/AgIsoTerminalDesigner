@@ -404,6 +404,75 @@ pub(crate) fn validate_complete_pool_requirements(
         }
 
         match object {
+            Object::ScaledGraphic(graphic) => {
+                let mut reference = graphic.value.0;
+                let mut visited = HashSet::new();
+                while let Some(id) = reference {
+                    let target = pool.object_by_id(id);
+                    if !visited.insert(id) {
+                        diagnostics.push(ValidationDiagnostic {
+                            severity: ValidationSeverity::Error,
+                            message: "Scaled Graphic contains a circular Object Pointer chain"
+                                .into(),
+                            affected_objects: Some(vec![graphic.id.value(), id.value()]),
+                            code: "SCALED_GRAPHIC_POINTER_CYCLE".into(),
+                        });
+                        break;
+                    }
+                    match target {
+                        Some(Object::ObjectPointer(pointer)) => reference = pointer.value.0,
+                        Some(Object::PictureGraphic(_) | Object::GraphicData(_)) | None => break,
+                        Some(_) => {
+                            diagnostics.push(ValidationDiagnostic {
+                                severity: ValidationSeverity::Error,
+                                message: "Scaled Graphic pointer must resolve to Picture Graphic, Graphic Data, or NULL".into(),
+                                affected_objects: Some(vec![graphic.id.value(), id.value()]),
+                                code: "SCALED_GRAPHIC_TARGET_INVALID".into(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            Object::Macro(macro_object) if macro_object.commands.is_empty() => {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: "Macro must contain at least one command packet".into(),
+                    affected_objects: Some(vec![object.id().value()]),
+                    code: "MACRO_EMPTY".into(),
+                });
+            }
+            Object::PictureGraphic(picture) => {
+                let data_length = decoded_picture_data_len(picture);
+                let problem = match (picture_required_bytes(picture), data_length) {
+                    (Err(error), _) | (_, Err(error)) => Some(("PICTURE_DATA_INVALID", error)),
+                    (Ok(required), Ok(length)) if required > length => Some((
+                        "PICTURE_DATA_TRUNCATED",
+                        format!("Picture Graphic pixel data is truncated (need {required} decoded bytes)"),
+                    )),
+                    _ => None,
+                };
+                if let Some((code, message)) = problem {
+                    diagnostics.push(ValidationDiagnostic {
+                        severity: ValidationSeverity::Error,
+                        message,
+                        affected_objects: Some(vec![object.id().value()]),
+                        code: code.into(),
+                    });
+                }
+            }
+            Object::GraphicData(graphic) => {
+                if !graphic.data.is_empty() {
+                    if let Err(message) = validate_graphic_data_png(&graphic.data) {
+                        diagnostics.push(ValidationDiagnostic {
+                            severity: ValidationSeverity::Error,
+                            message,
+                            affected_objects: Some(vec![object.id().value()]),
+                            code: "GRAPHIC_DATA_PNG_INVALID".into(),
+                        });
+                    }
+                }
+            }
             Object::OutputPolygon(polygon) if polygon.points.len() < 3 => {
                 diagnostics.push(ValidationDiagnostic {
                     severity: ValidationSeverity::Error,
@@ -449,7 +518,34 @@ pub(crate) fn validate_complete_pool_requirements(
             }
             _ => {}
         }
+
+        if let Object::FillAttributes(fill) = object {
+            if fill.fill_type == 3 {
+                if let Some(target) = fill.fill_pattern.0.and_then(|id| pool.object_by_id(id)) {
+                    if let Object::PictureGraphic(picture) = target {
+                        let width = usize::from(picture.actual_width);
+                        let aligned = match picture.format {
+                            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::Monochrome => width % 8 == 0,
+                            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::FourBit => width % 2 == 0,
+                            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::EightBit => true,
+                        };
+                        if !aligned {
+                            diagnostics.push(ValidationDiagnostic {
+                                severity: ValidationSeverity::Error,
+                                message: "Fill pattern width must be byte aligned for its Picture Graphic format".into(),
+                                affected_objects: Some(vec![object.id().value(), target.id().value()]),
+                                code: "FILL_PATTERN_NOT_BYTE_ALIGNED".into(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    diagnostics.extend(validate_required_references(pool));
+    diagnostics.extend(validate_macro_graph(pool, vt_version));
+    diagnostics.extend(validate_macro_command_targets(pool, vt_version));
 
     for object in pool.objects() {
         let mut reported = HashSet::new();
@@ -599,6 +695,327 @@ fn remove_reference_once(references: &mut Vec<ObjectId>, ignored_id: ObjectId) {
     if let Some(index) = references.iter().position(|id| *id == ignored_id) {
         references.remove(index);
     }
+}
+
+fn validate_required_references(pool: &ObjectPool) -> Vec<ValidationDiagnostic> {
+    use ag_iso_stack::object_pool::object::Object;
+    let mut diagnostics = Vec::new();
+    for object in pool.objects() {
+        let required: Vec<(&str, Option<ObjectId>)> = match object {
+            Object::InputBoolean(value) => vec![("foreground_colour", value.foreground_colour.0)],
+            Object::InputString(value) => vec![("font_attributes", value.font_attributes.0)],
+            Object::InputNumber(value) => vec![("font_attributes", value.font_attributes.0)],
+            Object::OutputString(value) => vec![("font_attributes", value.font_attributes.0)],
+            Object::OutputNumber(value) => vec![("font_attributes", value.font_attributes.0)],
+            Object::OutputLine(value) => vec![("line_attributes", value.line_attributes.0)],
+            Object::OutputRectangle(value) => vec![("line_attributes", value.line_attributes.0)],
+            Object::OutputEllipse(value) => vec![("line_attributes", value.line_attributes.0)],
+            Object::OutputPolygon(value) => vec![("line_attributes", value.line_attributes.0)],
+            _ => Vec::new(),
+        };
+        for (property, value) in required {
+            if value.is_none() {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: format!("Required reference {property} cannot be NULL"),
+                    affected_objects: Some(vec![object.id().value()]),
+                    code: "REQUIRED_REFERENCE_NULL".into(),
+                });
+            }
+        }
+    }
+    diagnostics
+}
+
+fn validate_macro_command_targets(
+    pool: &ObjectPool,
+    version: VtVersion,
+) -> Vec<ValidationDiagnostic> {
+    use ag_iso_stack::object_pool::object::Object;
+    let mut diagnostics = Vec::new();
+    for object in pool.objects() {
+        let Object::Macro(macro_object) = object else {
+            continue;
+        };
+        let targets = match crate::vt_macro_commands::macro_command_targets(
+            &macro_object.commands,
+            version,
+        ) {
+            Ok(targets) => targets,
+            Err(_) => continue,
+        };
+        for target in targets {
+            let Some(id) = target.object_id else {
+                if !target.nullable {
+                    diagnostics.push(ValidationDiagnostic {
+                        severity: ValidationSeverity::Error,
+                        message: format!(
+                            "Macro command at offset {} has a NULL target",
+                            target.command_offset
+                        ),
+                        affected_objects: Some(vec![object.id().value()]),
+                        code: "MACRO_TARGET_NULL".into(),
+                    });
+                }
+                continue;
+            };
+            let resolved = pool
+                .objects()
+                .iter()
+                .find(|candidate| candidate.id().value() == id);
+            let Some(resolved) = resolved else {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "Macro command at offset {} references missing object {id}",
+                        target.command_offset
+                    ),
+                    affected_objects: Some(vec![object.id().value(), id]),
+                    code: "MACRO_TARGET_NOT_FOUND".into(),
+                });
+                continue;
+            };
+            if !target.expected_types.is_empty()
+                && !target.expected_types.contains(&resolved.object_type())
+            {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: format!(
+                        "Macro command at offset {} targets {:?}; expected {}",
+                        target.command_offset,
+                        resolved.object_type(),
+                        target
+                            .expected_types
+                            .iter()
+                            .map(|kind| format!("{kind:?}"))
+                            .collect::<Vec<_>>()
+                            .join(" or ")
+                    ),
+                    affected_objects: Some(vec![object.id().value(), id]),
+                    code: "MACRO_TARGET_WRONG_TYPE".into(),
+                });
+            }
+        }
+    }
+    diagnostics
+}
+
+fn validate_macro_graph(pool: &ObjectPool, version: VtVersion) -> Vec<ValidationDiagnostic> {
+    use ag_iso_stack::object_pool::object::Object;
+    use ag_iso_stack::object_pool::object_attributes::Event;
+    use std::collections::{HashMap, HashSet};
+    let macros: HashSet<u16> = pool
+        .objects()
+        .iter()
+        .filter_map(|object| matches!(object, Object::Macro(_)).then_some(object.id().value()))
+        .collect();
+    let mut edges: HashMap<u16, HashSet<u16>> = HashMap::new();
+    for object in pool.objects() {
+        let Object::Macro(macro_object) = object else {
+            continue;
+        };
+        if let Ok(targets) =
+            crate::vt_macro_commands::macro_command_targets(&macro_object.commands, version)
+        {
+            for command_target in targets {
+                let Some(target) = command_target.object_id else {
+                    continue;
+                };
+                if command_target.command == 0xBE || command_target.command == 0xBC {
+                    if macros.contains(&target) {
+                        edges.entry(object.id().value()).or_default().insert(target);
+                    }
+                    continue;
+                }
+                if let Some(target_object) = pool
+                    .objects()
+                    .iter()
+                    .find(|candidate| candidate.id().value() == target)
+                {
+                    if let Some(references) = crate::operations::macro_refs(target_object) {
+                        let event = match command_target.command {
+                            0xA0 => Some(
+                                if macro_object.commands.get(command_target.command_offset + 3)
+                                    == Some(&0)
+                                {
+                                    Event::OnHide
+                                } else {
+                                    Event::OnShow
+                                },
+                            ),
+                            0xA1 => Some(
+                                if macro_object.commands.get(command_target.command_offset + 3)
+                                    == Some(&0)
+                                {
+                                    Event::OnDisable
+                                } else {
+                                    Event::OnEnable
+                                },
+                            ),
+                            0xA5 => Some(Event::OnChangeChildLocation),
+                            0xA6 => Some(Event::OnChangeSize),
+                            0xA7 => Some(Event::OnChangeBackgroundColour),
+                            0xA8 | 0xB3 => Some(Event::OnChangeValue),
+                            0xA9 => Some(Event::OnChangeEndPoint),
+                            0xAA => Some(Event::OnChangeFontAttributes),
+                            0xAB => Some(Event::OnChangeLineAttributes),
+                            0xAC => Some(Event::OnChangeFillAttributes),
+                            0xAD => Some(Event::OnChangeActiveMask),
+                            0xAE => Some(Event::OnChangeSoftKeyMask),
+                            0xAF | 0xB5 => Some(Event::OnChangeAttribute),
+                            0xB0 => Some(Event::OnChangePriority),
+                            0xB4 => Some(Event::OnChangeChildPosition),
+                            _ => None,
+                        };
+                        let primary_operand = match command_target.command {
+                            0xA5 | 0xB4 | 0xAD => command_target.operand_offset == 1,
+                            0xAC => command_target.operand_offset == 1,
+                            0xAE => command_target.operand_offset == 2,
+                            _ => command_target.operand_offset == 1,
+                        };
+                        if !primary_operand {
+                            continue;
+                        }
+                        let Some(event) = event else { continue };
+                        for reference in references {
+                            let event_macro = u16::from(reference.macro_id);
+                            if reference.event_id == event && macros.contains(&event_macro) {
+                                edges
+                                    .entry(object.id().value())
+                                    .or_default()
+                                    .insert(event_macro);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Use iterative tri-colour DFS so a large imported pool cannot overflow
+    // the native or wasm call stack.
+    let mut state = HashMap::<u16, u8>::new();
+    let mut cycle_path = None;
+    for start in macros {
+        if state.get(&start).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        state.insert(start, 1);
+        let mut active = vec![start];
+        let mut active_index = HashMap::from([(start, 0usize)]);
+        let children: Vec<u16> = edges
+            .get(&start)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        let mut frames = vec![(start, children, 0usize)];
+        while let Some((node, children, next)) = frames.last_mut() {
+            if *next == children.len() {
+                let finished = *node;
+                frames.pop();
+                active.pop();
+                active_index.remove(&finished);
+                state.insert(finished, 2);
+                continue;
+            }
+            let child = children[*next];
+            *next += 1;
+            match state.get(&child).copied().unwrap_or(0) {
+                1 => {
+                    let index = active_index[&child];
+                    let mut path = active[index..].to_vec();
+                    path.push(child);
+                    cycle_path = Some(path);
+                    break;
+                }
+                2 => {}
+                _ => {
+                    state.insert(child, 1);
+                    active_index.insert(child, active.len());
+                    active.push(child);
+                    let children: Vec<u16> = edges
+                        .get(&child)
+                        .map(|set| set.iter().copied().collect())
+                        .unwrap_or_default();
+                    frames.push((child, children, 0));
+                }
+            }
+        }
+        if cycle_path.is_some() {
+            break;
+        }
+    }
+    cycle_path
+        .map(|cycle| {
+            vec![ValidationDiagnostic {
+                severity: ValidationSeverity::Error,
+                message: "Macro references form a recursive execution loop".into(),
+                affected_objects: Some(cycle),
+                code: "MACRO_EXECUTION_CYCLE".into(),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+fn picture_required_bytes(
+    picture: &ag_iso_stack::object_pool::object::PictureGraphic,
+) -> Result<usize, String> {
+    let width = usize::from(picture.actual_width);
+    let height = usize::from(picture.actual_height);
+    let row_bytes = match picture.format {
+        ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::Monochrome => {
+            width.div_ceil(8)
+        }
+        ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::FourBit => {
+            width.div_ceil(2)
+        }
+        ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::EightBit => width,
+    };
+    row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| "Picture Graphic dimensions overflow".into())
+}
+
+fn decoded_picture_data_len(
+    picture: &ag_iso_stack::object_pool::object::PictureGraphic,
+) -> Result<usize, String> {
+    use ag_iso_stack::object_pool::object_attributes::DataCodeType;
+    match picture.options.data_code_type {
+        DataCodeType::Raw => Ok(picture.data.len()),
+        DataCodeType::RunLength => {
+            if picture.data.len() % 2 != 0 {
+                return Err("Picture Graphic has a truncated run-length pair".into());
+            }
+            let mut length = 0usize;
+            for pair in picture.data.chunks_exact(2) {
+                length = length
+                    .checked_add(usize::from(pair[0]))
+                    .ok_or_else(|| "Picture Graphic decoded data length overflows".to_owned())?;
+            }
+            Ok(length)
+        }
+    }
+}
+
+fn validate_graphic_data_png(bytes: &[u8]) -> Result<(), String> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("Graphic Data is not a valid PNG: {error}"))?;
+    let info = reader.info();
+    let bits_per_pixel = info.color_type.samples() * info.bit_depth as usize;
+    if bits_per_pixel > 32 {
+        return Err("Graphic Data PNG exceeds the 32-bit RGBA maximum".into());
+    }
+    let size = reader
+        .output_buffer_size()
+        .ok_or_else(|| "Graphic Data PNG dimensions overflow".to_owned())?;
+    if size > png::Limits::default().bytes {
+        return Err("Graphic Data PNG exceeds the decoder memory limit".into());
+    }
+    let mut output = vec![0; size];
+    reader
+        .next_frame(&mut output)
+        .map_err(|error| format!("Graphic Data PNG cannot be decoded: {error}"))?;
+    Ok(())
 }
 
 /// Return compatibility diagnostics whose violation is new or has worsened

@@ -101,6 +101,33 @@ pub fn asset_texture(ctx: &egui::Context, asset: &super::GraphicAsset) -> Option
     )
 }
 
+/// Graphic Data owns its PNG palette; Working Set maps and palettes do not apply.
+pub(crate) fn graphic_data_texture(
+    ctx: &egui::Context,
+    graphic: &ag_iso_stack::object_pool::object::GraphicData,
+) -> Option<TextureHandle> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    graphic.format.hash(&mut hasher);
+    graphic.data.hash(&mut hasher);
+    cached_texture(
+        ctx,
+        egui::Id::new(("graphic_data", graphic.id.value())),
+        hasher.finish(),
+        || {
+            if graphic.format != 0 {
+                return Err("Unsupported Graphic Data format".into());
+            }
+            let image = image::load_from_memory_with_format(&graphic.data, image::ImageFormat::Png)
+                .map_err(|error| error.to_string())?
+                .into_rgba8();
+            Ok(ColorImage::from_rgba_unmultiplied(
+                [image.width() as usize, image.height() as usize],
+                image.as_raw(),
+            ))
+        },
+    )
+}
+
 fn cached_texture(
     ctx: &egui::Context,
     key: egui::Id,

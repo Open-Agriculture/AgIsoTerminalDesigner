@@ -39,6 +39,7 @@ pub struct CanvasState {
     pages: HashMap<u16, (Option<u16>, usize)>,
     preferred_slot: Option<(u16, usize, Option<u16>)>,
     pair_layout: Vec<(u16, Vec2, Rect)>,
+    preview: Option<super::preview::PreviewMode>,
 }
 
 impl Default for CanvasState {
@@ -70,6 +71,7 @@ impl Default for CanvasState {
             pages: HashMap::new(),
             preferred_slot: None,
             pair_layout: Vec::new(),
+            preview: None,
         }
     }
 }
@@ -657,6 +659,31 @@ impl CanvasState {
         view: &mut MaskViewState,
         captions: bool,
     ) {
+        let mut enter_preview = false;
+        let mut leave_preview = false;
+        ui.horizontal(|ui| {
+            leave_preview = ui
+                .selectable_label(self.preview.is_none(), "Design")
+                .clicked();
+            enter_preview = ui
+                .selectable_label(self.preview.is_some(), "Preview")
+                .clicked();
+        });
+        if leave_preview {
+            self.preview = None;
+        }
+        if enter_preview && self.preview.is_none() {
+            self.cancel_interaction();
+            self.preview = Some(super::preview::PreviewMode::new(
+                project,
+                &materialized.pool,
+                view.focused,
+            ));
+        }
+        if let Some(preview) = &mut self.preview {
+            preview.show(ui, project, &materialized.pool);
+            return;
+        }
         let frame_revision = project.revision();
         if !ui.input(|i| i.focused) {
             self.cancel_interaction();

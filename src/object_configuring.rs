@@ -164,6 +164,28 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
     let properties = get_property_descriptors(object_type);
 
     render_identity(ui, id, object_type, design);
+    if matches!(
+        object,
+        Object::AuxiliaryFunctionType1(_) | Object::AuxiliaryInputType1(_)
+    ) {
+        ui.label("Designator preview");
+        let (width, height) = design.soft_key_size();
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(width as f32, height as f32),
+            egui::Sense::hover(),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.shrink_clip_rect(rect);
+            crate::render_object_with_settings(
+                ui,
+                design.get_pool(),
+                object,
+                ag_iso_stack::object_pool::object_attributes::Point::default(),
+                design.vt_version(),
+                design.soft_key_size(),
+            );
+        });
+    }
     let mut unavailable = unavailable_features(object, design.vt_version);
     if object_type == ObjectType::ObjectPointer {
         for target in design.get_object_info(object).allowed_references {

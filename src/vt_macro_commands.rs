@@ -1,6 +1,175 @@
 //! Validation for command streams stored in ISO 11783-6 Macro objects.
 
 use ag_iso_stack::object_pool::vt_version::VtVersion;
+use ag_iso_stack::object_pool::ObjectType;
+
+/// A local object operand found in a Macro command. `expected_types` is empty
+/// when the command permits any object type; nullable operands are reported
+/// with `object_id == None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroCommandTarget {
+    pub command: u8,
+    pub command_offset: usize,
+    pub operand_offset: usize,
+    pub object_id: Option<u16>,
+    pub nullable: bool,
+    pub expected_types: Vec<ObjectType>,
+}
+
+/// Decode local object operands from a validated Macro command stream.
+/// This metadata is shared by whole-pool validation and local preview.
+pub fn macro_command_targets(
+    bytes: &[u8],
+    version: VtVersion,
+) -> Result<Vec<MacroCommandTarget>, String> {
+    validate_macro_commands(bytes, version)?;
+    let mut targets = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let command = bytes[offset];
+        let target = |relative: usize, expected_types: Vec<ObjectType>| {
+            let id = u16::from_le_bytes([bytes[offset + relative], bytes[offset + relative + 1]]);
+            MacroCommandTarget {
+                command,
+                command_offset: offset,
+                operand_offset: relative,
+                object_id: (id != u16::MAX).then_some(id),
+                nullable: false,
+                expected_types,
+            }
+        };
+        match command {
+            0xA0 | 0xA1 | 0xA6 | 0xA7 | 0xAF | 0xB0 | 0xB5 | 0xBD => {
+                targets.push(target(1, vec![]));
+            }
+            0xA2 => targets.push(target(
+                1,
+                vec![
+                    ObjectType::InputBoolean,
+                    ObjectType::InputString,
+                    ObjectType::InputNumber,
+                    ObjectType::InputList,
+                ],
+            )),
+            0xA5 => {
+                targets.push(target(1, vec![]));
+                targets.push(target(3, vec![]));
+            }
+            0xA8 => targets.push(target(
+                1,
+                vec![
+                    ObjectType::InputBoolean,
+                    ObjectType::InputNumber,
+                    ObjectType::InputList,
+                    ObjectType::OutputNumber,
+                    ObjectType::OutputList,
+                    ObjectType::OutputMeter,
+                    ObjectType::OutputLinearBarGraph,
+                    ObjectType::OutputArchedBarGraph,
+                    ObjectType::NumberVariable,
+                    ObjectType::ObjectPointer,
+                    ObjectType::ExternalObjectPointer,
+                    ObjectType::Animation,
+                    ObjectType::ScaledGraphic,
+                ],
+            )),
+            0xA9 => targets.push(target(1, vec![ObjectType::OutputLine])),
+            0xAA => targets.push(target(1, vec![ObjectType::FontAttributes])),
+            0xAB => {
+                targets.push(target(1, vec![ObjectType::LineAttributes]));
+            }
+            0xAC => {
+                targets.push(target(1, vec![ObjectType::FillAttributes]));
+                let mut pattern = target(5, vec![ObjectType::PictureGraphic]);
+                pattern.nullable = true;
+                targets.push(pattern);
+            }
+            0xAD => {
+                targets.push(target(1, vec![ObjectType::WorkingSet]));
+                let mut mask = target(3, vec![ObjectType::DataMask, ObjectType::AlarmMask]);
+                mask.nullable = true;
+                targets.push(mask);
+            }
+            0xAE => {
+                let mut mask = target(2, vec![ObjectType::DataMask, ObjectType::AlarmMask]);
+                mask.nullable = true;
+                targets.push(mask);
+                let mut soft_key_mask = target(4, vec![ObjectType::SoftKeyMask]);
+                soft_key_mask.nullable = true;
+                targets.push(soft_key_mask);
+            }
+            0xB1 => {
+                targets.push(target(
+                    1,
+                    vec![
+                        ObjectType::InputList,
+                        ObjectType::OutputList,
+                        ObjectType::Animation,
+                        ObjectType::ExternalObjectDefinition,
+                    ],
+                ));
+                let mut item = target(4, vec![]);
+                item.nullable = true;
+                targets.push(item);
+            }
+            0xB3 => targets.push(target(
+                1,
+                vec![
+                    ObjectType::InputString,
+                    ObjectType::OutputString,
+                    ObjectType::StringVariable,
+                ],
+            )),
+            0xB4 => {
+                targets.push(target(1, vec![]));
+                targets.push(target(3, vec![]));
+            }
+            0xB6 | 0xB7 => targets.push(target(1, vec![ObjectType::OutputPolygon])),
+            0xB8 => {
+                targets.push(target(1, vec![ObjectType::GraphicsContext]));
+                let subcommand = bytes[offset + 3];
+                if subcommand == 18 {
+                    targets.push(target(4, vec![]));
+                }
+                let operand = match subcommand {
+                    4 => Some((4, ObjectType::LineAttributes)),
+                    5 => Some((4, ObjectType::FillAttributes)),
+                    6 => Some((4, ObjectType::FontAttributes)),
+                    19 | 20 => Some((4, ObjectType::PictureGraphic)),
+                    _ => None,
+                };
+                if let Some((relative, kind)) = operand {
+                    let mut target = target(relative, vec![kind]);
+                    target.nullable = matches!(subcommand, 4 | 5 | 6);
+                    targets.push(target);
+                }
+            }
+            0xBC => targets.push(target(1, vec![ObjectType::Macro])),
+            0xBE => {
+                let id = u16::from(bytes[offset + 1]);
+                targets.push(MacroCommandTarget {
+                    command,
+                    command_offset: offset,
+                    operand_offset: 1,
+                    object_id: Some(id),
+                    nullable: false,
+                    expected_types: vec![ObjectType::Macro],
+                });
+            }
+            _ => {}
+        }
+        let spec = command_spec(command).expect("validated command has a spec");
+        if command == 0xB3 {
+            let count = u16::from_le_bytes([bytes[offset + 3], bytes[offset + 4]]) as usize;
+            offset += (5 + count).max(8);
+        } else if command == 0xB8 {
+            offset += (3 + graphics_subcommand_length(bytes, offset + 3)?).max(8);
+        } else {
+            offset += spec.length;
+        }
+    }
+    Ok(targets)
+}
 
 /// Validate the framing and version availability of a Macro command stream.
 ///
@@ -72,6 +241,11 @@ pub fn validate_macro_commands(bytes: &[u8], version: VtVersion) -> Result<(), S
                     command_offset + frame_length,
                 )?;
                 offset += frame_length;
+            }
+            0xBE => {
+                require(bytes, command_offset, spec.length, spec.name)?;
+                validate_padding(bytes, command_offset + 2, command_offset + spec.length)?;
+                offset += spec.length;
             }
             _ => {
                 require(bytes, command_offset, spec.length, spec.name)?;

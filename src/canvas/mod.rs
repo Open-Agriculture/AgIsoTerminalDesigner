@@ -4,6 +4,7 @@ pub mod edits;
 mod geometry;
 mod layout;
 pub mod mask_view;
+mod preview;
 mod softkeys;
 mod ui;
 

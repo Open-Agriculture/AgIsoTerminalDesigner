@@ -211,6 +211,30 @@ pub(crate) fn text_width(
     }
 }
 
+/// Unwrapped presentation extent used by Graphics Context Draw Text.
+pub(crate) fn text_extent(
+    ui: &egui::Ui,
+    font: &ag_iso_stack::object_pool::object::FontAttributes,
+    text: &str,
+) -> egui::Vec2 {
+    let lines = controls(text);
+    let width = lines
+        .iter()
+        .map(|line| {
+            text_width(
+                ui,
+                font,
+                &line.iter().filter(|c| **c != '\u{ad}').collect::<String>(),
+            )
+        })
+        .fold(0.0, f32::max);
+    let height = match font.font_size {
+        FontSize::NonProportional(size) => size.height() as f32,
+        FontSize::Proportional(height) => height as f32,
+    };
+    egui::vec2(width, lines.len() as f32 * height)
+}
+
 /// Fit styled glyph geometry inside its character box. Texture coordinates stay
 /// in atlas texels so egui can normalize them after all glyphs have been loaded.
 fn styled_glyph(mut galley: Arc<Galley>, width: f32, height: f32, style: FontStyle) -> Arc<Galley> {

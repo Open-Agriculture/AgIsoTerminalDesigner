@@ -4,9 +4,13 @@
 
 mod allowed_object_relationships;
 mod editor_project;
+mod graphic_rendering;
+mod graphics_context_raster;
+mod graphics_context_rendering;
 mod id_reassignment;
 mod interactive_rendering_simple;
 mod layout_containment;
+mod numeric_rendering;
 mod object_configuring;
 mod object_defaults;
 mod object_id_format;
@@ -15,6 +19,8 @@ mod object_info;
 mod object_rendering;
 mod output_string_rendering;
 mod possible_events;
+mod preview_commands;
+pub mod preview_session;
 mod project_file;
 mod smart_naming;
 mod soft_key_layout;
@@ -46,7 +52,8 @@ pub use object_id_format::ObjectIdFormat;
 pub use object_id_ranges::{ObjectIdRange, ObjectIdRanges};
 pub use object_info::ObjectInfo;
 pub use object_rendering::{
-    render_object_with_settings, render_object_with_version, RenderableObject,
+    render_object_with_preview_session, render_object_with_settings, render_object_with_version,
+    RenderableObject,
 };
 pub use soft_key_layout::{SoftKeyArrangement, SoftKeyLayout};
 

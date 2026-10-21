@@ -72,6 +72,8 @@ The canvas toolbar provides X/Y and supported W/H fields, alignment/distribution
 
 Moving a repeated reference updates its exact child-list occurrence. Resizing changes the shared object's dimensions at every reference; the toolbar identifies shared dimensions. Removing a placement retains its primitive object definition in the pool. Component instances move and duplicate as units; their internal geometry stays controlled by their component definitions.
 
+Switch the canvas to **Preview** to run local animations and visual macros against a temporary copy of the pool. Use **Reset** to restart from the current design, select a mask, press its keys and buttons, or run a macro directly. Playback values and Graphics Context drawings do not enter project history or saved files. Runtime errors appear above the preview. Selecting a VT2 Auxiliary Type 1 object also shows its designator in Properties.
+
 Primitive copies receive fresh object IDs and metadata identities. PictureGraphic placements reuse the original image object, including pictures inside copied parents. Internal references within the copied positioned subtree are remapped; external styles and resources remain shared. Component copies retain their master and overrides. Completed gestures and numeric edits each create one undo action.
 
 Properties provides Duplicate for the selected placement, or an unplaced copy for a standalone copyable object. Delete removes the selected placement and keeps its object definition. Drag hierarchy placements near a row's top or bottom to reorder siblings, or onto the center of a positioned parent to append inside it. Ordinary objects and component instances share the saved placement order; components move as complete instances. A floating label follows the cursor, the source stays dimmed, and an insertion line or parent outline previews valid destinations. Escape or releasing over an invalid destination cancels the move. Parent moves preserve canvas position where possible and adjust it to fit the new parent; sibling reordering keeps coordinates unchanged. ObjectPointer rows show their referenced object directly beneath them. Clicking a mask's title or uncovered background selects its properties. PictureGraphic properties show source resolution and allow either display dimension to be edited while preserving the aspect ratio.
@@ -155,9 +157,9 @@ The lists below only apply to version 3 of the VT specification. There are 3 sta
 - :yellow_circle: OutputRectangle
 - :green_circle: OutputEllipse
 - :white_circle: OutputPolygon
-- :white_circle: OutputMeter
-- :white_circle: OutputLinearBarGraph
-- :white_circle: OutputArchedBarGraph
+- :green_circle: OutputMeter
+- :green_circle: OutputLinearBarGraph
+- :green_circle: OutputArchedBarGraph
 - :green_circle: PictureGraphic
 - :green_circle: ObjectPointer
 - :yellow_circle: Auxiliary Function Type 2

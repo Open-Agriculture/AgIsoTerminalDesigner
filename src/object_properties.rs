@@ -1069,7 +1069,7 @@ ag_iso_stack::object_pool::object::ScaledGraphic {
             (0..=4).map(move |scaling| Value::from(scaling | (horizontal << 3) | (vertical << 5)))))
         .collect(),
     Options: options => PropertySemantic::Bitflags,
-    Value: value => object_reference!(PictureGraphic, GraphicData)
+    Value: value => object_reference!(PictureGraphic, GraphicData, ObjectPointer)
 }}
 
 // Master list used to generate every match over property-enabled objects.

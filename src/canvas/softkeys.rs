@@ -1,5 +1,5 @@
 //! Terminal preview geometry and paging, following ISO 11783-6 §4.5.3 and B.5.
-use crate::{EditorProject, SoftKeyArrangement};
+use crate::{EditorProject, ObjectIdFormat, SoftKeyArrangement, SoftKeyLayout};
 use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool};
 use egui::Rect;
 use std::collections::HashSet;
@@ -44,6 +44,10 @@ fn resolve(pool: &ObjectPool, id: u16) -> SlotContent {
                 Some(id) => current = id.value(),
                 None => return SlotContent::Empty,
             },
+            Some(Object::ExternalObjectPointer(pointer)) => match pointer.default_object_id.0 {
+                Some(id) => current = id.value(),
+                None => return SlotContent::Empty,
+            },
             _ => return SlotContent::Invalid,
         }
     }
@@ -55,6 +59,26 @@ pub(super) fn build(
     pool: &ObjectPool,
     root: u16,
     page: usize,
+) -> SoftKeys {
+    build_with_settings(
+        pool,
+        root,
+        page,
+        project.mask_size,
+        project.soft_key_size(),
+        project.soft_key_layout(),
+        project.object_id_format(),
+    )
+}
+
+pub(super) fn build_with_settings(
+    pool: &ObjectPool,
+    root: u16,
+    page: usize,
+    mask_size: u16,
+    soft_key_size: (u16, u16),
+    layout: SoftKeyLayout,
+    id_format: ObjectIdFormat,
 ) -> SoftKeys {
     let reference = match ObjectId::new(root)
         .ok()
@@ -80,12 +104,11 @@ pub(super) fn build(
     let Some(Object::SoftKeyMask(mask)) = pool.object_by_id(id) else {
         result.error = Some(format!(
             "Missing or invalid softkey mask {}",
-            project.format_object_id(id.value())
+            id_format.format(id.value())
         ));
         return result;
     };
     result.background = mask.background_colour;
-    let layout = project.soft_key_layout();
     let physical = usize::from(layout.physical_key_count);
     let per_line = usize::from(layout.keys_per_line);
     let mut contents: Vec<_> = mask
@@ -105,21 +128,21 @@ pub(super) fn build(
     result.pages = contents.len().div_ceil(capacity).max(1);
     result.page = page.min(result.pages - 1);
     let lines = physical.div_ceil(per_line);
-    let (width, height) = project.soft_key_size();
+    let (width, height) = soft_key_size;
     let (w, h) = (f32::from(width), f32::from(height));
     // Gaps are outside the designator content, including its separator stroke.
     let gap = 4.0;
     let mask_gap = 12.0;
     let (area_origin, area_size) = match layout.arrangement {
         SoftKeyArrangement::Right => (
-            egui::pos2(f32::from(project.mask_size) + mask_gap, 0.0),
+            egui::pos2(f32::from(mask_size) + mask_gap, 0.0),
             egui::vec2(
                 lines as f32 * (w + gap) - gap,
                 per_line as f32 * (h + gap) - gap,
             ),
         ),
         SoftKeyArrangement::Bottom => (
-            egui::pos2(0.0, f32::from(project.mask_size) + mask_gap),
+            egui::pos2(0.0, f32::from(mask_size) + mask_gap),
             egui::vec2(
                 per_line as f32 * (w + gap) - gap,
                 lines as f32 * (h + gap) - gap,
