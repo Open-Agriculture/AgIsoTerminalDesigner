@@ -1530,6 +1530,10 @@ fn render_identity(
             "Automatic"
         });
         ui.label(format!("Type: {object_type:?}"));
+        ui.label(format!(
+            "Referenced {} times",
+            direct_reference_count(design.get_pool(), id)
+        ));
     });
     ui.horizontal(|ui| {
         let toggled = ui.checkbox(&mut overridden, "Override ID").changed();
@@ -1618,6 +1622,14 @@ fn render_identity(
     if let Some(error) = ui.data(|data| data.get_temp::<String>(key.with("error"))) {
         crate::ui_style::error_text(ui, &error);
     }
+}
+
+fn direct_reference_count(pool: &ag_iso_stack::object_pool::ObjectPool, id: ObjectId) -> usize {
+    pool.objects()
+        .iter()
+        .flat_map(Object::referenced_objects)
+        .filter(|reference| *reference == id)
+        .count()
 }
 
 fn queue(design: &EditorProject, id: ObjectId, property: PropertyKey, value: serde_json::Value) {
@@ -2821,4 +2833,51 @@ fn pending_text(ui: &egui::Ui, key: egui::Id) -> Option<String> {
         Some(PendingValue::Text(value)) => Some(value),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::direct_reference_count;
+    use crate::default_object;
+    use ag_iso_stack::object_pool::object::Object;
+    use ag_iso_stack::object_pool::object_attributes::ObjectRef;
+    use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectPool, ObjectType};
+
+    #[test]
+    fn reference_count_counts_repeated_entries_and_object_pointers() {
+        let target_id = ObjectId::new(1).unwrap();
+        let unreferenced_id = ObjectId::new(4).unwrap();
+        let mut pool = ObjectPool::new();
+
+        let mut target = default_object(ObjectType::PictureGraphic);
+        let Object::PictureGraphic(target) = &mut target else {
+            unreachable!()
+        };
+        target.id = target_id;
+        pool.add(Object::PictureGraphic(target.clone()));
+
+        let mut container = default_object(ObjectType::Container);
+        let Object::Container(container) = &mut container else {
+            unreachable!()
+        };
+        container.id = ObjectId::new(2).unwrap();
+        container.object_refs = (0..2)
+            .map(|_| ObjectRef {
+                id: target_id,
+                offset: Default::default(),
+            })
+            .collect();
+        pool.add(Object::Container(container.clone()));
+
+        let mut pointer = default_object(ObjectType::ObjectPointer);
+        let Object::ObjectPointer(pointer) = &mut pointer else {
+            unreachable!()
+        };
+        pointer.id = ObjectId::new(3).unwrap();
+        pointer.value = NullableObjectId(Some(target_id));
+        pool.add(Object::ObjectPointer(pointer.clone()));
+
+        assert_eq!(direct_reference_count(&pool, target_id), 3);
+        assert_eq!(direct_reference_count(&pool, unreferenced_id), 0);
+    }
 }

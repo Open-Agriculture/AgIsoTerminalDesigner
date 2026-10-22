@@ -222,7 +222,7 @@ pub struct DesignerApp {
     recovery: Option<RecoveryRecord>,
     recovery_load_error: bool,
     error_message: Option<String>,
-    property_name_draft: Option<(u128, u64, u16, String, String)>,
+    property_name_draft: Option<ObjectNameDraft>,
     property_name_draft_seen: bool,
     add_object_query: String,
     add_object_menu_open: bool,
@@ -1198,6 +1198,94 @@ fn recovery_age_label(saved_at: u64) -> String {
     }
 }
 
+type ObjectNameDraft = (u128, u64, u16, String, String);
+
+fn finish_object_name_on_switch(
+    project: &mut EditorProject,
+    name_draft: &mut Option<ObjectNameDraft>,
+) {
+    if let Some((draft_session, draft_revision, draft_id, baseline, draft)) = name_draft.clone() {
+        let current_name = ObjectId::new(draft_id)
+            .ok()
+            .and_then(|id| project.get_pool().object_by_id(id))
+            .map(|object| project.get_object_info(object).get_name(object));
+        let switching = draft_session != project.ui_session_id().as_u128()
+            || draft_revision != project.revision()
+            || project.get_selected().0.map(|id| id.value()) != Some(draft_id)
+            || matches!(
+                project.editor_selection(),
+                Some(EditorSelection::ComponentNode { .. })
+            )
+            || current_name.as_deref() != Some(baseline.as_str());
+        if switching {
+            *name_draft = None;
+            if draft_session == project.ui_session_id().as_u128()
+                && draft_revision == project.revision()
+                && current_name.as_deref() == Some(baseline.as_str())
+            {
+                if let Ok(draft_id) = ObjectId::new(draft_id) {
+                    project.rename_object(draft_id, draft);
+                }
+            }
+        }
+    }
+}
+
+fn render_object_name(
+    ui: &mut egui::Ui,
+    project: &mut EditorProject,
+    original: &Object,
+    draft: &mut Option<ObjectNameDraft>,
+) {
+    let project_key = project.ui_session_id().as_u128();
+    let project_revision = project.revision();
+    let object_id = original.id().value();
+    let original_name = project.get_object_info(original).get_name(original);
+    ui.horizontal(|ui| {
+        ui.label("Name:");
+        let mut name = draft
+            .as_ref()
+            .filter(|(key, revision, draft_id, _, _)| {
+                *key == project_key && *revision == project_revision && *draft_id == object_id
+            })
+            .map(|(_, _, _, _, draft)| draft.clone())
+            .unwrap_or_else(|| original_name.clone());
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut name)
+                .id(egui::Id::new((
+                    "property_object_name",
+                    project_key,
+                    object_id,
+                )))
+                .desired_width(ui.available_width()),
+        );
+        if response.changed() {
+            *draft = Some((
+                project_key,
+                project_revision,
+                object_id,
+                original_name.clone(),
+                name.clone(),
+            ));
+        }
+        let active = response.has_focus() || response.lost_focus();
+        let enter = active && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        let escape = active && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if escape {
+            *draft = None;
+            response.surrender_focus();
+        } else if enter || response.lost_focus() {
+            if let Some((_, _, _, _, draft)) = draft.take() {
+                if draft != original_name {
+                    if let Ok(object_id) = ObjectId::new(object_id) {
+                        project.rename_object(object_id, draft);
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn duplicate_standalone_object(project: &mut EditorProject, source_id: u16) -> bool {
     let Ok(source_object_id) = ObjectId::new(source_id) else {
         return false;
@@ -1205,9 +1293,6 @@ fn duplicate_standalone_object(project: &mut EditorProject, source_id: u16) -> b
     let Some(source) = project.get_pool().object_by_id(source_object_id).cloned() else {
         return false;
     };
-    if matches!(source, Object::PictureGraphic(_)) {
-        return false;
-    }
     let Ok(new_id) = project.allocate_object_id(source.object_type()) else {
         return false;
     };
@@ -1251,6 +1336,7 @@ fn render_selectable_object(
     project: &EditorProject,
     drag_payload: Option<TreeDragPayload>,
     drop_destination: Option<(u16, u16, Vec<usize>)>,
+    primary: bool,
 ) -> bool {
     let this_ui_id = ui.id();
     let object_info = project.get_object_info(object);
@@ -1282,10 +1368,11 @@ fn render_selectable_object(
     } else {
         let is_selected = project.get_selected() == object.id().into();
         let label_text = project.object_display_name(object);
-        let response = tree_row_with_id(
+        let response = tree_row_with_highlight(
             ui,
             ui.id().with(("object_row", object.id().value())),
             is_selected,
+            primary,
             label_text,
         );
         hierarchy_drag_row(ui, &response, drag_payload.as_ref(), drop_destination);
@@ -1328,6 +1415,7 @@ fn render_filtered_object_list(
     project: &EditorProject,
     query: &str,
     mask_view: &mut MaskViewState,
+    canvas: &mut CanvasState,
 ) {
     let matches: Vec<_> = project
         .get_pool()
@@ -1351,7 +1439,8 @@ fn render_filtered_object_list(
         });
     }
     for object in matches {
-        if render_selectable_object(ui, object, project, None, None) {
+        if render_selectable_object(ui, object, project, None, None, true) {
+            canvas.select_all_hierarchy_references(Some(object.id().value()));
             mask_view.navigate(project, object.id().value());
         }
     }
@@ -1432,6 +1521,7 @@ fn render_mask_object_hierarchy_inner(
         !placed.is_empty() || !component_instances.is_empty() || pointer_target.is_some();
     let occurrence_id = parent_id.with((root, path.clone()));
     let selected_id = project.get_selected().0.map(|id| id.value());
+    let primary = canvas.hierarchy_occurrence_is_primary(project, root, path, id_value);
     let expand = open_selection
         && selected_id.is_some_and(|selected| {
             selected != id_value && {
@@ -1440,8 +1530,7 @@ fn render_mask_object_hierarchy_inner(
         });
 
     if has_children {
-        let selected_in_header =
-            std::cell::Cell::new(None::<(u16, Option<usize>, Option<PlacementTarget>)>);
+        let selected_in_header = std::cell::Cell::new(false);
         let header_path = path.clone();
         if expand {
             let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
@@ -1463,14 +1552,9 @@ fn render_mask_object_hierarchy_inner(
                     project,
                     placement_source.clone(),
                     Some((root, id_value, clone_tree_path(&header_path))),
+                    primary,
                 ) {
-                    selected_in_header.set(Some((
-                        id_value,
-                        softkey_slot,
-                        placement_source
-                            .as_ref()
-                            .map(|source| source.target.clone()),
-                    )));
+                    selected_in_header.set(true);
                 }
             },
             |ui| {
@@ -1653,19 +1737,12 @@ fn render_mask_object_hierarchy_inner(
                 }
             },
         );
-        if let Some((selected, slot, target)) = selected_in_header.take() {
-            mask_view.navigate(project, selected);
-            if let Some(slot) = slot {
+        if selected_in_header.get() {
+            mask_view.navigate(project, id_value);
+            if let Some(slot) = softkey_slot {
                 canvas.select_softkey_slot(project, root, slot);
             }
-            if let (Some(target), Some(source)) = (target, placement_source.as_ref()) {
-                canvas.select_hierarchy_placement(
-                    project,
-                    root,
-                    &source.source_parent_path,
-                    target,
-                );
-            }
+            canvas.select_hierarchy_object(project, root, path, id_value);
         }
     } else if render_selectable_object(
         ui,
@@ -1673,19 +1750,13 @@ fn render_mask_object_hierarchy_inner(
         project,
         placement_source.clone(),
         Some((root, id_value, clone_tree_path(path))),
+        primary,
     ) {
         mask_view.navigate(project, id_value);
         if let Some(slot) = softkey_slot {
             canvas.select_softkey_slot(project, root, slot);
         }
-        if let Some(source) = placement_source.as_ref() {
-            canvas.select_hierarchy_placement(
-                project,
-                root,
-                &source.source_parent_path,
-                source.target.clone(),
-            );
-        }
+        canvas.select_hierarchy_object(project, root, path, id_value);
     }
     visiting.remove(&id_value);
 }
@@ -1823,7 +1894,7 @@ fn render_focused_mask_hierarchy(
                     section_id,
                     opens_softkeys,
                     |ui| {
-                        if render_selectable_object(ui, softkey_mask, project, None, None) {
+                        if render_selectable_object(ui, softkey_mask, project, None, None, true) {
                             selected_softkey_mask.set(true);
                         }
                     },
@@ -2053,7 +2124,7 @@ fn render_selected_ancestry_hierarchy(
     if parents.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(ui.spacing().indent);
-            render_selectable_object(ui, object, project, None, None);
+            render_selectable_object(ui, object, project, None, None, true);
         });
         return;
     }
@@ -2064,7 +2135,7 @@ fn render_selected_ancestry_hierarchy(
         id,
         true,
         |ui| {
-            render_selectable_object(ui, object, project, None, None);
+            render_selectable_object(ui, object, project, None, None, true);
         },
         |ui| {
             for (idx, parent) in parents.iter().enumerate() {
@@ -2642,6 +2713,8 @@ impl eframe::App for DesignerApp {
                 },
             ) {
                 pool.get_mut_selected().set(selected);
+                self.canvas
+                    .select_all_hierarchy_references(selected.0.map(|id| id.value()));
                 explicit_navigation = true;
             }
 
@@ -2897,7 +2970,13 @@ impl DesignerApp {
                         data.insert_temp(egui::Id::new("tree_row_bounds"), ui.max_rect())
                     });
                     if !query.is_empty() {
-                        render_filtered_object_list(ui, pool, &query, &mut self.mask_view);
+                        render_filtered_object_list(
+                            ui,
+                            pool,
+                            &query,
+                            &mut self.mask_view,
+                            &mut self.canvas,
+                        );
                         ui.separator();
                     }
                     render_focused_mask_hierarchy(ui, pool, &mut self.mask_view, &mut self.canvas);
@@ -2916,30 +2995,7 @@ impl DesignerApp {
             }
             Pane::Properties => {
                 let materialized = pool.materialize_shared();
-                if let Some((draft_session, draft_revision, draft_id, baseline, draft)) =
-                    self.property_name_draft.clone()
-                {
-                    let current_name = ObjectId::new(draft_id)
-                        .ok()
-                        .and_then(|id| pool.get_pool().object_by_id(id))
-                        .map(|object| pool.get_object_info(object).get_name(object));
-                    let switching = draft_session != pool.ui_session_id().as_u128()
-                        || draft_revision != pool.revision()
-                        || pool.get_selected().0.map(|id| id.value()) != Some(draft_id)
-                        || pool.editor_selection().is_some()
-                        || current_name.as_deref() != Some(baseline.as_str());
-                    if switching {
-                        self.property_name_draft = None;
-                        if draft_session == pool.ui_session_id().as_u128()
-                            && draft_revision == pool.revision()
-                            && current_name.as_deref() == Some(baseline.as_str())
-                        {
-                            if let Ok(draft_id) = ObjectId::new(draft_id) {
-                                pool.rename_object(draft_id, draft);
-                            }
-                        }
-                    }
-                }
+                finish_object_name_on_switch(pool, &mut self.property_name_draft);
                 if let Some(EditorSelection::ComponentNode {
                     instance_id,
                     node_id,
@@ -2954,14 +3010,10 @@ impl DesignerApp {
                 } else if let Some(id) = pool.get_selected().into() {
                     if let Some(original) = pool.get_pool().object_by_id(id).cloned() {
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            let project_key = pool.ui_session_id().as_u128();
-                            let project_revision = pool.revision();
                             let object_id = original.id().value();
-                            let original_name = pool.get_object_info(&original).get_name(&original);
                             let has_placement = self.canvas.has_placement_selection(pool);
-                            let duplicate_enabled = self.canvas.selected_placement(pool).is_some()
-                                || (!has_placement
-                                    && !matches!(&original, Object::PictureGraphic(_)));
+                            let duplicate_enabled =
+                                self.canvas.selected_placement(pool).is_some() || !has_placement;
                             ui.horizontal(|ui| {
                                 if ui
                                     .add_enabled(duplicate_enabled, egui::Button::new("Duplicate"))
@@ -2988,52 +3040,8 @@ impl DesignerApp {
                                     }
                                 }
                             });
-                            // Display editable object name as header
-                            ui.horizontal(|ui| {
-                                ui.label("Name:");
-                                self.property_name_draft_seen = true;
-                                let mut name = self
-                                    .property_name_draft
-                                    .as_ref()
-                                    .filter(|(key, revision, draft_id, _, _)| {
-                                        *key == project_key
-                                            && *revision == project_revision
-                                            && *draft_id == object_id
-                                    })
-                                    .map(|(_, _, _, _, draft)| draft.clone())
-                                    .unwrap_or_else(|| original_name.clone());
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(&mut name)
-                                        .desired_width(ui.available_width()),
-                                );
-                                if response.changed() {
-                                    self.property_name_draft = Some((
-                                        project_key,
-                                        project_revision,
-                                        object_id,
-                                        original_name.clone(),
-                                        name.clone(),
-                                    ));
-                                }
-                                let enter = response.has_focus()
-                                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                                let escape = response.has_focus()
-                                    && ui.input(|input| input.key_pressed(egui::Key::Escape));
-                                if escape {
-                                    self.property_name_draft = None;
-                                    response.surrender_focus();
-                                } else if enter || response.lost_focus() {
-                                    if let Some((_, _, _, _, draft)) =
-                                        self.property_name_draft.take()
-                                    {
-                                        if draft != original_name {
-                                            if let Ok(object_id) = ObjectId::new(object_id) {
-                                                pool.rename_object(object_id, draft);
-                                            }
-                                        }
-                                    }
-                                }
-                            });
+                            self.property_name_draft_seen = true;
+                            render_object_name(ui, pool, &original, &mut self.property_name_draft);
                             ui.separator();
 
                             render_property_editor(ui, &original, pool);
@@ -3389,6 +3397,16 @@ fn tree_row_with_id(
     selected: bool,
     label: impl Into<String>,
 ) -> egui::Response {
+    tree_row_with_highlight(ui, id, selected, true, label)
+}
+
+fn tree_row_with_highlight(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    selected: bool,
+    primary: bool,
+    label: impl Into<String>,
+) -> egui::Response {
     let background = ui
         .data_mut(|data| {
             let key = egui::Id::new("tree_row_background");
@@ -3412,7 +3430,9 @@ fn tree_row_with_id(
     if response.has_focus() {
         ui.data_mut(|data| data.insert_temp(egui::Id::new("tree_row_had_focus"), true));
     }
-    let fill = if selected {
+    let fill = if selected && !primary {
+        ui.visuals().selection.bg_fill.gamma_multiply(0.5)
+    } else if selected {
         ui.visuals().selection.bg_fill
     } else if response.hovered() {
         ui.visuals().widgets.hovered.weak_bg_fill
@@ -3421,14 +3441,14 @@ fn tree_row_with_id(
     };
     ui.painter()
         .set(background, egui::Shape::rect_filled(row_rect, 0, fill));
-    if selected {
+    if selected && primary {
         ui.painter().rect_filled(
             egui::Rect::from_min_size(row_rect.min, egui::vec2(3.0, row_rect.height())),
             0,
             ui.visuals().selection.stroke.color,
         );
     }
-    let text_color = if selected {
+    let text_color = if selected && primary {
         ui.visuals().selection.stroke.color
     } else {
         ui.visuals().text_color()

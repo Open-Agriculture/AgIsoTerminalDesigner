@@ -23,6 +23,8 @@ pub struct CanvasState {
     placement_owner: Option<u16>,
     context: Vec<usize>,
     inspector: Option<u16>,
+    hierarchy_selection: Option<(u64, u16, Vec<usize>, u16)>,
+    all_hierarchy_references: Option<u16>,
     zoom: f32,
     pan: Vec2,
     viewport: Rect,
@@ -55,6 +57,8 @@ impl Default for CanvasState {
             placement_owner: None,
             context: vec![],
             inspector: None,
+            hierarchy_selection: None,
+            all_hierarchy_references: None,
             zoom: 1.0,
             pan: egui::vec2(24.0, 24.0),
             viewport: Rect::NOTHING,
@@ -125,7 +129,9 @@ impl CanvasState {
         let selected = self.reconciled_selection(&scene);
         let path = selected.first()?;
         let item = scene.items.iter().find(|i| &i.path == path)?;
-        if project.get_selected().0.map(|id| id.value()) != Some(item.object_id) {
+        if project.get_selected().0.map(|id| id.value()) != Some(item.object_id)
+            && !self.has_placement_selection(project)
+        {
             return None;
         }
         item.target.clone()
@@ -137,6 +143,73 @@ impl CanvasState {
     pub fn has_placement_selection(&self, project: &EditorProject) -> bool {
         self.placement_owner.is_some()
             && self.placement_owner == project.get_selected().0.map(|id| id.value())
+    }
+
+    /// Preserve the identity of a clicked hierarchy row independently of the
+    /// object rendered at its placement (in particular, an ObjectPointer).
+    pub fn select_hierarchy_object(
+        &mut self,
+        project: &EditorProject,
+        root: u16,
+        path: &[usize],
+        object: u16,
+    ) {
+        self.switch_mask(Some(root));
+        self.selected.clear();
+        self.placement_owner = None;
+        if let Ok(materialized) = project.materialize_shared() {
+            let scene = geometry::build_page(project, &materialized, root, self.softkey_page);
+            if let Some(scene_path) = hierarchy_scene_path(project, &materialized, root, path) {
+                if let Some(item) = scene.items.iter().find(|item| item.path == scene_path) {
+                    self.selected.push(scene_path);
+                    self.placement_owner = item.target.as_ref().map(|_| object);
+                }
+            }
+            self.remember_scene(&scene);
+        }
+        self.revision = project.revision();
+        self.hierarchy_selection = Some((project.revision(), root, path.to_vec(), object));
+        self.all_hierarchy_references = None;
+        self.inspector = Some(object);
+        project
+            .get_mut_selected()
+            .set(NullableObjectId::new(object));
+    }
+
+    /// Highlight every hierarchy occurrence after an object search, without
+    /// making the other placements part of the canvas edit selection.
+    pub fn select_all_hierarchy_references(&mut self, object: Option<u16>) {
+        self.hierarchy_selection = None;
+        self.all_hierarchy_references = object;
+    }
+
+    /// Whether a matching hierarchy row receives the full selection highlight.
+    /// A search or a selection without an exact occurrence highlights all rows.
+    pub fn hierarchy_occurrence_is_primary(
+        &self,
+        project: &EditorProject,
+        root: u16,
+        path: &[usize],
+        object: u16,
+    ) -> bool {
+        if self.all_hierarchy_references == Some(object) {
+            return true;
+        }
+        if let Some((revision, selected_root, selected_path, selected_object)) =
+            &self.hierarchy_selection
+        {
+            if *revision == project.revision() && *selected_object == object {
+                return *selected_root == root && selected_path == path;
+            }
+        }
+        if self.inspector != Some(object) || self.mask != Some(root) || self.selected.is_empty() {
+            return true;
+        }
+        let Ok(materialized) = project.materialize_shared() else {
+            return true;
+        };
+        hierarchy_scene_path(project, &materialized, root, path)
+            .is_some_and(|scene_path| self.selected.contains(&scene_path))
     }
 
     fn scene_identity(scene: &Scene) -> Vec<(Vec<usize>, u16, Option<PlacementTarget>)> {
@@ -425,61 +498,10 @@ impl CanvasState {
         let page = self.pages.get(&root).map_or(0, |page| page.1);
         let scene = geometry::build_page(project, &materialized, root, page);
 
-        let (mut object_id, mut scene_path, remaining) = match parent_path.first() {
-            Some(0) => (root, Vec::new(), &parent_path[1..]),
-            Some(tree_slot) => {
-                let slot = *tree_slot - 1;
-                let path = vec![super::softkeys::PATH_PREFIX, slot];
-                let Some(object_id) = softkey_object_id(project, root, slot) else {
-                    return false;
-                };
-                if !scene.items.iter().any(|item| item.path == path) {
-                    return false;
-                }
-                (object_id, path, &parent_path[1..])
-            }
-            None => return false,
+        let Some(scene_path) = hierarchy_scene_path(project, &materialized, root, parent_path)
+        else {
+            return false;
         };
-
-        for &index in remaining {
-            if index == usize::MAX {
-                let Ok(pointer_id) = ag_iso_stack::object_pool::ObjectId::new(object_id) else {
-                    return false;
-                };
-                let Some(ag_iso_stack::object_pool::object::Object::ObjectPointer(pointer)) =
-                    project.get_pool().object_by_id(pointer_id)
-                else {
-                    return false;
-                };
-                let Some(pointer_target) = pointer.value.0 else {
-                    return false;
-                };
-                object_id = pointer_target.value();
-                continue;
-            }
-
-            let Some(materialized_index) =
-                canonical_to_materialized_index(&materialized, object_id, index)
-            else {
-                return false;
-            };
-            scene_path.push(materialized_index);
-            if !scene.items.iter().any(|item| item.path == scene_path) {
-                return false;
-            }
-            let Ok(parent_object_id) = ObjectId::new(object_id) else {
-                return false;
-            };
-            let Some(parent) = materialized.pool.object_by_id(parent_object_id) else {
-                return false;
-            };
-            let Some(reference) = crate::operations::object_refs(parent)
-                .and_then(|refs| refs.get(materialized_index))
-            else {
-                return false;
-            };
-            object_id = reference.id.value();
-        }
 
         let Some(item) = scene.items.iter().find(|item| {
             item.target.as_ref() == Some(&target)
@@ -1745,6 +1767,8 @@ impl CanvasState {
             .find(|i| i.path == leaf.path[..leaf.path.len().min(depth)])
     }
     fn sync_selection(&mut self, project: &EditorProject, scene: &Scene) {
+        self.hierarchy_selection = None;
+        self.all_hierarchy_references = None;
         let id = self
             .selected
             .last()
@@ -2119,6 +2143,45 @@ impl CanvasState {
     }
 }
 
+fn hierarchy_scene_path(
+    project: &EditorProject,
+    materialized: &MaterializedProject,
+    root: u16,
+    path: &[usize],
+) -> Option<Vec<usize>> {
+    let (&branch, children) = path.split_first()?;
+    let (mut object, mut scene_path) = if branch == 0 {
+        (root, Vec::new())
+    } else {
+        (
+            softkey_object_id(project, root, branch - 1)?,
+            vec![super::softkeys::PATH_PREFIX, branch - 1],
+        )
+    };
+    for &index in children {
+        if index == usize::MAX {
+            let ag_iso_stack::object_pool::object::Object::ObjectPointer(pointer) = materialized
+                .pool
+                .object_by_id(ObjectId::new(object).ok()?)?
+            else {
+                return None;
+            };
+            object = pointer.value.0?.value();
+        } else {
+            let index = canonical_to_materialized_index(materialized, object, index)?;
+            let parent = materialized
+                .pool
+                .object_by_id(ObjectId::new(object).ok()?)?;
+            object = crate::operations::object_refs(parent)?
+                .get(index)?
+                .id
+                .value();
+            scene_path.push(index);
+        }
+    }
+    Some(scene_path)
+}
+
 fn canonical_to_materialized_index(
     materialized: &MaterializedProject,
     parent_id: u16,
@@ -2213,7 +2276,7 @@ mod tests {
 
     #[test]
     fn hierarchy_selection_keeps_repeated_parent_and_pointer_alias_occurrences() {
-        let project = repeated_parent_project();
+        let mut project = repeated_parent_project();
         let target = PlacementTarget::Primitive {
             parent_id: 100,
             child_index: 0,
@@ -2222,8 +2285,39 @@ mod tests {
 
         assert!(canvas.select_hierarchy_placement(&project, 2, &[0, 1], target.clone()));
         assert_eq!(canvas.selected, vec![vec![1, 0]]);
+        assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 1, 0], 101));
+        assert!(!canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 0, 0], 101));
 
         assert!(canvas.select_hierarchy_placement(&project, 2, &[0, 2, usize::MAX], target,));
         assert_eq!(canvas.selected, vec![vec![2, 0]]);
+        assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 2, usize::MAX, 0], 101));
+        assert!(!canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 1, 0], 101));
+
+        canvas.select_all_hierarchy_references(Some(101));
+        assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 0, 0], 101));
+        assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 1, 0], 101));
+        assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 2, usize::MAX, 0], 101));
+
+        canvas.select_hierarchy_object(&project, 2, &[0, 1, 0], 101);
+        assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 1, 0], 101));
+        assert!(!canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 0, 0], 101));
+
+        canvas.select_hierarchy_object(&project, 2, &[0, 2], 104);
+        project.update_selected();
+        assert_eq!(project.get_selected(), NullableObjectId::new(104));
+        assert_eq!(canvas.selected, vec![vec![2]]);
+        assert_eq!(
+            canvas.selected_placement(&project),
+            Some(PlacementTarget::Primitive {
+                parent_id: 2,
+                child_index: 2,
+            })
+        );
+
+        canvas.select_hierarchy_object(&project, 2, &[0, 2, usize::MAX], 100);
+        project.update_selected();
+        assert_eq!(project.get_selected(), NullableObjectId::new(100));
+        assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 2, usize::MAX], 100));
+        assert!(!canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 0], 100));
     }
 }

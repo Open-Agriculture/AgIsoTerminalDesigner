@@ -728,7 +728,17 @@ fn duplicate_target(
                 .clone();
             let root_id = target_id(&root.child).ok_or_else(invalid_placement)?;
             let mut graph_ids = Vec::new();
-            collect_positioned_subtree(pool, root_id, &mut HashSet::new(), &mut graph_ids)?;
+            if matches!(
+                pool.object_by_id(object_id(root_id)?),
+                Some(ag_iso_stack::object_pool::object::Object::PictureGraphic(_))
+            ) {
+                // A picture selected as the duplicate target is itself the
+                // object being copied. Pictures reached below a container
+                // remain shared image resources.
+                graph_ids.push(root_id);
+            } else {
+                collect_positioned_subtree(pool, root_id, &mut HashSet::new(), &mut graph_ids)?;
+            }
             let mut copy_pool = ObjectPool::new();
             let mut copied_info = HashMap::new();
             for old in &graph_ids {
@@ -843,8 +853,7 @@ fn collect_positioned_subtree(
     let object = pool.object_by_id(object_id(id)?).ok_or_else(|| {
         ComponentError::new("CANVAS_EDIT_INVALID", format!("Missing object {id}"))
     })?;
-    // Image data is a shared resource: duplicating placements and containers
-    // retains PictureGraphic identities rather than copying their pixel payload.
+    // Image data is a shared resource when reached through a container.
     if matches!(
         object,
         ag_iso_stack::object_pool::object::Object::PictureGraphic(_)
@@ -1095,4 +1104,174 @@ fn compare_removals(left: &CanvasEdit, right: &CanvasEdit) -> std::cmp::Ordering
 
 fn invalid_placement() -> ComponentError {
     ComponentError::new("CANVAS_EDIT_INVALID", "Placement no longer exists")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply, CanvasEdit, PlacementTarget};
+    use crate::{default_object, EditorProject};
+    use ag_iso_stack::object_pool::{
+        object::{Object, PictureGraphic},
+        object_attributes::{ObjectRef, Point},
+        ObjectId, ObjectPool, ObjectType,
+    };
+
+    fn with_id(object_type: ObjectType, id: u16) -> Object {
+        let mut object = default_object(object_type);
+        object.mut_id().set_value(id).unwrap();
+        object
+    }
+
+    fn add_child(pool: &mut ObjectPool, parent_id: u16, child_id: u16) {
+        let parent = pool
+            .object_mut_by_id(ObjectId::new(parent_id).unwrap())
+            .unwrap();
+        let references = match parent {
+            Object::DataMask(mask) => &mut mask.object_refs,
+            Object::Container(container) => &mut container.object_refs,
+            _ => panic!("expected a positioned parent"),
+        };
+        references.push(ObjectRef {
+            id: ObjectId::new(child_id).unwrap(),
+            offset: Point { x: 0, y: 0 },
+        });
+    }
+
+    fn picture(project: &EditorProject, id: u16) -> PictureGraphic {
+        match project
+            .get_pool()
+            .object_by_id(ObjectId::new(id).unwrap())
+            .unwrap()
+        {
+            Object::PictureGraphic(picture) => picture.clone(),
+            _ => panic!("expected a PictureGraphic"),
+        }
+    }
+
+    fn mask_child_count(project: &EditorProject) -> usize {
+        match project
+            .get_pool()
+            .object_by_id(ObjectId::new(1).unwrap())
+            .unwrap()
+        {
+            Object::DataMask(mask) => mask.object_refs.len(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn duplicate_picture_copies_object_while_container_duplicate_shares_picture() {
+        let mut pool = ObjectPool::new();
+        pool.add(with_id(ObjectType::DataMask, 1));
+        pool.add(with_id(ObjectType::PictureGraphic, 2));
+        pool.add(with_id(ObjectType::Container, 3));
+        if let Some(Object::Container(container)) = pool.object_mut_by_id(ObjectId::new(3).unwrap())
+        {
+            container.width = 100;
+            container.height = 60;
+        }
+        if let Some(Object::PictureGraphic(picture)) =
+            pool.object_mut_by_id(ObjectId::new(2).unwrap())
+        {
+            picture.width = 8;
+            picture.actual_width = 8;
+            picture.actual_height = 1;
+            picture.data = vec![0xA5];
+        }
+        add_child(&mut pool, 1, 2);
+        add_child(&mut pool, 1, 3);
+        add_child(&mut pool, 3, 2);
+        let mut project = EditorProject::from(pool);
+        project.mask_size = 500;
+
+        let copied_picture = apply(
+            &mut project,
+            "Duplicate picture",
+            &[CanvasEdit::Duplicate {
+                target: PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index: 0,
+                },
+                x: 10,
+                y: 20,
+            }],
+        )
+        .unwrap();
+        let PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index,
+        } = copied_picture[0]
+        else {
+            panic!("expected duplicated primitive placement");
+        };
+        let duplicate_id = match &project
+            .get_pool()
+            .object_by_id(ObjectId::new(1).unwrap())
+            .unwrap()
+        {
+            Object::DataMask(mask) => mask.object_refs[child_index].id.value(),
+            _ => unreachable!(),
+        };
+        assert_ne!(duplicate_id, 2);
+        assert_eq!(
+            picture(&project, duplicate_id).data,
+            picture(&project, 2).data
+        );
+        assert_eq!(
+            picture(&project, duplicate_id).width,
+            picture(&project, 2).width
+        );
+        assert_eq!(mask_child_count(&project), 3);
+        assert!(project.undo_operation());
+        assert!(project
+            .get_pool()
+            .object_by_id(ObjectId::new(duplicate_id).unwrap())
+            .is_none());
+        assert_eq!(mask_child_count(&project), 2);
+        assert!(project.redo_operation());
+        assert_eq!(
+            picture(&project, duplicate_id).data,
+            picture(&project, 2).data
+        );
+        assert_eq!(mask_child_count(&project), 3);
+
+        let copied_container = apply(
+            &mut project,
+            "Duplicate container",
+            &[CanvasEdit::Duplicate {
+                target: PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index: 1,
+                },
+                x: 30,
+                y: 40,
+            }],
+        )
+        .unwrap();
+        let PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index,
+        } = copied_container[0]
+        else {
+            panic!("expected duplicated primitive placement");
+        };
+        let container_id = match &project
+            .get_pool()
+            .object_by_id(ObjectId::new(1).unwrap())
+            .unwrap()
+        {
+            Object::DataMask(mask) => mask.object_refs[child_index].id.value(),
+            _ => unreachable!(),
+        };
+        match project
+            .get_pool()
+            .object_by_id(ObjectId::new(container_id).unwrap())
+            .unwrap()
+        {
+            Object::Container(container) => {
+                assert_eq!(container.object_refs[0].id.value(), 2);
+            }
+            _ => panic!("expected duplicated container"),
+        }
+    }
 }
