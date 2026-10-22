@@ -6,7 +6,9 @@ use super::{
 };
 use crate::object_rendering::Colorable;
 use crate::{components::MaterializedProject, EditorProject};
-use ag_iso_stack::object_pool::{object_attributes::Point, NullableObjectId, ObjectId};
+use ag_iso_stack::object_pool::{
+    object::Object, object_attributes::Point, NullableObjectId, ObjectId,
+};
 use egui::{Key, Modifiers, Pos2, Rect, Stroke, Vec2};
 use std::collections::HashMap;
 
@@ -84,6 +86,8 @@ impl Default for CanvasState {
 enum GestureKind {
     Move,
     Resize(Vec2),
+    PolygonVertex(usize),
+    LineEndpoint(usize),
     Marquee,
     Pan,
 }
@@ -542,6 +546,31 @@ impl CanvasState {
         true
     }
 
+    /// Keep the occurrence selected after replacing its child at the same slot.
+    pub fn replaced_placement(
+        &mut self,
+        project: &EditorProject,
+        target: &PlacementTarget,
+        replacement_id: u16,
+    ) {
+        let Some(root) = self.mask else {
+            return;
+        };
+        let Ok(materialized) = project.materialize() else {
+            return;
+        };
+        let scene = geometry::build_page(project, &materialized, root, self.softkey_page);
+        let Some(item) = scene
+            .items
+            .iter()
+            .find(|item| item.target.as_ref() == Some(target) && item.object_id == replacement_id)
+        else {
+            return;
+        };
+        self.selected = vec![item.path.clone()];
+        self.sync_selection(project, &scene);
+    }
+
     /// Cancel unfinished canvas edits when its pane is hidden or moved.
     /// Completed edits, selection, zoom, and pan remain intact.
     pub fn cancel_interaction(&mut self) {
@@ -927,6 +956,28 @@ impl CanvasState {
         if !focused {
             self.gesture = None;
         }
+        if let Some(gesture) = self.gesture.as_ref() {
+            let shape_point = match &gesture.kind {
+                GestureKind::PolygonVertex(index) => Some(*index),
+                _ => None,
+            };
+            let shape_object = match &gesture.kind {
+                GestureKind::PolygonVertex(_) | GestureKind::LineEndpoint(_) => {
+                    gesture.items.first().map(|item| item.object_id)
+                }
+                _ => None,
+            };
+            if shape_object.is_some_and(|object_id| {
+                gesture.base_selection != self.selected
+                    || !crate::shape_editing::editing(ui.ctx(), project, object_id)
+                    || shape_point.is_some_and(|point| {
+                        crate::shape_editing::selected_point(ui.ctx(), project, object_id)
+                            != Some(point)
+                    })
+            }) {
+                self.gesture = None;
+            }
+        }
         if response.hovered() && self.gesture.is_none() && scroll != Vec2::ZERO {
             if modifiers.ctrl || modifiers.command {
                 let anchor = pointer.hover_pos().unwrap_or(viewport.center()) - viewport.min;
@@ -1028,8 +1079,24 @@ impl CanvasState {
                 } else {
                     None
                 };
+                let shape_handle = if items.len() == 1 {
+                    shape_handle(project, ui.ctx(), &items[0], p, origin, self.zoom)
+                } else {
+                    None
+                };
                 let kind = if space {
                     GestureKind::Pan
+                } else if let Some(kind) = shape_handle {
+                    if let (Some(item), GestureKind::PolygonVertex(index)) = (items.first(), &kind)
+                    {
+                        crate::shape_editing::select_point(
+                            ui.ctx(),
+                            project,
+                            item.object_id,
+                            *index,
+                        );
+                    }
+                    kind
                 } else if let Some(h) = handle {
                     GestureKind::Resize(h)
                 } else if let Some(hit) = hit {
@@ -1127,6 +1194,7 @@ impl CanvasState {
                 let raw = gesture.current - gesture.start;
                 gesture.changed |= raw.length() * self.zoom > 3.0;
                 if gesture.changed {
+                    gesture.edits.clear();
                     match gesture.kind {
                         GestureKind::Pan => {
                             self.pan += pointer.delta();
@@ -1185,6 +1253,46 @@ impl CanvasState {
                                     resize_edits(project, item, handle, delta, modifiers);
                             }
                         }
+                        GestureKind::PolygonVertex(index) => {
+                            if let Some(item) = gesture.items.first() {
+                                if let Some(Object::OutputPolygon(polygon)) =
+                                    ObjectId::new(item.object_id)
+                                        .ok()
+                                        .and_then(|id| project.get_pool().object_by_id(id))
+                                {
+                                    let brush = f32::from(line_brush(
+                                        project.get_pool(),
+                                        polygon.line_attributes,
+                                    )) * 0.5;
+                                    let x = (gesture.current.x - item.rect.min.x - brush)
+                                        .round()
+                                        .clamp(0.0, f32::from(polygon.width.saturating_sub(1)))
+                                        as u16;
+                                    let y = (gesture.current.y - item.rect.min.y - brush)
+                                        .round()
+                                        .clamp(0.0, f32::from(polygon.height.saturating_sub(1)))
+                                        as u16;
+                                    if let Some(target) = item.target.clone() {
+                                        gesture.edits.push(CanvasEdit::SetPolygonPoint {
+                                            object_id: item.object_id,
+                                            target,
+                                            index,
+                                            x,
+                                            y,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        GestureKind::LineEndpoint(endpoint) => {
+                            if let Some(item) = gesture.items.first() {
+                                if let Some(edit) =
+                                    line_endpoint_edit(project, item, endpoint, gesture.current)
+                                {
+                                    gesture.edits.push(edit);
+                                }
+                            }
+                        }
                     }
                     if gesture.edits.is_empty() {
                         gesture.draft = None;
@@ -1225,6 +1333,8 @@ impl CanvasState {
                     if gesture.changed && gesture.draft.is_some() && !gesture.edits.is_empty() {
                         let description = match gesture.kind {
                             GestureKind::Resize(_) => "Resize object",
+                            GestureKind::PolygonVertex(_) => "Move polygon point",
+                            GestureKind::LineEndpoint(_) => "Move line endpoint",
                             _ if modifiers.alt => "Duplicate placements",
                             _ => "Move placements",
                         };
@@ -1391,6 +1501,19 @@ impl CanvasState {
                 Stroke::new(1.5, selection_color),
                 egui::StrokeKind::Outside,
             );
+        }
+        if display_items.len() == 1 {
+            let item = &display_items[0];
+            if crate::shape_editing::editing(ui.ctx(), project, item.object_id) {
+                paint_shape_handles(
+                    &painter,
+                    &display.pool,
+                    item,
+                    transform,
+                    selection_color,
+                    crate::shape_editing::selected_point(ui.ctx(), project, item.object_id),
+                );
+            }
         }
         if self.gesture.is_none() {
             if let Some(item) = hit {
@@ -2032,7 +2155,16 @@ impl CanvasState {
     ) {
         let take = |key, mods| ui.input_mut(|i| i.consume_key(mods, key));
         if take(Key::Escape, Modifiers::NONE) {
-            if self.gesture.take().is_none() {
+            let canceled_gesture = self.gesture.take().is_some();
+            if canceled_gesture {
+                // The next Escape leaves shape editing mode.
+            } else if let Some(item) = self
+                .selection(scene)
+                .first()
+                .filter(|item| crate::shape_editing::editing(ui.ctx(), project, item.object_id))
+            {
+                crate::shape_editing::stop_editing(ui.ctx(), project, item.object_id);
+            } else {
                 self.selected.clear();
                 self.context.clear();
                 self.sync_selection(project, scene);
@@ -2141,6 +2273,204 @@ impl CanvasState {
             commands.extend(move_edits(project, &items, nudge, false));
         }
     }
+}
+
+fn shape_handle(
+    project: &EditorProject,
+    ctx: &egui::Context,
+    item: &SceneItem,
+    pointer: Pos2,
+    origin: Pos2,
+    zoom: f32,
+) -> Option<GestureKind> {
+    if !crate::shape_editing::editing(ctx, project, item.object_id) {
+        return None;
+    }
+    let pool = project.get_pool();
+    let object = ObjectId::new(item.object_id)
+        .ok()
+        .and_then(|id| pool.object_by_id(id))?;
+    let handles = shape_handle_positions(pool, item, object)?;
+    handles
+        .into_iter()
+        .filter_map(|(point, kind)| {
+            let distance = (origin + point.to_vec2() * zoom - pointer).length();
+            (distance <= 9.0).then_some((distance, kind))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, kind)| kind)
+}
+
+fn paint_shape_handles(
+    painter: &egui::Painter,
+    pool: &ag_iso_stack::object_pool::ObjectPool,
+    item: &SceneItem,
+    transform: egui::emath::TSTransform,
+    color: egui::Color32,
+    selected_point: Option<usize>,
+) {
+    let Some(object) = ObjectId::new(item.object_id)
+        .ok()
+        .and_then(|id| pool.object_by_id(id))
+    else {
+        return;
+    };
+    let Some(handles) = shape_handle_positions(pool, item, object) else {
+        return;
+    };
+    for (point, kind) in handles {
+        let (index, name) = match kind {
+            GestureKind::PolygonVertex(index) => (Some(index), (index + 1).to_string()),
+            GestureKind::LineEndpoint(index) => (None, if index == 0 { "A" } else { "B" }.into()),
+            _ => continue,
+        };
+        let center = transform * point;
+        let selected = index.is_some() && index == selected_point;
+        painter.circle_filled(center, if selected { 5.5 } else { 4.5 }, color);
+        painter.circle_stroke(center, 5.5, Stroke::new(1.0, egui::Color32::WHITE));
+        painter.text(
+            center + egui::vec2(7.0, -7.0),
+            egui::Align2::LEFT_BOTTOM,
+            name,
+            egui::FontId::proportional(10.0),
+            color,
+        );
+    }
+}
+
+fn shape_handle_positions(
+    pool: &ag_iso_stack::object_pool::ObjectPool,
+    item: &SceneItem,
+    object: &Object,
+) -> Option<Vec<(Pos2, GestureKind)>> {
+    use ag_iso_stack::object_pool::object::Object;
+    match object {
+        Object::OutputPolygon(polygon) => {
+            let brush = line_brush(pool, polygon.line_attributes);
+            let offset = f32::from(brush) * 0.5;
+            Some(
+                polygon
+                    .points
+                    .iter()
+                    .enumerate()
+                    .map(|(index, point)| {
+                        (
+                            item.rect.min
+                                + egui::vec2(
+                                    f32::from(point.x) + offset,
+                                    f32::from(point.y) + offset,
+                                ),
+                            GestureKind::PolygonVertex(index),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        Object::OutputLine(line) => {
+            let brush = f32::from(line_brush(pool, line.line_attributes));
+            let right = (item.rect.right() - brush).max(item.rect.left());
+            let bottom = (item.rect.bottom() - brush).max(item.rect.top());
+            let (start, end) = match line.line_direction {
+                ag_iso_stack::object_pool::object_attributes::LineDirection::TopLeftToBottomRight => {
+                    (item.rect.min, egui::pos2(right, bottom))
+                }
+                ag_iso_stack::object_pool::object_attributes::LineDirection::BottomLeftToTopRight => {
+                    (egui::pos2(item.rect.left(), bottom), egui::pos2(right, item.rect.top()))
+                }
+            };
+            let offset = egui::vec2(brush * 0.5, brush * 0.5);
+            Some(vec![
+                (start + offset, GestureKind::LineEndpoint(0)),
+                (end + offset, GestureKind::LineEndpoint(1)),
+            ])
+        }
+        _ => None,
+    }
+}
+
+fn line_brush(pool: &ag_iso_stack::object_pool::ObjectPool, attributes: NullableObjectId) -> u8 {
+    use ag_iso_stack::object_pool::object::Object;
+    pool.object_by_nullable_id(attributes)
+        .and_then(|object| match object {
+            Object::LineAttributes(attributes) => Some(attributes.line_width),
+            _ => None,
+        })
+        .unwrap_or(1)
+}
+
+fn line_endpoint_edit(
+    project: &EditorProject,
+    item: &SceneItem,
+    endpoint: usize,
+    pointer: Pos2,
+) -> Option<CanvasEdit> {
+    use ag_iso_stack::object_pool::object::Object;
+    use ag_iso_stack::object_pool::object_attributes::LineDirection;
+    let object_id = ObjectId::new(item.object_id).ok()?;
+    let Object::OutputLine(line) = project.get_pool().object_by_id(object_id)? else {
+        return None;
+    };
+    let target = item.target.clone()?;
+    let (local_x, local_y) = position(project, &target)?;
+    let brush = f32::from(line_brush(project.get_pool(), line.line_attributes));
+    let handles = shape_handle_positions(
+        project.get_pool(),
+        item,
+        project.get_pool().object_by_id(object_id)?,
+    )?;
+    let start = handles.first()?.0;
+    let end = handles.get(1)?.0;
+    let fixed = if endpoint == 0 { end } else { start };
+    let half = brush * 0.5;
+    let parent_origin = item.rect.min - egui::vec2(f32::from(local_x), f32::from(local_y));
+    let fixed_local = fixed - parent_origin - egui::vec2(half, half);
+    let moving_local = pointer - parent_origin - egui::vec2(half, half);
+    let (x, width, moving_x) = line_axis_geometry(moving_local.x, fixed_local.x, brush)?;
+    let (y, height, moving_y) = line_axis_geometry(moving_local.y, fixed_local.y, brush)?;
+    let direction = if (moving_x - fixed_local.x).signum() == (moving_y - fixed_local.y).signum() {
+        LineDirection::TopLeftToBottomRight
+    } else {
+        LineDirection::BottomLeftToTopRight
+    };
+    Some(CanvasEdit::EditLineEndpoint {
+        object_id: item.object_id,
+        target,
+        x,
+        y,
+        width,
+        height,
+        direction,
+    })
+}
+
+/// Clamp a dragged line endpoint to representable placement and dimension
+/// limits while leaving the opposite endpoint at its original coordinate.
+fn line_axis_geometry(moving: f32, fixed: f32, brush: f32) -> Option<(i16, u16, f32)> {
+    let fixed = fixed.round();
+    let max_distance = f32::from(u16::MAX) - brush;
+    let min_placement = f32::from(i16::MIN);
+    let max_placement = f32::from(i16::MAX);
+    let (min_moving, max_moving) = if fixed < min_placement {
+        return None;
+    } else if fixed > max_placement {
+        (fixed - max_distance, max_placement)
+    } else {
+        (
+            (fixed - max_distance).max(min_placement),
+            fixed + max_distance,
+        )
+    };
+    if min_moving > max_moving {
+        return None;
+    }
+    let moving = moving.round().clamp(min_moving, max_moving);
+    let top_left = fixed.min(moving);
+    if !(min_placement..=max_placement).contains(&top_left) {
+        return None;
+    }
+    let distance = (fixed - moving).abs();
+    let dimension = (distance + brush).round().clamp(1.0, f32::from(u16::MAX)) as u16;
+    Some((top_left as i16, dimension, moving))
 }
 
 fn hierarchy_scene_path(
@@ -2319,5 +2649,27 @@ mod tests {
         assert_eq!(project.get_selected(), NullableObjectId::new(100));
         assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 2, usize::MAX], 100));
         assert!(!canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 0], 100));
+    }
+
+    #[test]
+    fn line_endpoint_geometry_keeps_fixed_endpoint_through_crossing_and_bounds() {
+        let (origin, size, moving) = line_axis_geometry(10.0, 100.0, 3.0).unwrap();
+        assert_eq!(origin, 10);
+        assert_eq!(size, 93);
+        assert_eq!(origin as i32 + size as i32 - 3, 100);
+        assert_eq!(moving, 10.0);
+
+        let (origin, size, moving) = line_axis_geometry(120.0, 100.0, 3.0).unwrap();
+        assert_eq!(origin, 100);
+        assert_eq!(size, 23);
+        assert_eq!(moving, 120.0);
+
+        let (origin, size, _) = line_axis_geometry(-40_000.0, 40.0, 1.0).unwrap();
+        assert_eq!(origin, i16::MIN);
+        assert_eq!(origin as i32 + size as i32 - 1, 40);
+
+        let (origin, size, _) = line_axis_geometry(50_000.0, 40_000.0, 1.0).unwrap();
+        assert_eq!(origin, i16::MAX);
+        assert_eq!(origin as i32 + size as i32 - 1, 40_000);
     }
 }

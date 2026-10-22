@@ -2805,7 +2805,7 @@ fn containment_component_error(
     diagnostic
 }
 
-fn new_or_worsened_project_errors(
+pub(crate) fn new_or_worsened_project_errors(
     baseline: &[crate::ValidationDiagnostic],
     candidate: &[crate::ValidationDiagnostic],
 ) -> Vec<crate::ValidationDiagnostic> {

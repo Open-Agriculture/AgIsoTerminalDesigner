@@ -164,6 +164,70 @@ pub(crate) fn remap_macro_object_ids_checked(
     )
 }
 
+/// Validate local IDs and typed attribute-reference payloads after redirection.
+pub(crate) fn validate_macro_reference_values(
+    bytes: &[u8],
+    version: VtVersion,
+    object_types: &HashMap<u16, ObjectType>,
+) -> Result<(), String> {
+    use crate::object_properties::{get_property_descriptors, PropertyKey, PropertySemantic};
+    // An empty mapping validates the candidate stream without rewriting bytes.
+    remap_macro_object_ids_checked(bytes, &HashMap::new(), version, object_types)?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let command = bytes[offset];
+        let spec = command_spec(command).expect("checked command framing");
+        if matches!(command, 0xA8 | 0xAF) {
+            let owner = u16::from_le_bytes([bytes[offset + 1], bytes[offset + 2]]);
+            let object_type = object_types[&owner];
+            let aid = (command == 0xAF).then(|| bytes[offset + 3]);
+            if let MacroAttributeValueKind::LocalObjectId16 { value_offset } =
+                macro_attribute_value_kind(object_type, aid, version)
+            {
+                let value_at = offset + 4 + value_offset;
+                let target = u16::from_le_bytes([bytes[value_at], bytes[value_at + 1]]);
+                if target != u16::MAX {
+                    let property = match (object_type, aid) {
+                        (_, None) => Some(PropertyKey::Value),
+                        (ObjectType::WindowMask, Some(3)) | (ObjectType::KeyGroup, Some(2)) => {
+                            Some(PropertyKey::Name)
+                        }
+                        (ObjectType::OutputLinearBarGraph, Some(10))
+                        | (ObjectType::OutputArchedBarGraph, Some(12)) => {
+                            Some(PropertyKey::TargetValueVariableReference)
+                        }
+                        (ObjectType::AuxiliaryControlDesignatorType2, Some(2)) => {
+                            Some(PropertyKey::AuxiliaryObjectId)
+                        }
+                        (ObjectType::ExternalObjectPointer, Some(1)) => {
+                            Some(PropertyKey::DefaultObjectId)
+                        }
+                        (ObjectType::ExternalObjectPointer, Some(2)) => {
+                            Some(PropertyKey::ExternalReferenceNameId)
+                        }
+                        (_, Some(aid)) => crate::preview_commands::attribute_key(object_type, aid),
+                    };
+                    if let Some(descriptor) = get_property_descriptors(object_type)
+                        .into_iter()
+                        .find(|descriptor| Some(descriptor.name) == property)
+                    {
+                        if let PropertySemantic::ObjectReference { allowed_types } =
+                            descriptor.semantic
+                        {
+                            let target_type = object_types[&target];
+                            if !allowed_types.is_empty() && !allowed_types.contains(&target_type) {
+                                return Err(format!("Macro attribute reference on object {owner} targets incompatible {target_type:?} object {target}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        offset += frame_length(bytes, offset, command, spec.length)?;
+    }
+    Ok(())
+}
+
 /// Inspect local IDs with the same semantic layouts used for safe remapping.
 /// Unknown attribute payload semantics return an error instead of guessing IDs.
 pub(crate) fn macro_object_references(
@@ -445,4 +509,42 @@ fn remap_execute_macro(
     bytes[offset] = 0xBC;
     bytes[offset + 1..offset + 3].copy_from_slice(&new_id.to_le_bytes());
     Ok(())
+}
+
+#[cfg(test)]
+mod redirected_reference_tests {
+    use super::*;
+
+    #[test]
+    fn redirected_attribute_payloads_require_existing_compatible_targets() {
+        let types = HashMap::from([
+            (1, ObjectType::OutputPolygon),
+            (2, ObjectType::LineAttributes),
+            (3, ObjectType::FontAttributes),
+        ]);
+        let valid = [0xAF, 1, 0, 3, 2, 0, 0xFF, 0xFF];
+        assert!(validate_macro_reference_values(&valid, VtVersion::Version6, &types).is_ok());
+        let mut wrong_type = valid;
+        wrong_type[4] = 3;
+        assert!(validate_macro_reference_values(&wrong_type, VtVersion::Version6, &types).is_err());
+        for (object_type, aid) in [
+            (ObjectType::OutputLinearBarGraph, 10),
+            (ObjectType::OutputArchedBarGraph, 12),
+        ] {
+            let types = HashMap::from([
+                (1, object_type),
+                (2, ObjectType::NumberVariable),
+                (3, ObjectType::FontAttributes),
+            ]);
+            let mut packet = [0xAF, 1, 0, aid, 2, 0, 0xFF, 0xFF];
+            assert!(validate_macro_reference_values(&packet, VtVersion::Version6, &types).is_ok());
+            packet[4] = 3;
+            assert!(validate_macro_reference_values(&packet, VtVersion::Version6, &types).is_err());
+        }
+        let pointer_types = HashMap::from([(1, ObjectType::ObjectPointer)]);
+        let missing = [0xA8, 1, 0, 0xFF, 9, 0, 0xFF, 0xFF];
+        assert!(
+            validate_macro_reference_values(&missing, VtVersion::Version6, &pointer_types).is_err()
+        );
+    }
 }

@@ -4,6 +4,7 @@
 
 mod allowed_object_relationships;
 mod editor_project;
+mod enum_labels;
 mod graphic_rendering;
 mod graphics_context_raster;
 mod graphics_context_rendering;
@@ -20,6 +21,7 @@ mod object_rendering;
 mod output_string_rendering;
 mod possible_events;
 mod preview_commands;
+pub mod replacement;
 pub mod preview_session;
 mod project_file;
 mod smart_naming;
@@ -27,6 +29,7 @@ mod soft_key_layout;
 
 // Operation system and automation support
 pub mod canvas;
+mod shape_editing;
 pub mod cli;
 pub mod components;
 pub mod effective_colour;

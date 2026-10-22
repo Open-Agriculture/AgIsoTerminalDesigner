@@ -9,7 +9,7 @@ use crate::{
     operations::{object_refs, ChildPlacement, ObjectTarget, Operation, OperationContext},
 };
 use ag_iso_stack::object_pool::vt_version::VtVersion;
-use ag_iso_stack::object_pool::{ObjectId, ObjectPool};
+use ag_iso_stack::object_pool::{object_attributes::LineDirection, ObjectId, ObjectPool};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -28,9 +28,9 @@ enum DisplayedSibling {
     Component(crate::components::ComponentInstance),
 }
 
-/// An edit to a placed object or its dimensions.
-/// Positions are signed parent-relative pool pixels. Dimensions belong to the
-/// shared object definition; omitted dimensions remain unchanged.
+/// An edit to a placement or shared shape geometry.
+/// Positions are signed parent-relative pool pixels. Dimensions and polygon
+/// points belong to the shared object definition.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CanvasEdit {
     Move {
@@ -42,6 +42,22 @@ pub enum CanvasEdit {
         object_id: u16,
         width: Option<u16>,
         height: Option<u16>,
+    },
+    SetPolygonPoint {
+        object_id: u16,
+        target: PlacementTarget,
+        index: usize,
+        x: u16,
+        y: u16,
+    },
+    EditLineEndpoint {
+        object_id: u16,
+        target: PlacementTarget,
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+        direction: LineDirection,
     },
     Remove {
         target: PlacementTarget,
@@ -84,7 +100,8 @@ pub fn position(project: &EditorProject, target: &PlacementTarget) -> Option<(i1
 /// changed batch creates one history entry; no-op batches create none, and any
 /// invalid edit leaves the project intact. Returned targets identify surviving
 /// placements after the batch's removals have shifted their child indices.
-/// Move and Duplicate supply selection targets; a Resize alone supplies none.
+/// Movement, duplication, and shape edits supply selection targets; resize alone
+/// supplies none.
 /// Primitive indices refer to the lists at the beginning of this batch.
 pub fn apply(
     project: &mut EditorProject,
@@ -141,6 +158,52 @@ pub fn apply(
                         width,
                         height,
                     } => resize_object(pool, *object_id, *width, *height)?,
+                    CanvasEdit::SetPolygonPoint { object_id: id, target, index, x, y } => {
+                        let Some(ag_iso_stack::object_pool::object::Object::OutputPolygon(polygon)) =
+                            pool.object_mut_by_id(object_id(*id)?)
+                        else {
+                            return Err(ComponentError::new(
+                                "CANVAS_EDIT_INVALID",
+                                "Selected object is not an output polygon",
+                            ));
+                        };
+                        let Some(point) = polygon.points.get_mut(*index) else {
+                            return Err(ComponentError::new(
+                                "CANVAS_EDIT_INVALID",
+                                "Polygon point no longer exists",
+                            ));
+                        };
+                        point.x = *x;
+                        point.y = *y;
+                        if !touched.contains(target) {
+                            touched.push(target.clone());
+                        }
+                    }
+                    CanvasEdit::EditLineEndpoint {
+                        object_id: line_id,
+                        target,
+                        x,
+                        y,
+                        width,
+                        height,
+                        direction,
+                    } => {
+                        move_target(pool, source, target, *x, *y, vt_version)?;
+                        let Some(ag_iso_stack::object_pool::object::Object::OutputLine(line)) =
+                            pool.object_mut_by_id(object_id(*line_id)?)
+                        else {
+                            return Err(ComponentError::new(
+                                "CANVAS_EDIT_INVALID",
+                                "Selected object is not an output line",
+                            ));
+                        };
+                        line.width = *width;
+                        line.height = *height;
+                        line.line_direction = *direction;
+                        if !touched.contains(target) {
+                            touched.push(target.clone());
+                        }
+                    }
                     CanvasEdit::Remove { target } => {
                         remove_target(pool, source, target, vt_version)?
                     }
@@ -1108,11 +1171,11 @@ fn invalid_placement() -> ComponentError {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, CanvasEdit, PlacementTarget};
+    use super::{apply, position, CanvasEdit, PlacementTarget};
     use crate::{default_object, EditorProject};
     use ag_iso_stack::object_pool::{
         object::{Object, PictureGraphic},
-        object_attributes::{ObjectRef, Point},
+        object_attributes::{LineDirection, ObjectRef, Point},
         ObjectId, ObjectPool, ObjectType,
     };
 
@@ -1273,5 +1336,113 @@ mod tests {
             }
             _ => panic!("expected duplicated container"),
         }
+    }
+
+    #[test]
+    fn shape_edits_are_shared_and_line_geometry_is_one_undoable_change() {
+        let mut pool = ObjectPool::new();
+        pool.add(with_id(ObjectType::DataMask, 1));
+        pool.add(with_id(ObjectType::OutputPolygon, 2));
+        pool.add(with_id(ObjectType::OutputLine, 3));
+        pool.add(with_id(ObjectType::LineAttributes, 4));
+        if let Some(Object::OutputPolygon(polygon)) =
+            pool.object_mut_by_id(ObjectId::new(2).unwrap())
+        {
+            polygon.width = 80;
+            polygon.height = 60;
+            polygon.points = vec![
+                Point { x: 2, y: 3 },
+                Point { x: 20, y: 3 },
+                Point { x: 20, y: 20 },
+            ];
+        }
+        if let Some(Object::OutputLine(line)) = pool.object_mut_by_id(ObjectId::new(3).unwrap()) {
+            line.line_attributes = ObjectId::new(4).unwrap().into();
+            line.width = 30;
+            line.height = 20;
+        }
+        if let Some(Object::LineAttributes(line)) = pool.object_mut_by_id(ObjectId::new(4).unwrap())
+        {
+            line.line_width = 4;
+        }
+        add_child(&mut pool, 1, 2);
+        add_child(&mut pool, 1, 2);
+        add_child(&mut pool, 1, 3);
+        let mut project = EditorProject::from(pool);
+        project.mask_size = 500;
+        let polygon_target = PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index: 0,
+        };
+        let selected = apply(
+            &mut project,
+            "Move polygon point",
+            &[CanvasEdit::SetPolygonPoint {
+                object_id: 2,
+                target: polygon_target.clone(),
+                index: 1,
+                x: 25,
+                y: 12,
+            }],
+        )
+        .unwrap();
+        assert_eq!(selected, vec![polygon_target]);
+        let polygon_point = |project: &EditorProject| match project
+            .get_pool()
+            .object_by_id(ObjectId::new(2).unwrap())
+            .unwrap()
+        {
+            Object::OutputPolygon(polygon) => polygon.points[1],
+            _ => unreachable!(),
+        };
+        assert_eq!(polygon_point(&project), Point { x: 25, y: 12 });
+        assert!(project.undo_operation());
+        assert_eq!(polygon_point(&project), Point { x: 20, y: 3 });
+        assert!(project.redo_operation());
+        assert_eq!(polygon_point(&project), Point { x: 25, y: 12 });
+
+        let line_target = PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index: 2,
+        };
+        apply(
+            &mut project,
+            "Move line endpoint",
+            &[CanvasEdit::EditLineEndpoint {
+                object_id: 3,
+                target: line_target.clone(),
+                x: 20,
+                y: 30,
+                width: 50,
+                height: 40,
+                direction: LineDirection::BottomLeftToTopRight,
+            }],
+        )
+        .unwrap();
+        assert_eq!(position(&project, &line_target), Some((20, 30)));
+        let line_geometry = |project: &EditorProject| match project
+            .get_pool()
+            .object_by_id(ObjectId::new(3).unwrap())
+            .unwrap()
+        {
+            Object::OutputLine(line) => (line.width, line.height, line.line_direction),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            line_geometry(&project),
+            (50, 40, LineDirection::BottomLeftToTopRight)
+        );
+        assert!(project.undo_operation());
+        assert_eq!(position(&project, &line_target), Some((0, 0)));
+        assert_eq!(
+            line_geometry(&project),
+            (30, 20, LineDirection::TopLeftToBottomRight)
+        );
+        assert!(project.redo_operation());
+        assert_eq!(position(&project, &line_target), Some((20, 30)));
+        assert_eq!(
+            line_geometry(&project),
+            (50, 40, LineDirection::BottomLeftToTopRight)
+        );
     }
 }

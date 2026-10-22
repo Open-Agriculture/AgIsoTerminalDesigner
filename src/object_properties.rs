@@ -232,6 +232,7 @@ pub enum EditorKind {
     /// A bit-mask or JSON object of boolean options.
     FlagSet,
     Justification,
+    PolygonPoints,
     MacroReferences,
 }
 
@@ -273,6 +274,7 @@ fn default_editor(semantic: &PropertySemantic) -> EditorKind {
 /// Widgets whose presentation cannot be determined from their semantic alone.
 fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<EditorKind> {
     match (object_type, property) {
+        (ObjectType::OutputPolygon, PropertyKey::Points) => Some(EditorKind::PolygonPoints),
         (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }

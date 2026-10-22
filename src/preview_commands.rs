@@ -389,7 +389,7 @@ fn change_attribute(
     Ok(vec![(id.value(), Event::OnChangeAttribute)])
 }
 
-fn attribute_key(
+pub(crate) fn attribute_key(
     object_type: ObjectType,
     aid: u8,
 ) -> Option<crate::object_properties::PropertyKey> {

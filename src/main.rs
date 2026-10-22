@@ -227,6 +227,7 @@ pub struct DesignerApp {
     add_object_query: String,
     add_object_menu_open: bool,
     add_object_menu_seen: bool,
+    replace_dialog: Option<ReplaceDialog>,
     #[cfg(not(target_arch = "wasm32"))]
     recent_projects: Vec<RecentProject>,
     #[cfg(target_arch = "wasm32")]
@@ -235,7 +236,162 @@ pub struct DesignerApp {
     _before_unload: Option<Closure<dyn FnMut(web_sys::BeforeUnloadEvent)>>,
 }
 
+#[derive(Clone)]
+struct ReplaceDialog {
+    source_id: u16,
+    source_name: String,
+    revision: u64,
+    occurrence: Option<PlacementTarget>,
+    compatible_ids: Option<Vec<u16>>,
+    candidate_query: Option<String>,
+}
+
 impl DesignerApp {
+    fn show_replace_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.replace_dialog.as_ref() else {
+            return;
+        };
+        let Some(project) = self.project.as_ref() else {
+            self.replace_dialog = None;
+            return;
+        };
+        if project.revision() != dialog.revision
+            || project
+                .get_pool()
+                .object_by_id(ObjectId::new(dialog.source_id).unwrap_or_default())
+                .is_none()
+            || project.get_selected().0.map(|id| id.value()) != Some(dialog.source_id)
+            || self.canvas.selected_placement(project) != dialog.occurrence
+            || (dialog.occurrence.is_none() && self.canvas.has_placement_selection(project))
+        {
+            self.replace_dialog = None;
+            return;
+        }
+        let picker = egui::Id::new("replace_object_picker");
+        let query = ctx.data(|data| {
+            data.get_temp::<String>(picker.with("query"))
+                .unwrap_or_default()
+        });
+        let needs_candidates = dialog.candidate_query.as_deref() != Some(query.as_str());
+        let candidate_ids = if needs_candidates {
+            let ids: Vec<_> = project
+                .get_pool()
+                .objects()
+                .iter()
+                .filter(|object| object.id().value() != dialog.source_id)
+                .filter(|object| {
+                    ag_iso_terminal_designer::object_picker::matches_object(project, object, &query)
+                })
+                .filter_map(|object| {
+                    let id = object.id().value();
+                    let mut trial = project.clone();
+                    let result = if let Some(target) = &dialog.occurrence {
+                        ag_iso_terminal_designer::replacement::replace_placement(
+                            &mut trial, target, id,
+                        )
+                    } else {
+                        trial.replace_object_references(dialog.source_id, id)
+                    };
+                    result.is_ok().then_some(id)
+                })
+                .collect();
+            if let Some(dialog) = self.replace_dialog.as_mut() {
+                dialog.candidate_query = Some(query.clone());
+                dialog.compatible_ids = Some(ids.clone());
+            }
+            ids
+        } else {
+            dialog.compatible_ids.clone().unwrap_or_default()
+        };
+        let dialog = self.replace_dialog.as_ref().unwrap().clone();
+        let selected = ag_iso_terminal_designer::object_picker::window(
+            ctx,
+            picker,
+            "Replace with",
+            |ui, query| {
+                ag_iso_terminal_designer::object_picker::objects(
+                    ui,
+                    project,
+                    query,
+                    None,
+                    false,
+                    |object| candidate_ids.contains(&object.id().value()),
+                )
+            },
+            |ui, choice| {
+                let Some(target_id) = choice.0.map(|id| id.value()) else {
+                    return false;
+                };
+                let Some(target_object) = project.get_pool().object_by_id(choice.0.unwrap()) else {
+                    return false;
+                };
+                ui.label(if dialog.occurrence.is_some() {
+                    "Replace this placement. The shared source object remains unchanged."
+                } else {
+                    "Redirect every local reference. Both object definitions remain."
+                });
+                ui.label(format!(
+                    "Before: {} ({})",
+                    dialog.source_name, dialog.source_id
+                ));
+                ui.label(format!(
+                    "After: {} ({})",
+                    project.object_display_name(target_object),
+                    target_id
+                ));
+                ag_iso_terminal_designer::object_picker::review_preview(ui, |ui, rect| {
+                    ag_iso_terminal_designer::object_picker::object_preview_with_settings(
+                        ui,
+                        rect,
+                        project.get_pool(),
+                        target_object,
+                        project.vt_version(),
+                        project.soft_key_size(),
+                    );
+                });
+                ag_iso_terminal_designer::object_picker::impact::review_change(
+                    ui,
+                    project,
+                    |candidate| {
+                        if let Some(target) = &dialog.occurrence {
+                            ag_iso_terminal_designer::replacement::replace_placement(
+                                candidate, target, target_id,
+                            )
+                        } else {
+                            candidate.replace_object_references(dialog.source_id, target_id)
+                        }
+                    },
+                )
+            },
+        );
+        let Some(target_id) = selected.and_then(|choice| choice.0.map(|id| id.value())) else {
+            if !ag_iso_terminal_designer::object_picker::is_open(ctx, picker) {
+                self.replace_dialog = None;
+            }
+            return;
+        };
+        let dialog = self.replace_dialog.take().unwrap();
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
+        let result = if let Some(target) = &dialog.occurrence {
+            ag_iso_terminal_designer::replacement::replace_placement(project, target, target_id)
+        } else {
+            project.replace_object_references(dialog.source_id, target_id)
+        };
+        match result {
+            Ok(()) => {
+                project
+                    .get_mut_selected()
+                    .set(NullableObjectId::new(target_id));
+                if let Some(target) = dialog.occurrence {
+                    self.canvas.replaced_placement(project, &target, target_id);
+                }
+            }
+            Err(error) => self.error_message = Some(format!("Could not replace object: {error}")),
+        }
+    }
+
     fn show_iop_import(&mut self, ctx: &egui::Context) {
         let Some((_, name, version)) = self.pending_iop_import.as_mut() else {
             return;
@@ -571,6 +727,7 @@ impl DesignerApp {
             add_object_query: String::new(),
             add_object_menu_open: false,
             add_object_menu_seen: false,
+            replace_dialog: None,
             #[cfg(not(target_arch = "wasm32"))]
             recent_projects,
             #[cfg(target_arch = "wasm32")]
@@ -2618,6 +2775,7 @@ impl eframe::App for DesignerApp {
         self.add_object_menu_open = self.add_object_menu_seen;
 
         self.show_id_reassignment(ctx);
+        self.show_replace_dialog(ctx);
 
         let requested_pane = designer_settings::show_project_settings(
             ctx,
@@ -3012,8 +3170,11 @@ impl DesignerApp {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             let object_id = original.id().value();
                             let has_placement = self.canvas.has_placement_selection(pool);
-                            let duplicate_enabled =
-                                self.canvas.selected_placement(pool).is_some() || !has_placement;
+                            let placement = self.canvas.selected_placement(pool);
+                            let placement_supported =
+                                matches!(placement, Some(PlacementTarget::Primitive { .. }));
+                            let replacement_enabled = !has_placement || placement_supported;
+                            let duplicate_enabled = placement.is_some() || !has_placement;
                             ui.horizontal(|ui| {
                                 if ui
                                     .add_enabled(duplicate_enabled, egui::Button::new("Duplicate"))
@@ -3039,12 +3200,44 @@ impl DesignerApp {
                                         }
                                     }
                                 }
+                                if ui
+                                    .add_enabled(
+                                        replacement_enabled,
+                                        egui::Button::new("Replace with…"),
+                                    )
+                                    .clicked()
+                                {
+                                    ag_iso_terminal_designer::object_picker::open(
+                                        ui.ctx(),
+                                        egui::Id::new("replace_object_picker"),
+                                    );
+                                    self.replace_dialog = Some(ReplaceDialog {
+                                        source_id: object_id,
+                                        source_name: pool
+                                            .get_object_info(&original)
+                                            .get_name(&original)
+                                            .to_owned(),
+                                        revision: pool.revision(),
+                                        occurrence: if placement_supported {
+                                            placement.clone()
+                                        } else {
+                                            None
+                                        },
+                                        compatible_ids: None,
+                                        candidate_query: None,
+                                    });
+                                }
                             });
                             self.property_name_draft_seen = true;
                             render_object_name(ui, pool, &original, &mut self.property_name_draft);
                             ui.separator();
 
-                            render_property_editor(ui, &original, pool);
+                            ui.push_id(
+                                ("property_occurrence", self.canvas.selected_placement(pool)),
+                                |ui| {
+                                    render_property_editor(ui, &original, pool);
+                                },
+                            );
                             let effective = materialized
                                 .as_ref()
                                 .map(|m| &m.pool)

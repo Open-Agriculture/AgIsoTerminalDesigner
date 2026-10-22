@@ -37,6 +37,7 @@ struct PendingOperation {
     session: uuid::Uuid,
     revision: u64,
     operation: Option<Operation>,
+    discard_on_disappear: bool,
 }
 
 #[derive(Clone, Default)]
@@ -78,6 +79,13 @@ fn update_draft(
             PendingOperation {
                 session: design.ui_session_id(),
                 revision: design.revision(),
+                discard_on_disappear: matches!(
+                    operation.as_ref(),
+                    Some(Operation::SetProperty {
+                        property: PropertyKey::Points,
+                        ..
+                    })
+                ),
                 operation,
             },
         );
@@ -98,6 +106,7 @@ fn clear_draft(ctx: &egui::Context, key: egui::Id) {
 }
 
 /// Finish property drafts whose widgets disappeared since the previous frame.
+/// Polygon coordinate drafts are discarded when their editor disappears.
 /// Call after rendering the editor panels and before committing queued edits.
 pub fn finish_property_edits(ctx: &egui::Context, design: &EditorProject) {
     let operations = ctx.data_mut(|data| {
@@ -118,7 +127,10 @@ pub fn finish_property_edits(ctx: &egui::Context, design: &EditorProject) {
                 expired_keys.push(*key);
                 return false;
             }
-            if pending.session == design.ui_session_id() && pending.revision == design.revision() {
+            if !pending.discard_on_disappear
+                && pending.session == design.ui_session_id()
+                && pending.revision == design.revision()
+            {
                 if let Some(operation) = pending.operation.take() {
                     operations.push(operation);
                 }
@@ -131,6 +143,7 @@ pub fn finish_property_edits(ctx: &egui::Context, design: &EditorProject) {
         for key in expired_keys {
             data.remove::<PendingValue>(key);
             data.remove::<PendingPosition>(key);
+            data.remove::<PolygonPointDraft>(key);
             data.remove::<u16>(key);
         }
         operations
@@ -164,6 +177,9 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
     let properties = get_property_descriptors(object_type);
 
     render_identity(ui, id, object_type, design);
+    if matches!(object, Object::OutputPolygon(_) | Object::OutputLine(_)) {
+        render_shape_edit_toggle(ui, id, design);
+    }
     if matches!(
         object,
         Object::AuxiliaryFunctionType1(_) | Object::AuxiliaryInputType1(_)
@@ -476,7 +492,11 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                     let label_response = ui.label(&label);
                     egui::ComboBox::from_id_salt(property_name)
                         .icon(crate::ui_style::combo_box_icon)
-                        .selected_text(enum_choice_label(&value))
+                        .selected_text(crate::enum_labels::enum_choice_label(
+                            object_type,
+                            property_key,
+                            &value,
+                        ))
                         .show_ui(ui, |ui| {
                             for choice in &property.enum_choices {
                                 let supported = crate::vt_compatibility::supported_enum_value(
@@ -497,7 +517,11 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                                     valid,
                                     egui::Button::selectable(
                                         choice == &value,
-                                        enum_choice_label(choice),
+                                        crate::enum_labels::enum_choice_label(
+                                            object_type,
+                                            property_key,
+                                            choice,
+                                        ),
                                     ),
                                 );
                                 if !supported && response.contains_pointer() {
@@ -530,6 +554,11 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
             }
             EditorKind::Justification => {
                 render_justification(ui, &label, &value, id, property_key, design)
+            }
+            EditorKind::PolygonPoints => {
+                if let Object::OutputPolygon(polygon) = object {
+                    render_polygon_points(ui, polygon, design);
+                }
             }
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
@@ -592,28 +621,6 @@ fn decoded_string_value(
             .decode(font_type)
             .map_err(|_| "Unsupported string encoding".to_owned()),
     )
-}
-
-/// Keep payload enums readable without exposing their JSON representation.
-fn enum_choice_label(value: &serde_json::Value) -> String {
-    if let Some(name) = value.as_str() {
-        return human_readable_property_name(name);
-    }
-    if let Some(fields) = value.as_object() {
-        if let Some(size) = fields
-            .get("NonProportional")
-            .and_then(serde_json::Value::as_str)
-        {
-            return format!("{} px", size.trim_start_matches("Px").replace('x', " × "));
-        }
-        if let Some(height) = fields.get("Proportional") {
-            return format!("Proportional: {height} px");
-        }
-        if let Some((variant, payload)) = fields.iter().next() {
-            return format!("{}: {payload}", human_readable_property_name(variant));
-        }
-    }
-    value.to_string()
 }
 
 /// Commit a palette selection through the same undoable operation as other properties.
@@ -701,7 +708,7 @@ fn render_colour(
 }
 
 /// Convert a snake_case property identifier to a title-cased editor label.
-fn human_readable_property_name(property: &str) -> String {
+pub(crate) fn human_readable_property_name(property: &str) -> String {
     let mut label = String::with_capacity(property.len());
     let mut capitalise_next = true;
     for character in property.chars() {
@@ -1729,7 +1736,14 @@ fn unavailable_features(object: &Object, version: VtVersion) -> Vec<String> {
                         {
                             "Proportional font sizes".to_owned()
                         } else {
-                            format!("{label}: {}", enum_choice_label(choice))
+                            format!(
+                                "{label}: {}",
+                                crate::enum_labels::enum_choice_label(
+                                    object_type,
+                                    property_key,
+                                    choice,
+                                )
+                            )
                         };
                         add(choice_label, &|v| {
                             compatibility::supported_enum_value(
@@ -1871,6 +1885,176 @@ fn number_after_edit(
     }
 
     serde_json::Number::from_f64(edited)
+}
+
+#[derive(Clone)]
+struct PolygonPointDraft {
+    points: Vec<ag_iso_stack::object_pool::object_attributes::Point<u16>>,
+}
+
+fn render_shape_edit_toggle(ui: &mut egui::Ui, id: ObjectId, design: &EditorProject) {
+    let mut editing = crate::shape_editing::editing(ui.ctx(), design, id.value());
+    if ui.checkbox(&mut editing, "Edit points").changed() {
+        crate::shape_editing::set_editing(ui.ctx(), design, id.value(), editing);
+    }
+    if editing {
+        ui.weak("Drag handles on the canvas. Changes affect the shared shape.");
+    }
+}
+
+fn render_polygon_points(
+    ui: &mut egui::Ui,
+    polygon: &ag_iso_stack::object_pool::object::OutputPolygon,
+    design: &EditorProject,
+) {
+    let id = polygon.id;
+    let key = ui.make_persistent_id((id.value(), "polygon_point_draft"));
+    touch_draft(ui.ctx(), key);
+    let mut points = ui
+        .data(|data| data.get_temp::<PolygonPointDraft>(key))
+        .map_or_else(|| polygon.points.clone(), |draft| draft.points);
+    let mut changed = false;
+    let mut finished = false;
+    let mut cancelled = false;
+    let mut structural = None;
+    ui.label(format!("Points ({}/255)", points.len()));
+    if points.len() < 3 {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "A polygon needs at least three points.",
+        );
+    }
+    let count = points.len();
+    // Reserve each insertion slot even while hidden, so hovering never moves rows.
+    for slot in 0..=count {
+        if slot > 0 || polygon.polygon_type == 3 || count == 0 {
+            let (rect, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+            let reveal = ui.rect_contains_pointer(rect.expand(8.0));
+            if reveal {
+                let button = egui::Rect::from_center_size(rect.center(), egui::vec2(30.0, 18.0));
+                let response = ui
+                    .add_enabled_ui(count < 255, |ui| {
+                        ui.put(button, egui::Button::new("+").sense(egui::Sense::click()))
+                    })
+                    .inner;
+                if response.on_hover_text("Insert point here").clicked() {
+                    structural = Some((slot, 0));
+                }
+            }
+        }
+        if slot == count {
+            break;
+        }
+        ui.push_id(slot, |ui| {
+            ui.horizontal(|ui| {
+                let selected = crate::shape_editing::selected_point(ui.ctx(), design, id.value())
+                    == Some(slot);
+                if ui
+                    .selectable_label(selected, format!("{}", slot + 1))
+                    .clicked()
+                {
+                    crate::shape_editing::select_point(ui.ctx(), design, id.value(), slot);
+                }
+                let point = &mut points[slot];
+                for (label, coordinate) in [("X", &mut point.x), ("Y", &mut point.y)] {
+                    ui.label(label);
+                    let response = ui.add(
+                        egui::DragValue::new(coordinate)
+                            .range(0..=u16::MAX)
+                            .speed(1),
+                    );
+                    if response.has_focus() || response.clicked() || response.dragged() {
+                        crate::shape_editing::select_point(ui.ctx(), design, id.value(), slot);
+                    }
+                    changed |= response.changed();
+                    finished |= drag_value_finished(&response)
+                        || response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    cancelled |=
+                        response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+                }
+                if ui
+                    .add_enabled(slot > 0, egui::Button::new("↑"))
+                    .on_hover_text("Move point up")
+                    .clicked()
+                {
+                    structural = Some((slot, 1));
+                }
+                if ui
+                    .add_enabled(slot + 1 < count, egui::Button::new("↓"))
+                    .on_hover_text("Move point down")
+                    .clicked()
+                {
+                    structural = Some((slot, 2));
+                }
+                if ui
+                    .add_enabled(count > 3, egui::Button::new("×"))
+                    .on_hover_text("Remove point")
+                    .clicked()
+                {
+                    structural = Some((slot, 3));
+                }
+            });
+        });
+    }
+    if let Some((slot, action)) = structural {
+        let selected = match action {
+            0 => {
+                let point = crate::shape_editing::insertion_point(
+                    &points,
+                    slot,
+                    polygon.polygon_type == 3,
+                    polygon.width,
+                    polygon.height,
+                );
+                points.insert(slot, point);
+                slot
+            }
+            1 => {
+                points.swap(slot, slot - 1);
+                slot - 1
+            }
+            2 => {
+                points.swap(slot, slot + 1);
+                slot + 1
+            }
+            _ => {
+                points.remove(slot);
+                slot.min(points.len().saturating_sub(1))
+            }
+        };
+        crate::shape_editing::select_point(ui.ctx(), design, id.value(), selected);
+        changed = true;
+        finished = true;
+    }
+    if cancelled {
+        ui.data_mut(|data| data.remove::<PolygonPointDraft>(key));
+        clear_draft(ui.ctx(), key);
+    } else if finished {
+        if points != polygon.points {
+            queue(
+                design,
+                id,
+                PropertyKey::Points,
+                serde_json::to_value(&points).unwrap(),
+            );
+        }
+        ui.data_mut(|data| data.remove::<PolygonPointDraft>(key));
+        clear_draft(ui.ctx(), key);
+    } else if changed {
+        update_draft(
+            ui.ctx(),
+            key,
+            design,
+            Some(property_operation(
+                design,
+                id,
+                PropertyKey::Points,
+                serde_json::to_value(&points).unwrap(),
+            )),
+        );
+        ui.data_mut(|data| data.insert_temp(key, PolygonPointDraft { points }));
+    }
 }
 
 fn render_auto(
@@ -2879,5 +3063,40 @@ mod tests {
 
         assert_eq!(direct_reference_count(&pool, target_id), 3);
         assert_eq!(direct_reference_count(&pool, unreferenced_id), 0);
+    }
+}
+
+#[cfg(test)]
+mod polygon_draft_tests {
+    use super::*;
+    use ag_iso_stack::object_pool::ObjectType;
+
+    #[test]
+    fn disappearing_polygon_coordinate_draft_does_not_commit() {
+        let mut project = EditorProject::default();
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::CreateObject {
+            object_id: Some(7),
+            object_type: ObjectType::OutputPolygon,
+            name: "Polygon".into(),
+        });
+        project.execute_transaction(transaction).unwrap();
+        let before = project.save_project().unwrap();
+        let ctx = egui::Context::default();
+        let key = egui::Id::new("test_polygon_draft");
+        update_draft(
+            &ctx,
+            key,
+            &project,
+            Some(Operation::SetProperty {
+                object: ObjectTarget::id(7),
+                property: PropertyKey::Points,
+                value: serde_json::json!([{"x":8,"y":8},{"x":16,"y":8},{"x":8,"y":16}]),
+            }),
+        );
+        finish_property_edits(&ctx, &project);
+        finish_property_edits(&ctx, &project);
+        assert!(!project.commit_queued("Finish hidden editor"));
+        assert_eq!(project.save_project().unwrap(), before);
     }
 }

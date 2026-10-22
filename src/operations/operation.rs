@@ -1876,6 +1876,53 @@ fn remap_references(
     Ok(changed)
 }
 
+/// Redirect inbound references while keeping both object definitions and IDs.
+/// Macro command references are decoded against the original pool before any
+/// ordinary references are rewritten.
+pub(crate) fn redirect_pool_references(
+    pool: &mut ObjectPool,
+    from: u16,
+    to: u16,
+    version: VtVersion,
+) -> Result<(), OperationError> {
+    let mapping = HashMap::from([(from, to)]);
+    remap_macro_commands(pool, &mapping, &[], version)?;
+    let mapping = HashMap::from([(
+        ObjectId::new(from).map_err(|_| OperationError::ObjectNotFound(from))?,
+        ObjectId::new(to).map_err(|_| OperationError::ObjectNotFound(to))?,
+    )]);
+    for object in pool.objects_mut() {
+        let external_id = match object {
+            Object::ExternalObjectPointer(pointer) => Some(pointer.external_object_id),
+            _ => None,
+        };
+        remap_references(object, &mapping)?;
+        if let (Some(external_id), Object::ExternalObjectPointer(pointer)) = (external_id, object) {
+            pointer.external_object_id = external_id;
+        }
+    }
+    let target_types: HashMap<_, _> = pool
+        .objects()
+        .iter()
+        .map(|object| (object.id().value(), object.object_type()))
+        .collect();
+    for object in pool.objects() {
+        if let Object::Macro(macro_object) = object {
+            crate::macro_id_remap::validate_macro_reference_values(
+                &macro_object.commands,
+                version,
+                &target_types,
+            )
+            .map_err(|reason| OperationError::OperationContextError {
+                object_id: object.id().value(),
+                context: "macro command reference".to_owned(),
+                reason,
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn remap_nullable_references(
     references: &mut [NullableObjectId],
     remap: &HashMap<ObjectId, ObjectId>,
