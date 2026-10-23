@@ -1173,6 +1173,10 @@ pub(crate) fn paint_shape(
     }
     let painter = ui.painter().with_clip_rect(clip);
     let line_colour = crate::effective_colour::colour(pool, line.line_colour).convert();
+    // Mesh quads avoid antialiased seams between scanlines after fractional
+    // canvas scaling.
+    let mut fill_mesh = egui::Mesh::default();
+    let mut border_mesh = egui::Mesh::default();
     let y_start = clip.top().floor() as i32;
     let y_end = clip.bottom().ceil() as i32;
     // Keep all brush footprints, including skipped line-art bits, so fill
@@ -1286,12 +1290,11 @@ pub(crate) fn paint_shape(
                     let end = a.min(right);
                     if end > left {
                         if let Some(colour) = solid {
-                            painter.rect_filled(
+                            fill_mesh.add_colored_rect(
                                 egui::Rect::from_min_max(
                                     egui::pos2(left, y as f32),
                                     egui::pos2(end, y as f32 + 1.0),
                                 ),
-                                0.0,
                                 colour,
                             );
                         } else if let Some(pattern) = &pattern {
@@ -1316,12 +1319,11 @@ pub(crate) fn paint_shape(
                                     }
                                     x += 1;
                                 }
-                                painter.rect_filled(
+                                fill_mesh.add_colored_rect(
                                     egui::Rect::from_min_size(
                                         egui::pos2(start as f32, y as f32),
                                         egui::vec2((x - start) as f32, 1.0),
                                     ),
-                                    0.0,
                                     colour,
                                 );
                             }
@@ -1349,12 +1351,11 @@ pub(crate) fn paint_shape(
             match run {
                 Some((left, right)) if a <= right => run = Some((left, right.max(b))),
                 Some((left, right)) => {
-                    painter.rect_filled(
+                    border_mesh.add_colored_rect(
                         egui::Rect::from_min_max(
                             egui::pos2(left, y as f32),
                             egui::pos2(right, y as f32 + 1.0),
                         ),
-                        0.0,
                         line_colour,
                     );
                     run = Some((a, b));
@@ -1362,6 +1363,12 @@ pub(crate) fn paint_shape(
                 None => run = Some((a, b)),
             }
         }
+    }
+    if !fill_mesh.is_empty() {
+        painter.add(egui::Shape::mesh(fill_mesh));
+    }
+    if !border_mesh.is_empty() {
+        painter.add(egui::Shape::mesh(border_mesh));
     }
 }
 
@@ -1804,24 +1811,103 @@ mod rendering_tests {
         let mut pool = ObjectPool::default();
         pool.add(line);
         let rendered = frame(&pool, Some(&polygon), 0.0);
-        let rows: Vec<_> = rendered
+        let red_meshes: Vec<_> = rendered
             .shapes
             .iter()
-            .filter_map(|s| {
-                if let egui::Shape::Rect(r) = &s.shape {
-                    (r.fill == Color32::RED && r.rect.left() <= 13.0 && r.rect.right() > 13.0)
-                        .then_some(r.rect.intersect(s.clip_rect))
-                } else {
-                    None
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh)
+                    if mesh
+                        .vertices
+                        .iter()
+                        .any(|vertex| vertex.color == Color32::RED) =>
+                {
+                    Some(mesh)
                 }
+                _ => None,
             })
             .collect();
-        let top_height: f32 = rows
+        assert_eq!(red_meshes.len(), 1);
+        let red_positions: Vec<_> = red_meshes[0]
+            .vertices
             .iter()
-            .filter(|r| r.top() < 10.0)
-            .map(|r| r.height())
-            .sum();
-        assert_eq!(top_height, 2.0);
+            .filter(|vertex| vertex.color == Color32::RED)
+            .map(|vertex| vertex.pos)
+            .collect();
+        let mut bounds = egui::Rect::NOTHING;
+        for point in red_positions {
+            bounds.extend_with(point);
+        }
+        // The path endpoints are inset by half the 2px brush, whose complete
+        // footprint restores the polygon's full 10px enclosing extent.
+        assert_eq!(bounds.size(), egui::vec2(10.0, 10.0));
+    }
+
+    #[test]
+    fn polygon_fill_mesh_has_no_scanline_gaps_at_fractional_zoom() {
+        let mut line_object = crate::default_object(ObjectType::LineAttributes);
+        *line_object.mut_id() = ag_iso_stack::object_pool::ObjectId::new(2).unwrap();
+        if let Object::LineAttributes(line) = &mut line_object {
+            line.line_width = 0;
+        }
+        let mut fill_object = crate::default_object(ObjectType::FillAttributes);
+        *fill_object.mut_id() = ag_iso_stack::object_pool::ObjectId::new(3).unwrap();
+        if let Object::FillAttributes(fill) = &mut fill_object {
+            fill.fill_type = 2;
+            fill.fill_colour = 10;
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(line_object);
+        pool.add(fill_object.clone());
+        let Object::FillAttributes(fill) = &fill_object else {
+            unreachable!()
+        };
+        let polygon_points = [
+            egui::pos2(10.0, 10.0),
+            egui::pos2(50.0, 10.0),
+            egui::pos2(50.0, 50.0),
+            egui::pos2(10.0, 50.0),
+            egui::pos2(10.0, 10.0),
+        ];
+        let line = match pool.object_by_id(ag_iso_stack::object_pool::ObjectId::new(2).unwrap()) {
+            Some(Object::LineAttributes(line)) => line,
+            _ => unreachable!(),
+        };
+        let expected = crate::effective_colour::colour(&pool, 10).convert();
+
+        for zoom in [0.5, 0.9, 0.95, 1.0, 1.25] {
+            let offset = egui::vec2(0.37, 0.61);
+            let transform = egui::emath::TSTransform::new(offset, zoom);
+            let image = crate::graphics_context_raster::rasterize_paint(80, 80, 6400, |ui| {
+                ui.with_visual_transform(transform, |ui| {
+                    paint_shape(
+                        ui,
+                        &pool,
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 80.0)),
+                        &polygon_points,
+                        line,
+                        Some(&fill_object),
+                        0,
+                    );
+                });
+            })
+            .unwrap();
+            // Stay well inside the outline and sample every rendered row;
+            // independently antialiased scanline rectangles used to leave
+            // background pixels here for fractional zooms.
+            let top = (transform * egui::pos2(16.0, 16.0)).y.ceil() as usize;
+            let bottom = (transform * egui::pos2(44.0, 44.0)).y.floor() as usize;
+            let left = (transform * egui::pos2(16.0, 16.0)).x.ceil() as usize;
+            let right = (transform * egui::pos2(44.0, 44.0)).x.floor() as usize;
+            for y in top..=bottom {
+                for x in left..=right {
+                    assert_eq!(
+                        image[(x, y)],
+                        expected,
+                        "gap at zoom={zoom}, pixel=({x},{y})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

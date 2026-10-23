@@ -21,6 +21,9 @@ pub(crate) struct SceneItem {
     pub path: Vec<usize>,
     /// The object whose visible geometry is rendered at this occurrence.
     pub object_id: u16,
+    /// Object occurrence chosen by the user. For an ObjectPointer this is the
+    /// pointer itself, while `object_id` remains the resolved render target.
+    pub selection_id: u16,
     /// Unclipped, nominal bounds in pool coordinates.
     pub rect: egui::Rect,
     /// The nominal bounds of the parent viewport that clips this occurrence.
@@ -60,10 +63,11 @@ pub(crate) fn build_page(
         Vec::new(),
         None,
         true,
+        None,
     );
     let keys = super::softkeys::build(project, &materialized.pool, root, page);
     for slot in keys.slots {
-        if let super::softkeys::SlotContent::Key(id) = slot.content {
+        if let super::softkeys::SlotContent::Key { id, selection_id } = slot.content {
             builder.ancestry.clear();
             builder.ancestry.insert(id);
             builder.push_object(
@@ -74,6 +78,7 @@ pub(crate) fn build_page(
                 vec![super::softkeys::PATH_PREFIX, slot.index],
                 None,
                 false,
+                Some(selection_id),
             );
         }
     }
@@ -100,13 +105,15 @@ impl SceneBuilder<'_> {
         path: Vec<usize>,
         target: Option<PlacementTarget>,
         is_root: bool,
+        selection_id_override: Option<u16>,
     ) {
         let Some(source_object) = object_by_id(self.materialized, object_id) else {
             return;
         };
         // An ObjectPointer paints its referred object at the pointer placement.
-        // Its visible hit/selection identity is therefore the referred object,
-        // while `target` continues to identify the pointer's child-list entry.
+        // Keep that occurrence identity separately from the geometry used to
+        // render and edit the target definition.
+        let selection_id = selection_id_override.unwrap_or_else(|| source_object.id().value());
         let Some(rendered_id) = self.resolve_pointer_id(source_object) else {
             return;
         };
@@ -180,6 +187,7 @@ impl SceneBuilder<'_> {
         self.items.push(SceneItem {
             path: path.clone(),
             object_id,
+            selection_id,
             rect,
             parent_rect,
             target,
@@ -221,6 +229,7 @@ impl SceneBuilder<'_> {
                 child_path,
                 placement,
                 false,
+                None,
             );
             self.ancestry.remove(&traversal_id);
         }
@@ -372,6 +381,86 @@ fn visible_children(object: &Object) -> Option<&[ag_iso_stack::object_pool::Obje
 mod tests {
     use super::*;
     use ag_iso_stack::object_pool::{object_attributes::Point, ObjectPool, ObjectRef, ObjectType};
+
+    #[test]
+    fn pointer_scene_item_keeps_pointer_selection_and_target_geometry() {
+        let mut pool = ObjectPool::default();
+        for (id, object_type) in [
+            (2, ObjectType::DataMask),
+            (100, ObjectType::ObjectPointer),
+            (101, ObjectType::OutputRectangle),
+        ] {
+            let mut object = crate::default_object(object_type);
+            object.mut_id().set_value(id).unwrap();
+            pool.add(object);
+        }
+        if let Some(Object::ObjectPointer(pointer)) =
+            pool.object_mut_by_id(ObjectId::new(100).unwrap())
+        {
+            pointer.value = ObjectId::new(101).unwrap().into();
+        }
+        if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(2).unwrap()) {
+            mask.object_refs.push(ObjectRef {
+                id: ObjectId::new(100).unwrap(),
+                offset: Point { x: 30, y: 40 },
+            });
+        }
+
+        let project = EditorProject::from(pool);
+        let materialized = project.materialize_shared().unwrap();
+        let scene = build_page(&project, &materialized, 2, 0);
+        let pointer_occurrence = scene.items.iter().find(|item| item.path == [0]).unwrap();
+
+        assert_eq!(pointer_occurrence.selection_id, 100);
+        assert_eq!(pointer_occurrence.object_id, 101);
+        assert_eq!(
+            pointer_occurrence.target,
+            Some(PlacementTarget::Primitive {
+                parent_id: 2,
+                child_index: 0,
+            })
+        );
+        assert_eq!(pointer_occurrence.rect.min, egui::pos2(30.0, 40.0));
+        assert!(!scene.items.iter().any(|item| item.path == [0, 0]));
+    }
+
+    #[test]
+    fn soft_key_pointer_keeps_pointer_selection_identity() {
+        let mut pool = ObjectPool::default();
+        for (id, object_type) in [
+            (2, ObjectType::DataMask),
+            (3, ObjectType::SoftKeyMask),
+            (100, ObjectType::ObjectPointer),
+            (101, ObjectType::Key),
+        ] {
+            let mut object = crate::default_object(object_type);
+            object.mut_id().set_value(id).unwrap();
+            pool.add(object);
+        }
+        if let Some(Object::ObjectPointer(pointer)) =
+            pool.object_mut_by_id(ObjectId::new(100).unwrap())
+        {
+            pointer.value = ObjectId::new(101).unwrap().into();
+        }
+        if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(2).unwrap()) {
+            mask.soft_key_mask = ObjectId::new(3).unwrap().into();
+        }
+        if let Some(Object::SoftKeyMask(mask)) = pool.object_mut_by_id(ObjectId::new(3).unwrap()) {
+            mask.objects.push(ObjectId::new(100).unwrap());
+        }
+
+        let project = EditorProject::from(pool);
+        let materialized = project.materialize_shared().unwrap();
+        let scene = build_page(&project, &materialized, 2, 0);
+        let key_occurrence = scene
+            .items
+            .iter()
+            .find(|item| item.path == [super::super::softkeys::PATH_PREFIX, 0])
+            .unwrap();
+
+        assert_eq!(key_occurrence.selection_id, 100);
+        assert_eq!(key_occurrence.object_id, 101);
+    }
 
     #[test]
     fn designator_children_keep_their_canvas_origin_and_clip_to_soft_key_size() {

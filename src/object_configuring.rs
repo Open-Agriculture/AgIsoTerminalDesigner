@@ -235,6 +235,17 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
     );
     ui.separator();
     if let Object::PictureGraphic(picture) = object {
+        let format_error_key =
+            egui::Id::new(("picture_format_error", design.ui_session_id(), id.value()));
+        if let Some((revision, message)) =
+            ui.data_mut(|data| data.get_temp::<(u64, String)>(format_error_key))
+        {
+            if revision == design.revision() {
+                crate::ui_style::error_text(ui, &message);
+            } else {
+                ui.data_mut(|data| data.remove::<(u64, String)>(format_error_key));
+            }
+        }
         let current_format = picture.format;
         ui.horizontal(|ui| {
             ui.label("Format:");
@@ -246,14 +257,82 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
             ] {
                 if ui.radio(current_format == format, label).clicked() && current_format != format {
                     let mut converted = picture.clone();
-                    crate::graphics::convert_picture_graphic_format(&mut converted, format);
-                    let value = serde_json::to_value(converted).unwrap();
-                    for property in [PropertyKey::Format, PropertyKey::Options, PropertyKey::Data] {
-                        queue(design, id, property, value[property.as_str()].clone());
+                    let palette = crate::effective_colour::colours(design.get_pool())
+                        .map(|colour| colour.as_rgb());
+                    let result = crate::graphics::validate_picture_format(
+                        design.get_pool(),
+                        id,
+                        picture.actual_width,
+                        format,
+                    )
+                    .and_then(|()| {
+                        crate::graphics::convert_picture_graphic_format(
+                            &mut converted,
+                            format,
+                            &palette,
+                        )
+                    });
+                    match result {
+                        Ok(()) => {
+                            ui.data_mut(|data| data.remove::<(u64, String)>(format_error_key));
+                            let value = serde_json::to_value(converted).unwrap();
+                            for property in [
+                                PropertyKey::Format,
+                                PropertyKey::Options,
+                                PropertyKey::TransparencyColour,
+                                PropertyKey::Data,
+                            ] {
+                                queue(design, id, property, value[property.as_str()].clone());
+                            }
+                        }
+                        Err(error) => {
+                            ui.data_mut(|data| {
+                                data.insert_temp(
+                                    format_error_key,
+                                    (design.revision(), error.clone()),
+                                )
+                            });
+                            crate::ui_style::error_text(ui, &error);
+                        }
                     }
                 }
             }
         });
+        let (pixels, packed, stored) = crate::graphics::picture_data_sizes(picture);
+        let packing = match picture.format {
+            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::Monochrome => {
+                "monochrome packing"
+            }
+            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::FourBit => {
+                "4-bit packing"
+            }
+            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::EightBit => {
+                "no bit packing"
+            }
+        };
+        ui.label(format!("Unpacked 8-bit indices: {pixels} bytes"));
+        let packing_delta = if packed <= pixels {
+            format!("{} bytes saved", pixels - packed)
+        } else {
+            format!("{} bytes larger", packed - pixels)
+        };
+        ui.label(format!(
+            "Packed raw data ({packing}): {packed} bytes ({packing_delta})"
+        ));
+        if picture.options.data_code_type
+            == ag_iso_stack::object_pool::object_attributes::DataCodeType::RunLength
+        {
+            let rle_delta = if stored < packed {
+                format!("{} bytes saved", packed - stored)
+            } else if stored > packed {
+                format!("{} bytes larger", stored - packed)
+            } else {
+                "same size as raw".to_owned()
+            };
+            ui.label(format!("Stored payload: {stored} bytes (RLE; {rle_delta})"));
+        } else {
+            ui.label(format!("Stored payload: {stored} bytes (raw; no RLE)"));
+        }
         let mut transparent = picture.options.transparent;
         let mut colour = picture.transparency_colour;
         let mut flashing = picture.options.flashing;

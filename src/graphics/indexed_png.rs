@@ -34,16 +34,27 @@ fn decoded_indices(picture: &PictureGraphic) -> Result<Vec<u8>, String> {
         .checked_mul(height)
         .ok_or_else(|| "PictureGraphic dimensions overflow".to_owned())?;
     let raw = match picture.options.data_code_type {
-        DataCodeType::Raw => picture.data.clone(),
+        DataCodeType::Raw => picture.data.iter().take(expected_bytes).copied().collect(),
         DataCodeType::RunLength => {
             if picture.data.len() % 2 != 0 {
                 return Err("PictureGraphic has a truncated run-length pair".into());
             }
-            let mut raw = Vec::new();
+            let mut raw = Vec::with_capacity(expected_bytes);
             for pair in picture.data.chunks_exact(2) {
                 let count = usize::from(pair[0]);
-                if count == 0 || raw.len().saturating_add(count) > expected_bytes {
-                    return Err("PictureGraphic has invalid run-length data".into());
+                // ISO 11783-6 B.12.2 says a zero count pair is ignored, and
+                // bytes beyond the complete bitmap are ignored.
+                if count == 0 {
+                    continue;
+                }
+                if raw.len() >= expected_bytes {
+                    break;
+                }
+                if raw.len().saturating_add(count) > expected_bytes {
+                    let remaining = expected_bytes - raw.len();
+                    raw.resize(expected_bytes, pair[1]);
+                    debug_assert!(remaining < count);
+                    break;
                 }
                 raw.resize(raw.len() + count, pair[1]);
             }
@@ -73,6 +84,12 @@ fn decoded_indices(picture: &PictureGraphic) -> Result<Vec<u8>, String> {
         }
     }
     Ok(indices)
+}
+
+/// Decode all visible pixel indices from raw or run-length encoded picture data.
+/// Row padding is discarded and any data beyond the declared image is ignored.
+pub(crate) fn pixel_indices(picture: &PictureGraphic) -> Result<Vec<u8>, String> {
+    decoded_indices(picture)
 }
 
 fn palette(pool: &ObjectPool) -> Vec<u8> {
@@ -173,7 +190,7 @@ fn transparency_matches(encoded: &[u8], expected: &[u8]) -> bool {
         && encoded.len() <= expected.len()
 }
 
-fn encode_indices(
+pub(crate) fn encode_indices(
     picture: &mut PictureGraphic,
     indices: &[u8],
     format: PictureGraphicFormat,
@@ -230,6 +247,44 @@ fn encode_indices(
         }
     };
     Ok(())
+}
+
+/// Encode indices in the picture's VT row format and keep RLE only when smaller.
+pub(crate) fn encode_indices_optimized(
+    picture: &mut PictureGraphic,
+    indices: &[u8],
+    format: PictureGraphicFormat,
+) -> Result<(), String> {
+    let mut raw_picture = picture.clone();
+    encode_indices(&mut raw_picture, indices, format, DataCodeType::Raw)?;
+    let raw = raw_picture.data.clone();
+    let mut compressed_picture = raw_picture.clone();
+    encode_indices(
+        &mut compressed_picture,
+        indices,
+        format,
+        DataCodeType::RunLength,
+    )?;
+    if compressed_picture.data.len() < raw.len() {
+        *picture = compressed_picture;
+    } else {
+        *picture = raw_picture;
+    }
+    Ok(())
+}
+
+/// Return the byte counts for indexed pixels, row-packed raw data, and storage.
+pub fn picture_data_sizes(picture: &PictureGraphic) -> (usize, usize, usize) {
+    let width = usize::from(picture.actual_width);
+    let height = usize::from(picture.actual_height);
+    let pixels = width.saturating_mul(height);
+    let row_bytes = match picture.format {
+        PictureGraphicFormat::Monochrome => width.div_ceil(8),
+        PictureGraphicFormat::FourBit => width.div_ceil(2),
+        PictureGraphicFormat::EightBit => width,
+    };
+    let raw = row_bytes.saturating_mul(height);
+    (pixels, raw, picture.data.len())
 }
 
 /// Apply an indexed PNG while retaining the target's display and macro settings.
@@ -327,4 +382,25 @@ pub fn picture_from_component_properties(
             .map_err(|error| format!("PictureGraphic property '{property}': {error}"))?;
     }
     Ok((*picture).clone())
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn raw_decoder_ignores_zero_count_pairs_and_excess_rle_data() {
+        let mut object = crate::default_object(ObjectType::PictureGraphic);
+        let Object::PictureGraphic(picture) = &mut object else {
+            unreachable!()
+        };
+        picture.actual_width = 2;
+        picture.actual_height = 1;
+        picture.format = PictureGraphicFormat::EightBit;
+        picture.options.data_code_type = DataCodeType::RunLength;
+        picture.data = vec![0, 9, 2, 4, 3, 8];
+        assert_eq!(decoded_indices(picture).unwrap(), vec![4, 4]);
+        picture.data = vec![0, 9, 1, 4];
+        assert!(decoded_indices(picture).is_err());
+    }
 }

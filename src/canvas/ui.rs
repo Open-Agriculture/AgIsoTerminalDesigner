@@ -20,7 +20,7 @@ pub struct CanvasState {
     softkey_page: usize,
     revision: u64,
     selected: Vec<Vec<usize>>,
-    scene_identity: Vec<(Vec<usize>, u16, Option<PlacementTarget>)>,
+    scene_identity: Vec<(Vec<usize>, u16, u16, Option<PlacementTarget>)>,
     scene_origins: HashMap<Vec<usize>, Pos2>,
     placement_owner: Option<u16>,
     context: Vec<usize>,
@@ -160,7 +160,7 @@ impl CanvasState {
         let selected = self.reconciled_selection(&scene);
         let path = selected.first()?;
         let item = scene.items.iter().find(|i| &i.path == path)?;
-        if project.get_selected().0.map(|id| id.value()) != Some(item.object_id)
+        if project.get_selected().0.map(|id| id.value()) != Some(item.selection_id)
             && !self.has_placement_selection(project)
         {
             return None;
@@ -409,7 +409,7 @@ impl CanvasState {
                 self.scene_identity
                     .iter()
                     .find(|row| &row.0 == scene_path)
-                    .and_then(|row| row.2.clone())
+                    .and_then(|row| row.3.clone())
             }),
             parent_path: path.len().checked_sub(1).map(|end| path[..end].to_vec()),
         }];
@@ -472,11 +472,18 @@ impl CanvasState {
             .is_some_and(|scene_path| self.selected.contains(&scene_path))
     }
 
-    fn scene_identity(scene: &Scene) -> Vec<(Vec<usize>, u16, Option<PlacementTarget>)> {
+    fn scene_identity(scene: &Scene) -> Vec<(Vec<usize>, u16, u16, Option<PlacementTarget>)> {
         scene
             .items
             .iter()
-            .map(|item| (item.path.clone(), item.object_id, item.target.clone()))
+            .map(|item| {
+                (
+                    item.path.clone(),
+                    item.object_id,
+                    item.selection_id,
+                    item.target.clone(),
+                )
+            })
             .collect()
     }
 
@@ -496,8 +503,10 @@ impl CanvasState {
         self.selected
             .iter()
             .filter_map(|path| {
-                let (_, object, target) =
-                    self.scene_identity.iter().find(|(old, _, _)| old == path)?;
+                let (_, _object, selection_id, target) = self
+                    .scene_identity
+                    .iter()
+                    .find(|(old, _, _, _)| old == path)?;
                 let origin = self.scene_origins.get(path)?;
                 let mut matches = scene.items.iter().filter(|item| {
                     let same_parent = match (target, &item.target) {
@@ -512,7 +521,7 @@ impl CanvasState {
                         (None, None) => true,
                         _ => false,
                     };
-                    item.object_id == *object
+                    item.selection_id == *selection_id
                         && item.rect.min == *origin
                         && same_parent
                         && super::softkeys::area(path) == super::softkeys::area(&item.path)
@@ -545,7 +554,8 @@ impl CanvasState {
         let capacity = usize::from(project.soft_key_layout().physical_key_count)
             - usize::from(keys.navigation);
         if !keys.slots.iter().any(|slot| {
-            slot.index == slot_index && matches!(slot.content, super::softkeys::SlotContent::Key(_))
+            slot.index == slot_index
+                && matches!(slot.content, super::softkeys::SlotContent::Key { .. })
         }) {
             keys = super::softkeys::build(project, project.get_pool(), root, slot_index / capacity);
         }
@@ -554,7 +564,7 @@ impl CanvasState {
             .iter()
             .find(|slot| {
                 slot.index == slot_index
-                    && matches!(slot.content, super::softkeys::SlotContent::Key(_))
+                    && matches!(slot.content, super::softkeys::SlotContent::Key { .. })
             })
             .ok_or("Missing soft-key occurrence")?;
         let mask_id = keys
@@ -816,11 +826,10 @@ impl CanvasState {
             return;
         };
         let scene = geometry::build_page(project, &materialized, root, self.softkey_page);
-        let Some(item) = scene
-            .items
-            .iter()
-            .find(|item| item.target.as_ref() == Some(target) && item.object_id == replacement_id)
-        else {
+        let Some(item) = scene.items.iter().find(|item| {
+            item.target.as_ref() == Some(target)
+                && (item.selection_id == replacement_id || item.object_id == replacement_id)
+        }) else {
             return;
         };
         self.selected = vec![item.path.clone()];
@@ -917,8 +926,12 @@ impl CanvasState {
                 .slots
                 .iter()
                 .any(|slot| match slot.content {
-                    super::softkeys::SlotContent::Key(key) => {
-                        super::mask_view::subtree_contains(&materialized.pool, key, object)
+                    super::softkeys::SlotContent::Key {
+                        id: key,
+                        selection_id,
+                    } => {
+                        selection_id == object
+                            || super::mask_view::subtree_contains(&materialized.pool, key, object)
                     }
                     _ => false,
                 })
@@ -1124,7 +1137,7 @@ impl CanvasState {
                     owner != root || selected != inspector ||
                         i.path.starts_with(&[super::softkeys::PATH_PREFIX, slot])
                 }))
-                .find(|i| (i.target.is_some() || i.path.first() == Some(&super::softkeys::PATH_PREFIX)) && (Some(i.object_id) == inspector || inspector.and_then(|id| materialized.source_map.by_object_id.get(&id)).is_some_and(|source| matches!((source, &i.target), (crate::components::MaterializedSource::ComponentNode { instance_id, .. }, Some(PlacementTarget::Component { instance_id: target })) if instance_id == target))))
+                .find(|i| (i.target.is_some() || i.path.first() == Some(&super::softkeys::PATH_PREFIX)) && (Some(i.selection_id) == inspector || inspector.and_then(|id| materialized.source_map.by_object_id.get(&id)).is_some_and(|source| matches!((source, &i.target), (crate::components::MaterializedSource::ComponentNode { instance_id, .. }, Some(PlacementTarget::Component { instance_id: target })) if instance_id == target))))
                 .map(|i| vec![i.path.clone()])
                 .unwrap_or_default();
             self.placement_owner = self
@@ -1136,7 +1149,7 @@ impl CanvasState {
                         .iter()
                         .find(|item| &item.path == path && item.target.is_some())
                 })
-                .map(|item| item.object_id);
+                .map(|item| item.selection_id);
         }
         let mut items = self.selection(&scene);
         let mut commands = vec![];
@@ -1881,12 +1894,9 @@ impl CanvasState {
                                 && i.hit_rect.height() >= 0.0
                                 && i.hit_rect.expand(hit_tolerance).contains(pos)
                         }) {
+                            let label = scene_item_name(project, item);
                             if ui
-                                .button(format!(
-                                    "{} · depth {}",
-                                    project.format_object_id(item.object_id),
-                                    item.path.len()
-                                ))
+                                .button(format!("{} · depth {}", label, item.path.len()))
                                 .clicked()
                             {
                                 self.selected = vec![item.path.clone()];
@@ -2031,7 +2041,7 @@ impl CanvasState {
                 egui::StrokeKind::Outside,
             );
             match slot.content {
-                super::softkeys::SlotContent::Key(id) => {
+                super::softkeys::SlotContent::Key { id, .. } => {
                     let mut key_ui = ui.new_child(
                         egui::UiBuilder::new()
                             .id_salt(("softkey", root, slot.index))
@@ -2163,7 +2173,7 @@ impl CanvasState {
             .selected
             .last()
             .and_then(|p| scene.items.iter().find(|i| &i.path == p))
-            .map(|i| i.object_id);
+            .map(|i| i.selection_id);
         self.inspector = id;
         self.remember_scene(scene);
         self.placement_owner = self
@@ -2175,7 +2185,7 @@ impl CanvasState {
                     .iter()
                     .find(|item| &item.path == path && item.target.is_some())
             })
-            .map(|item| item.object_id);
+            .map(|item| item.selection_id);
         project
             .get_mut_selected()
             .set(NullableObjectId(id.and_then(|id| ObjectId::new(id).ok())));
@@ -2273,7 +2283,7 @@ impl CanvasState {
                     .items
                     .iter()
                     .filter(|i| path.path.starts_with(&i.path))
-                    .map(|i| project.format_object_id(i.object_id))
+                    .map(|i| scene_item_name(project, i))
                     .collect::<Vec<_>>()
                     .join(" / ");
                 ui.label(if items.len() > 1 {
@@ -2740,6 +2750,15 @@ fn line_axis_geometry(moving: f32, fixed: f32, brush: f32) -> Option<(i16, u16, 
     Some((top_left as i16, dimension, moving))
 }
 
+fn scene_item_name(project: &EditorProject, item: &SceneItem) -> String {
+    let selection = project.format_object_id(item.selection_id);
+    if item.selection_id == item.object_id {
+        selection
+    } else {
+        format!("{selection} → {}", project.format_object_id(item.object_id))
+    }
+}
+
 fn hierarchy_scene_path(
     project: &EditorProject,
     materialized: &MaterializedProject,
@@ -2897,6 +2916,41 @@ mod tests {
         let mut project = EditorProject::from(pool);
         project.mask_size = 500;
         project
+    }
+
+    #[test]
+    fn pointer_target_change_keeps_placement_selection_and_uses_new_bounds() {
+        let mut project = repeated_parent_project();
+        let materialized = project.materialize_shared().unwrap();
+        let before = geometry::build_page(&project, &materialized, 2, 0);
+        let mut canvas = CanvasState::default();
+        canvas.select_hierarchy_object(&project, 2, &[0, 2], 104);
+        project.update_selected();
+
+        let mut after = before.clone();
+        let pointer = after
+            .items
+            .iter_mut()
+            .find(|item| item.path == [2])
+            .unwrap();
+        pointer.object_id = 101;
+        pointer.rect = Rect::from_min_size(pointer.rect.min, egui::vec2(23.0, 12.0));
+        pointer.hit_rect = pointer.rect.intersect(pointer.parent_rect);
+
+        let selected = canvas.reconciled_selection(&after);
+        assert_eq!(selected, vec![vec![2]]);
+        let selected_item = after
+            .items
+            .iter()
+            .find(|item| item.path == selected[0])
+            .unwrap();
+        assert_eq!(selected_item.selection_id, 104);
+        assert_eq!(selected_item.object_id, 101);
+        assert_eq!(selected_item.rect.size(), egui::vec2(23.0, 12.0));
+        assert_eq!(
+            canvas.selected_placement(&project),
+            selected_item.target.clone()
+        );
     }
 
     #[test]
@@ -3096,6 +3150,7 @@ mod tests {
         canvas.select_hierarchy_object(&project, 2, &[0, 2], 104);
         project.update_selected();
         assert_eq!(project.get_selected(), NullableObjectId::new(104));
+        assert!(canvas.has_placement_selection(&project));
         assert_eq!(canvas.selected, vec![vec![2]]);
         assert_eq!(
             canvas.selected_placement(&project),

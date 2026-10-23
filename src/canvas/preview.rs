@@ -271,7 +271,7 @@ impl PreviewMode {
                 (transform.inverse() * viewport.intersect(ui.clip_rect())).intersect(slot.rect),
             );
             child.with_visual_transform(transform, |ui| match slot.content {
-                SlotContent::Key(id) => {
+                SlotContent::Key { id, .. } => {
                     if let Ok(id) = ObjectId::new(id) {
                         crate::render_object_with_preview_session(
                             ui,

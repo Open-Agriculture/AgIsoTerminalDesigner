@@ -1945,16 +1945,20 @@ impl EditorProject {
                         binding.asset_id
                     )
                 })?;
-            let picture = ObjectId::new(object_id)
-                .ok()
-                .and_then(|id| pool.object_mut_by_id(id));
-            let Some(ag_iso_stack::object_pool::object::Object::PictureGraphic(picture)) = picture
+            let id = ObjectId::new(object_id)
+                .map_err(|_| format!("Invalid PictureGraphic ID {object_id}"))?;
+            let Some(ag_iso_stack::object_pool::object::Object::PictureGraphic(existing)) =
+                pool.object_by_id(id)
             else {
                 return Err(format!(
                     "Legacy graphic binding target {object_id} is not a PictureGraphic"
                 ));
             };
-            crate::graphics::apply_image_bytes_to_picture_graphic(picture, &asset.original_bytes)?;
+            let mut picture = existing.clone();
+            crate::graphics::apply_image_bytes_to_picture_graphic(
+                &mut picture,
+                &asset.original_bytes,
+            )?;
             if let Some(transparent) = binding.transparent {
                 picture.options.transparent = transparent;
             }
@@ -1965,7 +1969,14 @@ impl EditorProject {
                 picture.options.flashing = flashing;
             }
             if let Some(format) = binding.format {
-                crate::graphics::convert_picture_graphic_format(picture, format);
+                crate::graphics::validate_picture_format(&pool, id, picture.actual_width, format)?;
+                let palette = crate::effective_colour::colours(&pool).map(|colour| colour.as_rgb());
+                crate::graphics::convert_picture_graphic_format(&mut picture, format, &palette)?;
+            }
+            if let Some(ag_iso_stack::object_pool::object::Object::PictureGraphic(target)) =
+                pool.object_mut_by_id(id)
+            {
+                *target = picture;
             }
             project.graphics.assets.remove(&binding.asset_id);
         }

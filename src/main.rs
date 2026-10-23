@@ -1618,33 +1618,54 @@ fn recovery_age_label(saved_at: u64) -> String {
 
 type ObjectNameDraft = (u128, u64, u16, String, String);
 
+fn commit_object_name_draft(project: &mut EditorProject, draft: &mut Option<ObjectNameDraft>) {
+    let Some((session, revision, id, baseline, name)) = draft.take() else {
+        return;
+    };
+    let Ok(id) = ObjectId::new(id) else {
+        return;
+    };
+    if session == project.ui_session_id().as_u128()
+        && revision == project.revision()
+        && project
+            .get_pool()
+            .object_by_id(id)
+            .is_some_and(|object| project.get_object_info(object).get_name(object) == baseline)
+    {
+        project.rename_object(id, name);
+    }
+}
+
 fn finish_object_name_on_switch(
     project: &mut EditorProject,
     name_draft: &mut Option<ObjectNameDraft>,
 ) {
-    if let Some((draft_session, draft_revision, draft_id, baseline, draft)) = name_draft.clone() {
+    if let Some((draft_session, draft_revision, draft_id, baseline, _)) = name_draft.as_ref() {
+        let (draft_session, draft_revision, draft_id) =
+            (*draft_session, *draft_revision, *draft_id);
         let current_name = ObjectId::new(draft_id)
             .ok()
             .and_then(|id| project.get_pool().object_by_id(id))
             .map(|object| project.get_object_info(object).get_name(object));
         let switching = draft_session != project.ui_session_id().as_u128()
             || draft_revision != project.revision()
-            || project.get_selected().0.map(|id| id.value()) != Some(draft_id)
+            || !project
+                .get_selected()
+                .0
+                .and_then(|id| project.get_pool().object_by_id(id))
+                .is_some_and(|object| {
+                    inspector_objects(project, object)
+                        .0
+                        .iter()
+                        .any(|object| object.id().value() == draft_id)
+                })
             || matches!(
                 project.editor_selection(),
                 Some(EditorSelection::ComponentNode { .. })
             )
             || current_name.as_deref() != Some(baseline.as_str());
         if switching {
-            *name_draft = None;
-            if draft_session == project.ui_session_id().as_u128()
-                && draft_revision == project.revision()
-                && current_name.as_deref() == Some(baseline.as_str())
-            {
-                if let Ok(draft_id) = ObjectId::new(draft_id) {
-                    project.rename_object(draft_id, draft);
-                }
-            }
+            commit_object_name_draft(project, name_draft);
         }
     }
 }
@@ -1678,9 +1699,15 @@ fn render_object_name(
                 .desired_width(ui.available_width()),
         );
         if response.changed() {
+            if draft
+                .as_ref()
+                .is_some_and(|(_, _, id, _, _)| *id != object_id)
+            {
+                commit_object_name_draft(project, draft);
+            }
             *draft = Some((
                 project_key,
-                project_revision,
+                project.revision(),
                 object_id,
                 original_name.clone(),
                 name.clone(),
@@ -1692,7 +1719,11 @@ fn render_object_name(
         if escape {
             *draft = None;
             response.surrender_focus();
-        } else if enter || response.lost_focus() {
+        } else if (enter || response.lost_focus())
+            && draft
+                .as_ref()
+                .is_some_and(|(_, _, id, _, _)| *id == object_id)
+        {
             if let Some((_, _, _, _, draft)) = draft.take() {
                 if draft != original_name {
                     if let Ok(object_id) = ObjectId::new(object_id) {
@@ -1748,6 +1779,40 @@ fn duplicate_standalone_object(project: &mut EditorProject, source_id: u16) -> b
     true
 }
 
+/// Resolve the active pointer chain without changing object or placement identity.
+fn inspector_objects<'a>(
+    project: &'a EditorProject,
+    object: &'a Object,
+) -> (Vec<&'a Object>, Option<String>) {
+    let mut objects = vec![object];
+    let mut visited = HashSet::from([object.id()]);
+    while let Some(Object::ObjectPointer(pointer)) = objects.last().copied() {
+        let Some(id) = pointer.value.0 else {
+            break;
+        };
+        if !visited.insert(id) {
+            return (
+                objects,
+                Some(format!(
+                    "Pointer cycle at {}",
+                    project.format_object_id(id.value())
+                )),
+            );
+        }
+        let Some(target) = project.get_pool().object_by_id(id) else {
+            return (
+                objects,
+                Some(format!(
+                    "Missing active pointer target: {}",
+                    project.format_object_id(id.value())
+                )),
+            );
+        };
+        objects.push(target);
+    }
+    (objects, None)
+}
+
 fn render_selectable_object(
     ui: &mut egui::Ui,
     object: &Object,
@@ -1794,7 +1859,12 @@ fn render_selectable_object(
         } else {
             project.get_selected() == object.id().into()
         };
-        let label_text = project.object_display_name(object);
+        let (objects, _) = inspector_objects(project, object);
+        let label_text = objects
+            .iter()
+            .map(|object| project.object_display_name(object))
+            .collect::<Vec<_>>()
+            .join(" → ");
         let response = tree_row_with_highlight(
             ui,
             ui.id().with(("object_row", object.id().value())),
@@ -1954,19 +2024,36 @@ fn render_mask_object_hierarchy_inner(
         );
         return;
     }
+    let (chain, mut pointer_error) = inspector_objects(project, object);
+    let mut entered = Vec::new();
+    for target in chain.iter().skip(1) {
+        let id = target.id().value();
+        if !visiting.insert(id) {
+            pointer_error = Some(format!(
+                "Cycle detected at {}",
+                project.format_object_id(id)
+            ));
+            break;
+        }
+        entered.push(id);
+    }
+    let content = *chain.last().unwrap();
+    let content_id = content.id().value();
+    let pointer_hops = chain.len() - 1;
     let component_instances: Vec<_> = project
         .component_source()
         .instances
         .iter()
-        .filter(|instance| instance.parent == EditorParentRef::Primitive(id_value))
+        .filter(|instance| {
+            pointer_error.is_none() && instance.parent == EditorParentRef::Primitive(content_id)
+        })
         .collect();
-    let placed = ag_iso_terminal_designer::operations::object_refs(object).unwrap_or_default();
-    let pointer_target = match object {
-        Object::ObjectPointer(pointer) => pointer.value.0.map(|id| id.value()),
-        _ => None,
+    let placed = if pointer_error.is_none() {
+        ag_iso_terminal_designer::operations::object_refs(content).unwrap_or_default()
+    } else {
+        &[]
     };
-    let has_children =
-        !placed.is_empty() || !component_instances.is_empty() || pointer_target.is_some();
+    let has_children = !placed.is_empty() || !component_instances.is_empty();
     let occurrence_id = parent_id.with((root, path.clone()));
     let selected_id = project.get_selected().0.map(|id| id.value());
     canvas.register_hierarchy_occurrence(HierarchyOccurrence {
@@ -2023,6 +2110,8 @@ fn render_mask_object_hierarchy_inner(
                 }
             },
             |ui| {
+                let row_path_len = path.len();
+                path.extend(std::iter::repeat_n(usize::MAX, pointer_hops));
                 let mut children: Vec<_> =
                     (0..placed.len()).map(|index| (Some(index), None)).collect();
                 let mut instances = component_instances;
@@ -2060,13 +2149,13 @@ fn render_mask_object_hierarchy_inner(
                                     selection: None,
                                     source_parent_path,
                                     sibling_index,
-                                    parent_id: id_value,
+                                    parent_id: content_id,
                                     occurrence_id: occurrence_id
                                         .with(index)
                                         .with((root, path.clone())),
                                     label: project.object_display_name(child),
                                     target: PlacementTarget::Primitive {
-                                        parent_id: id_value,
+                                        parent_id: content_id,
                                         child_index: index,
                                     },
                                 }),
@@ -2087,7 +2176,7 @@ fn render_mask_object_hierarchy_inner(
                             selection: None,
                             source_parent_path: path.clone(),
                             sibling_index,
-                            parent_id: id_value,
+                            parent_id: content_id,
                             occurrence_id: component_id,
                             label: definition.name.clone(),
                             target: PlacementTarget::Component {
@@ -2184,38 +2273,7 @@ fn render_mask_object_hierarchy_inner(
                         });
                     }
                 }
-                if let Some(target_id) = pointer_target {
-                    let pointer_branch = occurrence_id.with("pointer-target");
-                    let target = ag_iso_stack::object_pool::ObjectId::new(target_id)
-                        .ok()
-                        .and_then(|id| project.get_pool().object_by_id(id));
-                    match target {
-                        Some(target) => {
-                            path.push(usize::MAX);
-                            render_mask_object_hierarchy(
-                                ui,
-                                pointer_branch,
-                                root,
-                                target,
-                                project,
-                                mask_view,
-                                canvas,
-                                path,
-                                visiting,
-                                softkey_slot,
-                                open_selection,
-                                None,
-                            );
-                            path.pop();
-                        }
-                        None => {
-                            ui_style::error_text(
-                                ui,
-                                &format!("Missing active pointer target: {target_id}"),
-                            );
-                        }
-                    };
-                }
+                path.truncate(row_path_len);
             },
         );
         if selected_in_header.get() {
@@ -2236,6 +2294,12 @@ fn render_mask_object_hierarchy_inner(
         if let Some(slot) = softkey_slot {
             canvas.select_softkey_slot(project, root, slot);
         }
+    }
+    if let Some(error) = pointer_error {
+        ui_style::error_text(ui, &error);
+    }
+    for id in entered {
+        visiting.remove(&id);
     }
     visiting.remove(&id_value);
 }
@@ -3611,6 +3675,25 @@ impl DesignerApp {
                                 ("property_occurrence", self.canvas.selected_placement(pool)),
                                 |ui| {
                                     render_property_editor(ui, &original, pool);
+                                    let (objects, error) = inspector_objects(pool, &original);
+                                    let targets: Vec<_> =
+                                        objects.into_iter().skip(1).cloned().collect();
+                                    for target in targets {
+                                        ui.separator();
+                                        ui.strong(pool.object_display_name(&target));
+                                        render_object_name(
+                                            ui,
+                                            pool,
+                                            &target,
+                                            &mut self.property_name_draft,
+                                        );
+                                        ui.push_id(("pointer_target", target.id().value()), |ui| {
+                                            render_property_editor(ui, &target, pool);
+                                        });
+                                    }
+                                    if let Some(error) = error {
+                                        ui_style::error_text(ui, &error);
+                                    }
                                 },
                             );
                             let effective = materialized

@@ -347,7 +347,7 @@ fn drag_zones_choose_sibling_slots_or_parent_without_consuming_payload() {
 }
 
 #[test]
-fn pointer_target_is_the_next_visible_row_without_an_extra_heading() {
+fn pointer_and_target_share_one_selectable_hierarchy_row() {
     let mut pool = ObjectPool::default();
     let mut mask = ag_iso_terminal_designer::default_object(ObjectType::DataMask);
     mask.mut_id().set_value(1).unwrap();
@@ -413,24 +413,13 @@ fn pointer_target_is_the_next_visible_row_without_an_extra_heading() {
             _ => None,
         })
         .collect();
-    assert!(!text
-        .iter()
-        .any(|(label, _)| *label == "Active pointer target"));
+    let combined_label = format!("{pointer_label} → {target_label}");
     let pointer_position = text
         .iter()
-        .find(|(label, _)| *label == pointer_label)
+        .find(|(label, _)| *label == combined_label)
         .unwrap()
         .1;
-    let target_position = text
-        .iter()
-        .find(|(label, _)| *label == target_label)
-        .unwrap()
-        .1;
-    assert!(target_position.y > pointer_position.y);
-    assert!(
-        target_position.y - pointer_position.y < 40.0,
-        "target should immediately follow pointer"
-    );
+    assert!(!text.iter().any(|(label, _)| *label == target_label));
     let click = pointer_position + egui::vec2(5.0, 6.0);
     for events in [
         vec![egui::Event::PointerMoved(click), pointer_event(click, true)],
@@ -456,6 +445,37 @@ fn pointer_target_is_the_next_visible_row_without_an_extra_heading() {
         });
     }
     assert_eq!(project.get_mut_selected().get().0.unwrap().value(), 2);
+}
+
+#[test]
+fn pointer_target_name_draft_stays_active_until_combined_selection_changes() {
+    let (_, original) = name_test_project();
+    let mut pool = ObjectPool::default();
+    pool.add(original.clone());
+    let mut pointer = ag_iso_terminal_designer::default_object(ObjectType::ObjectPointer);
+    pointer.mut_id().set_value(3).unwrap();
+    if let Object::ObjectPointer(pointer) = &mut pointer {
+        pointer.value = NullableObjectId::new(original.id().value());
+    }
+    pool.add(pointer);
+    let mut project = EditorProject::from(pool);
+    project.get_mut_selected().set(NullableObjectId::new(3));
+    project.update_selected();
+    let ctx = egui::Context::default();
+    let mut draft = None;
+    let initial_revision = project.revision();
+
+    type_name(&ctx, &mut project, &original, &mut draft, "Shared target");
+    render_name_frame(&ctx, &mut project, &original, &mut draft, Vec::new());
+    assert_eq!(project.revision(), initial_revision);
+    assert!(draft.is_some());
+
+    project.get_mut_selected().set(NullableObjectId::default());
+    project.update_selected();
+    render_name_frame(&ctx, &mut project, &original, &mut draft, Vec::new());
+    assert_eq!(name_of(&project, &original), "Shared target");
+    assert_eq!(project.revision(), initial_revision + 1);
+    assert!(draft.is_none());
 }
 
 #[test]

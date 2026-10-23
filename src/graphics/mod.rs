@@ -1,6 +1,7 @@
 //! Project-local original images and single-owner source bindings.
 use ag_iso_stack::object_pool::object::PictureGraphic;
 pub use ag_iso_stack::object_pool::object_attributes::{DataCodeType, PictureGraphicFormat};
+use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 pub mod indexed_png;
@@ -185,107 +186,107 @@ pub fn apply_image_bytes_to_picture_graphic(
     Ok(())
 }
 
-/// Preserve the legacy radio-button packing semantics, including incomplete chunks.
-pub fn convert_picture_graphic_format(picture: &mut PictureGraphic, target: PictureGraphicFormat) {
-    match target {
-        PictureGraphicFormat::Monochrome => match picture.format {
-            PictureGraphicFormat::FourBit => {
-                picture.data = picture
-                    .data_as_raw_encoded()
-                    .windows(4)
-                    .step_by(4)
-                    .flat_map(|chunk| {
-                        let mut byte = 0;
-                        for (i, bit) in chunk.iter().enumerate() {
-                            for j in 0..2 {
-                                if *bit & (1 << j) != 0 {
-                                    byte |= 1 << (i * 2 + j);
-                                }
-                            }
-                        }
-                        vec![byte]
-                    })
-                    .collect();
-            }
-            PictureGraphicFormat::EightBit => {
-                picture.data = picture
-                    .data_as_raw_encoded()
-                    .windows(8)
-                    .step_by(8)
-                    .flat_map(|chunk| {
-                        let mut byte = 0;
-                        for (i, bit) in chunk.iter().enumerate() {
-                            if *bit != 0 {
-                                byte |= 1 << i;
-                            }
-                        }
-                        vec![byte]
-                    })
-                    .collect();
-            }
-            _ => {}
-        },
-        PictureGraphicFormat::FourBit => match picture.format {
-            PictureGraphicFormat::Monochrome => {
-                picture.data = picture
-                    .data_as_raw_encoded()
-                    .iter()
-                    .flat_map(|value| {
-                        let mut result = vec![];
-                        for idx in 0..8 {
-                            let bit_color = value << idx & 0x01;
-                            if idx % 2 == 0 {
-                                result.push(bit_color);
-                            } else if let Some(last) = result.last_mut() {
-                                *last |= bit_color >> 4;
-                            }
-                        }
-                        result
-                    })
-                    .collect();
-            }
-            PictureGraphicFormat::EightBit => {
-                picture.data = picture
-                    .data_as_raw_encoded()
-                    .windows(2)
-                    .step_by(2)
-                    .flat_map(|values| {
-                        let high = (values[0] & 0x0F) << 4;
-                        let low = values[1] & 0x0F;
-                        vec![high | low]
-                    })
-                    .collect();
-            }
-            _ => {}
-        },
-        PictureGraphicFormat::EightBit => match picture.format {
-            PictureGraphicFormat::Monochrome => {
-                picture.data = picture
-                    .data_as_raw_encoded()
-                    .iter()
-                    .flat_map(|value| {
-                        let mut result = vec![];
-                        for bit in 0..8 {
-                            result.push(value >> bit & 0x01);
-                        }
-                        result
-                    })
-                    .collect();
-            }
-            PictureGraphicFormat::FourBit => {
-                picture.data = picture
-                    .data_as_raw_encoded()
-                    .iter()
-                    .flat_map(|value| {
-                        let high = (value >> 4) & 0x0F;
-                        let low = value & 0x0F;
-                        vec![high, low]
-                    })
-                    .collect();
-            }
-            _ => {}
-        },
+/// Convert indices between VT picture formats using the active palette.
+/// Reduced formats reserve a target index for transparent pixels and map opaque
+/// pixels to the nearest remaining target colour. `palette` is indexed by the
+/// effective colour index after Colour Map and Colour Palette resolution.
+pub fn convert_picture_graphic_format(
+    picture: &mut PictureGraphic,
+    target: PictureGraphicFormat,
+    palette: &[[u8; 3]; 256],
+) -> Result<(), String> {
+    let indices = indexed_png::pixel_indices(picture)?;
+    let source_key = picture.transparency_colour;
+    let transparent =
+        picture.options.transparent && indices.iter().any(|index| *index == source_key);
+    if picture.format == target {
+        if !transparent {
+            picture.options.transparent = false;
+        }
+        return Ok(());
     }
-    picture.format = target;
-    picture.options.data_code_type = DataCodeType::Raw;
+    let limit = match target {
+        PictureGraphicFormat::Monochrome => 2,
+        PictureGraphicFormat::FourBit => 16,
+        PictureGraphicFormat::EightBit => 256,
+    };
+    let source_key = usize::from(source_key);
+    let target_key = if transparent && target != PictureGraphicFormat::EightBit {
+        let rgb = palette[source_key];
+        (0..limit)
+            .min_by_key(|index| colour_distance(rgb, palette[*index]))
+            .unwrap_or(0)
+    } else if transparent {
+        source_key
+    } else {
+        0
+    };
+    let candidates: Vec<usize> = (0..limit)
+        .filter(|index| !transparent || *index != target_key)
+        .collect();
+    let mut converted = Vec::with_capacity(indices.len());
+    for index in indices {
+        if transparent && usize::from(index) == source_key {
+            converted.push(target_key as u8);
+            continue;
+        }
+        let mapped = if target == PictureGraphicFormat::EightBit {
+            usize::from(index)
+        } else {
+            let rgb = palette[usize::from(index)];
+            *candidates
+                .iter()
+                .min_by_key(|candidate| colour_distance(rgb, palette[**candidate]))
+                .ok_or_else(|| "No target colours remain after reserving transparency".to_owned())?
+        };
+        converted.push(mapped as u8);
+    }
+    let mut result = picture.clone();
+    result.options.transparent = transparent;
+    result.transparency_colour = target_key as u8;
+    indexed_png::encode_indices_optimized(&mut result, &converted, target)?;
+    *picture = result;
+    Ok(())
+}
+
+fn colour_distance(left: [u8; 3], right: [u8; 3]) -> u32 {
+    left.into_iter()
+        .zip(right)
+        .map(|(a, b)| (i32::from(a) - i32::from(b)).unsigned_abs().pow(2))
+        .sum()
+}
+
+/// Current-encoding size statistics: index pixels, packed raw bytes, stored bytes.
+pub fn picture_data_sizes(picture: &PictureGraphic) -> (usize, usize, usize) {
+    indexed_png::picture_data_sizes(picture)
+}
+
+/// Validate the format restrictions for pictures used as shape fill patterns.
+pub fn validate_picture_format(
+    pool: &ObjectPool,
+    picture_id: ObjectId,
+    picture_width: u16,
+    target: PictureGraphicFormat,
+) -> Result<(), String> {
+    let required_multiple = match target {
+        PictureGraphicFormat::Monochrome => 8,
+        PictureGraphicFormat::FourBit => 2,
+        PictureGraphicFormat::EightBit => 1,
+    };
+    if picture_width % required_multiple == 0 {
+        return Ok(());
+    }
+    let used_as_pattern = pool.objects().iter().any(|object| match object {
+        Object::FillAttributes(fill) => {
+            fill.fill_type == 3 && fill.fill_pattern.0 == Some(picture_id)
+        }
+        _ => false,
+    });
+    if used_as_pattern {
+        Err(format!(
+            "This PictureGraphic is used as a fill pattern; its width must be divisible by {required_multiple} in the selected format"
+        ))
+    } else {
+        Ok(())
+    }
 }

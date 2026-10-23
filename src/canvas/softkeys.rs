@@ -8,7 +8,7 @@ pub(super) const PATH_PREFIX: usize = usize::MAX;
 
 #[derive(Clone, Debug)]
 pub(super) enum SlotContent {
-    Key(u16),
+    Key { id: u16, selection_id: u16 },
     Empty,
     Invalid,
     Previous,
@@ -32,6 +32,7 @@ pub(super) struct SoftKeys {
 }
 
 fn resolve(pool: &ObjectPool, id: u16) -> SlotContent {
+    let selection_id = id;
     let mut current = id;
     let mut seen = HashSet::new();
     while seen.insert(current) {
@@ -39,7 +40,12 @@ fn resolve(pool: &ObjectPool, id: u16) -> SlotContent {
             .ok()
             .and_then(|id| pool.object_by_id(id))
         {
-            Some(Object::Key(_)) => return SlotContent::Key(current),
+            Some(Object::Key(_)) => {
+                return SlotContent::Key {
+                    id: current,
+                    selection_id,
+                }
+            }
             Some(Object::ObjectPointer(pointer)) => match pointer.value.0 {
                 Some(id) => current = id.value(),
                 None => return SlotContent::Empty,
