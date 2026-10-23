@@ -102,7 +102,8 @@ fn source_project() -> (EditorProject, ComponentParameterId, GraphicAssetId) {
     push_child(&mut pool, 200, 201, 0, 8);
 
     let mut project = EditorProject::from(pool);
-    project.mask_size = 500;
+    // The shared 140-pixel caption also appears in the Working Set designator.
+    project.set_design_dimensions(500, (160, 80)).unwrap();
     for (id, name) in [(2, "Main"), (3, "Alarm")] {
         assert!(project.rename_object(object_id(id), name.to_owned()));
     }

@@ -293,6 +293,7 @@ fn clicking_rows_selects_the_painted_row_in_flat_expanded_and_scrolled_layouts()
 fn drag_zones_choose_sibling_slots_or_parent_without_consuming_payload() {
     let ctx = egui::Context::default();
     let source = TreeDragPayload {
+        selection: None,
         root: 1,
         source_parent_path: vec![0],
         sibling_index: 2,
@@ -455,4 +456,117 @@ fn pointer_target_is_the_next_visible_row_without_an_extra_heading() {
         });
     }
     assert_eq!(project.get_mut_selected().get().0.unwrap().value(), 2);
+}
+
+#[test]
+fn hierarchy_pointer_gestures_select_exact_rows_and_preserve_context_selection() {
+    let mut pool = ObjectPool::default();
+    let mut mask = ag_iso_terminal_designer::default_object(ObjectType::DataMask);
+    mask.mut_id().set_value(1).unwrap();
+    if let Object::DataMask(mask) = &mut mask {
+        mask.object_refs = [2, 3, 2]
+            .into_iter()
+            .map(|id| ag_iso_stack::object_pool::ObjectRef {
+                id: ObjectId::new(id).unwrap(),
+                offset: Point { x: 10, y: 10 },
+            })
+            .collect();
+    }
+    pool.add(mask);
+    for id in [2, 3] {
+        let mut object = ag_iso_terminal_designer::default_object(ObjectType::OutputRectangle);
+        object.mut_id().set_value(id).unwrap();
+        pool.add(object);
+    }
+    let mut project = EditorProject::from(pool);
+    project.get_mut_selected().set(NullableObjectId::new(2));
+    let labels: Vec<_> = [2, 3]
+        .into_iter()
+        .map(|id| {
+            project.object_display_name(
+                project
+                    .get_pool()
+                    .object_by_id(ObjectId::new(id).unwrap())
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let ctx = egui::Context::default();
+    let mut canvas = CanvasState::default();
+    let mut masks = MaskViewState::default();
+    masks.focus(1);
+    let mut frame = |raw: egui::RawInput| {
+        project.update_selected();
+        ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                begin_hierarchy_frame(ui, &project, &mut canvas);
+                render_focused_mask_hierarchy(ui, &project, &mut masks, &mut canvas);
+                finish_hierarchy_click(ui, &project, &mut canvas);
+            });
+        })
+    };
+    frame(input(Vec::new()));
+    let mut settled = input(Vec::new());
+    settled.time = Some(1.0);
+    let output = frame(settled);
+    let mut rows: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if labels.iter().any(|label| label == text.galley.text()) => {
+                Some(text.pos + egui::vec2(5.0, 6.0))
+            }
+            _ => None,
+        })
+        .collect();
+    rows.sort_by(|a, b| a.y.total_cmp(&b.y));
+    assert_eq!(
+        rows.len(),
+        3,
+        "{:?}",
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+    let mut click = |index: usize, modifiers: egui::Modifiers, button| {
+        for pressed in [true, false] {
+            let mut raw = input(vec![
+                egui::Event::PointerMoved(rows[index]),
+                egui::Event::PointerButton {
+                    pos: rows[index],
+                    button,
+                    pressed,
+                    modifiers,
+                },
+            ]);
+            raw.modifiers = modifiers;
+            frame(raw);
+        }
+    };
+    click(0, egui::Modifiers::NONE, egui::PointerButton::Primary);
+    click(
+        2,
+        egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+        egui::PointerButton::Primary,
+    );
+    // A context click on either of the repeated references keeps both selected.
+    click(0, egui::Modifiers::NONE, egui::PointerButton::Secondary);
+    drop(click);
+    drop(frame);
+    assert_eq!(
+        canvas
+            .selected_hierarchy_occurrences()
+            .iter()
+            .map(|row| row.path.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![0, 0], vec![0, 2]]
+    );
 }

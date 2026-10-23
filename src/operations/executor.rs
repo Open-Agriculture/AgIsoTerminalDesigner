@@ -474,6 +474,7 @@ impl OperationExecutor {
             context.mask_size,
             &placements.new_references(),
             soft_key_size,
+            context.vt_version,
         )
         .map_err(|error| containment_transaction_error(error, &candidate_info))?;
         let id_changes = crate::id_reassignment::compose_id_mappings(&transaction.operations);
@@ -484,6 +485,7 @@ impl OperationExecutor {
             context.mask_size,
             &id_changes,
             soft_key_size.map(|size| (size, size)),
+            context.vt_version,
         )
         .map_err(|error| containment_transaction_error(error, &candidate_info))?;
         let candidate_validation = crate::pool_validation::validate_pool_state_for_version(

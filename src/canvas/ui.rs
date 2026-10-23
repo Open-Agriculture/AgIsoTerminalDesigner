@@ -26,6 +26,11 @@ pub struct CanvasState {
     context: Vec<usize>,
     inspector: Option<u16>,
     hierarchy_selection: Option<(u64, u16, Vec<usize>, u16)>,
+    hierarchy_frame_revision: Option<u64>,
+    hierarchy_visible: Vec<HierarchyOccurrence>,
+    hierarchy_selected: Vec<HierarchyOccurrence>,
+    hierarchy_anchor: Option<(u16, Vec<usize>)>,
+    hierarchy_selection_explicit: bool,
     all_hierarchy_references: Option<u16>,
     zoom: f32,
     pan: Vec2,
@@ -46,6 +51,23 @@ pub struct CanvasState {
     preview: Option<super::preview::PreviewMode>,
 }
 
+/// Identity and edit information for one visible hierarchy occurrence.
+/// Paths distinguish repeated references; component headers use synthetic paths
+/// and resolve their canvas placement through `target` and `parent_path`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HierarchyOccurrence {
+    /// Mask containing the hierarchy occurrence, including its Soft Key slots.
+    pub root: u16,
+    /// Exact row path within that mask's hierarchy.
+    pub path: Vec<usize>,
+    /// Object shown in the inspector, or the materialized component root.
+    pub object: u16,
+    /// Editable placement; roots and pointer-target aliases have none.
+    pub target: Option<PlacementTarget>,
+    /// Path of the containing occurrence, used to identify exact siblings.
+    pub parent_path: Option<Vec<usize>>,
+}
+
 impl Default for CanvasState {
     fn default() -> Self {
         Self {
@@ -60,6 +82,11 @@ impl Default for CanvasState {
             context: vec![],
             inspector: None,
             hierarchy_selection: None,
+            hierarchy_frame_revision: None,
+            hierarchy_visible: Vec::new(),
+            hierarchy_selected: Vec::new(),
+            hierarchy_anchor: None,
+            hierarchy_selection_explicit: false,
             all_hierarchy_references: None,
             zoom: 1.0,
             pan: egui::vec2(24.0, 24.0),
@@ -149,6 +176,206 @@ impl CanvasState {
             && self.placement_owner == project.get_selected().0.map(|id| id.value())
     }
 
+    /// Start a hierarchy rendering pass. Rows registered afterward define the
+    /// visible order used by Shift selection.
+    pub fn begin_hierarchy_frame(&mut self, revision: u64) {
+        if self
+            .hierarchy_frame_revision
+            .is_some_and(|old| old != revision)
+        {
+            self.hierarchy_selected.clear();
+            self.hierarchy_anchor = None;
+            self.hierarchy_selection = None;
+        }
+        self.hierarchy_frame_revision = Some(revision);
+        self.hierarchy_visible.clear();
+    }
+
+    /// Register a row in its hierarchy display order. Duplicate registration
+    /// of the same exact row updates its data without changing its range order.
+    pub fn register_hierarchy_occurrence(&mut self, occurrence: HierarchyOccurrence) {
+        if let Some(existing) = self
+            .hierarchy_visible
+            .iter_mut()
+            .find(|row| row.root == occurrence.root && row.path == occurrence.path)
+        {
+            *existing = occurrence;
+        } else {
+            self.hierarchy_visible.push(occurrence);
+        }
+    }
+
+    /// Return the exact selected hierarchy rows, independent of inspector ID.
+    pub fn selected_hierarchy_occurrences(&self) -> &[HierarchyOccurrence] {
+        &self.hierarchy_selected
+    }
+
+    /// Revision against which the current registered hierarchy rows were resolved.
+    pub fn hierarchy_selection_revision(&self) -> Option<u64> {
+        self.hierarchy_frame_revision
+    }
+
+    /// Return selected rows only when they are siblings under the same exact
+    /// parent occurrence. A one-row selection is valid for parent creation.
+    pub fn selected_hierarchy_siblings(&self) -> Option<Vec<HierarchyOccurrence>> {
+        let first = self.hierarchy_selected.first()?;
+        let parent = first.parent_path.as_ref()?;
+        self.hierarchy_selected
+            .iter()
+            .all(|row| row.root == first.root && row.parent_path.as_ref() == Some(parent))
+            .then(|| self.hierarchy_selected.clone())
+    }
+
+    /// Whether an exact hierarchy row belongs to the explicit occurrence selection.
+    pub fn hierarchy_occurrence_selected(&self, root: u16, path: &[usize]) -> bool {
+        self.hierarchy_selected
+            .iter()
+            .any(|row| row.root == root && row.path == path)
+    }
+
+    /// Apply normal, toggle, range, or context-menu selection to a registered row.
+    /// The clicked object remains the inspector selection while all editable
+    /// selected rows are reflected in the canvas scene selection.
+    pub fn hierarchy_click(
+        &mut self,
+        project: &EditorProject,
+        root: u16,
+        path: &[usize],
+        modifiers: Modifiers,
+        right_click: bool,
+    ) -> bool {
+        let Some(clicked_index) = self
+            .hierarchy_visible
+            .iter()
+            .position(|row| row.root == root && row.path == path)
+        else {
+            return false;
+        };
+        let clicked = self.hierarchy_visible[clicked_index].clone();
+        self.switch_mask(Some(root));
+        let already_selected = self.hierarchy_occurrence_selected(root, path);
+        if right_click && already_selected {
+            // Keep the block intact for a context menu.
+        } else if right_click || (!modifiers.ctrl && !modifiers.command && !modifiers.shift) {
+            self.hierarchy_selected = vec![clicked.clone()];
+            self.hierarchy_anchor = Some((root, path.to_vec()));
+        } else if modifiers.shift {
+            let anchor_index = self
+                .hierarchy_anchor
+                .as_ref()
+                .and_then(|(anchor_root, anchor_path)| {
+                    (*anchor_root == root)
+                        .then(|| {
+                            self.hierarchy_visible.iter().position(|row| {
+                                row.root == *anchor_root && row.path == *anchor_path
+                            })
+                        })
+                        .flatten()
+                })
+                .unwrap_or(clicked_index);
+            let (start, end) = if anchor_index <= clicked_index {
+                (anchor_index, clicked_index)
+            } else {
+                (clicked_index, anchor_index)
+            };
+            self.hierarchy_selected = self.hierarchy_visible[start..=end].to_vec();
+        } else if modifiers.ctrl || modifiers.command {
+            if already_selected {
+                self.hierarchy_selected
+                    .retain(|row| !(row.root == root && row.path == path));
+            } else {
+                self.hierarchy_selected.push(clicked.clone());
+                self.hierarchy_anchor = Some((root, path.to_vec()));
+            }
+            self.hierarchy_selected.sort_by_key(|selected| {
+                self.hierarchy_visible
+                    .iter()
+                    .position(|row| row.root == selected.root && row.path == selected.path)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        self.hierarchy_selection_explicit = true;
+        self.sync_hierarchy_selection(project, &clicked);
+        true
+    }
+
+    /// Restore a batch selection after a structural edit using the fresh
+    /// placement targets and their exact destination parent occurrence.
+    pub fn select_hierarchy_placements(
+        &mut self,
+        project: &EditorProject,
+        root: u16,
+        parent_path: &[usize],
+        targets: &[PlacementTarget],
+    ) -> bool {
+        let selected: Vec<_> = targets
+            .iter()
+            .filter_map(|target| {
+                self.hierarchy_visible
+                    .iter()
+                    .find(|row| {
+                        row.root == root
+                            && row.parent_path.as_deref() == Some(parent_path)
+                            && row.target.as_ref() == Some(target)
+                    })
+                    .cloned()
+            })
+            .collect();
+        let Some(clicked) = selected.last().cloned() else {
+            return false;
+        };
+        self.switch_mask(Some(root));
+        self.hierarchy_selected = selected;
+        self.hierarchy_anchor = Some((clicked.root, clicked.path.clone()));
+        self.hierarchy_selection_explicit = true;
+        self.sync_hierarchy_selection(project, &clicked);
+        true
+    }
+
+    fn sync_hierarchy_selection(&mut self, project: &EditorProject, clicked: &HierarchyOccurrence) {
+        self.switch_mask(Some(clicked.root));
+        self.hierarchy_selection = None;
+        self.all_hierarchy_references = None;
+        if self.hierarchy_selected.is_empty() {
+            self.selected.clear();
+            self.inspector = None;
+            self.placement_owner = None;
+            project.get_mut_selected().set(NullableObjectId::default());
+        }
+        let Ok(materialized) = project.materialize_shared() else {
+            return;
+        };
+        let page = self.pages.get(&clicked.root).map_or(0, |page| page.1);
+        let scene = geometry::build_page(project, &materialized, clicked.root, page);
+        let keys = super::softkeys::build(project, &materialized.pool, clicked.root, page);
+        self.pages.insert(clicked.root, (keys.mask_id, keys.page));
+        self.softkey_mask = keys.mask_id;
+        self.softkey_page = keys.page;
+        self.selected = self
+            .hierarchy_selected
+            .iter()
+            .filter_map(|row| {
+                if row.root != clicked.root {
+                    return None;
+                }
+                row_scene_item(project, &materialized, &scene, row)
+                    .filter(|item| item.target.is_some())
+                    .map(|item| item.path.clone())
+            })
+            .collect();
+        self.revision = project.revision();
+        if !self.hierarchy_selected.is_empty() {
+            self.inspector = Some(clicked.object);
+            self.placement_owner = clicked.target.as_ref().map(|_| clicked.object);
+        }
+        self.remember_scene(&scene);
+        if !self.hierarchy_selected.is_empty() {
+            project
+                .get_mut_selected()
+                .set(NullableObjectId::new(clicked.object));
+        }
+    }
+
     /// Preserve the identity of a clicked hierarchy row independently of the
     /// object rendered at its placement (in particular, an ObjectPointer).
     pub fn select_hierarchy_object(
@@ -174,6 +401,20 @@ impl CanvasState {
         self.revision = project.revision();
         self.hierarchy_selection = Some((project.revision(), root, path.to_vec(), object));
         self.all_hierarchy_references = None;
+        self.hierarchy_selected = vec![HierarchyOccurrence {
+            root,
+            path: path.to_vec(),
+            object,
+            target: self.selected.first().and_then(|scene_path| {
+                self.scene_identity
+                    .iter()
+                    .find(|row| &row.0 == scene_path)
+                    .and_then(|row| row.2.clone())
+            }),
+            parent_path: path.len().checked_sub(1).map(|end| path[..end].to_vec()),
+        }];
+        self.hierarchy_anchor = Some((root, path.to_vec()));
+        self.hierarchy_selection_explicit = true;
         self.inspector = Some(object);
         project
             .get_mut_selected()
@@ -184,6 +425,9 @@ impl CanvasState {
     /// making the other placements part of the canvas edit selection.
     pub fn select_all_hierarchy_references(&mut self, object: Option<u16>) {
         self.hierarchy_selection = None;
+        self.hierarchy_selected.clear();
+        self.hierarchy_anchor = None;
+        self.hierarchy_selection_explicit = false;
         self.all_hierarchy_references = object;
     }
 
@@ -198,6 +442,18 @@ impl CanvasState {
     ) -> bool {
         if self.all_hierarchy_references == Some(object) {
             return true;
+        }
+        if self.hierarchy_selection_explicit {
+            return self
+                .hierarchy_selected
+                .iter()
+                .any(|row| row.root == root && row.path == path && row.object == object);
+        }
+        if !self.hierarchy_selected.is_empty() {
+            return self
+                .hierarchy_selected
+                .iter()
+                .any(|row| row.root == root && row.path == path && row.object == object);
         }
         if let Some((revision, selected_root, selected_path, selected_object)) =
             &self.hierarchy_selection
@@ -684,6 +940,10 @@ impl CanvasState {
         }
         self.cancel_interaction();
         self.selected.clear();
+        self.hierarchy_selection = None;
+        self.hierarchy_selected.clear();
+        self.hierarchy_anchor = None;
+        self.hierarchy_selection_explicit = false;
         self.context.clear();
         self.inspector = None;
         self.error = None;
@@ -853,6 +1113,10 @@ impl CanvasState {
         let inspector = project.get_selected().0.map(|i| i.value());
         if inspector != self.inspector {
             self.inspector = inspector;
+            self.hierarchy_selected.clear();
+            self.hierarchy_anchor = None;
+            self.hierarchy_selection = None;
+            self.hierarchy_selection_explicit = false;
             self.selected = scene
                 .items
                 .iter()
@@ -1891,6 +2155,9 @@ impl CanvasState {
     }
     fn sync_selection(&mut self, project: &EditorProject, scene: &Scene) {
         self.hierarchy_selection = None;
+        self.hierarchy_selected.clear();
+        self.hierarchy_anchor = None;
+        self.hierarchy_selection_explicit = false;
         self.all_hierarchy_references = None;
         let id = self
             .selected
@@ -2512,6 +2779,34 @@ fn hierarchy_scene_path(
     Some(scene_path)
 }
 
+fn row_scene_item<'a>(
+    project: &EditorProject,
+    materialized: &MaterializedProject,
+    scene: &'a Scene,
+    row: &HierarchyOccurrence,
+) -> Option<&'a SceneItem> {
+    if let Some(scene_path) = hierarchy_scene_path(project, materialized, row.root, &row.path) {
+        if let Some(item) = scene.items.iter().find(|item| {
+            item.path == scene_path
+                && row
+                    .target
+                    .as_ref()
+                    .is_none_or(|target| item.target.as_ref() == Some(target))
+        }) {
+            return Some(item);
+        }
+    }
+
+    let target = row.target.as_ref()?;
+    let parent_path = row.parent_path.as_ref()?;
+    let parent_scene_path = hierarchy_scene_path(project, materialized, row.root, parent_path)?;
+    scene.items.iter().find(|item| {
+        item.target.as_ref() == Some(target)
+            && item.path.len() == parent_scene_path.len() + 1
+            && item.path.starts_with(&parent_scene_path)
+    })
+}
+
 fn canonical_to_materialized_index(
     materialized: &MaterializedProject,
     parent_id: u16,
@@ -2605,6 +2900,169 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_selection_supports_toggle_range_context_and_exact_siblings() {
+        let project = repeated_parent_project();
+        let mut canvas = CanvasState::default();
+        canvas.begin_hierarchy_frame(project.revision());
+        for (index, object) in [(0, 100), (1, 100), (2, 104)] {
+            let path = vec![0, index];
+            canvas.register_hierarchy_occurrence(HierarchyOccurrence {
+                root: 2,
+                parent_path: Some(vec![0]),
+                target: Some(PlacementTarget::Primitive {
+                    parent_id: 2,
+                    child_index: index,
+                }),
+                path,
+                object,
+            });
+        }
+
+        assert!(canvas.hierarchy_click(&project, 2, &[0, 0], Modifiers::default(), false));
+        assert_eq!(canvas.selected_hierarchy_occurrences().len(), 1);
+        assert!(canvas.hierarchy_occurrence_selected(2, &[0, 0]));
+        assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 0], 100));
+        assert!(canvas.hierarchy_click(
+            &project,
+            2,
+            &[0, 1],
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+            false,
+        ));
+        let siblings = canvas.selected_hierarchy_siblings().unwrap();
+        assert_eq!(
+            siblings
+                .iter()
+                .map(|row| row.path.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 0], vec![0, 1]]
+        );
+        assert!(canvas.hierarchy_occurrence_selected(2, &[0, 0]));
+
+        // A context click on either selected row keeps the whole selection.
+        assert!(canvas.hierarchy_click(&project, 2, &[0, 0], Modifiers::default(), true));
+        assert_eq!(canvas.selected_hierarchy_occurrences().len(), 2);
+
+        // A plain selection establishes the Shift range anchor.
+        assert!(canvas.hierarchy_click(&project, 2, &[0, 0], Modifiers::default(), false,));
+        assert!(canvas.hierarchy_click(
+            &project,
+            2,
+            &[0, 2],
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            false,
+        ));
+        assert_eq!(canvas.selected_hierarchy_occurrences().len(), 3);
+        assert!(canvas.selected_hierarchy_siblings().is_some());
+
+        // Right-clicking outside the selection selects only that occurrence.
+        assert!(canvas.hierarchy_click(&project, 2, &[0, 0], Modifiers::default(), false));
+        assert!(canvas.hierarchy_click(&project, 2, &[0, 1], Modifiers::default(), true));
+        assert_eq!(canvas.selected_hierarchy_occurrences().len(), 1);
+        assert_eq!(canvas.selected_hierarchy_occurrences()[0].path, vec![0, 1]);
+    }
+
+    #[test]
+    fn hierarchy_toggle_restores_visible_order_and_synthetic_rows_resolve_by_target() {
+        let project = repeated_parent_project();
+        let synthetic_path = vec![0, usize::MAX - 1, 0];
+        let mut canvas = CanvasState::default();
+        canvas.begin_hierarchy_frame(project.revision());
+        for (path, index, object) in [
+            (vec![0, 0], 0, 100),
+            (vec![0, 1], 1, 100),
+            (synthetic_path.clone(), 2, 104),
+        ] {
+            canvas.register_hierarchy_occurrence(HierarchyOccurrence {
+                root: 2,
+                path,
+                object,
+                target: Some(PlacementTarget::Primitive {
+                    parent_id: 2,
+                    child_index: index,
+                }),
+                parent_path: Some(vec![0]),
+            });
+        }
+
+        assert!(canvas.hierarchy_click(&project, 2, &[0, 0], Modifiers::default(), false));
+        assert!(canvas.hierarchy_click(
+            &project,
+            2,
+            &synthetic_path,
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+            false,
+        ));
+        assert!(canvas.hierarchy_click(
+            &project,
+            2,
+            &[0, 1],
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+            false,
+        ));
+        assert_eq!(
+            canvas
+                .selected_hierarchy_occurrences()
+                .iter()
+                .map(|row| row.path.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![0, 0], vec![0, 1], synthetic_path],
+        );
+        assert_eq!(canvas.selected, vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn toggling_off_the_last_hierarchy_row_clears_inspector_and_highlight() {
+        let mut project = repeated_parent_project();
+        let mut canvas = CanvasState::default();
+        canvas.begin_hierarchy_frame(project.revision());
+        canvas.register_hierarchy_occurrence(HierarchyOccurrence {
+            root: 2,
+            path: vec![0, 0],
+            object: 100,
+            target: Some(PlacementTarget::Primitive {
+                parent_id: 2,
+                child_index: 0,
+            }),
+            parent_path: Some(vec![0]),
+        });
+
+        assert!(canvas.hierarchy_click(&project, 2, &[0, 0], Modifiers::default(), false));
+        project.update_selected();
+        assert_eq!(project.get_selected(), NullableObjectId::new(100));
+        assert!(canvas.hierarchy_click(
+            &project,
+            2,
+            &[0, 0],
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+            false,
+        ));
+        project.update_selected();
+
+        assert!(canvas.selected_hierarchy_occurrences().is_empty());
+        assert!(canvas.selected.is_empty());
+        assert_eq!(canvas.inspector, None);
+        assert_eq!(canvas.placement_owner, None);
+        assert_eq!(project.get_selected(), NullableObjectId::default());
+        assert!(!canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 0], 100));
+    }
+
+    #[test]
     fn hierarchy_selection_keeps_repeated_parent_and_pointer_alias_occurrences() {
         let mut project = repeated_parent_project();
         let target = PlacementTarget::Primitive {
@@ -2623,7 +3081,10 @@ mod tests {
         assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 2, usize::MAX, 0], 101));
         assert!(!canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 1, 0], 101));
 
+        canvas.select_hierarchy_object(&project, 2, &[0, 1, 0], 101);
         canvas.select_all_hierarchy_references(Some(101));
+        assert!(canvas.selected_hierarchy_occurrences().is_empty());
+
         assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 0, 0], 101));
         assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 1, 0], 101));
         assert!(canvas.hierarchy_occurrence_is_primary(&project, 2, &[0, 2, usize::MAX, 0], 101));

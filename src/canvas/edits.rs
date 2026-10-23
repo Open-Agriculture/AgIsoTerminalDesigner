@@ -22,6 +22,17 @@ pub enum PlacementTarget {
     Component { instance_id: ComponentInstanceId },
 }
 
+/// A possible parent type for the current grouping selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupingCandidate {
+    /// Object type to create when enabled.
+    pub object_type: ag_iso_stack::object_pool::ObjectType,
+    /// Whether grouping with this type currently validates.
+    pub enabled: bool,
+    /// Why the type cannot currently be used.
+    pub reason: Option<String>,
+}
+
 #[derive(Clone)]
 enum DisplayedSibling {
     Primitive(ChildPlacement),
@@ -253,12 +264,10 @@ pub fn hierarchy_child_origin(
             };
             id = pointer.value.0.ok_or("Empty pointer target")?.value();
         } else {
-            if matches!(object, Object::Button(_)) {
-                origin += egui::vec2(
-                    crate::object_rendering::BUTTON_BORDER_INSET,
-                    crate::object_rendering::BUTTON_BORDER_INSET,
-                );
-            }
+            origin += egui::vec2(
+                crate::button_geometry::object_face_inset(object, project.vt_version),
+                crate::button_geometry::object_face_inset(object, project.vt_version),
+            );
             let child = object_refs(object)
                 .and_then(|children| children.get(index))
                 .ok_or("Invalid hierarchy path")?;
@@ -270,12 +279,8 @@ pub fn hierarchy_child_origin(
         .get_pool()
         .object_by_id(object_id(id).map_err(|e| e.to_string())?)
         .ok_or("Missing destination object")?;
-    if matches!(parent, Object::Button(_)) {
-        origin += egui::vec2(
-            crate::object_rendering::BUTTON_BORDER_INSET,
-            crate::object_rendering::BUTTON_BORDER_INSET,
-        );
-    }
+    let inset = crate::button_geometry::object_face_inset(parent, project.vt_version);
+    origin += egui::vec2(inset, inset);
     Ok(origin)
 }
 
@@ -289,16 +294,29 @@ pub fn hierarchy_path_after_removal(
     path: &[usize],
     target: &PlacementTarget,
 ) -> Result<Vec<usize>, String> {
+    hierarchy_path_after_removals(project, root, path, std::slice::from_ref(target))
+}
+
+/// Adjust a synthetic hierarchy path after removing several occurrences.
+/// Primitive indexes are interpreted against the original hierarchy at each
+/// level; all removed preceding primitive siblings are counted together.
+/// Component removals do not shift primitive indexes. A path into an occurrence
+/// being removed is rejected.
+pub fn hierarchy_path_after_removals(
+    project: &EditorProject,
+    root: u16,
+    path: &[usize],
+    targets: &[PlacementTarget],
+) -> Result<Vec<usize>, String> {
     use ag_iso_stack::object_pool::object::Object;
 
+    if !targets
+        .iter()
+        .any(|target| matches!(target, PlacementTarget::Primitive { .. }))
+    {
+        return Ok(path.to_vec());
+    }
     let mut adjusted = path.to_vec();
-    let PlacementTarget::Primitive {
-        parent_id: source_parent,
-        child_index: source_index,
-    } = target
-    else {
-        return Ok(adjusted);
-    };
     let Some(first) = path.first() else {
         return Err("Empty hierarchy path".into());
     };
@@ -342,9 +360,24 @@ pub fn hierarchy_path_after_removal(
             parent_id = pointer.value.0.ok_or("Empty pointer target")?.value();
             continue;
         }
-        if parent_id == *source_parent && segment > *source_index {
-            adjusted[path_index] = segment - 1;
+        let mut removed_before = 0;
+        for target in targets {
+            if let PlacementTarget::Primitive {
+                parent_id: source_parent,
+                child_index: source_index,
+            } = target
+            {
+                if parent_id == *source_parent {
+                    if segment == *source_index {
+                        return Err("Destination is inside an occurrence being removed".into());
+                    }
+                    if *source_index < segment {
+                        removed_before += 1;
+                    }
+                }
+            }
         }
+        adjusted[path_index] = segment.saturating_sub(removed_before);
         let parent = project
             .get_pool()
             .object_by_id(object_id(parent_id).map_err(|e| e.to_string())?)
@@ -514,7 +547,8 @@ pub fn reparent_at_index(
         _ => project.get_pool().content_size(parent),
     };
     if matches!(parent, Object::Button(_)) {
-        let inset = (crate::object_rendering::BUTTON_BORDER_INSET * 2.0) as u16;
+        let inset =
+            (crate::button_geometry::object_face_inset(parent, project.vt_version) * 2.0) as u16;
         width = width.saturating_sub(inset);
         height = height.saturating_sub(inset);
     }
@@ -612,6 +646,754 @@ pub fn reparent_at_index(
         )
         .map_err(|error| error.to_string())?;
     Ok(result)
+}
+
+/// Return version-compatible parent choices with a reason for each rejected
+/// choice. Candidate checks run the real grouping edit on a project copy, so
+/// geometry, relationships, ID ranges and normal project validation agree with
+/// execution.
+pub fn grouping_candidates(
+    project: &EditorProject,
+    targets: &[PlacementTarget],
+) -> Vec<GroupingCandidate> {
+    use ag_iso_stack::object_pool::ObjectType;
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let Ok(parent_id) = targets[0].parent_id(project) else {
+        return Vec::new();
+    };
+    if targets
+        .iter()
+        .any(|target| target.parent_id(project).ok() != Some(parent_id))
+    {
+        return Vec::new();
+    }
+    let Ok(parent_object_id) = object_id(parent_id) else {
+        return Vec::new();
+    };
+    let Some(existing_parent) = project.get_pool().object_by_id(parent_object_id) else {
+        return Vec::new();
+    };
+    let parent_allowed = crate::allowed_object_relationships::get_allowed_child_refs(
+        existing_parent.object_type(),
+        project.vt_version,
+    );
+    let Ok(siblings) =
+        displayed_siblings(project.get_pool(), project.component_source(), parent_id)
+    else {
+        return Vec::new();
+    };
+    let Ok(materialized) = project.materialize() else {
+        return Vec::new();
+    };
+    let mut selected_types = Vec::new();
+    for (index, sibling) in siblings.iter().enumerate() {
+        if targets
+            .iter()
+            .any(|target| sibling_matches_target(&siblings, index, target))
+        {
+            let Ok(child_id) =
+                displayed_child_id(sibling, &materialized, project.component_source())
+            else {
+                return Vec::new();
+            };
+            let Ok(child_id) = object_id(child_id) else {
+                return Vec::new();
+            };
+            let Some(child) = materialized.pool.object_by_id(child_id) else {
+                return Vec::new();
+            };
+            selected_types.push(child.object_type());
+        }
+    }
+    ObjectType::values()
+        .into_iter()
+        .filter(|object_type| {
+            crate::vt_compatibility::supported_object_type(*object_type, project.vt_version)
+                && crate::operations::object_refs(&crate::object_defaults::default_object(
+                    *object_type,
+                ))
+                .is_some()
+                && parent_allowed.contains(object_type)
+                && selected_types.iter().all(|child_type| {
+                    crate::allowed_object_relationships::get_allowed_child_refs(
+                        *object_type,
+                        project.vt_version,
+                    )
+                    .contains(child_type)
+                })
+        })
+        .map(|object_type| {
+            let mut preview = project.clone();
+            let result = group_placements(&mut preview, targets, object_type, "Grouping preview")
+                .map(|_| ());
+            GroupingCandidate {
+                object_type,
+                enabled: result.is_ok(),
+                reason: result.err(),
+            }
+        })
+        .collect()
+}
+
+/// Group one or more sibling occurrences under a newly-created parent. The
+/// selected children retain their positions in the parent’s canvas coordinate
+/// system, and their displayed order is retained. The new parent is inserted
+/// at the first selected sibling’s position. The entire operation is one
+/// validated history change.
+pub fn group_placements(
+    project: &mut EditorProject,
+    targets: &[PlacementTarget],
+    parent_type: ag_iso_stack::object_pool::ObjectType,
+    name: &str,
+) -> Result<PlacementTarget, String> {
+    use ag_iso_stack::object_pool::{object::Object, ObjectType};
+    if targets.is_empty() {
+        return Err("Select at least one sibling occurrence".into());
+    }
+    if !crate::vt_compatibility::supported_object_type(parent_type, project.vt_version) {
+        return Err(format!("{parent_type:?} is unavailable in this VT version"));
+    }
+    let parent_template =
+        crate::object_defaults::default_object_for_version(parent_type, project.vt_version)
+            .ok_or_else(|| format!("{parent_type:?} is unavailable in this VT version"))?;
+    if crate::operations::object_refs(&parent_template).is_none() {
+        return Err(format!(
+            "{parent_type:?} does not support positioned children"
+        ));
+    }
+    let parent_id = targets[0].parent_id(project)?;
+    if targets
+        .iter()
+        .any(|target| target.parent_id(project).ok() != Some(parent_id))
+    {
+        return Err("Selected occurrences must be siblings under the same parent".into());
+    }
+    let siblings = displayed_siblings(project.get_pool(), project.component_source(), parent_id)
+        .map_err(|error| error.to_string())?;
+    let mut selected = Vec::new();
+    for (display_index, sibling) in siblings.iter().enumerate() {
+        if targets
+            .iter()
+            .any(|target| sibling_matches_target(&siblings, display_index, target))
+        {
+            selected.push((display_index, sibling.clone()));
+        }
+    }
+    if selected.len() != targets.iter().collect::<HashSet<_>>().len() {
+        return Err("A selected occurrence no longer exists".into());
+    }
+    if selected.len() != targets.len() {
+        return Err("The same occurrence was selected more than once".into());
+    }
+    if parent_type == ObjectType::Animation && selected.len() > usize::from(u8::MAX) + 1 {
+        return Err("An Animation can contain at most 256 selected frames".into());
+    }
+    let materialized = project.materialize().map_err(|error| error.to_string())?;
+    let mut child_bounds = Vec::new();
+    for (_, sibling) in &selected {
+        let child_id = displayed_child_id(sibling, &materialized, project.component_source())?;
+        let child = materialized
+            .pool
+            .object_by_id(object_id(child_id).map_err(|e| e.to_string())?)
+            .ok_or("Missing selected object")?;
+        let (width, height) = occurrence_size(&materialized.pool, child, project.soft_key_size());
+        let width = u16::try_from(width).map_err(|_| "Selected object width is out of range")?;
+        let height = u16::try_from(height).map_err(|_| "Selected object height is out of range")?;
+        let (x, y) = displayed_position(sibling);
+        child_bounds.push((x, y, width, height));
+    }
+    let min_x = child_bounds.iter().map(|b| i32::from(b.0)).min().unwrap();
+    let min_y = child_bounds.iter().map(|b| i32::from(b.1)).min().unwrap();
+    let max_x = child_bounds
+        .iter()
+        .map(|b| i32::from(b.0) + i32::from(b.2))
+        .max()
+        .unwrap();
+    let max_y = child_bounds
+        .iter()
+        .map(|b| i32::from(b.1) + i32::from(b.3))
+        .max()
+        .unwrap();
+    let inset =
+        crate::button_geometry::object_face_inset(&parent_template, project.vt_version) as i32;
+    let required_width = u16::try_from(max_x - min_x + inset * 2)
+        .map_err(|_| "Grouped parent width is out of range")?;
+    let required_height = u16::try_from(max_y - min_y + inset * 2)
+        .map_err(|_| "Grouped parent height is out of range")?;
+    let (width, height) = match parent_type {
+        ObjectType::DataMask | ObjectType::AlarmMask => (project.mask_size, project.mask_size),
+        ObjectType::Key
+        | ObjectType::WorkingSet
+        | ObjectType::AuxiliaryFunctionType1
+        | ObjectType::AuxiliaryInputType1
+        | ObjectType::AuxiliaryFunctionType2
+        | ObjectType::AuxiliaryInputType2 => project.soft_key_size(),
+        _ => (required_width, required_height),
+    };
+    let content_width = width.saturating_sub((inset * 2) as u16);
+    let content_height = height.saturating_sub((inset * 2) as u16);
+    if max_x - min_x > i32::from(content_width) || max_y - min_y > i32::from(content_height) {
+        return Err(format!(
+            "Selected objects do not fit inside {parent_type:?}"
+        ));
+    }
+    let parent_x =
+        i16::try_from(min_x - inset).map_err(|_| "Grouped parent x position is out of range")?;
+    let parent_y =
+        i16::try_from(min_y - inset).map_err(|_| "Grouped parent y position is out of range")?;
+    let positions: Vec<_> = child_bounds
+        .iter()
+        .map(|(x, y, _, _)| {
+            let x = i16::try_from(i32::from(*x) - min_x)
+                .map_err(|_| "Grouped child x position is out of range")?;
+            let y = i16::try_from(i32::from(*y) - min_y)
+                .map_err(|_| "Grouped child y position is out of range")?;
+            Ok((x, y))
+        })
+        .collect::<Result<_, String>>()?;
+
+    let version = project.vt_version;
+    let parent_object_id = project
+        .allocate_object_id(parent_type)
+        .map_err(|error| error.to_string())?;
+    let new_id = parent_object_id.value();
+    let selected_targets = targets.to_vec();
+    let mut result = None;
+    project
+        .edit_source("Group placements", |pool, source, _graphics, info| {
+            let current = displayed_siblings(pool, source, parent_id)?;
+            if selected_targets.iter().any(|target| {
+                !current
+                    .iter()
+                    .enumerate()
+                    .any(|(i, _)| sibling_matches_target(&current, i, target))
+            }) {
+                return Err(ComponentError::new(
+                    "CANVAS_EDIT_INVALID",
+                    "A selected occurrence no longer exists",
+                ));
+            }
+            let mut parent = parent_template.clone();
+            parent.mut_id().set_value(new_id).map_err(|e| {
+                ComponentError::new("CANVAS_EDIT_INVALID", format!("Invalid object ID: {e:?}"))
+            })?;
+            match &mut parent {
+                Object::Container(container) => {
+                    container.width = width;
+                    container.height = height;
+                }
+                Object::Button(button) => {
+                    button.width = width;
+                    button.height = height;
+                }
+                Object::Animation(animation) => {
+                    animation.width = width;
+                    animation.height = height;
+                    animation.first_child_index = 0;
+                    animation.last_child_index = (selected.len() - 1) as u8;
+                    animation.default_child_index = 0;
+                }
+                _ => (),
+            }
+            pool.add(parent.clone());
+            let parent_oid = parent_object_id;
+            let parent_object = pool
+                .object_by_id(parent_oid)
+                .ok_or_else(invalid_placement)?;
+            let mut metadata = ObjectInfo::new(parent_object);
+            metadata.set_name(name.to_owned());
+            info.insert(parent_oid, metadata);
+
+            let mut child_siblings = Vec::new();
+            for ((_, sibling), (x, y)) in selected.iter().zip(positions.iter().copied()) {
+                match sibling {
+                    DisplayedSibling::Primitive(placement) => {
+                        child_siblings.push(DisplayedSibling::Primitive(ChildPlacement {
+                            x,
+                            y,
+                            ..placement.clone()
+                        }))
+                    }
+                    DisplayedSibling::Component(instance) => {
+                        let mut moved = instance.clone();
+                        moved.x = i32::from(x);
+                        moved.y = i32::from(y);
+                        moved.parent = EditorParentRef::Primitive(new_id);
+                        child_siblings.push(DisplayedSibling::Component(moved));
+                    }
+                }
+            }
+            let new_children: Vec<_> = child_siblings
+                .iter()
+                .filter_map(|s| match s {
+                    DisplayedSibling::Primitive(p) => Some(p.clone()),
+                    _ => None,
+                })
+                .collect();
+            for sibling in &child_siblings {
+                let child_id = match sibling {
+                    DisplayedSibling::Primitive(p) => {
+                        target_id(&p.child).ok_or_else(invalid_placement)?
+                    }
+                    DisplayedSibling::Component(instance) => {
+                        let definition = source
+                            .definitions
+                            .get(&instance.component_id)
+                            .ok_or_else(invalid_placement)?;
+                        *materialized
+                            .source_map
+                            .by_component_node
+                            .get(&(instance.id, definition.root_node))
+                            .ok_or_else(invalid_placement)?
+                    }
+                };
+                let child_type = materialized
+                    .pool
+                    .object_by_id(object_id(child_id)?)
+                    .ok_or_else(invalid_placement)?
+                    .object_type();
+                if !crate::allowed_object_relationships::get_allowed_child_refs(
+                    parent_type,
+                    version,
+                )
+                .contains(&child_type)
+                {
+                    return Err(ComponentError::new(
+                        "CANVAS_EDIT_INVALID",
+                        format!("{parent_type:?} cannot contain {child_type:?} for VT {version:?}"),
+                    ));
+                }
+            }
+            let existing_parent = pool
+                .object_by_id(object_id(parent_id)?)
+                .ok_or_else(invalid_placement)?;
+            if !crate::allowed_object_relationships::get_allowed_child_refs(
+                existing_parent.object_type(),
+                version,
+            )
+            .contains(&parent_type)
+            {
+                return Err(ComponentError::new(
+                    "CANVAS_EDIT_INVALID",
+                    format!(
+                        "{:?} cannot contain {parent_type:?} for VT {version:?}",
+                        existing_parent.object_type()
+                    ),
+                ));
+            }
+            set_child_placements(pool, new_id, new_children, version)?;
+            let mut remaining = current
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| {
+                    !selected_targets
+                        .iter()
+                        .any(|t| sibling_matches_target(&current, *i, t))
+                })
+                .map(|(_, s)| s.clone())
+                .collect::<Vec<_>>();
+            let first_slot = selected
+                .first()
+                .map(|item| item.0)
+                .unwrap_or(remaining.len())
+                .min(remaining.len());
+            remaining.insert(
+                first_slot,
+                DisplayedSibling::Primitive(ChildPlacement {
+                    child: ObjectTarget::id(new_id),
+                    x: parent_x,
+                    y: parent_y,
+                }),
+            );
+            set_displayed_siblings(pool, source, parent_id, remaining, version)?;
+            set_displayed_siblings(pool, source, new_id, child_siblings, version)?;
+            result = Some(PlacementTarget::Primitive {
+                parent_id,
+                child_index: child_placements(pool, parent_id)?
+                    .iter()
+                    .position(|p| target_id(&p.child) == Some(new_id))
+                    .ok_or_else(invalid_placement)?,
+            });
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+    result.ok_or_else(|| "Grouping did not create a parent occurrence".into())
+}
+
+/// Move selected sibling occurrences as one block, preserving their displayed
+/// order and coordinates. Cross-parent moves apply `coordinate_delta` and fail
+/// if any child would fall outside the destination’s content area.
+pub fn move_placements(
+    project: &mut EditorProject,
+    targets: &[PlacementTarget],
+    destination_parent: u16,
+    insertion_index: Option<usize>,
+    coordinate_delta: (i32, i32),
+) -> Result<Vec<PlacementTarget>, String> {
+    use ag_iso_stack::object_pool::object::Object;
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let source_parent = targets[0].parent_id(project)?;
+    if targets
+        .iter()
+        .any(|target| target.parent_id(project).ok() != Some(source_parent))
+    {
+        return Err("Selected occurrences must be siblings under the same parent".into());
+    }
+    let initial = displayed_siblings(
+        project.get_pool(),
+        project.component_source(),
+        source_parent,
+    )
+    .map_err(|e| e.to_string())?;
+    let selected: Vec<_> = initial
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            targets
+                .iter()
+                .any(|t| sibling_matches_target(&initial, *i, t))
+        })
+        .map(|(_, s)| s.clone())
+        .collect();
+    if selected.len() != targets.iter().collect::<HashSet<_>>().len() {
+        return Err("A selected occurrence no longer exists".into());
+    }
+    if selected.len() != targets.len() {
+        return Err("The same occurrence was selected more than once".into());
+    }
+    let same_parent = source_parent == destination_parent;
+    let materialized = project.materialize().map_err(|e| e.to_string())?;
+    let destination = project
+        .get_pool()
+        .object_by_id(object_id(destination_parent).map_err(|e| e.to_string())?)
+        .ok_or("Missing destination parent")?;
+    if object_refs(destination).is_none() {
+        return Err("Destination does not support positioned children".into());
+    }
+    let mut size = match destination {
+        Object::DataMask(_) | Object::AlarmMask(_) => (project.mask_size, project.mask_size),
+        Object::Key(_)
+        | Object::WorkingSet(_)
+        | Object::AuxiliaryFunctionType1(_)
+        | Object::AuxiliaryInputType1(_)
+        | Object::AuxiliaryFunctionType2(_)
+        | Object::AuxiliaryInputType2(_) => project.soft_key_size(),
+        _ => project.get_pool().content_size(destination),
+    };
+    if matches!(destination, Object::Button(_)) {
+        let insets = (crate::button_geometry::object_face_inset(destination, project.vt_version)
+            * 2.0) as u16;
+        size.0 = size.0.saturating_sub(insets);
+        size.1 = size.1.saturating_sub(insets);
+    }
+    let mut moved = Vec::new();
+    for sibling in &selected {
+        let id = displayed_child_id(sibling, &materialized, project.component_source())?;
+        let child = materialized
+            .pool
+            .object_by_id(object_id(id).map_err(|e| e.to_string())?)
+            .ok_or("Missing selected object")?;
+        let child_type = materialized
+            .pool
+            .object_by_id(object_id(id).map_err(|e| e.to_string())?)
+            .ok_or("Missing selected object")?
+            .object_type();
+        if !crate::allowed_object_relationships::get_allowed_child_refs(
+            destination.object_type(),
+            project.vt_version,
+        )
+        .contains(&child_type)
+        {
+            return Err(format!(
+                "{:?} cannot contain {child_type:?} for VT {:?}",
+                destination.object_type(),
+                project.vt_version
+            ));
+        }
+        let (old_x, old_y) = displayed_position(sibling);
+        let x = if same_parent {
+            i32::from(old_x)
+        } else {
+            i32::from(old_x) + coordinate_delta.0
+        };
+        let y = if same_parent {
+            i32::from(old_y)
+        } else {
+            i32::from(old_y) + coordinate_delta.1
+        };
+        let (child_width, child_height) =
+            occurrence_size(&materialized.pool, child, project.soft_key_size());
+        if !same_parent
+            && (x < 0
+                || y < 0
+                || x + child_width > i32::from(size.0)
+                || y + child_height > i32::from(size.1))
+        {
+            return Err(format!(
+                "Object {} does not fit inside the destination",
+                project.get_object_info(child).get_name(child)
+            ));
+        }
+        moved.push(match sibling {
+            DisplayedSibling::Primitive(p) => DisplayedSibling::Primitive(ChildPlacement {
+                x: i16::try_from(x).map_err(|_| "Destination x position is out of range")?,
+                y: i16::try_from(y).map_err(|_| "Destination y position is out of range")?,
+                ..p.clone()
+            }),
+            DisplayedSibling::Component(instance) => {
+                let mut copy = instance.clone();
+                copy.x = x;
+                copy.y = y;
+                copy.parent = EditorParentRef::Primitive(destination_parent);
+                DisplayedSibling::Component(copy)
+            }
+        });
+    }
+    let version = project.vt_version;
+    let selected_targets = targets.to_vec();
+    let mut output = Vec::new();
+    project
+        .edit_source(
+            "Move sibling placements",
+            |pool, source, _graphics, _info| {
+                let mut source_siblings = displayed_siblings(pool, source, source_parent)?;
+                let extracted: Vec<_> = source_siblings
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        selected_targets
+                            .iter()
+                            .any(|t| sibling_matches_target(&source_siblings, *i, t))
+                    })
+                    .map(|(_, s)| s.clone())
+                    .collect();
+                if extracted.len() != selected_targets.len() {
+                    return Err(invalid_placement());
+                }
+                let source_before = source_siblings.clone();
+                source_siblings = source_before
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        !selected_targets
+                            .iter()
+                            .any(|t| sibling_matches_target(&source_before, *i, t))
+                    })
+                    .map(|(_, s)| s.clone())
+                    .collect();
+                if same_parent {
+                    let before = insertion_index.unwrap_or(initial.len()).min(initial.len());
+                    let removed_before = initial
+                        .iter()
+                        .take(before)
+                        .enumerate()
+                        .filter(|(i, _)| {
+                            selected_targets
+                                .iter()
+                                .any(|t| sibling_matches_target(&initial, *i, t))
+                        })
+                        .count();
+                    let slot = before
+                        .saturating_sub(removed_before)
+                        .min(source_siblings.len());
+                    for (offset, sibling) in moved.iter().cloned().enumerate() {
+                        source_siblings.insert(slot + offset, sibling);
+                    }
+                    if same_displayed_siblings(&source_siblings, &initial) {
+                        output = selected_targets.clone();
+                        return Ok(());
+                    }
+                    set_displayed_siblings(
+                        pool,
+                        source,
+                        source_parent,
+                        source_siblings.clone(),
+                        version,
+                    )?;
+                    output = targets_for_block(&source_siblings, slot, moved.len(), source_parent);
+                } else {
+                    let mut dest = displayed_siblings(pool, source, destination_parent)?;
+                    let slot = insertion_index.unwrap_or(dest.len()).min(dest.len());
+                    for (offset, sibling) in moved.iter().cloned().enumerate() {
+                        dest.insert(slot + offset, sibling);
+                    }
+                    set_displayed_siblings(pool, source, source_parent, source_siblings, version)?;
+                    set_displayed_siblings(
+                        pool,
+                        source,
+                        destination_parent,
+                        dest.clone(),
+                        version,
+                    )?;
+                    output = targets_for_block(&dest, slot, moved.len(), destination_parent);
+                }
+                Ok(())
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(output)
+}
+
+/// Check a block move using the same validation and fit rules as execution,
+/// without changing the supplied project.
+pub fn validate_move_placements(
+    project: &EditorProject,
+    targets: &[PlacementTarget],
+    destination_parent: u16,
+    insertion_index: Option<usize>,
+    coordinate_delta: (i32, i32),
+) -> Result<(), String> {
+    let mut preview = project.canvas_preview_copy();
+    move_placements(
+        &mut preview,
+        targets,
+        destination_parent,
+        insertion_index,
+        coordinate_delta,
+    )
+    .map(|_| ())
+}
+
+fn targets_for_block(
+    siblings: &[DisplayedSibling],
+    slot: usize,
+    count: usize,
+    parent_id: u16,
+) -> Vec<PlacementTarget> {
+    let mut primitive_index = 0usize;
+    let mut output = Vec::new();
+    for (display_index, sibling) in siblings.iter().enumerate() {
+        if display_index >= slot && display_index < slot + count {
+            output.push(match sibling {
+                DisplayedSibling::Primitive(_) => PlacementTarget::Primitive {
+                    parent_id,
+                    child_index: primitive_index,
+                },
+                DisplayedSibling::Component(instance) => PlacementTarget::Component {
+                    instance_id: instance.id,
+                },
+            });
+        }
+        if matches!(sibling, DisplayedSibling::Primitive(_)) {
+            primitive_index += 1;
+        }
+    }
+    output
+}
+
+impl PlacementTarget {
+    fn parent_id(&self, project: &EditorProject) -> Result<u16, String> {
+        match self {
+            Self::Primitive {
+                parent_id,
+                child_index,
+            } => {
+                if *child_index
+                    >= child_placements(project.get_pool(), *parent_id)
+                        .map_err(|e| e.to_string())?
+                        .len()
+                {
+                    return Err("Selected occurrence no longer exists".into());
+                }
+                Ok(*parent_id)
+            }
+            Self::Component { instance_id } => project
+                .component_source()
+                .instances
+                .iter()
+                .find(|i| i.id == *instance_id)
+                .map(|i| match i.parent {
+                    EditorParentRef::Primitive(id) => id,
+                })
+                .ok_or_else(|| "Selected component no longer exists".into()),
+        }
+    }
+}
+
+fn sibling_matches_target(
+    siblings: &[DisplayedSibling],
+    display_index: usize,
+    target: &PlacementTarget,
+) -> bool {
+    let Some(sibling) = siblings.get(display_index) else {
+        return false;
+    };
+    match (sibling, target) {
+        (DisplayedSibling::Primitive(_), PlacementTarget::Primitive { child_index, .. }) => {
+            siblings[..display_index]
+                .iter()
+                .filter(|s| matches!(s, DisplayedSibling::Primitive(_)))
+                .count()
+                == *child_index
+        }
+        (DisplayedSibling::Component(i), PlacementTarget::Component { instance_id }) => {
+            i.id == *instance_id
+        }
+        _ => false,
+    }
+}
+
+fn displayed_position(sibling: &DisplayedSibling) -> (i16, i16) {
+    match sibling {
+        DisplayedSibling::Primitive(p) => (p.x, p.y),
+        DisplayedSibling::Component(i) => (i.x as i16, i.y as i16),
+    }
+}
+
+fn occurrence_size(
+    pool: &ObjectPool,
+    object: &ag_iso_stack::object_pool::object::Object,
+    soft_key_size: (u16, u16),
+) -> (i32, i32) {
+    let bounds = crate::layout_containment::bounds_for_object_with_soft_key_size(
+        pool,
+        object,
+        Some(soft_key_size),
+    );
+    (bounds.width, bounds.height)
+}
+
+fn displayed_child_id(
+    sibling: &DisplayedSibling,
+    materialized: &crate::components::MaterializedProject,
+    source: &ComponentSource,
+) -> Result<u16, String> {
+    match sibling {
+        DisplayedSibling::Primitive(p) => {
+            target_id(&p.child).ok_or_else(|| "Selected child has no object ID".into())
+        }
+        DisplayedSibling::Component(instance) => {
+            let definition = source
+                .definitions
+                .get(&instance.component_id)
+                .ok_or("Missing component definition")?;
+            materialized
+                .source_map
+                .by_component_node
+                .get(&(instance.id, definition.root_node))
+                .copied()
+                .ok_or_else(|| "Missing component root".into())
+        }
+    }
+}
+
+fn same_displayed_siblings(left: &[DisplayedSibling], right: &[DisplayedSibling]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter().zip(right).all(|(a, b)| match (a, b) {
+        (DisplayedSibling::Primitive(a), DisplayedSibling::Primitive(b)) => {
+            a.child == b.child && a.x == b.x && a.y == b.y
+        }
+        (DisplayedSibling::Component(a), DisplayedSibling::Component(b)) => {
+            a.id == b.id && a.x == b.x && a.y == b.y
+        }
+        _ => false,
+    })
 }
 
 fn normalize_touched_targets(targets: &mut [PlacementTarget], removals: &[PlacementTarget]) {
@@ -1171,7 +1953,10 @@ fn invalid_placement() -> ComponentError {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply, position, CanvasEdit, PlacementTarget};
+    use super::{
+        apply, group_placements, hierarchy_path_after_removals, move_placements, position,
+        CanvasEdit, PlacementTarget,
+    };
     use crate::{default_object, EditorProject};
     use ag_iso_stack::object_pool::{
         object::{Object, PictureGraphic},
@@ -1444,5 +2229,410 @@ mod tests {
             line_geometry(&project),
             (50, 40, LineDirection::BottomLeftToTopRight)
         );
+    }
+
+    #[test]
+    fn grouping_preserves_selected_positions_and_is_one_undoable_change() {
+        let mut pool = ObjectPool::new();
+        pool.add(with_id(ObjectType::DataMask, 1));
+        for id in 2..=3 {
+            let mut rect = with_id(ObjectType::OutputRectangle, id);
+            if let Object::OutputRectangle(rect) = &mut rect {
+                rect.width = 12;
+                rect.height = 8;
+            }
+            pool.add(rect);
+            add_child(&mut pool, 1, id);
+        }
+        if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(1).unwrap()) {
+            mask.object_refs[0].offset = Point { x: 20, y: 30 };
+            mask.object_refs[1].offset = Point { x: 60, y: 40 };
+        }
+        let mut project = EditorProject::from(pool);
+        project.mask_size = 500;
+        let grouped = group_placements(
+            &mut project,
+            &[
+                PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index: 0,
+                },
+                PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index: 1,
+                },
+            ],
+            ObjectType::Container,
+            "Grouped",
+        )
+        .unwrap();
+        let PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index,
+        } = grouped
+        else {
+            panic!("expected a primitive group occurrence");
+        };
+        let group_id = match project
+            .get_pool()
+            .object_by_id(ObjectId::new(1).unwrap())
+            .unwrap()
+        {
+            Object::DataMask(mask) => mask.object_refs[child_index].id.value(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            position(
+                &project,
+                &PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index
+                }
+            ),
+            Some((20, 30))
+        );
+        match project
+            .get_pool()
+            .object_by_id(ObjectId::new(group_id).unwrap())
+            .unwrap()
+        {
+            Object::Container(container) => {
+                assert_eq!((container.width, container.height), (52, 18));
+                assert_eq!(
+                    container
+                        .object_refs
+                        .iter()
+                        .map(|r| (r.id.value(), r.offset.x, r.offset.y))
+                        .collect::<Vec<_>>(),
+                    vec![(2, 0, 0), (3, 40, 10)]
+                );
+            }
+            _ => panic!("expected a Container"),
+        }
+        assert!(project.undo_operation());
+        assert_eq!(mask_child_count(&project), 2);
+        assert!(project.redo_operation());
+        assert_eq!(mask_child_count(&project), 1);
+    }
+
+    #[test]
+    fn moving_noncontiguous_siblings_reorders_them_as_a_block() {
+        let mut pool = ObjectPool::new();
+        pool.add(with_id(ObjectType::DataMask, 1));
+        for id in 2..=4 {
+            pool.add(with_id(ObjectType::OutputRectangle, id));
+            add_child(&mut pool, 1, id);
+        }
+        let mut project = EditorProject::from(pool);
+        project.mask_size = 500;
+        move_placements(
+            &mut project,
+            &[
+                PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index: 0,
+                },
+                PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index: 2,
+                },
+            ],
+            1,
+            Some(2),
+            (0, 0),
+        )
+        .unwrap();
+        let ids = match project
+            .get_pool()
+            .object_by_id(ObjectId::new(1).unwrap())
+            .unwrap()
+        {
+            Object::DataMask(mask) => mask
+                .object_refs
+                .iter()
+                .map(|r| r.id.value())
+                .collect::<Vec<_>>(),
+            _ => unreachable!(),
+        };
+        assert_eq!(ids, vec![3, 2, 4]);
+        assert!(project.undo_operation());
+        let restored = match project
+            .get_pool()
+            .object_by_id(ObjectId::new(1).unwrap())
+            .unwrap()
+        {
+            Object::DataMask(mask) => mask
+                .object_refs
+                .iter()
+                .map(|r| r.id.value())
+                .collect::<Vec<_>>(),
+            _ => unreachable!(),
+        };
+        assert_eq!(restored, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn one_occurrence_can_be_grouped_under_a_button_with_content_inset() {
+        let mut pool = ObjectPool::new();
+        pool.add(with_id(ObjectType::DataMask, 1));
+        let mut rect = with_id(ObjectType::OutputRectangle, 2);
+        if let Object::OutputRectangle(rect) = &mut rect {
+            rect.width = 12;
+            rect.height = 8;
+        }
+        pool.add(rect);
+        add_child(&mut pool, 1, 2);
+        if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(1).unwrap()) {
+            mask.object_refs[0].offset = Point { x: 10, y: 12 };
+        }
+        let mut project = EditorProject::from(pool);
+        project.mask_size = 500;
+        let grouped = group_placements(
+            &mut project,
+            &[PlacementTarget::Primitive {
+                parent_id: 1,
+                child_index: 0,
+            }],
+            ObjectType::Button,
+            "Single child",
+        )
+        .unwrap();
+        let PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index,
+        } = grouped
+        else {
+            panic!("expected a primitive group occurrence");
+        };
+        let group_id = match project
+            .get_pool()
+            .object_by_id(ObjectId::new(1).unwrap())
+            .unwrap()
+        {
+            Object::DataMask(mask) => mask.object_refs[child_index].id.value(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            position(
+                &project,
+                &PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index
+                }
+            ),
+            Some((6, 8))
+        );
+        match project
+            .get_pool()
+            .object_by_id(ObjectId::new(group_id).unwrap())
+            .unwrap()
+        {
+            Object::Button(button) => {
+                assert_eq!((button.width, button.height), (20, 16));
+                assert_eq!(
+                    (
+                        button.object_refs[0].offset.x,
+                        button.object_refs[0].offset.y
+                    ),
+                    (0, 0)
+                );
+            }
+            _ => panic!("expected a Button"),
+        }
+        assert_eq!(
+            crate::canvas::edits::hierarchy_child_origin(&project, 1, &[0]).unwrap(),
+            egui::pos2(10.0, 12.0)
+        );
+    }
+
+    #[test]
+    fn compatible_animation_can_group_positioned_children() {
+        let mut pool = ObjectPool::new();
+        pool.add(with_id(ObjectType::DataMask, 1));
+        let mut rect = with_id(ObjectType::OutputRectangle, 2);
+        if let Object::OutputRectangle(rect) = &mut rect {
+            rect.width = 12;
+            rect.height = 8;
+        }
+        pool.add(rect);
+        add_child(&mut pool, 1, 2);
+        let mut project = EditorProject::from(pool);
+        project.mask_size = 500;
+        let candidates = super::grouping_candidates(
+            &project,
+            &[PlacementTarget::Primitive {
+                parent_id: 1,
+                child_index: 0,
+            }],
+        );
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.object_type == ObjectType::Animation));
+        let grouped = group_placements(
+            &mut project,
+            &[PlacementTarget::Primitive {
+                parent_id: 1,
+                child_index: 0,
+            }],
+            ObjectType::Animation,
+            "Animation parent",
+        )
+        .unwrap();
+        let PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index,
+        } = grouped
+        else {
+            panic!("expected a primitive group occurrence");
+        };
+        let group_id = match project
+            .get_pool()
+            .object_by_id(ObjectId::new(1).unwrap())
+            .unwrap()
+        {
+            Object::DataMask(mask) => mask.object_refs[child_index].id.value(),
+            _ => unreachable!(),
+        };
+        match project
+            .get_pool()
+            .object_by_id(ObjectId::new(group_id).unwrap())
+            .unwrap()
+        {
+            Object::Animation(animation) => {
+                assert_eq!((animation.width, animation.height), (12, 8));
+                assert_eq!(
+                    (animation.first_child_index, animation.last_child_index),
+                    (0, 0)
+                );
+                assert_eq!(animation.object_refs[0].id.value(), 2);
+            }
+            _ => panic!("expected an Animation"),
+        }
+    }
+
+    #[test]
+    fn hierarchy_destination_path_accounts_for_multiple_removed_siblings() {
+        let mut pool = ObjectPool::new();
+        pool.add(with_id(ObjectType::DataMask, 1));
+        for id in 2..=5 {
+            pool.add(with_id(ObjectType::Container, id));
+        }
+        add_child(&mut pool, 1, 2);
+        add_child(&mut pool, 1, 3);
+        add_child(&mut pool, 1, 4);
+        add_child(&mut pool, 4, 5);
+        let project = EditorProject::from(pool);
+        let adjusted = hierarchy_path_after_removals(
+            &project,
+            1,
+            &[0, 2, 0],
+            &[
+                PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index: 0,
+                },
+                PlacementTarget::Primitive {
+                    parent_id: 1,
+                    child_index: 1,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(adjusted, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn grouping_candidates_reject_designators_that_are_too_small_for_the_selection() {
+        let mut pool = ObjectPool::new();
+        pool.add(with_id(ObjectType::DataMask, 1));
+        let mut rect = with_id(ObjectType::OutputRectangle, 2);
+        if let Object::OutputRectangle(rect) = &mut rect {
+            rect.width = 150;
+            rect.height = 90;
+        }
+        pool.add(rect);
+        add_child(&mut pool, 1, 2);
+        let mut project = EditorProject::from(pool);
+        project.mask_size = 500;
+        project.set_design_dimensions(500, (100, 80)).unwrap();
+
+        let candidates = super::grouping_candidates(
+            &project,
+            &[PlacementTarget::Primitive {
+                parent_id: 1,
+                child_index: 0,
+            }],
+        );
+        for object_type in [ObjectType::WorkingSet, ObjectType::AuxiliaryFunctionType2] {
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.object_type == object_type)
+                .expect("the compatible designator type should be offered");
+            assert!(!candidate.enabled);
+            assert!(candidate.reason.as_deref().unwrap().contains("do not fit"));
+        }
+    }
+
+    #[test]
+    fn grouping_designator_must_fit_inside_the_current_mask() {
+        let mut pool = ObjectPool::new();
+        pool.add(with_id(ObjectType::DataMask, 1));
+        let mut rect = with_id(ObjectType::OutputRectangle, 2);
+        if let Object::OutputRectangle(rect) = &mut rect {
+            rect.width = 10;
+            rect.height = 10;
+        }
+        pool.add(rect);
+        add_child(&mut pool, 1, 2);
+        if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(1).unwrap()) {
+            mask.object_refs[0].offset = Point { x: 490, y: 0 };
+        }
+        let mut project = EditorProject::from(pool);
+        project.set_design_dimensions(500, (100, 80)).unwrap();
+        let target = PlacementTarget::Primitive {
+            parent_id: 1,
+            child_index: 0,
+        };
+
+        let mut interior = project.clone();
+        apply(
+            &mut interior,
+            "Move selection inside mask",
+            &[CanvasEdit::Move {
+                target: target.clone(),
+                x: 0,
+                y: 0,
+            }],
+        )
+        .unwrap();
+        let interior_candidates =
+            super::grouping_candidates(&interior, std::slice::from_ref(&target));
+        let candidates = super::grouping_candidates(&project, std::slice::from_ref(&target));
+        for object_type in [ObjectType::WorkingSet, ObjectType::AuxiliaryFunctionType2] {
+            assert!(
+                interior_candidates
+                    .iter()
+                    .find(|candidate| candidate.object_type == object_type)
+                    .expect("the compatible designator type should be offered")
+                    .enabled
+            );
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.object_type == object_type)
+                .expect("the compatible designator type should be offered");
+            assert!(!candidate.enabled);
+        }
+
+        let before_pool = project.get_pool().clone();
+        let before_source = project.component_source().clone();
+        assert!(group_placements(
+            &mut project,
+            &[target],
+            ObjectType::WorkingSet,
+            "Off-screen designator",
+        )
+        .is_err());
+        assert_eq!(project.get_pool(), &before_pool);
+        assert_eq!(project.component_source(), &before_source);
     }
 }

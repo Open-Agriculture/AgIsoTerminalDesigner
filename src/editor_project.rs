@@ -768,6 +768,7 @@ impl EditorProject {
             self.mask_size,
             self.soft_key_size,
             self.soft_key_size,
+            self.vt_version,
         )
         .map_err(containment_component_error)?;
         after
@@ -2406,6 +2407,7 @@ impl EditorProject {
             self.mask_size,
             &id_changes,
             Some((self.soft_key_size, self.soft_key_size)),
+            self.vt_version,
         )
         .map_err(|error| {
             crate::operations::executor::containment_transaction_error(error, &prepared.object_info)
@@ -2791,6 +2793,7 @@ impl EditorProject {
             candidate.mask_size,
             &id_changes,
             Some((self.soft_key_size, candidate.soft_key_size)),
+            candidate.vt_version,
         )
         .map_err(containment_component_error)?;
         Ok(())

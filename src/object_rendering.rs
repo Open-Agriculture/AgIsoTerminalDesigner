@@ -465,13 +465,8 @@ impl RenderableObject for Button {
         //
         // The border is a VT proprietary 8-pixel area, but we must reduce face size accordingly.
         // Let's assume a uniform distribution of that 8-pixel shrinkage (4 pixels on each side).
-        let face_rect = if no_border {
-            rect
-        } else {
-            // Face is area minus 8 pixels in width and height.
-            // We'll just evenly shrink by 4 pixels on each side.
-            rect.shrink(BUTTON_BORDER_INSET)
-        };
+        let face_inset = crate::button_geometry::face_inset(self, vt_version);
+        let face_rect = rect.shrink(face_inset);
 
         let response = ui.interact(
             face_rect,

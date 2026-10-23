@@ -3,7 +3,6 @@
 use super::edits::PlacementTarget;
 use crate::{
     components::{MaterializedProject, MaterializedSource},
-    object_rendering::BUTTON_BORDER_INSET,
     operations::object_refs,
     EditorProject,
 };
@@ -154,17 +153,27 @@ impl SceneBuilder<'_> {
         );
         let (child_origin, child_parent_rect, child_clip_rect) = match rendered {
             Object::Button(_) => {
-                let face = raw_outer.shrink(BUTTON_BORDER_INSET);
-                (
-                    face.min,
-                    rect.shrink(BUTTON_BORDER_INSET),
-                    face.intersect(clip_rect),
-                )
+                let inset =
+                    crate::button_geometry::object_face_inset(rendered, self.project.vt_version);
+                let face = raw_outer.shrink(inset);
+                (face.min, rect.shrink(inset), face.intersect(clip_rect))
             }
             Object::Container(_) => (origin, rect, raw_outer.intersect(clip_rect)),
-            Object::Key(_) | Object::AuxiliaryFunctionType2(_) | Object::AuxiliaryInputType2(_) => {
-                (origin, clip_rect, clip_rect)
+            Object::WorkingSet(_)
+            | Object::AuxiliaryFunctionType1(_)
+            | Object::AuxiliaryInputType1(_)
+            | Object::AuxiliaryFunctionType2(_)
+            | Object::AuxiliaryInputType2(_) => {
+                let (width, height) = self.project.soft_key_size();
+                let designator_rect =
+                    egui::Rect::from_min_size(origin, egui::vec2(width as f32, height as f32));
+                (
+                    origin,
+                    designator_rect,
+                    designator_rect.intersect(clip_rect),
+                )
             }
+            Object::Key(_) => (origin, clip_rect, clip_rect),
             _ if is_root => (origin, rect, raw_outer.intersect(clip_rect)),
             _ => (clip_rect.min, clip_rect, clip_rect),
         };
@@ -267,7 +276,15 @@ impl SceneBuilder<'_> {
     }
 
     fn size_of(&self, object: &Object, visiting: &mut HashSet<u16>) -> (u16, u16) {
-        if matches!(object, Object::Key(_)) {
+        if matches!(
+            object,
+            Object::Key(_)
+                | Object::WorkingSet(_)
+                | Object::AuxiliaryFunctionType1(_)
+                | Object::AuxiliaryInputType1(_)
+                | Object::AuxiliaryFunctionType2(_)
+                | Object::AuxiliaryInputType2(_)
+        ) {
             return self.project.soft_key_size();
         }
         if let Some(size) = object.as_sized_object() {
@@ -343,8 +360,87 @@ fn visible_children(object: &Object) -> Option<&[ag_iso_stack::object_pool::Obje
         | Object::Container(_)
         | Object::Button(_)
         | Object::Key(_)
+        | Object::AuxiliaryFunctionType1(_)
+        | Object::AuxiliaryInputType1(_)
         | Object::AuxiliaryFunctionType2(_)
         | Object::AuxiliaryInputType2(_) => object_refs(object),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ag_iso_stack::object_pool::{object_attributes::Point, ObjectPool, ObjectRef, ObjectType};
+
+    #[test]
+    fn designator_children_keep_their_canvas_origin_and_clip_to_soft_key_size() {
+        for parent_type in [
+            ObjectType::WorkingSet,
+            ObjectType::AuxiliaryFunctionType1,
+            ObjectType::AuxiliaryInputType1,
+            ObjectType::AuxiliaryFunctionType2,
+            ObjectType::AuxiliaryInputType2,
+        ] {
+            let mut pool = ObjectPool::default();
+            for (id, object_type) in [
+                (2, ObjectType::DataMask),
+                (100, parent_type),
+                (101, ObjectType::OutputRectangle),
+            ] {
+                let mut object = crate::default_object(object_type);
+                object.mut_id().set_value(id).unwrap();
+                pool.add(object);
+            }
+            if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(2).unwrap()) {
+                mask.object_refs.push(ObjectRef {
+                    id: ObjectId::new(100).unwrap(),
+                    offset: Point { x: 80, y: 60 },
+                });
+            }
+            if let Some(parent) = pool.object_mut_by_id(ObjectId::new(100).unwrap()) {
+                object_refs_mut(parent).unwrap().push(ObjectRef {
+                    id: ObjectId::new(101).unwrap(),
+                    offset: Point { x: 5, y: 6 },
+                });
+            }
+
+            let mut project = EditorProject::from(pool);
+            project.mask_size = 500;
+            let soft_key_size = project.soft_key_size();
+            let materialized = project.materialize_shared().unwrap();
+            let scene = build_page(&project, &materialized, 2, 0);
+            let designator = scene
+                .items
+                .iter()
+                .find(|item| item.object_id == 100)
+                .unwrap();
+            let child = scene
+                .items
+                .iter()
+                .find(|item| item.object_id == 101)
+                .unwrap();
+            let expected_parent = egui::Rect::from_min_size(
+                egui::pos2(80.0, 60.0),
+                egui::vec2(soft_key_size.0 as f32, soft_key_size.1 as f32),
+            );
+            assert_eq!(designator.rect, expected_parent);
+            assert_eq!(child.rect.min, egui::pos2(85.0, 66.0));
+            assert_eq!(child.parent_rect, expected_parent);
+            assert_eq!(child.hit_rect, child.rect.intersect(expected_parent));
+        }
+    }
+
+    fn object_refs_mut(
+        object: &mut Object,
+    ) -> Option<&mut Vec<ag_iso_stack::object_pool::ObjectRef>> {
+        match object {
+            Object::WorkingSet(value) => Some(&mut value.object_refs),
+            Object::AuxiliaryFunctionType1(value) => Some(&mut value.object_refs),
+            Object::AuxiliaryInputType1(value) => Some(&mut value.object_refs),
+            Object::AuxiliaryFunctionType2(value) => Some(&mut value.object_refs),
+            Object::AuxiliaryInputType2(value) => Some(&mut value.object_refs),
+            _ => None,
+        }
     }
 }

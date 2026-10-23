@@ -1,5 +1,5 @@
 use ag_iso_stack::object_pool::{
-    object::Object, object_attributes::FontType, ObjectId, ObjectPool, ObjectRef, ObjectType,
+    ObjectId, ObjectPool, ObjectRef, ObjectType, object::Object, object_attributes::FontType,
 };
 use ag_iso_terminal_designer::operations::object_refs;
 use ag_iso_terminal_designer::{components::*, *};
@@ -19,6 +19,14 @@ fn fixture_with_sibling(sibling: bool) -> EditorProject {
 }
 
 fn fixture_with_options(sibling: bool, sibling_first: bool) -> EditorProject {
+    fixture_with_extra(sibling, sibling_first, false)
+}
+
+fn fixture_with_destination() -> EditorProject {
+    fixture_with_extra(true, false, true)
+}
+
+fn fixture_with_extra(sibling: bool, sibling_first: bool, destination: bool) -> EditorProject {
     let mut pool = ObjectPool::default();
     for (id, ty) in [
         (2, ObjectType::DataMask),
@@ -29,6 +37,17 @@ fn fixture_with_options(sibling: bool, sibling_first: bool) -> EditorProject {
         let mut object = default_object(ty);
         object.mut_id().set_value(id).unwrap();
         pool.add(object);
+    }
+    if destination {
+        for (id, width, height) in [(104, 220, 120), (105, 20, 20)] {
+            let mut object = default_object(ObjectType::Container);
+            object.mut_id().set_value(id).unwrap();
+            if let Object::Container(container) = &mut object {
+                container.width = width;
+                container.height = height;
+            }
+            pool.add(object);
+        }
     }
     if sibling {
         let mut object = default_object(ObjectType::OutputString);
@@ -51,6 +70,14 @@ fn fixture_with_options(sibling: bool, sibling_first: bool) -> EditorProject {
                 id: ObjectId::new(103).unwrap(),
                 offset: ag_iso_stack::object_pool::object_attributes::Point { x: 40, y: 60 },
             });
+        }
+        if destination {
+            for id in [104, 105] {
+                mask.object_refs.push(ObjectRef {
+                    id: ObjectId::new(id).unwrap(),
+                    offset: ag_iso_stack::object_pool::object_attributes::Point { x: 0, y: 0 },
+                });
+            }
         }
     }
     if let Some(Object::Button(button)) = pool.object_mut_by_id(ObjectId::new(100).unwrap()) {
@@ -126,7 +153,7 @@ fn capture_preserves_domain_output_and_is_undoable() {
 
 #[test]
 fn hierarchy_reorders_component_roots_with_primitive_siblings() {
-    use ag_iso_terminal_designer::canvas::edits::{position, reparent_at_index, PlacementTarget};
+    use ag_iso_terminal_designer::canvas::edits::{PlacementTarget, position, reparent_at_index};
 
     let mut p = fixture_with_sibling(true);
     let plan = plan_component_capture(&p, 100, "Primary Button".into()).unwrap();
@@ -201,8 +228,146 @@ fn hierarchy_reorders_component_roots_with_primitive_siblings() {
 }
 
 #[test]
+fn grouping_mixed_component_and_primitive_siblings_preserves_identity_and_order() {
+    use ag_iso_terminal_designer::canvas::edits::{PlacementTarget, group_placements};
+
+    let mut p = fixture_with_destination();
+    let plan = plan_component_capture(&p, 100, "Primary Button".into()).unwrap();
+    let component = plan.definition.id;
+    let instance_id =
+        ComponentService::create_component_from_selection(&mut p, plan, false).unwrap();
+    let instance_target = PlacementTarget::Component { instance_id };
+    let primitive_target = PlacementTarget::Primitive {
+        parent_id: 2,
+        child_index: 0,
+    };
+
+    let grouped = group_placements(
+        &mut p,
+        &[instance_target, primitive_target],
+        ObjectType::Container,
+        "Mixed group",
+    )
+    .unwrap();
+    let PlacementTarget::Primitive {
+        parent_id: 2,
+        child_index,
+    } = grouped
+    else {
+        panic!("expected a primitive group occurrence");
+    };
+    let group_id = object_refs(
+        p.get_pool()
+            .object_by_id(ObjectId::new(2).unwrap())
+            .unwrap(),
+    )
+    .unwrap()[child_index]
+        .id
+        .value();
+    let instance = p
+        .component_source()
+        .instances
+        .iter()
+        .find(|instance| instance.id == instance_id)
+        .unwrap();
+    assert_eq!(instance.component_id, component);
+    assert_eq!(instance.parent, EditorParentRef::Primitive(group_id));
+    assert_eq!((instance.x, instance.y), (0, 0));
+    let definition = &p.component_source().definitions[&component];
+    let compiled_root = instance.compiled_ids[&definition.root_node];
+    let group = p.materialize().unwrap();
+    let grouped_refs = object_refs(
+        group
+            .pool
+            .object_by_id(ObjectId::new(group_id).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        grouped_refs
+            .iter()
+            .map(|r| (r.id.value(), r.offset.x, r.offset.y))
+            .collect::<Vec<_>>(),
+        vec![(compiled_root, 0, 0), (103, 30, 40)]
+    );
+    let mask_refs = object_refs(
+        p.get_pool()
+            .object_by_id(ObjectId::new(2).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        mask_refs.iter().map(|r| r.id.value()).collect::<Vec<_>>(),
+        vec![group_id, 104, 105]
+    );
+}
+
+#[test]
+fn batch_reparent_preserves_mixed_positions_and_rejects_overflow_atomically() {
+    use ag_iso_terminal_designer::canvas::edits::{PlacementTarget, move_placements, position};
+
+    let mut p = fixture_with_destination();
+    let plan = plan_component_capture(&p, 100, "Primary Button".into()).unwrap();
+    let instance_id =
+        ComponentService::create_component_from_selection(&mut p, plan, false).unwrap();
+    let component_target = PlacementTarget::Component { instance_id };
+    let primitive_target = PlacementTarget::Primitive {
+        parent_id: 2,
+        child_index: 0,
+    };
+    let before_component = position(&p, &component_target).unwrap();
+    let before_primitive = position(&p, &primitive_target).unwrap();
+    let moved = move_placements(
+        &mut p,
+        &[component_target.clone(), primitive_target],
+        104,
+        None,
+        (0, 0),
+    )
+    .unwrap();
+    assert_eq!(position(&p, &component_target), Some(before_component));
+    let primitive_after = moved
+        .iter()
+        .find(|target| matches!(target, PlacementTarget::Primitive { .. }))
+        .unwrap();
+    assert_eq!(position(&p, primitive_after), Some(before_primitive));
+    let instance = p
+        .component_source()
+        .instances
+        .iter()
+        .find(|instance| instance.id == instance_id)
+        .unwrap();
+    assert_eq!(instance.parent, EditorParentRef::Primitive(104));
+    assert_eq!(instance.child_index, Some(0));
+    let destination_refs = object_refs(
+        p.get_pool()
+            .object_by_id(ObjectId::new(104).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        destination_refs
+            .iter()
+            .map(|r| r.id.value())
+            .collect::<Vec<_>>(),
+        vec![103]
+    );
+
+    let before_pool = objects_by_id(p.get_pool());
+    let before_source = p.component_source().clone();
+    assert!(move_placements(&mut p, &moved, 105, None, (0, 0)).is_err());
+    assert_eq!(objects_by_id(p.get_pool()), before_pool);
+    assert_eq!(p.component_source(), &before_source);
+    assert!(p.undo_operation());
+    assert_eq!(
+        p.component_source().instances[0].parent,
+        EditorParentRef::Primitive(2)
+    );
+}
+
+#[test]
 fn hierarchy_destination_path_shifts_after_removing_an_earlier_ancestor_sibling() {
-    use ag_iso_terminal_designer::canvas::edits::{hierarchy_path_after_removal, PlacementTarget};
+    use ag_iso_terminal_designer::canvas::edits::{PlacementTarget, hierarchy_path_after_removal};
 
     let p = fixture_with_options(true, true);
     let source = PlacementTarget::Primitive {
@@ -408,10 +573,12 @@ fn reassignment_includes_compiled_nodes_and_round_trips_as_one_change() {
     assert_eq!(compiled.parent, EditorParentRef::Primitive(mappings[&2]));
     let materialized = project.materialize().unwrap();
     for old in [2, 100, 101, 102] {
-        assert!(materialized
-            .pool
-            .object_by_id(ObjectId::new(mappings[&old]).unwrap())
-            .is_some());
+        assert!(
+            materialized
+                .pool
+                .object_by_id(ObjectId::new(mappings[&old]).unwrap())
+                .is_some()
+        );
     }
     let after = project.save_project().unwrap();
     assert!(project.undo_operation());

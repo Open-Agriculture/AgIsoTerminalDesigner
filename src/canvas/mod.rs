@@ -9,4 +9,4 @@ mod softkeys;
 mod ui;
 
 pub use mask_view::MaskViewState;
-pub use ui::CanvasState;
+pub use ui::{CanvasState, HierarchyOccurrence};

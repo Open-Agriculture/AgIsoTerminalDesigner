@@ -20,7 +20,9 @@ use ag_iso_stack::object_pool::ObjectId;
 use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectType;
 use ag_iso_terminal_designer::canvas::{
-    edits::PlacementTarget, mask_view::MaskViewState, CanvasState,
+    edits::{self, PlacementTarget},
+    mask_view::MaskViewState,
+    CanvasState, HierarchyOccurrence,
 };
 use ag_iso_terminal_designer::components::{EditorParentRef, EditorSelection};
 use ag_iso_terminal_designer::render_property_editor;
@@ -44,6 +46,225 @@ use wasm_bindgen::{closure::Closure, JsCast as _};
 const OBJECT_HIERARCHY_ID: &str = "object_hierarchy_ui";
 const SELECTED_ANCESTRY_HIERARCHY_ID: &str = "selected_ancestry_hierarchy_ui";
 
+#[derive(Clone, Default)]
+struct HierarchyFrameSelection {
+    session: uuid::Uuid,
+    revision: u64,
+    occurrences: Vec<HierarchyOccurrence>,
+}
+
+#[derive(Clone)]
+struct HierarchyClick {
+    root: u16,
+    path: Vec<usize>,
+    modifiers: egui::Modifiers,
+    right_click: bool,
+}
+
+#[derive(Clone)]
+struct GroupRequest {
+    session: uuid::Uuid,
+    revision: u64,
+    root: u16,
+    parent_path: Vec<usize>,
+    targets: Vec<PlacementTarget>,
+    object_type: ObjectType,
+}
+
+#[derive(Clone)]
+struct HierarchyDragSelection {
+    session: uuid::Uuid,
+    revision: u64,
+    targets: Vec<PlacementTarget>,
+    valid: bool,
+}
+
+struct PendingHierarchySelection {
+    session: uuid::Uuid,
+    revision: u64,
+    root: u16,
+    parent_path: Vec<usize>,
+    targets: Vec<PlacementTarget>,
+}
+
+impl PendingHierarchySelection {
+    fn new(
+        project: &EditorProject,
+        root: u16,
+        parent_path: Vec<usize>,
+        targets: Vec<PlacementTarget>,
+    ) -> Self {
+        Self {
+            session: project.ui_session_id(),
+            revision: project.revision(),
+            root,
+            parent_path,
+            targets,
+        }
+    }
+
+    fn is_current(&self, project: &EditorProject) -> bool {
+        self.session == project.ui_session_id() && self.revision == project.revision()
+    }
+}
+
+fn hierarchy_selection_snapshot(ui: &egui::Ui) -> HierarchyFrameSelection {
+    ui.data(|data| data.get_temp(egui::Id::new("hierarchy_frame_selection")))
+        .unwrap_or_default()
+}
+
+fn begin_hierarchy_frame(ui: &egui::Ui, project: &EditorProject, canvas: &mut CanvasState) {
+    canvas.begin_hierarchy_frame(project.revision());
+    ui.data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new("hierarchy_frame_selection"),
+            HierarchyFrameSelection {
+                session: project.ui_session_id(),
+                revision: project.revision(),
+                occurrences: canvas.selected_hierarchy_occurrences().to_vec(),
+            },
+        )
+    });
+}
+
+fn finish_hierarchy_click(ui: &egui::Ui, project: &EditorProject, canvas: &mut CanvasState) {
+    let click = ui.data_mut(|data| {
+        let key = egui::Id::new("hierarchy_click");
+        let click = data.get_temp::<HierarchyClick>(key);
+        data.remove::<HierarchyClick>(key);
+        click
+    });
+    if let Some(click) = click {
+        canvas.hierarchy_click(
+            project,
+            click.root,
+            &click.path,
+            click.modifiers,
+            click.right_click,
+        );
+    }
+}
+
+fn hierarchy_selected(ui: &egui::Ui, root: u16, path: &[usize]) -> bool {
+    hierarchy_selection_snapshot(ui)
+        .occurrences
+        .iter()
+        .any(|row| row.root == root && row.path == path)
+}
+
+fn hierarchy_row_event(ui: &egui::Ui, response: &egui::Response, root: u16, path: &[usize]) {
+    if response.clicked() || response.secondary_clicked() || response.drag_started() {
+        ui.ctx().request_repaint();
+        if response.drag_started() && hierarchy_selected(ui, root, path) {
+            return;
+        }
+        let modifiers = if response.drag_started() {
+            egui::Modifiers::NONE
+        } else {
+            ui.input(|i| i.modifiers)
+        };
+        let right_click = response.secondary_clicked();
+        ui.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("hierarchy_click"),
+                HierarchyClick {
+                    root,
+                    path: path.to_vec(),
+                    modifiers,
+                    right_click,
+                },
+            )
+        });
+    }
+}
+
+fn hierarchy_group_menu(
+    ui: &mut egui::Ui,
+    project: &EditorProject,
+    root: u16,
+    path: &[usize],
+    source: Option<&TreeDragPayload>,
+) -> usize {
+    let snapshot = hierarchy_selection_snapshot(ui);
+    let selected = snapshot
+        .occurrences
+        .iter()
+        .any(|row| row.root == root && row.path == path);
+    let (targets, parent_path, valid, count) = if selected {
+        let rows = &snapshot.occurrences;
+        let first = rows.first();
+        let valid = first.is_some_and(|first| {
+            first.parent_path.is_some()
+                && rows.iter().all(|row| {
+                    row.root == first.root
+                        && row.parent_path == first.parent_path
+                        && row.target.is_some()
+                })
+        });
+        (
+            rows.iter()
+                .filter_map(|row| row.target.clone())
+                .collect::<Vec<_>>(),
+            first
+                .and_then(|row| row.parent_path.clone())
+                .unwrap_or_default(),
+            valid,
+            rows.len(),
+        )
+    } else {
+        (
+            source
+                .map(|source| vec![source.target.clone()])
+                .unwrap_or_default(),
+            source
+                .map(|source| source.source_parent_path.clone())
+                .unwrap_or_default(),
+            source.is_some(),
+            1,
+        )
+    };
+    if !valid {
+        ui.add_enabled(false, egui::Button::new("Create parent for object(s)"))
+            .on_disabled_hover_text("Select editable sibling occurrences under the same parent.");
+    } else {
+        ui.menu_button("Create parent for object(s)", |ui| {
+            let candidates = edits::grouping_candidates(project, &targets);
+            if candidates.is_empty() {
+                ui.add_enabled(
+                    false,
+                    egui::Label::new("No compatible parent types for this VT version"),
+                );
+            }
+            for candidate in candidates {
+                let response = ui.add_enabled(
+                    candidate.enabled,
+                    egui::Button::new(format!("{:?}", candidate.object_type)),
+                );
+                if let Some(reason) = candidate.reason {
+                    response.clone().on_disabled_hover_text(reason);
+                }
+                if response.clicked() {
+                    ui.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("hierarchy_group_request"),
+                            GroupRequest {
+                                session: project.ui_session_id(),
+                                revision: snapshot.revision,
+                                root,
+                                parent_path: parent_path.clone(),
+                                targets: targets.clone(),
+                                object_type: candidate.object_type,
+                            },
+                        )
+                    });
+                    ui.close();
+                }
+            }
+        });
+    }
+    count
+}
+
 #[derive(Clone)]
 struct TreeDragPayload {
     root: u16,
@@ -53,6 +274,7 @@ struct TreeDragPayload {
     parent_id: u16,
     occurrence_id: egui::Id,
     label: String,
+    selection: Option<HierarchyDragSelection>,
 }
 
 #[derive(Clone)]
@@ -68,6 +290,39 @@ struct TreeDropCandidate {
     edge_y: Option<f32>,
 }
 
+fn hierarchy_drag_payload(ui: &egui::Ui, source: &TreeDragPayload) -> TreeDragPayload {
+    let mut payload = source.clone();
+    let snapshot = hierarchy_selection_snapshot(ui);
+    payload.selection = Some(HierarchyDragSelection {
+        session: snapshot.session,
+        revision: snapshot.revision,
+        targets: vec![source.target.clone()],
+        valid: true,
+    });
+    if snapshot.occurrences.iter().any(|row| {
+        row.target.as_ref() == Some(&source.target)
+            && row.root == source.root
+            && row.parent_path.as_ref() == Some(&source.source_parent_path)
+    }) {
+        let valid = snapshot.occurrences.iter().all(|row| {
+            row.root == source.root
+                && row.parent_path.as_ref() == Some(&source.source_parent_path)
+                && row.target.is_some()
+        });
+        payload.selection = Some(HierarchyDragSelection {
+            session: snapshot.session,
+            revision: snapshot.revision,
+            targets: snapshot
+                .occurrences
+                .iter()
+                .filter_map(|row| row.target.clone())
+                .collect(),
+            valid,
+        });
+    }
+    payload
+}
+
 /// Collect one geometric destination; validation and commit share the same edit path.
 fn hierarchy_drag_row(
     ui: &mut egui::Ui,
@@ -76,7 +331,7 @@ fn hierarchy_drag_row(
     inside: Option<(u16, u16, Vec<usize>)>,
 ) {
     if let Some(source) = source {
-        response.dnd_set_drag_payload(source.clone());
+        response.dnd_set_drag_payload(hierarchy_drag_payload(ui, source));
     }
     let Some(dragged) = egui::DragAndDrop::payload::<TreeDragPayload>(ui.ctx()) else {
         return;
@@ -190,6 +445,8 @@ pub struct DesignerApp {
     file_channel: (Sender<FileEvent>, Receiver<FileEvent>),
     show_development_popup: bool,
     new_object_dialog: Option<(ObjectType, String)>,
+    new_object_group: Option<GroupRequest>,
+    pending_hierarchy_selection: Option<PendingHierarchySelection>,
     pending_iop_import: Option<(
         Vec<u8>,
         String,
@@ -694,6 +951,8 @@ impl DesignerApp {
             file_channel: std::sync::mpsc::channel(),
             show_development_popup: true,
             new_object_dialog: None,
+            new_object_group: None,
+            pending_hierarchy_selection: None,
             pending_iop_import: None,
             apply_smart_naming_on_import: true, // Default to true for better UX
             #[cfg(not(target_arch = "wasm32"))]
@@ -1073,6 +1332,8 @@ impl DesignerApp {
                 self.project = Some(EditorProject::new_pool());
                 self.project_display_name = "Untitled.aitp".to_owned();
                 self.new_object_dialog = None;
+                self.new_object_group = None;
+                self.pending_hierarchy_selection = None;
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     self.project_path = None;
@@ -1523,7 +1784,16 @@ fn render_selectable_object(
         }
         false
     } else {
-        let is_selected = project.get_selected() == object.id().into();
+        let occurrence_selected = drop_destination
+            .as_ref()
+            .is_some_and(|(root, _, path)| hierarchy_selected(ui, *root, path));
+        let is_selected = if drop_destination.is_some()
+            && !hierarchy_selection_snapshot(ui).occurrences.is_empty()
+        {
+            occurrence_selected
+        } else {
+            project.get_selected() == object.id().into()
+        };
         let label_text = project.object_display_name(object);
         let response = tree_row_with_highlight(
             ui,
@@ -1532,7 +1802,15 @@ fn render_selectable_object(
             primary,
             label_text,
         );
-        hierarchy_drag_row(ui, &response, drag_payload.as_ref(), drop_destination);
+        hierarchy_drag_row(
+            ui,
+            &response,
+            drag_payload.as_ref(),
+            drop_destination.clone(),
+        );
+        if let Some((root, _, path)) = &drop_destination {
+            hierarchy_row_event(ui, &response, *root, path);
+        }
 
         if response.clicked() {
             project
@@ -1553,11 +1831,24 @@ fn render_selectable_object(
         }
 
         response.context_menu(|ui| {
-            if ui.button("Rename").on_hover_text("Rename object").clicked() {
+            let count = if let Some((root, _, path)) = &drop_destination {
+                hierarchy_group_menu(ui, project, *root, path, drag_payload.as_ref())
+            } else {
+                1
+            };
+            if ui
+                .add_enabled(count == 1, egui::Button::new("Rename"))
+                .on_hover_text("Rename object")
+                .clicked()
+            {
                 project.set_renaming_object(this_ui_id, object.id(), object_info.get_name(object));
                 ui.close();
             }
-            if ui.button("Delete").on_hover_text("Delete object").clicked() {
+            if ui
+                .add_enabled(count == 1, egui::Button::new("Delete"))
+                .on_hover_text("Delete object")
+                .clicked()
+            {
                 project.request_delete_object(object.id());
                 ui.close();
             }
@@ -1678,13 +1969,30 @@ fn render_mask_object_hierarchy_inner(
         !placed.is_empty() || !component_instances.is_empty() || pointer_target.is_some();
     let occurrence_id = parent_id.with((root, path.clone()));
     let selected_id = project.get_selected().0.map(|id| id.value());
+    canvas.register_hierarchy_occurrence(HierarchyOccurrence {
+        root,
+        path: path.clone(),
+        object: id_value,
+        target: placement_source
+            .as_ref()
+            .map(|source| source.target.clone()),
+        parent_path: placement_source
+            .as_ref()
+            .map(|source| source.source_parent_path.clone()),
+    });
     let primary = canvas.hierarchy_occurrence_is_primary(project, root, path, id_value);
-    let expand = open_selection
-        && selected_id.is_some_and(|selected| {
-            selected != id_value && {
-                mask_branch_contains(project, object, selected, &mut HashSet::new())
-            }
+    let reveal = ui
+        .data(|data| data.get_temp::<(u16, Vec<usize>)>(egui::Id::new("hierarchy_reveal_path")))
+        .is_some_and(|(reveal_root, reveal_path)| {
+            reveal_root == root && reveal_path.starts_with(path)
         });
+    let expand = reveal
+        || open_selection
+            && selected_id.is_some_and(|selected| {
+                selected != id_value && {
+                    mask_branch_contains(project, object, selected, &mut HashSet::new())
+                }
+            });
 
     if has_children {
         let selected_in_header = std::cell::Cell::new(false);
@@ -1749,6 +2057,7 @@ fn render_mask_object_hierarchy_inner(
                                 open_selection,
                                 Some(TreeDragPayload {
                                     root,
+                                    selection: None,
                                     source_parent_path,
                                     sibling_index,
                                     parent_id: id_value,
@@ -1775,6 +2084,7 @@ fn render_mask_object_hierarchy_inner(
                         let component_id = occurrence_id.with(("component", instance.id));
                         let payload = TreeDragPayload {
                             root,
+                            selection: None,
                             source_parent_path: path.clone(),
                             sibling_index,
                             parent_id: id_value,
@@ -1798,6 +2108,18 @@ fn render_mask_object_hierarchy_inner(
                             state.set_open(true);
                             state.store(ui.ctx());
                         }
+                        let mut component_path = path.clone();
+                        component_path.extend([usize::MAX - 1, sibling_index]);
+                        let component_object = instance.compiled_ids[&definition.root_node];
+                        canvas.register_hierarchy_occurrence(HierarchyOccurrence {
+                            root,
+                            path: component_path.clone(),
+                            object: component_object,
+                            target: Some(payload.target.clone()),
+                            parent_path: Some(path.clone()),
+                        });
+                        let component_selected =
+                            canvas.hierarchy_occurrence_selected(root, &component_path);
                         ui.push_id(component_id, |ui| {
                             if egui::DragAndDrop::payload::<TreeDragPayload>(ui.ctx())
                                 .is_some_and(|source| source.occurrence_id == component_id)
@@ -1810,7 +2132,7 @@ fn render_mask_object_hierarchy_inner(
                                 component_id,
                                 opens_component,
                                 |ui| {
-                                    let selected =
+                                    let selected = component_selected ||
                                         matches!(project.editor_selection(),
                                             Some(EditorSelection::ComponentInstance(id))
                                             | Some(EditorSelection::ComponentNode { instance_id: id, .. })
@@ -1822,6 +2144,8 @@ fn render_mask_object_hierarchy_inner(
                                         &definition.name,
                                     );
                                     hierarchy_drag_row(ui, &row, Some(&payload), None);
+                                    hierarchy_row_event(ui, &row, root, &component_path);
+                                    row.context_menu(|ui| { hierarchy_group_menu(ui, project, root, &component_path, Some(&payload)); });
                                     header_clicked.set(row.clicked());
                                 },
                                 |ui| {
@@ -1836,7 +2160,7 @@ fn render_mask_object_hierarchy_inner(
                                             &node.name,
                                         );
                                         // A compiled node still drags its complete owning instance.
-                                        row.dnd_set_drag_payload(payload.clone());
+                                        row.dnd_set_drag_payload(hierarchy_drag_payload(ui, &payload));
                                         if row.clicked() {
                                             project
                                                 .get_mut_selected()
@@ -1855,7 +2179,7 @@ fn render_mask_object_hierarchy_inner(
                                 if let Some(slot) = softkey_slot {
                                     canvas.select_softkey_slot(project, root, slot);
                                 }
-                                canvas.select_hierarchy_placement(project, root, &payload.source_parent_path, payload.target.clone());
+
                             }
                         });
                     }
@@ -1899,7 +2223,6 @@ fn render_mask_object_hierarchy_inner(
             if let Some(slot) = softkey_slot {
                 canvas.select_softkey_slot(project, root, slot);
             }
-            canvas.select_hierarchy_object(project, root, path, id_value);
         }
     } else if render_selectable_object(
         ui,
@@ -1913,7 +2236,6 @@ fn render_mask_object_hierarchy_inner(
         if let Some(slot) = softkey_slot {
             canvas.select_softkey_slot(project, root, slot);
         }
-        canvas.select_hierarchy_object(project, root, path, id_value);
     }
     visiting.remove(&id_value);
 }
@@ -2595,10 +2917,34 @@ impl eframe::App for DesignerApp {
                 });
 
             if should_create {
-                // Create the object through the operation API so it is
-                // immediately represented in undo/redo history.
                 if let Some(pool) = &mut self.project {
-                    if let Some(id) = pool.create_object(object_type, name) {
+                    if let Some(group) = self.new_object_group.take() {
+                        let result = if pool.ui_session_id() != group.session
+                            || pool.revision() != group.revision
+                        {
+                            Err("The project changed while the parent dialog was open. Select the occurrences again.".to_owned())
+                        } else {
+                            edits::group_placements(pool, &group.targets, object_type, &name)
+                        };
+                        match result {
+                            Ok(target) => {
+                                self.canvas.select_hierarchy_placement(
+                                    pool,
+                                    group.root,
+                                    &group.parent_path,
+                                    target.clone(),
+                                );
+                                self.pending_hierarchy_selection =
+                                    Some(PendingHierarchySelection::new(
+                                        pool,
+                                        group.root,
+                                        group.parent_path,
+                                        vec![target],
+                                    ));
+                            }
+                            Err(error) => self.error_message = Some(error),
+                        }
+                    } else if let Some(id) = pool.create_object(object_type, name) {
                         pool.get_mut_selected()
                             .set(NullableObjectId::new(id.value()));
                     }
@@ -2606,6 +2952,7 @@ impl eframe::App for DesignerApp {
                 self.new_object_dialog = None;
             } else if should_cancel {
                 self.new_object_dialog = None;
+                self.new_object_group = None;
             } else {
                 // Update the name in the dialog state
                 self.new_object_dialog = Some((object_type, name));
@@ -3137,7 +3484,35 @@ impl DesignerApp {
                         );
                         ui.separator();
                     }
+                    begin_hierarchy_frame(ui, pool, &mut self.canvas);
+                    if self
+                        .pending_hierarchy_selection
+                        .as_ref()
+                        .is_some_and(|selection| !selection.is_current(pool))
+                    {
+                        self.pending_hierarchy_selection = None;
+                    }
+                    if let Some(selection) = &self.pending_hierarchy_selection {
+                        ui.data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("hierarchy_reveal_path"),
+                                (selection.root, selection.parent_path.clone()),
+                            )
+                        });
+                    }
                     render_focused_mask_hierarchy(ui, pool, &mut self.mask_view, &mut self.canvas);
+                    if let Some(selection) = self.pending_hierarchy_selection.take() {
+                        self.canvas.select_hierarchy_placements(
+                            pool,
+                            selection.root,
+                            &selection.parent_path,
+                            &selection.targets,
+                        );
+                        ui.data_mut(|data| {
+                            data.remove::<(u16, Vec<usize>)>(egui::Id::new("hierarchy_reveal_path"))
+                        });
+                    }
+                    finish_hierarchy_click(ui, pool, &mut self.canvas);
                     ui.allocate_space(ui.available_size());
                 });
             }
@@ -3335,6 +3710,43 @@ impl DesignerApp {
             let Some(project) = self.project.as_ref() else {
                 return false;
             };
+            if let Some(selection) = &payload.selection {
+                if !selection.valid
+                    || selection.session != project.ui_session_id()
+                    || selection.revision != project.revision()
+                {
+                    return false;
+                }
+                if selection.targets.len() > 1 {
+                    let same_occurrence = candidate.root == payload.root
+                        && candidate.parent_path == payload.source_parent_path;
+                    if candidate.parent_id == payload.parent_id && !same_occurrence {
+                        return false;
+                    }
+                    let delta = self
+                        .canvas
+                        .hierarchy_child_origin(project, payload.root, &payload.source_parent_path)
+                        .and_then(|source| {
+                            self.canvas
+                                .hierarchy_child_origin(
+                                    project,
+                                    candidate.root,
+                                    &candidate.parent_path,
+                                )
+                                .map(|dest| source - dest)
+                        });
+                    return delta.is_ok_and(|delta| {
+                        edits::validate_move_placements(
+                            project,
+                            &selection.targets,
+                            candidate.parent_id,
+                            candidate.insertion_index,
+                            (delta.x.round() as i32, delta.y.round() as i32),
+                        )
+                        .is_ok()
+                    });
+                }
+            }
             self.canvas
                 .validate_hierarchy_drop(
                     project,
@@ -3378,7 +3790,15 @@ impl DesignerApp {
                 .fixed_pos(position + egui::vec2(14.0, 14.0))
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.label(&payload.label);
+                        if let Some(selection) = payload
+                            .selection
+                            .as_ref()
+                            .filter(|selection| selection.targets.len() > 1)
+                        {
+                            ui.label(format!("{} occurrences", selection.targets.len()));
+                        } else {
+                            ui.label(&payload.label);
+                        }
                     });
                 });
         }
@@ -3386,6 +3806,61 @@ impl DesignerApp {
             if valid {
                 let candidate = candidate.unwrap();
                 if let Some(project) = self.project.as_mut() {
+                    if let Some(selection) = payload
+                        .selection
+                        .as_ref()
+                        .filter(|selection| selection.targets.len() > 1)
+                    {
+                        let delta = self
+                            .canvas
+                            .hierarchy_child_origin(
+                                project,
+                                payload.root,
+                                &payload.source_parent_path,
+                            )
+                            .and_then(|source| {
+                                self.canvas
+                                    .hierarchy_child_origin(
+                                        project,
+                                        candidate.root,
+                                        &candidate.parent_path,
+                                    )
+                                    .map(|dest| source - dest)
+                            });
+                        let destination_path = edits::hierarchy_path_after_removals(
+                            project,
+                            candidate.root,
+                            &candidate.parent_path,
+                            &selection.targets,
+                        );
+                        let result = destination_path
+                            .and_then(|path| delta.map(|delta| (path, delta)))
+                            .and_then(|(path, delta)| {
+                                edits::move_placements(
+                                    project,
+                                    &selection.targets,
+                                    candidate.parent_id,
+                                    candidate.insertion_index,
+                                    (delta.x.round() as i32, delta.y.round() as i32),
+                                )
+                                .map(|targets| (path, targets))
+                            });
+                        match result {
+                            Ok((path, targets)) => {
+                                self.pending_hierarchy_selection =
+                                    Some(PendingHierarchySelection::new(
+                                        project,
+                                        candidate.root,
+                                        path,
+                                        targets,
+                                    ))
+                            }
+                            Err(error) => self.error_message = Some(error),
+                        }
+                        egui::DragAndDrop::clear_payload(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
                     let parent_path =
                         ag_iso_terminal_designer::canvas::edits::hierarchy_path_after_removal(
                             project,
@@ -3439,6 +3914,17 @@ impl DesignerApp {
             });
         self.workspace.dock = dock;
         self.finish_hierarchy_drag(ctx);
+        if let Some(request) = ctx.data_mut(|data| {
+            let value = data.get_temp::<GroupRequest>(egui::Id::new("hierarchy_group_request"));
+            data.remove::<GroupRequest>(egui::Id::new("hierarchy_group_request"));
+            value
+        }) {
+            if let Some(project) = &self.project {
+                let name = project.generate_smart_name_for_new_object(request.object_type);
+                self.new_object_dialog = Some((request.object_type, name));
+                self.new_object_group = Some(request);
+            }
+        }
         if !self.canvas_visible {
             self.canvas.cancel_interaction();
         }
@@ -3486,8 +3972,8 @@ impl DesignerApp {
                             .as_ref()
                             .unwrap()
                             .generate_smart_name_for_new_object(object_type);
-                        self.new_object_dialog =
-                            Some((object_type, default_name));
+                        self.new_object_group = None;
+                        self.new_object_dialog = Some((object_type, default_name));
                         ui.close();
                     }
                 }
