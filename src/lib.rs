@@ -22,15 +22,14 @@ mod object_rendering;
 mod output_string_rendering;
 mod possible_events;
 mod preview_commands;
-pub mod replacement;
 pub mod preview_session;
 mod project_file;
+pub mod replacement;
 mod smart_naming;
 mod soft_key_layout;
 
 // Operation system and automation support
 pub mod canvas;
-mod shape_editing;
 pub mod cli;
 pub mod components;
 pub mod effective_colour;
@@ -42,6 +41,7 @@ pub mod object_picker;
 pub mod object_properties;
 pub mod operations;
 pub mod pool_validation;
+mod shape_editing;
 pub mod ui_style;
 pub mod vt_compatibility;
 pub mod vt_macro_commands;

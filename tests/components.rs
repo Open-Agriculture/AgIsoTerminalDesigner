@@ -1,5 +1,5 @@
 use ag_iso_stack::object_pool::{
-    ObjectId, ObjectPool, ObjectRef, ObjectType, object::Object, object_attributes::FontType,
+    object::Object, object_attributes::FontType, ObjectId, ObjectPool, ObjectRef, ObjectType,
 };
 use ag_iso_terminal_designer::operations::object_refs;
 use ag_iso_terminal_designer::{components::*, *};
@@ -153,7 +153,7 @@ fn capture_preserves_domain_output_and_is_undoable() {
 
 #[test]
 fn hierarchy_reorders_component_roots_with_primitive_siblings() {
-    use ag_iso_terminal_designer::canvas::edits::{PlacementTarget, position, reparent_at_index};
+    use ag_iso_terminal_designer::canvas::edits::{position, reparent_at_index, PlacementTarget};
 
     let mut p = fixture_with_sibling(true);
     let plan = plan_component_capture(&p, 100, "Primary Button".into()).unwrap();
@@ -229,7 +229,7 @@ fn hierarchy_reorders_component_roots_with_primitive_siblings() {
 
 #[test]
 fn grouping_mixed_component_and_primitive_siblings_preserves_identity_and_order() {
-    use ag_iso_terminal_designer::canvas::edits::{PlacementTarget, group_placements};
+    use ag_iso_terminal_designer::canvas::edits::{group_placements, PlacementTarget};
 
     let mut p = fixture_with_destination();
     let plan = plan_component_capture(&p, 100, "Primary Button".into()).unwrap();
@@ -304,7 +304,7 @@ fn grouping_mixed_component_and_primitive_siblings_preserves_identity_and_order(
 
 #[test]
 fn batch_reparent_preserves_mixed_positions_and_rejects_overflow_atomically() {
-    use ag_iso_terminal_designer::canvas::edits::{PlacementTarget, move_placements, position};
+    use ag_iso_terminal_designer::canvas::edits::{move_placements, position, PlacementTarget};
 
     let mut p = fixture_with_destination();
     let plan = plan_component_capture(&p, 100, "Primary Button".into()).unwrap();
@@ -367,7 +367,7 @@ fn batch_reparent_preserves_mixed_positions_and_rejects_overflow_atomically() {
 
 #[test]
 fn hierarchy_destination_path_shifts_after_removing_an_earlier_ancestor_sibling() {
-    use ag_iso_terminal_designer::canvas::edits::{PlacementTarget, hierarchy_path_after_removal};
+    use ag_iso_terminal_designer::canvas::edits::{hierarchy_path_after_removal, PlacementTarget};
 
     let p = fixture_with_options(true, true);
     let source = PlacementTarget::Primitive {
@@ -573,12 +573,10 @@ fn reassignment_includes_compiled_nodes_and_round_trips_as_one_change() {
     assert_eq!(compiled.parent, EditorParentRef::Primitive(mappings[&2]));
     let materialized = project.materialize().unwrap();
     for old in [2, 100, 101, 102] {
-        assert!(
-            materialized
-                .pool
-                .object_by_id(ObjectId::new(mappings[&old]).unwrap())
-                .is_some()
-        );
+        assert!(materialized
+            .pool
+            .object_by_id(ObjectId::new(mappings[&old]).unwrap())
+            .is_some());
     }
     let after = project.save_project().unwrap();
     assert!(project.undo_operation());
