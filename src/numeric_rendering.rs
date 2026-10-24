@@ -3,6 +3,7 @@
 use ag_iso_stack::object_pool::{
     object::{NumberVariable, Object, OutputArchedBarGraph, OutputLinearBarGraph, OutputMeter},
     object_attributes::{AxisOrientation, BarGraphType, DeflectionDirection, GrowDirection, Point},
+    vt_version::VtVersion,
     ObjectPool,
 };
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke};
@@ -14,6 +15,7 @@ pub(crate) fn render_meter(
     ui: &mut egui::Ui,
     pool: &ObjectPool,
     position: Point<i16>,
+    version: VtVersion,
 ) {
     let rect = object_rect(ui, position, object.width as f32, object.width as f32);
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
@@ -54,16 +56,16 @@ pub(crate) fn render_meter(
         }
     }
 
-    if let Some(value) =
-        variable_value(pool, object.variable_reference.0).or(Some(object.value as u32))
-    {
-        let min = object.min_value as u32;
-        let max = object.max_value as u32;
-        let Some(fraction) = (max > min)
-            .then(|| value.clamp(min, max).saturating_sub(min) as f32 / (max - min) as f32)
-        else {
-            return;
-        };
+    let value = variable_value(pool, object.variable_reference.0).unwrap_or(object.value as u32);
+    let min = object.min_value as u32;
+    let max = object.max_value as u32;
+    // Preserve the historical meter endpoint clamping on VT2/VT3.
+    let value = if max > min {
+        value.clamp(min, max)
+    } else {
+        value
+    };
+    if let Some(fraction) = value_fraction(value, min, max, version) {
         let angle = start + span * fraction;
         painter.line_segment(
             [center, point_on_arc(center, radius * 0.78, angle)],
@@ -77,6 +79,7 @@ pub(crate) fn render_linear_bar_graph(
     ui: &mut egui::Ui,
     pool: &ObjectPool,
     position: Point<i16>,
+    version: VtVersion,
 ) {
     let rect = object_rect(ui, position, object.width as f32, object.height as f32);
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
@@ -88,8 +91,12 @@ pub(crate) fn render_linear_bar_graph(
     let horizontal = object.options.axis_orientation == AxisOrientation::Horizontal;
     let grow_positive = object.options.grow_direction == GrowDirection::GrowRightUp;
     let value = variable_value(pool, object.variable_reference.0).unwrap_or(object.value as u32);
-    let value_position_fraction =
-        value_fraction(value, object.min_value as u32, object.max_value as u32);
+    let value_position_fraction = value_fraction(
+        value,
+        object.min_value as u32,
+        object.max_value as u32,
+        version,
+    );
 
     let (axis_start, axis_end) = axis_points(rect, horizontal, grow_positive);
     if object.options.draw_ticks && object.nr_of_ticks > 0 {
@@ -137,14 +144,12 @@ pub(crate) fn render_linear_bar_graph(
     if object.options.draw_target_line {
         let target = variable_value(pool, object.target_value_variable_reference.0)
             .unwrap_or(object.target_value as u32);
-        let fraction = value_fraction(target, object.min_value as u32, object.max_value as u32)
-            .unwrap_or_else(|| {
-                if target < object.min_value as u32 {
-                    0.0
-                } else {
-                    1.0
-                }
-            });
+        let fraction = target_fraction(
+            target,
+            object.min_value as u32,
+            object.max_value as u32,
+            version,
+        );
         let point = axis_start + (axis_end - axis_start) * fraction;
         let endpoints = if horizontal {
             [
@@ -174,6 +179,7 @@ pub(crate) fn render_arched_bar_graph(
     ui: &mut egui::Ui,
     pool: &ObjectPool,
     position: Point<i16>,
+    version: VtVersion,
 ) {
     let rect = object_rect(ui, position, object.width as f32, object.height as f32);
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
@@ -200,7 +206,12 @@ pub(crate) fn render_arched_bar_graph(
         direction,
     );
     let value = variable_value(pool, object.variable_reference.0).unwrap_or(object.value as u32);
-    let value_progress = value_fraction(value, object.min_value as u32, object.max_value as u32);
+    let value_progress = value_fraction(
+        value,
+        object.min_value as u32,
+        object.max_value as u32,
+        version,
+    );
     let inner_radius_x = (outer_radius_x - thickness).max(0.0);
     let inner_radius_y = (outer_radius_y - thickness).max(0.0);
 
@@ -231,14 +242,12 @@ pub(crate) fn render_arched_bar_graph(
     if object.options.draw_target_line {
         let target = variable_value(pool, object.target_value_variable_reference.0)
             .unwrap_or(object.target_value as u32);
-        let progress = value_fraction(target, object.min_value as u32, object.max_value as u32)
-            .unwrap_or_else(|| {
-                if target < object.min_value as u32 {
-                    0.0
-                } else {
-                    1.0
-                }
-            });
+        let progress = target_fraction(
+            target,
+            object.min_value as u32,
+            object.max_value as u32,
+            version,
+        );
         let angle = start + span * progress;
         painter.line_segment(
             [
@@ -290,12 +299,24 @@ fn variable_value(
         })
 }
 
-fn value_fraction(value: u32, min: u32, max: u32) -> Option<f32> {
+/// B.11.1 defines endpoint saturation and degenerate ranges from VT4 onward.
+fn value_fraction(value: u32, min: u32, max: u32, version: VtVersion) -> Option<f32> {
+    if version >= VtVersion::Version4 {
+        return Some(if max <= min {
+            0.0
+        } else {
+            (value.clamp(min, max) - min) as f32 / (max - min) as f32
+        });
+    }
     if max <= min || value < min || value > max {
         None
     } else {
         Some((value - min) as f32 / (max - min) as f32)
     }
+}
+
+fn target_fraction(value: u32, min: u32, max: u32, version: VtVersion) -> f32 {
+    value_fraction(value, min, max, version).unwrap_or(if value < min { 0.0 } else { 1.0 })
 }
 
 fn tick_fraction(index: usize, count: usize) -> f32 {
@@ -352,7 +373,15 @@ fn point_on_arc(center: Pos2, radius: f32, angle: f32) -> Pos2 {
 }
 
 fn ellipse_point(center: Pos2, radius_x: f32, radius_y: f32, angle: f32) -> Pos2 {
-    center + egui::vec2(angle.cos() * radius_x, -angle.sin() * radius_y)
+    // Intersect a ray at the specified geometric angle with the ellipse.
+    // Scaling a circle's parameter coordinates distorts angles (Figure B.8).
+    if radius_x <= 0.0 || radius_y <= 0.0 {
+        return center;
+    }
+    let direction = egui::vec2(angle.cos(), -angle.sin());
+    let distance =
+        1.0 / ((direction.x / radius_x).powi(2) + (direction.y / radius_y).powi(2)).sqrt();
+    center + direction * distance
 }
 
 fn arc_points(center: Pos2, radius: f32, start: f32, span: f32) -> Vec<Pos2> {
@@ -406,10 +435,29 @@ mod tests {
     use ag_iso_stack::object_pool::{object_attributes::OutputMeterOptions, ObjectId};
 
     #[test]
-    fn value_range_excludes_out_of_range_values_and_handles_single_tick() {
-        assert_eq!(value_fraction(15, 10, 20), Some(0.5));
-        assert_eq!(value_fraction(9, 10, 20), None);
-        assert_eq!(value_fraction(10, 10, 10), None);
+    fn value_ranges_follow_version_rules_and_handle_single_tick() {
+        for version in [VtVersion::Version2, VtVersion::Version3] {
+            assert_eq!(value_fraction(15, 10, 20, version), Some(0.5));
+            assert_eq!(value_fraction(9, 10, 20, version), None);
+            assert_eq!(value_fraction(21, 10, 20, version), None);
+            assert_eq!(value_fraction(10, 10, 10, version), None);
+            assert_eq!(target_fraction(21, 10, 20, version), 1.0);
+        }
+        for version in [
+            VtVersion::Version4,
+            VtVersion::Version5,
+            VtVersion::Version6,
+        ] {
+            assert_eq!(value_fraction(15, 10, 20, version), Some(0.5));
+            assert_eq!(value_fraction(9, 10, 20, version), Some(0.0));
+            assert_eq!(value_fraction(21, 10, 20, version), Some(1.0));
+            for value in [0, 10, 20, u32::MAX] {
+                assert_eq!(value_fraction(value, 10, 10, version), Some(0.0));
+                assert_eq!(value_fraction(value, 20, 10, version), Some(0.0));
+                assert_eq!(target_fraction(value, 10, 10, version), 0.0);
+                assert_eq!(target_fraction(value, 20, 10, version), 0.0);
+            }
+        }
         assert_eq!(tick_fraction(0, 1), 0.5);
     }
 
@@ -432,44 +480,158 @@ mod tests {
             4.0,
             10.0,
             8.0,
-            0.0,
-            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::FRAC_PI_4,
+            std::f32::consts::FRAC_PI_4,
         );
         assert!(!quads.is_empty());
-        assert_eq!(quads[0][0], ellipse_point(Pos2::ZERO, 10.0, 8.0, 0.0));
-        assert_eq!(quads[0][3], ellipse_point(Pos2::ZERO, 5.0, 4.0, 0.0));
+        for (point, rx, ry) in [(quads[0][0], 10.0, 8.0), (quads[0][3], 5.0, 4.0)] {
+            // Both boundaries meet the same geometric 45-degree ray.
+            assert!((point.x + point.y).abs() < 0.0001);
+            assert!(((point.x / rx).powi(2) + (point.y / ry).powi(2) - 1.0).abs() < 0.0001);
+        }
+    }
+
+    fn render(object: &Object, pool: &ObjectPool, version: VtVersion) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                crate::object_rendering::render_object_with_version(
+                    ui,
+                    pool,
+                    object,
+                    Point::default(),
+                    version,
+                );
+            });
+        })
+    }
+
+    fn indicator_lines(output: &egui::FullOutput, colour: Color32) -> Vec<[Pos2; 2]> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::LineSegment { points, stroke } if stroke.color == colour => {
+                    Some(*points)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
-    fn meter_preview_emits_graphics() {
-        let ctx = egui::Context::default();
-        let pool = ObjectPool::new();
-        let meter = OutputMeter {
-            id: ObjectId::new(1).unwrap(),
-            width: 80,
-            needle_colour: 12,
-            border_colour: 1,
-            arc_and_tick_colour: 0,
-            options: OutputMeterOptions {
-                draw_arc: true,
-                draw_border: true,
-                draw_ticks: true,
-                deflection_direction: DeflectionDirection::AntiClockwise,
-            },
-            nr_of_ticks: 3,
-            start_angle: 0,
-            end_angle: 90,
-            min_value: 0,
-            max_value: 100,
-            variable_reference: Default::default(),
-            value: 50,
-            macro_refs: vec![],
-        };
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                render_meter(&meter, ui, &pool, Point { x: 0, y: 0 });
-            });
-        });
-        assert!(!output.shapes.is_empty());
+    fn numeric_previews_draw_values_and_targets_at_endpoints() {
+        use ag_iso_stack::object_pool::{NullableObjectId, ObjectType};
+        let mut pool = ObjectPool::new();
+        pool.add(Object::NumberVariable(NumberVariable {
+            id: ObjectId::new(2).unwrap(),
+            value: 200,
+        }));
+        for kind in [
+            ObjectType::OutputMeter,
+            ObjectType::OutputLinearBarGraph,
+            ObjectType::OutputArchedBarGraph,
+        ] {
+            let mut object = crate::default_object(kind);
+            let reference = NullableObjectId::new(2);
+            match &mut object {
+                Object::OutputMeter(o) => {
+                    o.width = 80;
+                    o.needle_colour = 12;
+                    o.options = OutputMeterOptions {
+                        draw_arc: false,
+                        draw_border: false,
+                        draw_ticks: false,
+                        deflection_direction: DeflectionDirection::AntiClockwise,
+                    };
+                    o.start_angle = 0;
+                    o.end_angle = 45;
+                    o.min_value = 10;
+                    o.max_value = 100;
+                    o.variable_reference = reference;
+                }
+                Object::OutputLinearBarGraph(o) => {
+                    o.width = 80;
+                    o.height = 40;
+                    o.colour = 12;
+                    o.target_line_colour = 14;
+                    o.options.draw_border = false;
+                    o.options.draw_ticks = false;
+                    o.options.draw_target_line = true;
+                    o.options.bar_graph_type = BarGraphType::NotFilled;
+                    o.options.axis_orientation = AxisOrientation::Horizontal;
+                    o.options.grow_direction = GrowDirection::GrowRightUp;
+                    o.min_value = 10;
+                    o.max_value = 100;
+                    o.variable_reference = reference;
+                    o.target_value_variable_reference = reference;
+                }
+                Object::OutputArchedBarGraph(o) => {
+                    o.width = 80;
+                    o.height = 40;
+                    o.bar_graph_width = 5;
+                    o.colour = 12;
+                    o.target_line_colour = 14;
+                    o.options.draw_border = false;
+                    o.options.draw_target_line = true;
+                    o.options.bar_graph_type = BarGraphType::NotFilled;
+                    o.options.axis_orientation = AxisOrientation::Vertical;
+                    o.start_angle = 0;
+                    o.end_angle = 45;
+                    o.min_value = 10;
+                    o.max_value = 100;
+                    o.variable_reference = reference;
+                    o.target_value_variable_reference = reference;
+                }
+                _ => unreachable!(),
+            }
+            for range in [(10, 100), (100, 100), (100, 10)] {
+                match &mut object {
+                    Object::OutputMeter(o) => {
+                        o.min_value = range.0;
+                        o.max_value = range.1;
+                    }
+                    Object::OutputLinearBarGraph(o) => {
+                        o.min_value = range.0;
+                        o.max_value = range.1;
+                    }
+                    Object::OutputArchedBarGraph(o) => {
+                        o.min_value = range.0;
+                        o.max_value = range.1;
+                    }
+                    _ => unreachable!(),
+                }
+                for raw in [0, 200] {
+                    if let Some(Object::NumberVariable(v)) =
+                        pool.object_mut_by_id(ObjectId::new(2).unwrap())
+                    {
+                        v.value = raw;
+                    }
+                    for version in [VtVersion::Version4, VtVersion::Version6] {
+                        let output = render(&object, &pool, version);
+                        let values = indicator_lines(&output, colour(&pool, 12));
+                        assert_eq!(values.len(), 1, "{kind:?}, {range:?}, {raw}");
+                        let at_minimum = range.0 >= range.1 || raw == 0;
+                        let [a, b] = values[0];
+                        match kind {
+                            ObjectType::OutputMeter | ObjectType::OutputArchedBarGraph => {
+                                if at_minimum {
+                                    assert!(b.x > a.x && (a.y - b.y).abs() < 0.001);
+                                } else {
+                                    assert!(b.y < a.y && (a.x - b.x).abs() < 0.001);
+                                }
+                            }
+                            ObjectType::OutputLinearBarGraph => {
+                                assert!((a.x - if at_minimum { 8.0 } else { 88.0 }).abs() < 0.001);
+                            }
+                            _ => unreachable!(),
+                        }
+                        if kind != ObjectType::OutputMeter {
+                            assert_eq!(indicator_lines(&output, colour(&pool, 14)), values);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

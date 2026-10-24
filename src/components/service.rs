@@ -57,6 +57,15 @@ impl ComponentService {
                         y,
                         overrides,
                     } => {
+                        let definition = source.definitions.get(component_id).ok_or_else(|| {
+                            ComponentError::new(
+                                "COMPONENT_NOT_FOUND",
+                                "Instance definition is missing",
+                            )
+                        })?;
+                        for (parameter, value) in overrides {
+                            validate_component_parameter_value(definition, *parameter, value)?;
+                        }
                         let name = unique_instance_name(source, *component_id);
                         source.instances.push(ComponentInstance {
                             id: instance_id.unwrap_or_default(),
@@ -87,6 +96,7 @@ impl ComponentService {
                         });
                         if let Some((node, ComponentParameterTarget::Property(property))) = target {
                             validate_font_edit(node, property, value, version)?;
+                            validate_iso_domain_edit(node, property, value)?;
                         }
                         instance_mut(source, *instance_id)?
                             .overrides
@@ -111,6 +121,7 @@ impl ComponentService {
                                 ComponentError::new("COMPONENT_NODE_INVALID", "Unknown master node")
                             })?;
                         validate_font_edit(node, *property, value, version)?;
+                        validate_iso_domain_edit(node, *property, value)?;
                         node.properties.insert(property.clone(), value.clone());
                         for parameter in definition.parameters.iter_mut().filter(|p| {
                             p.target_node == *node_id
@@ -154,6 +165,12 @@ impl ComponentService {
     ) -> ComponentResult<ComponentInstanceId> {
         let id = ComponentInstanceId::default();
         project.edit_components("Instantiate component", |pool, source| {
+            let definition = source.definitions.get(&component).ok_or_else(|| {
+                ComponentError::new("COMPONENT_NOT_FOUND", "Instance definition is missing")
+            })?;
+            for (parameter, value) in &overrides {
+                validate_component_parameter_value(definition, *parameter, value)?;
+            }
             let name = unique_instance_name(source, component);
             source.instances.push(ComponentInstance {
                 id,
@@ -176,6 +193,7 @@ impl ComponentService {
     ) -> ComponentResult<()> {
         project.edit_components("Edit component definition", |_, source| {
             validate_definition_names(source, &definition)?;
+            validate_changed_iso_domain_properties(source, &definition)?;
             definition.revision = source
                 .definitions
                 .get(&definition.id)
@@ -438,6 +456,82 @@ fn validate_font_edit(
         ));
     }
     Ok(())
+}
+
+fn validate_iso_domain_edit(
+    node: &ComponentNode,
+    property: crate::object_properties::PropertyKey,
+    value: &Value,
+) -> ComponentResult<()> {
+    if !crate::object_properties::property_has_repairable_iso_domain(node.object_type, property) {
+        return Ok(());
+    }
+    let mut pool = ag_iso_stack::object_pool::ObjectPool::new();
+    let object = crate::default_object(node.object_type);
+    let id = object.id();
+    pool.add(object);
+    crate::object_properties::validate_property(&pool, id, property, value)
+        .map_err(|error| ComponentError::new("ISO_PROPERTY_INVALID", error.to_string()))
+}
+
+fn validate_changed_iso_domain_properties(
+    source: &ComponentSource,
+    definition: &ComponentDefinition,
+) -> ComponentResult<()> {
+    let previous = source.definitions.get(&definition.id);
+    for node in &definition.nodes {
+        let old_node =
+            previous.and_then(|previous| previous.nodes.iter().find(|old| old.id == node.id));
+        for (property, value) in &node.properties {
+            if old_node.is_some_and(|old| {
+                old.object_type == node.object_type && old.properties.get(property) == Some(value)
+            }) {
+                continue;
+            }
+            validate_iso_domain_edit(node, *property, value)?;
+        }
+    }
+    for parameter in &definition.parameters {
+        let old_parameter = previous.and_then(|previous| {
+            previous
+                .parameters
+                .iter()
+                .find(|old| old.id == parameter.id)
+        });
+        if old_parameter.is_some_and(|old| {
+            old.target_node == parameter.target_node
+                && old.property == parameter.property
+                && old.kind == parameter.kind
+                && old.default_value == parameter.default_value
+        }) {
+            continue;
+        }
+        validate_component_parameter_value(definition, parameter.id, &parameter.default_value)?;
+    }
+    Ok(())
+}
+
+fn validate_component_parameter_value(
+    definition: &ComponentDefinition,
+    parameter_id: ComponentParameterId,
+    value: &Value,
+) -> ComponentResult<()> {
+    let parameter = definition
+        .parameters
+        .iter()
+        .find(|parameter| parameter.id == parameter_id)
+        .ok_or_else(|| ComponentError::new("COMPONENT_PARAMETER_INVALID", "Unknown parameter"))?;
+    let ComponentParameterTarget::Property(property) = parameter.property else {
+        return Ok(());
+    };
+    let node = definition
+        .nodes
+        .iter()
+        .find(|node| node.id == parameter.target_node)
+        .ok_or_else(|| {
+            ComponentError::new("COMPONENT_PARAMETER_INVALID", "Parameter node is missing")
+        })?;
+    validate_iso_domain_edit(node, property, value)
 }
 fn unique_component_name(source: &ComponentSource, name: &str) -> String {
     let base = format!("{name} copy");

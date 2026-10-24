@@ -1284,7 +1284,51 @@ pub fn get_property_descriptors(object_type: ObjectType) -> Vec<PropertyDescript
             descriptor.valid_range = Some((Value::from(0), Value::from(7)));
         }
     }
+    let bounded_properties: &[(PropertyKey, i64, i64)] = match object_type {
+        ObjectType::OutputEllipse | ObjectType::OutputMeter | ObjectType::OutputArchedBarGraph => {
+            &[
+                (PropertyKey::StartAngle, 0, 180),
+                (PropertyKey::EndAngle, 0, 180),
+            ]
+        }
+        ObjectType::GraphicsContext => &[
+            (PropertyKey::ViewportWidth, 0, 32767),
+            (PropertyKey::ViewportHeight, 0, 32767),
+            (PropertyKey::CanvasWidth, 0, 32767),
+            (PropertyKey::CanvasHeight, 0, 32767),
+        ],
+        _ => &[],
+    };
+    for (property, minimum, maximum) in bounded_properties {
+        if let Some(descriptor) = descriptors
+            .iter_mut()
+            .find(|descriptor| descriptor.name == *property)
+        {
+            descriptor.valid_range = Some((Value::from(*minimum), Value::from(*maximum)));
+        }
+    }
     descriptors
+}
+
+/// Whether materialization must preserve an imported component value so the
+/// user can repair it instead of making the existing project unopenable.
+pub(crate) fn property_has_repairable_iso_domain(
+    object_type: ObjectType,
+    property: PropertyKey,
+) -> bool {
+    get_property_descriptors(object_type)
+        .into_iter()
+        .any(|descriptor| descriptor.name == property && descriptor.valid_range.is_some())
+        || matches!(
+            (object_type, property),
+            (ObjectType::ExtendedInputAttributes, PropertyKey::CodePlanes)
+                | (ObjectType::WorkingSet, PropertyKey::LanguageCodes)
+                | (
+                    ObjectType::WorkingSetSpecialControls,
+                    PropertyKey::LanguagePairs
+                )
+                | (ObjectType::NumberVariable, PropertyKey::Value)
+        )
 }
 
 /// Remap all property-backed object references simultaneously. Structural
@@ -1421,6 +1465,8 @@ pub fn validate_property(
         }
     }
 
+    validate_iso_property_payload(pool, object, property, value)?;
+
     match descriptor.semantic {
         PropertySemantic::Colour => {
             if !matches!(value.as_u64(), Some(0..=255)) {
@@ -1459,6 +1505,122 @@ pub fn validate_property(
     }
 
     Ok(())
+}
+
+pub(crate) fn validate_iso_property_payload(
+    pool: &ObjectPool,
+    object: &Object,
+    property: PropertyKey,
+    value: &Value,
+) -> Result<(), PropertyError> {
+    let invalid = |reason: String| PropertyError::InvalidValue {
+        object_id: object.id(),
+        property,
+        reason,
+    };
+    match (object, property) {
+        (Object::ExtendedInputAttributes(_), PropertyKey::CodePlanes) => {
+            let planes: Vec<ag_iso_stack::object_pool::object::CodePlane> =
+                serde_json::from_value(value.clone())
+                    .map_err(|error| invalid(error.to_string()))?;
+            if !(1..=17).contains(&planes.len()) {
+                return Err(invalid(format!(
+                    "code planes contain {}; expected 1 through 17",
+                    planes.len()
+                )));
+            }
+            for plane in planes {
+                if plane.number > 16 {
+                    return Err(invalid(format!(
+                        "code plane {} is outside 0 through 16",
+                        plane.number
+                    )));
+                }
+                if !(1..=255).contains(&plane.character_ranges.len()) {
+                    return Err(invalid(format!(
+                        "code plane {} contains {} character ranges; expected 1 through 255",
+                        plane.number,
+                        plane.character_ranges.len()
+                    )));
+                }
+                if let Some(range) = plane
+                    .character_ranges
+                    .iter()
+                    .find(|range| range.first_character > range.last_character)
+                {
+                    return Err(invalid(format!(
+                        "code plane {} has reversed character range {} through {}",
+                        plane.number, range.first_character, range.last_character
+                    )));
+                }
+            }
+        }
+        (Object::WorkingSet(_), PropertyKey::LanguageCodes) => {
+            let codes: Vec<String> = serde_json::from_value(value.clone())
+                .map_err(|error| invalid(error.to_string()))?;
+            if let Some(code) = codes.iter().find(|code| !two_ascii_letters(code)) {
+                return Err(invalid(format!(
+                    "language code {code:?} must contain exactly two ASCII letters"
+                )));
+            }
+        }
+        (Object::WorkingSetSpecialControls(_), PropertyKey::LanguagePairs) => {
+            let pairs: Vec<(String, String)> = serde_json::from_value(value.clone())
+                .map_err(|error| invalid(error.to_string()))?;
+            if let Some((language, country)) = pairs.iter().find(|(language, country)| {
+                !two_ascii_letters(language) || !(two_ascii_letters(country) || country == "  ")
+            }) {
+                return Err(invalid(format!("language/country pair ({language:?}, {country:?}) must use two ASCII letters per code; an unspecified country is two spaces")));
+            }
+        }
+        (Object::NumberVariable(_), PropertyKey::Value) => {
+            let Some(new_value) = value.as_u64().and_then(|value| u32::try_from(value).ok()) else {
+                return Err(invalid(
+                    "Number Variable value must be an unsigned 32-bit integer".into(),
+                ));
+            };
+            if new_value > u16::MAX as u32 && number_variable_has_16_bit_consumer(pool, object.id())
+            {
+                return Err(invalid(format!("Number Variable value {new_value} referenced by Output Meter or bar graphs exceeds 65535")));
+            }
+        }
+        (Object::OutputMeter(_), PropertyKey::VariableReference)
+        | (Object::OutputLinearBarGraph(_), PropertyKey::VariableReference)
+        | (Object::OutputArchedBarGraph(_), PropertyKey::VariableReference)
+        | (Object::OutputLinearBarGraph(_), PropertyKey::TargetValueVariableReference)
+        | (Object::OutputArchedBarGraph(_), PropertyKey::TargetValueVariableReference) => {
+            if !value.is_null() {
+                let id = serde_json::from_value::<ObjectId>(value.clone())
+                    .map_err(|error| invalid(error.to_string()))?;
+                if let Some(Object::NumberVariable(variable)) = pool.object_by_id(id) {
+                    if variable.value > u16::MAX as u32 {
+                        return Err(invalid(format!("Number Variable value {} referenced by Output Meter or bar graphs exceeds 65535", variable.value)));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn two_ascii_letters(value: &str) -> bool {
+    value.len() == 2 && value.bytes().all(|byte| byte.is_ascii_alphabetic())
+}
+
+fn number_variable_has_16_bit_consumer(pool: &ObjectPool, id: ObjectId) -> bool {
+    pool.objects().iter().any(|object| match object {
+        Object::OutputMeter(object) => object.variable_reference.0 == Some(id),
+        Object::OutputLinearBarGraph(object) => {
+            object.variable_reference.0 == Some(id)
+                || object.target_value_variable_reference.0 == Some(id)
+        }
+        Object::OutputArchedBarGraph(object) => {
+            object.variable_reference.0 == Some(id)
+                || object.target_value_variable_reference.0 == Some(id)
+        }
+        _ => false,
+    })
 }
 
 /// Array element prototypes shared by command insertion and schema discovery.

@@ -320,6 +320,8 @@ pub fn validate_pool_state_for_version(
         }
     }
 
+    diagnostics.extend(validate_iso_domain_diagnostics(pool));
+
     // Fixed-width text fit is advisory: it does not affect whether a pool can
     // be serialized or executed. This uses the preview's own text normalization
     // and wrapping logic so valid wrapping does not create false positives.
@@ -353,31 +355,15 @@ pub fn validate_pool_state_for_version(
     diagnostics
 }
 
-/// Validate a pool that is expected to be complete enough for project
-/// diagnostics or IOP export. Incremental validation deliberately omits these
-/// whole-pool requirements so drafts remain editable and saveable.
-pub fn validate_complete_pool_state_for_version(
-    pool: &ObjectPool,
-    vt_version: VtVersion,
-) -> Vec<ValidationDiagnostic> {
-    let mut diagnostics = validate_pool_state_for_version(pool, vt_version);
-    diagnostics.extend(validate_complete_pool_requirements(pool, vt_version));
-    diagnostics
-}
-
-/// Checks complete-pool cardinalities, collection constraints, imported
-/// property ranges, and references whose ID 0 cannot be treated as an
-/// unresolved authoring placeholder.
-pub(crate) fn validate_complete_pool_requirements(
-    pool: &ObjectPool,
-    vt_version: VtVersion,
-) -> Vec<ValidationDiagnostic> {
-    use ag_iso_stack::object_pool::{object::Object, ObjectType};
+/// ISO-domain diagnostics used at edit boundaries. Their stable property codes are
+/// compared against the baseline so existing imported violations stay
+/// repairable while edits cannot introduce new ones.
+fn validate_iso_domain_diagnostics(pool: &ObjectPool) -> Vec<ValidationDiagnostic> {
+    use crate::object_properties::PropertyKey;
+    use ag_iso_stack::object_pool::object::Object;
 
     let mut diagnostics = Vec::new();
     for object in pool.objects() {
-        // Property ranges also validate imported records that bypassed the
-        // authoring operation path.
         for descriptor in crate::object_properties::get_property_descriptors(object.object_type()) {
             let Some((minimum, maximum)) = descriptor.valid_range else {
                 continue;
@@ -394,11 +380,78 @@ pub(crate) fn validate_complete_pool_requirements(
                 diagnostics.push(ValidationDiagnostic {
                     severity: ValidationSeverity::Error,
                     message: format!(
-                        "{} is outside the allowed range {} through {}",
-                        descriptor.name, minimum, maximum
+                        "{} value {} is outside the allowed range {} through {}",
+                        descriptor.name, value, minimum, maximum
                     ),
                     affected_objects: Some(vec![object.id().value()]),
                     code: "PROPERTY_OUT_OF_RANGE".into(),
+                });
+            }
+        }
+
+        let constrained_properties: &[PropertyKey] = match object {
+            Object::ExtendedInputAttributes(_) => &[PropertyKey::CodePlanes],
+            Object::WorkingSet(_) => &[PropertyKey::LanguageCodes],
+            Object::WorkingSetSpecialControls(_) => &[PropertyKey::LanguagePairs],
+            Object::NumberVariable(_) => &[PropertyKey::Value],
+            _ => &[],
+        };
+        for property in constrained_properties {
+            let Ok(value) = crate::object_properties::get_object_property(object, *property) else {
+                continue;
+            };
+            if matches!(object, Object::ExtendedInputAttributes(_))
+                && value.as_array().is_some_and(Vec::is_empty)
+            {
+                continue;
+            }
+            if let Err(error) = crate::object_properties::validate_iso_property_payload(
+                pool, object, *property, &value,
+            ) {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: error.to_string(),
+                    affected_objects: Some(vec![object.id().value()]),
+                    code: "ISO_PROPERTY_INVALID".into(),
+                });
+            }
+        }
+    }
+    diagnostics
+}
+
+/// Validate a pool that is expected to be complete enough for project
+/// diagnostics or IOP export. Incremental validation deliberately omits these
+/// whole-pool requirements so drafts remain editable and saveable.
+pub fn validate_complete_pool_state_for_version(
+    pool: &ObjectPool,
+    vt_version: VtVersion,
+) -> Vec<ValidationDiagnostic> {
+    let mut diagnostics = validate_pool_state_for_version(pool, vt_version);
+    diagnostics.extend(validate_complete_pool_requirements(pool, vt_version));
+    diagnostics
+}
+
+/// Checks complete-pool cardinalities, collection constraints, and references
+/// whose ID 0 cannot be treated as an unresolved authoring placeholder.
+pub(crate) fn validate_complete_pool_requirements(
+    pool: &ObjectPool,
+    vt_version: VtVersion,
+) -> Vec<ValidationDiagnostic> {
+    use ag_iso_stack::object_pool::{object::Object, ObjectType};
+
+    let mut diagnostics = Vec::new();
+    for object in pool.objects() {
+        // Empty code-plane arrays remain an editable default; complete-pool
+        // requirements reject them for export.
+        if let Object::ExtendedInputAttributes(attributes) = object {
+            if attributes.code_planes.is_empty() {
+                diagnostics.push(ValidationDiagnostic {
+                    severity: ValidationSeverity::Error,
+                    message: "Extended Input Attributes has 0 code planes; expected 1 through 17"
+                        .into(),
+                    affected_objects: Some(vec![object.id().value()]),
+                    code: "ISO_PROPERTY_INVALID".into(),
                 });
             }
         }
@@ -1018,6 +1071,16 @@ fn validate_graphic_data_png(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Diagnostics in this set are compared to the current pool so edits can
+/// repair imported violations without making unrelated edits impossible.
+pub(crate) fn is_repairable_pool_diagnostic(diagnostic: &ValidationDiagnostic) -> bool {
+    diagnostic.code.starts_with("VT_")
+        || matches!(
+            diagnostic.code.as_str(),
+            "PROPERTY_OUT_OF_RANGE" | "ISO_PROPERTY_INVALID"
+        )
+}
+
 /// Return compatibility diagnostics whose violation is new or has worsened
 /// relative to an existing repair draft. Matching includes the diagnostic text
 /// so replacing one invalid value with another remains a rejected change.
@@ -1026,9 +1089,6 @@ pub(crate) fn new_or_worsened_compatibility_diagnostics(
     candidate: &[ValidationDiagnostic],
 ) -> Vec<ValidationDiagnostic> {
     use std::collections::HashMap;
-    fn is_compatibility(diagnostic: &ValidationDiagnostic) -> bool {
-        diagnostic.code.starts_with("VT_")
-    }
     fn key(diagnostic: &ValidationDiagnostic) -> (String, String, Vec<u16>) {
         (
             diagnostic.code.clone(),
@@ -1037,12 +1097,12 @@ pub(crate) fn new_or_worsened_compatibility_diagnostics(
         )
     }
     let mut remaining = HashMap::new();
-    for diagnostic in baseline.iter().filter(|d| is_compatibility(d)) {
+    for diagnostic in baseline.iter().filter(|d| is_repairable_pool_diagnostic(d)) {
         *remaining.entry(key(diagnostic)).or_insert(0usize) += 1;
     }
     candidate
         .iter()
-        .filter(|diagnostic| is_compatibility(diagnostic))
+        .filter(|diagnostic| is_repairable_pool_diagnostic(diagnostic))
         .filter_map(|diagnostic| {
             let count = remaining.entry(key(diagnostic)).or_insert(0);
             if *count > 0 {

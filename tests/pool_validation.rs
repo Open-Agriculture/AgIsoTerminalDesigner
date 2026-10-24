@@ -189,6 +189,244 @@ fn object_id_zero_is_valid_and_resolved_as_a_pool_reference() {
 }
 
 #[test]
+fn iso_attribute_domains_are_checked_for_complete_pools() {
+    use ag_iso_stack::object_pool::{
+        object::{CharacterRange, CodePlane, Object},
+        ObjectPool, ObjectType,
+    };
+
+    let mut pool = ObjectPool::new();
+    let mut meter = default_object(ObjectType::OutputMeter);
+    *meter.mut_id() = ObjectId::new(1).unwrap();
+    if let Object::OutputMeter(meter) = &mut meter {
+        meter.start_angle = 181;
+        meter.variable_reference = ObjectId::new(2).unwrap().into();
+    }
+    pool.add(meter);
+
+    let mut variable = default_object(ObjectType::NumberVariable);
+    *variable.mut_id() = ObjectId::new(2).unwrap();
+    if let Object::NumberVariable(variable) = &mut variable {
+        variable.value = 65_536;
+    }
+    pool.add(variable);
+
+    let mut extended = default_object(ObjectType::ExtendedInputAttributes);
+    *extended.mut_id() = ObjectId::new(3).unwrap();
+    if let Object::ExtendedInputAttributes(extended) = &mut extended {
+        extended.code_planes = vec![CodePlane {
+            number: 17,
+            character_ranges: vec![CharacterRange {
+                first_character: 2,
+                last_character: 1,
+            }],
+        }];
+    }
+    pool.add(extended);
+    let mut empty_extended = default_object(ObjectType::ExtendedInputAttributes);
+    *empty_extended.mut_id() = ObjectId::new(8).unwrap();
+    pool.add(empty_extended);
+    let mut working_set = default_object(ObjectType::WorkingSet);
+    *working_set.mut_id() = ObjectId::new(4).unwrap();
+    if let Object::WorkingSet(working_set) = &mut working_set {
+        working_set.language_codes = vec!["éx".into()];
+    }
+    pool.add(working_set);
+
+    let mut controls = default_object(ObjectType::WorkingSetSpecialControls);
+    *controls.mut_id() = ObjectId::new(5).unwrap();
+    if let Object::WorkingSetSpecialControls(controls) = &mut controls {
+        controls.language_pairs = vec![("eng".into(), "US".into())];
+    }
+    pool.add(controls);
+
+    let mut graphics = default_object(ObjectType::GraphicsContext);
+    *graphics.mut_id() = ObjectId::new(6).unwrap();
+    if let Object::GraphicsContext(graphics) = &mut graphics {
+        graphics.canvas_width = 32_768;
+    }
+    pool.add(graphics);
+
+    let diagnostics = validate_complete_pool_state_for_version(&pool, VtVersion::Version6);
+    let affected = |code: &str, id: u16| {
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == code
+                && diagnostic
+                    .affected_objects
+                    .as_ref()
+                    .is_some_and(|objects| objects.contains(&id))
+        })
+    };
+    assert!(affected("PROPERTY_OUT_OF_RANGE", 1)); // Meter angle.
+    assert!(affected("ISO_PROPERTY_INVALID", 2)); // Referenced Number Variable.
+    assert!(affected("ISO_PROPERTY_INVALID", 3)); // Code plane and character range.
+    assert!(affected("ISO_PROPERTY_INVALID", 4)); // Working Set language code.
+    assert!(affected("ISO_PROPERTY_INVALID", 5)); // Special Controls language pair.
+    assert!(affected("PROPERTY_OUT_OF_RANGE", 6)); // Graphics Context dimensions.
+    assert!(affected("ISO_PROPERTY_INVALID", 8)); // Empty authoring default blocks export.
+
+    if let Some(Object::NumberVariable(variable)) = pool.object_mut_by_id(ObjectId::new(2).unwrap())
+    {
+        variable.value = 65_535;
+    }
+    assert!(
+        !validate_complete_pool_state_for_version(&pool, VtVersion::Version6)
+            .iter()
+            .any(|diagnostic| diagnostic.code == "ISO_PROPERTY_INVALID"
+                && diagnostic
+                    .affected_objects
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&2)))
+    );
+}
+
+#[test]
+fn iso_attribute_edits_validate_domains_and_allow_defined_boundaries() {
+    use ag_iso_stack::object_pool::{object::Object, ObjectPool, ObjectType};
+    use ag_iso_terminal_designer::object_properties::{validate_property, PropertyKey};
+    use serde_json::json;
+
+    let mut pool = ObjectPool::new();
+    let mut variable = default_object(ObjectType::NumberVariable);
+    *variable.mut_id() = ObjectId::new(1).unwrap();
+    if let Object::NumberVariable(variable) = &mut variable {
+        variable.value = 65_536;
+    }
+    pool.add(variable);
+    let mut meter = default_object(ObjectType::OutputMeter);
+    *meter.mut_id() = ObjectId::new(2).unwrap();
+    if let Object::OutputMeter(meter) = &mut meter {
+        meter.variable_reference = ObjectId::new(1).unwrap().into();
+    }
+    pool.add(meter);
+    let mut bar = default_object(ObjectType::OutputLinearBarGraph);
+    *bar.mut_id() = ObjectId::new(6).unwrap();
+    pool.add(bar);
+    let mut working_set = default_object(ObjectType::WorkingSet);
+    *working_set.mut_id() = ObjectId::new(3).unwrap();
+    pool.add(working_set);
+    let mut controls = default_object(ObjectType::WorkingSetSpecialControls);
+    *controls.mut_id() = ObjectId::new(4).unwrap();
+    pool.add(controls);
+    let mut extended = default_object(ObjectType::ExtendedInputAttributes);
+    *extended.mut_id() = ObjectId::new(5).unwrap();
+    pool.add(extended);
+    let mut graphics = default_object(ObjectType::GraphicsContext);
+    *graphics.mut_id() = ObjectId::new(7).unwrap();
+    pool.add(graphics);
+
+    let reject = |id, property, value| {
+        validate_property(&pool, ObjectId::new(id).unwrap(), property, &value).is_err()
+    };
+    assert!(reject(1, PropertyKey::Value, json!(65_537)));
+    assert!(reject(
+        2,
+        PropertyKey::VariableReference,
+        json!(ObjectId::new(1).unwrap())
+    ));
+    assert!(reject(
+        6,
+        PropertyKey::TargetValueVariableReference,
+        json!(ObjectId::new(1).unwrap())
+    ));
+    assert!(reject(2, PropertyKey::StartAngle, json!(181)));
+    assert!(reject(7, PropertyKey::ViewportWidth, json!(32768)));
+    assert!(reject(7, PropertyKey::CanvasHeight, json!(32768)));
+    assert!(reject(3, PropertyKey::LanguageCodes, json!(["en", "éx"])));
+    assert!(reject(
+        4,
+        PropertyKey::LanguagePairs,
+        json!([["eng", "US"]])
+    ));
+    assert!(reject(5, PropertyKey::CodePlanes, json!([])));
+    assert!(reject(
+        5,
+        PropertyKey::CodePlanes,
+        json!(vec![
+            json!({"number":0,"character_ranges":[{"first_character":0,"last_character":0}]});
+            18
+        ])
+    ));
+    assert!(reject(
+        5,
+        PropertyKey::CodePlanes,
+        json!([{"number":17,"character_ranges":[{"first_character":0,"last_character":0}]}])
+    ));
+    assert!(reject(
+        5,
+        PropertyKey::CodePlanes,
+        json!([{"number":0,"character_ranges":[]}])
+    ));
+    assert!(reject(
+        5,
+        PropertyKey::CodePlanes,
+        json!([{"number":0,"character_ranges":[{"first_character":8,"last_character":7}]}])
+    ));
+
+    assert!(validate_property(
+        &pool,
+        ObjectId::new(2).unwrap(),
+        PropertyKey::EndAngle,
+        &json!(180)
+    )
+    .is_ok());
+    assert!(validate_property(
+        &pool,
+        ObjectId::new(7).unwrap(),
+        PropertyKey::ViewportWidth,
+        &json!(32767)
+    )
+    .is_ok());
+    assert!(validate_property(
+        &pool,
+        ObjectId::new(7).unwrap(),
+        PropertyKey::CanvasHeight,
+        &json!(32767)
+    )
+    .is_ok());
+    assert!(validate_property(
+        &pool,
+        ObjectId::new(6).unwrap(),
+        PropertyKey::TargetValueVariableReference,
+        &json!(null)
+    )
+    .is_ok());
+    assert!(validate_property(
+        &pool,
+        ObjectId::new(3).unwrap(),
+        PropertyKey::LanguageCodes,
+        &json!(["en", "EN"])
+    )
+    .is_ok());
+    assert!(validate_property(
+        &pool,
+        ObjectId::new(4).unwrap(),
+        PropertyKey::LanguagePairs,
+        &json!([["en", "  "]])
+    )
+    .is_ok());
+    assert!(validate_property(&pool, ObjectId::new(5).unwrap(), PropertyKey::CodePlanes, &json!([{"number":16,"character_ranges":[{"first_character":65_535,"last_character":65_535}]}])).is_ok());
+    if let Some(Object::NumberVariable(variable)) = pool.object_mut_by_id(ObjectId::new(1).unwrap())
+    {
+        variable.value = 65_535;
+    }
+    assert!(validate_property(
+        &pool,
+        ObjectId::new(1).unwrap(),
+        PropertyKey::Value,
+        &json!(65_535)
+    )
+    .is_ok());
+    assert!(validate_property(
+        &pool,
+        ObjectId::new(6).unwrap(),
+        PropertyKey::TargetValueVariableReference,
+        &json!(ObjectId::new(1).unwrap())
+    )
+    .is_ok());
+}
+
+#[test]
 fn complete_validation_rejects_malformed_graphics_and_macros() {
     use ag_iso_stack::object_pool::{
         object::Object,

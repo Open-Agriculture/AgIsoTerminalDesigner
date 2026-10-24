@@ -506,16 +506,26 @@ fn compile_nodes(
                 }
                 ComponentReference::Null => None,
             };
-            apply(
-                pool,
-                version,
+            let restore_stored_graph_number_reference =
+                is_graph_number_variable_reference(pool, node.object_type, *property, target);
+            let reference_value = target
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null);
+            let reference_operation = if restore_stored_graph_number_reference {
+                Operation::RestoreObjectReference {
+                    object_id: id,
+                    property: *property,
+                    value: reference_value,
+                }
+            } else {
                 Operation::SetObjectReference {
                     object: ObjectTarget::id(id),
                     property: *property,
                     reference: target.map(ObjectTarget::id),
-                },
-            )
-            .map_err(|e| locate(e, definition, instance, node.id, Some(property.as_str())))?;
+                }
+            };
+            apply(pool, version, reference_operation)
+                .map_err(|e| locate(e, definition, instance, node.id, Some(property.as_str())))?;
         }
         for parameter in definition
             .parameters
@@ -533,20 +543,27 @@ fn compile_nodes(
                 unreachable!("graphic parameters are skipped above");
             };
             let op = if parameter.kind == ComponentParameterKind::ObjectReference {
-                Operation::SetObjectReference {
-                    object: ObjectTarget::id(id),
-                    property: property,
-                    reference: external_value(value, canonical, info)
-                        .map_err(|e| {
-                            locate(
-                                e,
-                                definition,
-                                instance,
-                                node.id,
-                                Some(parameter.property.as_str()),
-                            )
-                        })?
-                        .map(ObjectTarget::id),
+                let target = external_value(value, canonical, info).map_err(|e| {
+                    locate(
+                        e,
+                        definition,
+                        instance,
+                        node.id,
+                        Some(parameter.property.as_str()),
+                    )
+                })?;
+                if is_graph_number_variable_reference(pool, node.object_type, property, target) {
+                    Operation::RestoreObjectReference {
+                        object_id: id,
+                        property,
+                        value: target.map(Value::from).unwrap_or(Value::Null),
+                    }
+                } else {
+                    Operation::SetObjectReference {
+                        object: ObjectTarget::id(id),
+                        property,
+                        reference: target.map(ObjectTarget::id),
+                    }
                 }
             } else {
                 stored_property_operation(node.object_type, id, property, value)
@@ -642,10 +659,10 @@ fn compile_nodes(
     Ok(())
 }
 
-/// Materialization replays stored authoring data, including reserved numeric
-/// enum values from imported drafts that need repair.
-/// Keep scalar type checks in the property setter while bypassing edit-domain
-/// validation for enum fields only.
+/// Materialization replays stored authoring data, including values outside the
+/// edit domain from imported drafts that need repair. Keep scalar type checks
+/// in the property setter while bypassing authoring-domain checks for enums
+/// and ISO-constrained properties.
 fn stored_property_operation(
     object_type: ag_iso_stack::object_pool::ObjectType,
     object_id: u16,
@@ -655,7 +672,9 @@ fn stored_property_operation(
     let is_enum = crate::object_properties::get_property_descriptors(object_type)
         .into_iter()
         .any(|descriptor| descriptor.name == property && !descriptor.enum_choices.is_empty());
-    if is_enum {
+    let is_iso_domain_property =
+        crate::object_properties::property_has_repairable_iso_domain(object_type, property);
+    if is_enum || is_iso_domain_property {
         Operation::RestoreProperty {
             object_id,
             property,
@@ -669,6 +688,38 @@ fn stored_property_operation(
         }
     }
 }
+
+fn is_graph_number_variable_reference(
+    pool: &ObjectPool,
+    object_type: ag_iso_stack::object_pool::ObjectType,
+    property: crate::object_properties::PropertyKey,
+    target_id: Option<u16>,
+) -> bool {
+    let is_graph_reference = matches!(
+        (object_type, property),
+        (
+            ag_iso_stack::object_pool::ObjectType::OutputMeter
+                | ag_iso_stack::object_pool::ObjectType::OutputLinearBarGraph
+                | ag_iso_stack::object_pool::ObjectType::OutputArchedBarGraph,
+            crate::object_properties::PropertyKey::VariableReference
+        ) | (
+            ag_iso_stack::object_pool::ObjectType::OutputLinearBarGraph
+                | ag_iso_stack::object_pool::ObjectType::OutputArchedBarGraph,
+            crate::object_properties::PropertyKey::TargetValueVariableReference
+        )
+    );
+    is_graph_reference
+        && target_id
+            .and_then(|id| ObjectId::new(id).ok())
+            .and_then(|id| pool.object_by_id(id))
+            .is_some_and(|target| {
+                matches!(
+                    target,
+                    ag_iso_stack::object_pool::object::Object::NumberVariable(_)
+                )
+            })
+}
+
 fn external_value(
     value: &Value,
     pool: &ObjectPool,
@@ -885,7 +936,7 @@ fn validate_pool(
 ) -> ComponentResult<()> {
     for diagnostic in crate::pool_validation::validate_pool_state_for_version(pool, version) {
         if diagnostic.severity == crate::ValidationSeverity::Error
-            && !diagnostic.code.starts_with("VT_")
+            && !crate::pool_validation::is_repairable_pool_diagnostic(&diagnostic)
         {
             let mut error =
                 ComponentError::new("COMPONENT_MATERIALIZATION_FAILED", diagnostic.message);

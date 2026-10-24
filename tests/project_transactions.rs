@@ -409,3 +409,93 @@ fn checked_macro_remapping_rejects_invalid_commands_without_mutation() {
         }
     }
 }
+
+#[test]
+fn variables_consumed_by_components_reject_invalid_edits_and_preserve_repair_history() {
+    use ag_iso_stack::object_pool::{object_attributes::Point, ObjectRef};
+    use ag_iso_terminal_designer::components::{plan_component_capture, ComponentService};
+
+    let mut mask = object_with_id(ObjectType::DataMask, 1);
+    if let Object::DataMask(mask) = &mut mask {
+        mask.object_refs.push(ObjectRef {
+            id: ObjectId::new(2).unwrap(),
+            offset: Point::default(),
+        });
+    }
+    let mut meter = object_with_id(ObjectType::OutputMeter, 2);
+    if let Object::OutputMeter(meter) = &mut meter {
+        meter.width = 40;
+        meter.variable_reference = NullableObjectId::new(3);
+    }
+    let mut variable = object_with_id(ObjectType::NumberVariable, 3);
+    if let Object::NumberVariable(variable) = &mut variable {
+        variable.value = 65_535;
+    }
+    let mut pool = ObjectPool::new();
+    for object in [mask, meter, variable] {
+        pool.add(object);
+    }
+    let mut project = EditorProject::from(pool);
+    let capture = plan_component_capture(&project, 2, "Meter".into()).unwrap();
+    ComponentService::create_component_from_selection(&mut project, capture, true).unwrap();
+    assert!(project
+        .get_pool()
+        .object_by_id(ObjectId::new(2).unwrap())
+        .is_none());
+
+    let set_value = |value| {
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(3),
+            property: PropertyKey::Value,
+            value: json!(value),
+        });
+        transaction
+    };
+    let before = project.save_project().unwrap();
+    let revision = project.revision();
+    assert!(project.execute_transaction(set_value(65_536)).is_err());
+    assert_eq!(project.save_project().unwrap(), before);
+    assert_eq!(project.revision(), revision);
+
+    // Simulate an existing authoring draft with a now-invalid shared value.
+    let mut saved: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    let variable = saved["objects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|object| object["type"] == "NumberVariable")
+        .unwrap();
+    variable["properties"]["value"] = json!(65_536);
+    let mut project = EditorProject::load_project(serde_json::to_vec(&saved).unwrap()).unwrap();
+    let draft = project.save_project().unwrap();
+    assert!(project.execute_transaction(set_value(65_537)).is_err());
+    assert_eq!(project.save_project().unwrap(), draft);
+    let mut unrelated = OperationTransaction::new(None);
+    unrelated.add_operation(Operation::SetProperty {
+        object: ObjectTarget::id(1),
+        property: PropertyKey::BackgroundColour,
+        value: json!(12),
+    });
+    project.execute_transaction(unrelated).unwrap();
+    let before_repair = project.save_project().unwrap();
+    project.execute_transaction(set_value(65_535)).unwrap();
+    assert!(!project
+        .compatibility_diagnostics()
+        .unwrap()
+        .iter()
+        .any(|diagnostic| diagnostic.code == "ISO_PROPERTY_INVALID"));
+    assert!(project.undo_operation());
+    assert_eq!(project.save_project().unwrap(), before_repair);
+    assert!(project
+        .compatibility_diagnostics()
+        .unwrap()
+        .iter()
+        .any(|diagnostic| diagnostic.code == "ISO_PROPERTY_INVALID"));
+    assert!(project.redo_operation());
+    assert!(!project
+        .compatibility_diagnostics()
+        .unwrap()
+        .iter()
+        .any(|diagnostic| diagnostic.code == "ISO_PROPERTY_INVALID"));
+}

@@ -504,7 +504,7 @@ impl OperationExecutor {
         );
         let validation_to_report = candidate_validation
             .into_iter()
-            .filter(|diagnostic| !diagnostic.code.starts_with("VT_"))
+            .filter(|diagnostic| !crate::pool_validation::is_repairable_pool_diagnostic(diagnostic))
             .chain(new_compatibility);
         let diagnostics: Vec<_> = validation_to_report
             .into_iter()

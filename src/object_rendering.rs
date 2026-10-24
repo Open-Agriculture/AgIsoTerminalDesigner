@@ -964,12 +964,13 @@ fn format_number(
     format: FormatType,
     options: ag_iso_stack::object_pool::object_attributes::NumberOptions,
 ) -> String {
+    // Tables B.18/B.23 test the effective raw value before offset/scaling.
+    if options.display_zero_as_blank && raw == 0 {
+        return String::new();
+    }
     let value = (f64::from(raw) + f64::from(offset)) * f64::from(scale);
     if !value.is_finite() {
         return value.to_string();
-    }
-    if options.display_zero_as_blank && value == 0.0 {
-        return String::new();
     }
     let decimals = decimals.min(7) as usize;
     if format == FormatType::Exponential {
@@ -1511,19 +1512,31 @@ impl RenderableObject for OutputPolygon {
 
 impl RenderableObject for OutputMeter {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        crate::numeric_rendering::render_meter(self, ui, pool, position);
+        crate::numeric_rendering::render_meter(self, ui, pool, position, render_version(ui));
     }
 }
 
 impl RenderableObject for OutputLinearBarGraph {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        crate::numeric_rendering::render_linear_bar_graph(self, ui, pool, position);
+        crate::numeric_rendering::render_linear_bar_graph(
+            self,
+            ui,
+            pool,
+            position,
+            render_version(ui),
+        );
     }
 }
 
 impl RenderableObject for OutputArchedBarGraph {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        crate::numeric_rendering::render_arched_bar_graph(self, ui, pool, position);
+        crate::numeric_rendering::render_arched_bar_graph(
+            self,
+            ui,
+            pool,
+            position,
+            render_version(ui),
+        );
     }
 }
 
@@ -1680,6 +1693,72 @@ impl RenderableObject for AuxiliaryControlDesignatorType2 {
 mod rendering_tests {
     use super::*;
     use ag_iso_stack::object_pool::{NullableObjectId, ObjectType};
+
+    #[test]
+    fn numeric_zero_blank_uses_raw_local_or_variable_value_before_scaling() {
+        use ag_iso_stack::object_pool::{object_attributes::NumberOptions, ObjectId};
+        let options = NumberOptions {
+            transparent: false,
+            display_leading_zeros: false,
+            display_zero_as_blank: true,
+            truncate: false,
+        };
+        for format in [FormatType::Decimal, FormatType::Exponential] {
+            assert_eq!(format_number(0, 5, 2.0, 0, format, options), "");
+            assert!(!format_number(1, -1, 1.0, 0, format, options).is_empty());
+            assert!(!format_number(1, 0, 0.0, 0, format, options).is_empty());
+        }
+        let mut pool = ObjectPool::new();
+        let mut font = crate::default_object(ObjectType::FontAttributes);
+        *font.mut_id() = ObjectId::new(2).unwrap();
+        pool.add(font);
+        pool.add(Object::NumberVariable(NumberVariable {
+            id: ObjectId::new(3).unwrap(),
+            value: 0,
+        }));
+        for kind in [ObjectType::InputNumber, ObjectType::OutputNumber] {
+            let mut object = crate::default_object(kind);
+            match &mut object {
+                Object::InputNumber(o) => {
+                    o.width = 80;
+                    o.height = 30;
+                    o.options = options;
+                    o.font_attributes = NullableObjectId::new(2);
+                    o.variable_reference = NullableObjectId::new(3);
+                    o.value = 1;
+                    o.offset = -1;
+                    o.scale = 1.0;
+                }
+                Object::OutputNumber(o) => {
+                    o.width = 80;
+                    o.height = 30;
+                    o.options = options;
+                    o.font_attributes = NullableObjectId::new(2);
+                    o.variable_reference = NullableObjectId::new(3);
+                    o.value = 1;
+                    o.offset = -1;
+                    o.scale = 1.0;
+                }
+                _ => unreachable!(),
+            }
+            for raw in [0, 1] {
+                if let Some(Object::NumberVariable(variable)) =
+                    pool.object_mut_by_id(ObjectId::new(3).unwrap())
+                {
+                    variable.value = raw;
+                }
+                let text: String = frame(&pool, Some(&object), 0.0)
+                    .shapes
+                    .into_iter()
+                    .filter_map(|shape| match shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(text, if raw == 0 { "" } else { "0" }, "{kind:?}");
+            }
+        }
+    }
 
     fn frame(pool: &ObjectPool, object: Option<&Object>, time: f64) -> egui::FullOutput {
         frame_at(pool, object, time, Point::default())

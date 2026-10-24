@@ -132,6 +132,153 @@ fn parameter(p: &mut EditorProject, component: ComponentId) -> ComponentParamete
     .unwrap();
     id
 }
+
+#[test]
+fn existing_component_iso_domain_values_remain_materializable_for_repair() {
+    use ag_iso_stack::object_pool::ObjectType;
+    use ag_iso_terminal_designer::components::{
+        materialize_source, ComponentDefinition, ComponentInstance, ComponentNode, ComponentSource,
+        EditorParentRef,
+    };
+    use std::collections::{BTreeMap, HashMap};
+
+    let mut canonical = ObjectPool::default();
+    let mut parent = default_object(ObjectType::DataMask);
+    parent.mut_id().set_value(1).unwrap();
+    canonical.add(parent);
+    let mut external_variable = default_object(ObjectType::NumberVariable);
+    external_variable.mut_id().set_value(20).unwrap();
+    if let Object::NumberVariable(variable) = &mut external_variable {
+        variable.value = 65_536;
+    }
+    canonical.add(external_variable);
+
+    let component_id = ComponentId::default();
+    let meter_node = ComponentNodeId::default();
+    let context_node = ComponentNodeId::default();
+    let input_attributes_node = ComponentNodeId::default();
+    let variable_node = ComponentNodeId::default();
+    let variable_parameter = ComponentParameterId::default();
+    let definition = ComponentDefinition {
+        schema_version: 1,
+        id: component_id,
+        name: "Repair draft".into(),
+        description: String::new(),
+        category_path: vec![],
+        tags: vec![],
+        revision: 1,
+        root_node: meter_node,
+        nodes: vec![
+            ComponentNode {
+                id: meter_node,
+                name: "Meter".into(),
+                object_type: ObjectType::OutputMeter,
+                properties: BTreeMap::from([(property("start_angle"), json!(181))]),
+                children: vec![],
+                references: BTreeMap::from([(
+                    property("variable_reference"),
+                    ComponentReference::Internal(variable_node),
+                )]),
+                macro_references: vec![],
+                object_list: None,
+            },
+            ComponentNode {
+                id: context_node,
+                name: "Graphics Context".into(),
+                object_type: ObjectType::GraphicsContext,
+                properties: BTreeMap::from([(property("canvas_width"), json!(32768))]),
+                children: vec![],
+                references: BTreeMap::new(),
+                macro_references: vec![],
+                object_list: None,
+            },
+            ComponentNode {
+                id: input_attributes_node,
+                name: "Input Attributes".into(),
+                object_type: ObjectType::ExtendedInputAttributes,
+                properties: BTreeMap::from([(property("code_planes"), json!([]))]),
+                children: vec![],
+                references: BTreeMap::new(),
+                macro_references: vec![],
+                object_list: None,
+            },
+            ComponentNode {
+                id: variable_node,
+                name: "Number Variable".into(),
+                object_type: ObjectType::NumberVariable,
+                properties: BTreeMap::from([(property("value"), json!(65_536))]),
+                children: vec![],
+                references: BTreeMap::new(),
+                macro_references: vec![],
+                object_list: None,
+            },
+        ],
+        parameters: vec![ComponentParameter {
+            id: variable_parameter,
+            name: "Meter value".into(),
+            description: None,
+            target_node: meter_node,
+            property: ComponentParameterTarget::Property(property("variable_reference")),
+            kind: ComponentParameterKind::ObjectReference,
+            default_value: json!(20),
+        }],
+    };
+    let instance_id = ComponentInstanceId::default();
+    let source = ComponentSource {
+        definitions: BTreeMap::from([(component_id, definition)]),
+        instances: vec![ComponentInstance {
+            id: instance_id,
+            component_id,
+            name: "Repair draft instance".into(),
+            parent: EditorParentRef::Primitive(1),
+            child_index: None,
+            x: 0,
+            y: 0,
+            overrides: BTreeMap::new(),
+            compiled_ids: BTreeMap::from([
+                (meter_node, 100),
+                (context_node, 101),
+                (input_attributes_node, 102),
+                (variable_node, 103),
+            ]),
+        }],
+    };
+
+    let materialized = materialize_source(
+        &canonical,
+        &source,
+        ag_iso_stack::object_pool::vt_version::VtVersion::Version6,
+        &HashMap::new(),
+        &ObjectIdRanges::default(),
+    )
+    .expect("stored invalid values should remain available for repair");
+    assert!(materialized
+        .pool
+        .object_by_id(ObjectId::new(100).unwrap())
+        .is_some());
+    assert!(materialized
+        .pool
+        .object_by_id(ObjectId::new(101).unwrap())
+        .is_some());
+    assert!(materialized
+        .pool
+        .object_by_id(ObjectId::new(102).unwrap())
+        .is_some());
+    assert!(materialized
+        .pool
+        .object_by_id(ObjectId::new(103).unwrap())
+        .is_some());
+    let Object::OutputMeter(meter) = materialized
+        .pool
+        .object_by_id(ObjectId::new(100).unwrap())
+        .unwrap()
+    else {
+        panic!("compiled root should remain a meter");
+    };
+    assert_eq!(meter.start_angle, 181);
+    // The persisted parameter overrides the stored internal reference.
+    assert_eq!(meter.variable_reference.0.unwrap().value(), 20);
+}
 fn objects_by_id(pool: &ObjectPool) -> BTreeMap<u16, serde_json::Value> {
     pool.objects()
         .iter()
