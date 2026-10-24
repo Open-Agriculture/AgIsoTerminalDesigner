@@ -1123,24 +1123,10 @@ impl DesignerApp {
                         }
                     },
                     FileDialogReason::OpenImagePictureGraphics(id) => {
-                        if let Some(pool) = &mut self.project {
-                            if let Some(Object::PictureGraphic(o)) =
-                                pool.get_pool().object_by_id(id)
-                            {
-                                let mut picture = o.clone();
-                                match ag_iso_terminal_designer::graphics::apply_image_bytes_to_picture_graphic(&mut picture, &content) {
-                                    Ok(()) => {
-                                        let value = serde_json::to_value(&picture).unwrap();
-                                        for property in [ag_iso_terminal_designer::PropertyKey::ActualWidth, ag_iso_terminal_designer::PropertyKey::ActualHeight, ag_iso_terminal_designer::PropertyKey::Width, ag_iso_terminal_designer::PropertyKey::Format, ag_iso_terminal_designer::PropertyKey::TransparencyColour, ag_iso_terminal_designer::PropertyKey::Options, ag_iso_terminal_designer::PropertyKey::Data] {
-                                            pool.queue_operation(Operation::SetProperty {
-                                                object: ag_iso_terminal_designer::ObjectTarget::id(id.value()),
-                                                property, value: value[property.as_str()].clone(),
-                                            });
-                                        }
-                                    }
-                                    Err(e) => self.error_message = Some(e),
-                                }
-                            }
+                        if let Some(project) = &self.project {
+                            ag_iso_terminal_designer::graphics::conversion_ui::open_for_import(
+                                ctx, project, id, content, None,
+                            );
                         }
                     }
                 },
@@ -3311,9 +3297,15 @@ impl eframe::App for DesignerApp {
             if pool.commit_queued("Edit object pool") {
                 ctx.request_repaint();
             }
-            if pool.commit_graphic_assignment() {
-                ctx.request_repaint();
+            if let Some((asset, target)) = pool.take_graphic_assignment() {
+                ag_iso_terminal_designer::graphics::conversion_ui::open_for_asset(
+                    ctx,
+                    pool,
+                    asset,
+                    Some(target),
+                );
             }
+            ag_iso_terminal_designer::graphics::conversion_ui::show(ctx, pool);
             if let Some((object_id, name)) = pool.take_rename_request() {
                 if pool.rename_object(object_id, name) {
                     ctx.request_repaint();

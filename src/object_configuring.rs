@@ -235,17 +235,6 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
     );
     ui.separator();
     if let Object::PictureGraphic(picture) = object {
-        let format_error_key =
-            egui::Id::new(("picture_format_error", design.ui_session_id(), id.value()));
-        if let Some((revision, message)) =
-            ui.data_mut(|data| data.get_temp::<(u64, String)>(format_error_key))
-        {
-            if revision == design.revision() {
-                crate::ui_style::error_text(ui, &message);
-            } else {
-                ui.data_mut(|data| data.remove::<(u64, String)>(format_error_key));
-            }
-        }
         let current_format = picture.format;
         ui.horizontal(|ui| {
             ui.label("Format:");
@@ -256,83 +245,61 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                 (PictureGraphicFormat::EightBit, "8-bit colour"),
             ] {
                 if ui.radio(current_format == format, label).clicked() && current_format != format {
-                    let mut converted = picture.clone();
-                    let palette = crate::effective_colour::colours(design.get_pool())
-                        .map(|colour| colour.as_rgb());
-                    let result = crate::graphics::validate_picture_format(
-                        design.get_pool(),
+                    crate::graphics::conversion_ui::open_for_picture(
+                        ui.ctx(),
+                        design,
                         id,
-                        picture.actual_width,
-                        format,
-                    )
-                    .and_then(|()| {
-                        crate::graphics::convert_picture_graphic_format(
-                            &mut converted,
-                            format,
-                            &palette,
-                        )
-                    });
-                    match result {
-                        Ok(()) => {
-                            ui.data_mut(|data| data.remove::<(u64, String)>(format_error_key));
-                            let value = serde_json::to_value(converted).unwrap();
-                            for property in [
-                                PropertyKey::Format,
-                                PropertyKey::Options,
-                                PropertyKey::TransparencyColour,
-                                PropertyKey::Data,
-                            ] {
-                                queue(design, id, property, value[property.as_str()].clone());
-                            }
-                        }
-                        Err(error) => {
-                            ui.data_mut(|data| {
-                                data.insert_temp(
-                                    format_error_key,
-                                    (design.revision(), error.clone()),
-                                )
-                            });
-                            crate::ui_style::error_text(ui, &error);
-                        }
-                    }
+                        Some(format),
+                    );
                 }
             }
+            if ui.button("Convert…").clicked() {
+                crate::graphics::conversion_ui::open_for_picture(ui.ctx(), design, id, None);
+            }
         });
-        let (pixels, packed, stored) = crate::graphics::picture_data_sizes(picture);
-        let packing = match picture.format {
-            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::Monochrome => {
-                "monochrome packing"
-            }
-            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::FourBit => {
-                "4-bit packing"
-            }
-            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::EightBit => {
-                "no bit packing"
-            }
-        };
-        ui.label(format!("Unpacked 8-bit indices: {pixels} bytes"));
-        let packing_delta = if packed <= pixels {
-            format!("{} bytes saved", pixels - packed)
+        let palette =
+            crate::effective_colour::colours(design.get_pool()).map(|colour| colour.as_rgb());
+        let raw = crate::graphics::picture_data_sizes(picture).1;
+        let rle =
+            crate::graphics::conversion::candidate_rle_size(picture).unwrap_or(picture.data.len());
+        let stored = picture.data.len();
+        let rle_stored = picture.options.data_code_type
+            == ag_iso_stack::object_pool::object_attributes::DataCodeType::RunLength;
+        let summary = if rle_stored && stored < raw {
+            format!("Data size: {raw} bytes (raw) optimized to {stored} bytes (RLE)")
+        } else if rle_stored && stored >= raw {
+            format!("Data size: {stored} bytes (stored as RLE; RLE provides no size reduction)")
+        } else if rle >= raw {
+            format!("Data size: {raw} bytes (raw; RLE provides no size reduction)")
         } else {
-            format!("{} bytes larger", packed - pixels)
+            format!("Data size: {raw} bytes (raw; candidate RLE is smaller)")
         };
-        ui.label(format!(
-            "Packed raw data ({packing}): {packed} bytes ({packing_delta})"
-        ));
-        if picture.options.data_code_type
-            == ag_iso_stack::object_pool::object_attributes::DataCodeType::RunLength
-        {
-            let rle_delta = if stored < packed {
-                format!("{} bytes saved", packed - stored)
-            } else if stored > packed {
-                format!("{} bytes larger", stored - packed)
-            } else {
-                "same size as raw".to_owned()
-            };
-            ui.label(format!("Stored payload: {stored} bytes (RLE; {rle_delta})"));
+        let benefit = if rle < raw {
+            format!("saves {} bytes", raw - rle)
+        } else if rle == raw {
+            "ties raw size".into()
         } else {
-            ui.label(format!("Stored payload: {stored} bytes (raw; no RLE)"));
-        }
+            format!("increases size by {} bytes", rle - raw)
+        };
+        let tooltip = if rle < raw {
+            format!("Packed raw bytes (including row padding, before RLE): {raw}; candidate RLE: {rle} bytes; {benefit}.")
+        } else if rle == raw {
+            format!("Packed raw bytes (including row padding, before RLE): {raw}; candidate RLE: {rle} bytes; ties raw size.")
+        } else {
+            format!(
+                "Packed raw bytes (including row padding, before RLE): {raw}; candidate RLE: {rle} bytes; increases size by {} bytes.",
+                rle - raw
+            )
+        };
+        let tooltip = if rle_stored && stored >= raw {
+            format!(
+                "{tooltip} Existing payload is stored as RLE, which provides no size reduction."
+            )
+        } else {
+            tooltip
+        };
+        ui.label(egui::RichText::new(summary).weak())
+            .on_hover_text(tooltip);
         let mut transparent = picture.options.transparent;
         let mut colour = picture.transparency_colour;
         let mut flashing = picture.options.flashing;
@@ -342,13 +309,16 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                 .checkbox(&mut transparent, "Transparent Pixels")
                 .changed();
             if transparent {
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut colour, 0..=255)
-                            .text("Transparent Colour")
-                            .drag_value_speed(1.0),
-                    )
-                    .changed();
+                ui.label("Transparent colour:");
+                let maximum = match picture.format {
+                    ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::Monochrome => 1,
+                    ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::FourBit => 15,
+                    ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::EightBit => 255,
+                };
+                if let Some(selected) = colour_index_picker(ui, colour, &palette, 0..=maximum) {
+                    changed |= colour != selected;
+                    colour = selected;
+                }
             }
         });
         changed |= ui.checkbox(&mut flashing, "Flashing").changed();
@@ -711,54 +681,60 @@ fn render_colour(
     property: PropertyKey,
     design: &EditorProject,
 ) {
-    use crate::isobus_colour::{self, FIRST_PROPRIETARY};
     let Some(current) = value.as_u64().and_then(|v| u8::try_from(v).ok()) else {
         return;
     };
     ui.label(label);
-    ui.horizontal(|ui| {
-        if let Some([r, g, b]) = isobus_colour::standard_rgb(current) {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
-            ui.painter()
-                .rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+    let palette = crate::effective_colour::colours(design.get_pool()).map(|colour| colour.as_rgb());
+    if let Some(index) = colour_index_picker(ui, current, &palette, 0..=u8::MAX) {
+        if index != current {
+            queue(design, id, property, serde_json::json!(index));
         }
-        ui.menu_button(isobus_colour::label(current), |ui| {
-            ui.label("ISOBUS standard palette (8-bit index)");
-            egui::ScrollArea::vertical()
-                .max_height(420.0)
-                .show(ui, |ui| {
-                    for (title, start, end) in [
-                        ("Basic colours", 0, 15),
-                        ("Colour cube", 16, FIRST_PROPRIETARY - 1),
-                        (
-                            "Manufacturer-specific (appearance undefined)",
-                            FIRST_PROPRIETARY,
-                            255,
-                        ),
-                    ] {
-                        ui.label(title);
-                        egui::Grid::new(title)
+    }
+}
+
+/// Choose a resolved project-palette index, optionally restricting valid indices.
+/// Returns an explicitly selected index, including reselection of the current one.
+pub fn colour_index_picker(
+    ui: &mut egui::Ui,
+    current: u8,
+    palette: &[[u8; 3]; 256],
+    permitted: std::ops::RangeInclusive<u8>,
+) -> Option<u8> {
+    let colour = palette[usize::from(current)];
+    let mut selected = None;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            2.0,
+            egui::Color32::from_rgb(colour[0], colour[1], colour[2]),
+        );
+        ui.menu_button(
+            format!("{} · {current}", crate::isobus_colour::label(current)),
+            |ui| {
+                ui.label("Resolved project palette (8-bit index)");
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new(ui.next_auto_id())
                             .spacing(egui::vec2(3.0, 3.0))
                             .show(ui, |ui| {
-                                for index in start..=end {
-                                    let mut button = egui::Button::new(index.to_string())
-                                        .min_size(egui::vec2(32.0, 24.0));
-                                    if let Some([r, g, b]) = isobus_colour::standard_rgb(index) {
-                                        let text_colour =
-                                            if 299 * r as u32 + 587 * g as u32 + 114 * b as u32
-                                                > 128_000
-                                            {
-                                                egui::Color32::BLACK
-                                            } else {
-                                                egui::Color32::WHITE
-                                            };
-                                        button = egui::Button::new(
-                                            egui::RichText::new(index.to_string())
-                                                .color(text_colour),
-                                        )
-                                        .fill(egui::Color32::from_rgb(r, g, b))
-                                        .min_size(egui::vec2(32.0, 24.0));
-                                    }
+                                for (position, index) in permitted.enumerate() {
+                                    let [r, g, b] = palette[usize::from(index)];
+                                    let text_colour =
+                                        if 299 * r as u32 + 587 * g as u32 + 114 * b as u32
+                                            > 128_000
+                                        {
+                                            egui::Color32::BLACK
+                                        } else {
+                                            egui::Color32::WHITE
+                                        };
+                                    let mut button = egui::Button::new(
+                                        egui::RichText::new(index.to_string()).color(text_colour),
+                                    )
+                                    .fill(egui::Color32::from_rgb(r, g, b))
+                                    .min_size(egui::vec2(32.0, 24.0));
                                     if index == current {
                                         button = button.stroke(egui::Stroke::new(
                                             2.0,
@@ -767,23 +743,25 @@ fn render_colour(
                                     }
                                     if ui
                                         .add(button)
-                                        .on_hover_text(isobus_colour::label(index))
+                                        .on_hover_text(format!(
+                                            "{} · #{r:02X}{g:02X}{b:02X}",
+                                            crate::isobus_colour::label(index)
+                                        ))
                                         .clicked()
                                     {
-                                        if index != current {
-                                            queue(design, id, property, serde_json::json!(index));
-                                        }
+                                        selected = Some(index);
                                         ui.close();
                                     }
-                                    if (index as usize - start as usize + 1) % 8 == 0 {
+                                    if (position + 1) % 8 == 0 {
                                         ui.end_row();
                                     }
                                 }
                             });
-                    }
-                });
-        });
+                    });
+            },
+        );
     });
+    selected
 }
 
 /// Convert a snake_case property identifier to a title-cased editor label.

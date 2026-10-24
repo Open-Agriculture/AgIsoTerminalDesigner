@@ -66,6 +66,74 @@ pub(crate) fn recover_picture_graphic(
 }
 
 impl GraphicService {
+    /// Convert an existing PictureGraphic with explicit conversion settings.
+    /// The conversion and all normal project validation are committed as one edit.
+    pub fn convert_picture(
+        project: &mut EditorProject,
+        object_id: u16,
+        options: &super::conversion::ConversionOptions,
+    ) -> crate::components::ComponentResult<()> {
+        project.edit_source("Convert PictureGraphic", |pool, _, _, _| {
+            let id = ObjectId::new(object_id).ok().ok_or_else(|| {
+                ComponentError::new("GRAPHIC_TARGET_INVALID", "Invalid PictureGraphic ID")
+            })?;
+            let pool_snapshot = pool.clone();
+            let palette = resolved_rgb_palette(&pool_snapshot);
+            let picture = pool.object_mut_by_id(id);
+            let Some(Object::PictureGraphic(picture)) = picture else {
+                return Err(ComponentError::new(
+                    "GRAPHIC_TARGET_INVALID",
+                    format!("Target {object_id} must be a PictureGraphic"),
+                ));
+            };
+            super::validate_picture_format(
+                &pool_snapshot,
+                id,
+                picture.actual_width,
+                options.target,
+            )
+            .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))?;
+            super::conversion::apply_picture_conversion(picture, options, &palette)
+                .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))
+        })
+    }
+
+    /// Convert image bytes into an existing PictureGraphic without retaining the
+    /// source bytes. Existing display width, flashing and unrelated options remain.
+    pub fn convert_image_into_picture_graphic(
+        project: &mut EditorProject,
+        object_id: u16,
+        bytes: &[u8],
+        options: &super::conversion::ConversionOptions,
+    ) -> crate::components::ComponentResult<()> {
+        let bytes = bytes.to_vec();
+        project.edit_source("Load image into PictureGraphic", |pool, _, _, _| {
+            let id = ObjectId::new(object_id).ok().ok_or_else(|| {
+                ComponentError::new("GRAPHIC_TARGET_INVALID", "Invalid PictureGraphic ID")
+            })?;
+            let pool_snapshot = pool.clone();
+            let palette = resolved_rgb_palette(&pool_snapshot);
+            let picture = pool.object_mut_by_id(id);
+            let Some(Object::PictureGraphic(picture)) = picture else {
+                return Err(ComponentError::new(
+                    "GRAPHIC_TARGET_INVALID",
+                    format!("Target {object_id} must be a PictureGraphic"),
+                ));
+            };
+            let preview = super::conversion::preview_image(picture, &bytes, options, &palette)
+                .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))?;
+            super::validate_picture_format(
+                &pool_snapshot,
+                id,
+                preview.picture.actual_width,
+                options.target,
+            )
+            .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))?;
+            *picture = preview.picture;
+            Ok(())
+        })
+    }
+
     pub fn upload(
         project: &mut EditorProject,
         filename: &str,
@@ -218,6 +286,61 @@ impl GraphicService {
         )
     }
 
+    /// Convert and consume an Available asset into an existing picture in one
+    /// undoable source transaction.
+    pub fn convert_asset_into_picture_graphic_with_options(
+        project: &mut EditorProject,
+        asset_id: GraphicAssetId,
+        object_id: u16,
+        options: &super::conversion::ConversionOptions,
+    ) -> crate::components::ComponentResult<()> {
+        project.edit_source(
+            "Convert graphic into PictureGraphic",
+            |pool, _, graphics, info| {
+                let id = ObjectId::new(object_id).ok().ok_or_else(|| {
+                    ComponentError::new("GRAPHIC_TARGET_INVALID", "Invalid PictureGraphic ID")
+                })?;
+                let asset = graphics.assets.get(&asset_id).cloned().ok_or_else(|| {
+                    ComponentError::new("GRAPHIC_ASSET_NOT_FOUND", "Unknown graphic")
+                })?;
+                validate_pool_graphic_name(pool, info, &asset.name, Some(id))?;
+                let pool_snapshot = pool.clone();
+                let palette = resolved_rgb_palette(&pool_snapshot);
+                let picture = pool.object_mut_by_id(id);
+                let Some(Object::PictureGraphic(picture)) = picture else {
+                    return Err(ComponentError::new(
+                        "GRAPHIC_TARGET_INVALID",
+                        format!("Target {object_id} must be a PictureGraphic"),
+                    ));
+                };
+                let preview = super::conversion::preview_image(
+                    picture,
+                    &asset.original_bytes,
+                    options,
+                    &palette,
+                )
+                .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))?;
+                super::validate_picture_format(
+                    &pool_snapshot,
+                    id,
+                    preview.picture.actual_width,
+                    options.target,
+                )
+                .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))?;
+                *picture = preview.picture;
+                graphics.assets.remove(&asset_id);
+                let object = pool.object_by_id(id).expect("target was validated above");
+                let entry = info
+                    .entry(id)
+                    .or_insert_with(|| crate::ObjectInfo::new(object));
+                entry.name = Some(asset.name);
+                entry.description = asset.description;
+                entry.tags = asset.tags;
+                Ok(())
+            },
+        )
+    }
+
     pub fn create_picture_graphic_from_asset(
         project: &mut EditorProject,
         asset_id: GraphicAssetId,
@@ -231,28 +354,7 @@ impl GraphicService {
                     ComponentError::new("GRAPHIC_ASSET_NOT_FOUND", "Unknown graphic")
                 })?;
                 validate_pool_graphic_name(pool, info, &asset.name, None)?;
-                let range = ranges.range_for(ObjectType::PictureGraphic);
-                let id = (range.start..=range.end)
-                    .find(|id| {
-                        !pool
-                            .objects()
-                            .iter()
-                            .any(|object| object.id().value() == *id)
-                            && !source.instances.iter().any(|instance| {
-                                instance
-                                    .compiled_ids
-                                    .values()
-                                    .any(|reserved| reserved == id)
-                            })
-                    })
-                    .ok_or_else(|| {
-                        ComponentError::new(
-                            "OBJECT_ID_RANGE_EXHAUSTED",
-                            format!(
-                                "No free PictureGraphic ID remains in configured range {range}"
-                            ),
-                        )
-                    })?;
+                let id = next_picture_graphic_id(pool, source, &ranges)?;
                 let mut object = crate::default_object(ObjectType::PictureGraphic);
                 object.mut_id().set_value(id).map_err(|error| {
                     ComponentError::new("OBJECT_ID_INVALID", format!("{error:?}"))
@@ -278,6 +380,87 @@ impl GraphicService {
         )?;
         Ok(created_id.expect("successful conversion creates an object ID"))
     }
+
+    /// Create a PictureGraphic from an Available asset using explicit conversion
+    /// settings, consuming the asset only after conversion succeeds.
+    pub fn create_picture_graphic_from_asset_with_options(
+        project: &mut EditorProject,
+        asset_id: GraphicAssetId,
+        options: &super::conversion::ConversionOptions,
+    ) -> crate::components::ComponentResult<u16> {
+        let mut created_id = None;
+        let ranges = project.object_id_ranges().clone();
+        project.edit_source(
+            "Create PictureGraphic from graphic",
+            |pool, source, graphics, info| {
+                let asset = graphics.assets.get(&asset_id).cloned().ok_or_else(|| {
+                    ComponentError::new("GRAPHIC_ASSET_NOT_FOUND", "Unknown graphic")
+                })?;
+                validate_pool_graphic_name(pool, info, &asset.name, None)?;
+                let id = next_picture_graphic_id(pool, source, &ranges)?;
+                let mut object = crate::default_object(ObjectType::PictureGraphic);
+                object.mut_id().set_value(id).map_err(|error| {
+                    ComponentError::new("OBJECT_ID_INVALID", format!("{error:?}"))
+                })?;
+                let Object::PictureGraphic(picture) = &mut object else {
+                    unreachable!("PictureGraphic defaults must have PictureGraphic type")
+                };
+                let palette = resolved_rgb_palette(pool);
+                let preview = super::conversion::preview_image(
+                    picture,
+                    &asset.original_bytes,
+                    options,
+                    &palette,
+                )
+                .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))?;
+                picture.clone_from(&preview.picture);
+                let object_id = object.id();
+                pool.add(object);
+                graphics.assets.remove(&asset_id);
+                let object = pool.object_by_id(object_id).unwrap();
+                let entry = info
+                    .entry(object_id)
+                    .or_insert_with(|| crate::ObjectInfo::new(object));
+                entry.name = Some(asset.name);
+                entry.description = asset.description;
+                entry.tags = asset.tags;
+                created_id = Some(id);
+                Ok(())
+            },
+        )?;
+        Ok(created_id.expect("successful conversion creates an object ID"))
+    }
+}
+
+fn resolved_rgb_palette(pool: &ObjectPool) -> [[u8; 3]; 256] {
+    crate::effective_colour::colours(pool).map(|colour| colour.as_rgb())
+}
+
+fn next_picture_graphic_id(
+    pool: &ObjectPool,
+    source: &crate::components::ComponentSource,
+    ranges: &crate::ObjectIdRanges,
+) -> crate::components::ComponentResult<u16> {
+    let range = ranges.range_for(ObjectType::PictureGraphic);
+    (range.start..=range.end)
+        .find(|id| {
+            !pool
+                .objects()
+                .iter()
+                .any(|object| object.id().value() == *id)
+                && !source.instances.iter().any(|instance| {
+                    instance
+                        .compiled_ids
+                        .values()
+                        .any(|reserved| reserved == id)
+                })
+        })
+        .ok_or_else(|| {
+            ComponentError::new(
+                "OBJECT_ID_RANGE_EXHAUSTED",
+                format!("No free PictureGraphic ID remains in configured range {range}"),
+            )
+        })
 }
 
 fn validate_graphic_name(

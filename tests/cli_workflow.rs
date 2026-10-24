@@ -117,6 +117,144 @@ fn get(cwd: &Path, target: &str) -> Value {
 }
 
 #[test]
+fn graphic_conversion_cli_accepts_configurable_mappings_without_encoding_flags() {
+    let _session = CLI_SESSION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cwd = temp_dir("aitd-graphic-conversion");
+    new_session(&cwd);
+    success(cli(
+        &cwd,
+        &["object", "create", "PictureGraphic", "Picture"],
+    ));
+
+    let image = image::RgbaImage::from_raw(1, 1, vec![255, 0, 0, 255]).unwrap();
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    std::fs::write(cwd.join("pixel.png"), bytes.into_inner()).unwrap();
+    success(cli(
+        &cwd,
+        &["graphic", "import", "pixel.png", "--name", "Pixel"],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "graphic",
+            "assign",
+            "Pixel",
+            "Picture",
+            "--format",
+            "four_bit",
+            "--transparency",
+            "flatten",
+            "--map",
+            "rgba:FF0000FF=1",
+        ],
+    ));
+    let saved_path = cwd.join("converted.aitp");
+    success(cli(
+        &cwd,
+        &[
+            "project",
+            "save",
+            saved_path.to_str().unwrap(),
+            "--skip-validation",
+        ],
+    ));
+    let saved = EditorProject::load_project(std::fs::read(saved_path).unwrap()).unwrap();
+    let ag_iso_stack::object_pool::object::Object::PictureGraphic(template) =
+        default_object(ObjectType::PictureGraphic)
+    else {
+        unreachable!()
+    };
+    use ag_iso_terminal_designer::graphics::conversion::{
+        self, ColourMapping, ConversionOptions, SourceColour, TransparencyMode,
+    };
+    let palette = ag_iso_terminal_designer::effective_colour::colours(saved.get_pool())
+        .map(|colour| colour.as_rgb());
+    let mut options = ConversionOptions::suggested_with_palette(
+        ag_iso_terminal_designer::graphics::PictureGraphicFormat::FourBit,
+        &palette,
+    );
+    options.transparency = TransparencyMode::Flatten;
+    options.mappings.insert(
+        SourceColour::Rgba([255, 0, 0, 255]),
+        ColourMapping::Index(1),
+    );
+    let preview = conversion::preview_image(
+        &template,
+        &std::fs::read(cwd.join("pixel.png")).unwrap(),
+        &options,
+        &palette,
+    )
+    .unwrap();
+    let converted = saved.get_pool().objects_by_type(ObjectType::PictureGraphic)[0];
+    let ag_iso_stack::object_pool::object::Object::PictureGraphic(converted) = converted else {
+        unreachable!()
+    };
+    assert_eq!(converted.data, preview.picture.data);
+    assert_eq!(converted.format, preview.picture.format);
+    assert_eq!(converted.options, preview.picture.options);
+    success(cli(
+        &cwd,
+        &["graphic", "import", "pixel.png", "--name", "NewPixel"],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "graphic",
+            "create-picture",
+            "NewPixel",
+            "--format",
+            "four_bit",
+            "--map",
+            "rgba:FF0000FF=1",
+        ],
+    ));
+    success(cli(
+        &cwd,
+        &[
+            "graphic",
+            "convert",
+            "Pixel",
+            "--format",
+            "monochrome",
+            "--mapping",
+            "luminance_threshold",
+            "--threshold",
+            "127",
+            "--invert",
+        ],
+    ));
+    let invalid = failure(cli(
+        &cwd,
+        &[
+            "graphic",
+            "convert",
+            "Pixel",
+            "--format",
+            "four_bit",
+            "--mapping",
+            "luminance_threshold",
+        ],
+    ));
+    assert!(invalid["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("only available for monochrome output"));
+    let help = cli(&cwd, &["graphic", "convert", "--help"]);
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--format"));
+    assert!(help.contains("--map"));
+    assert!(!help.contains("--encoding"));
+    assert!(!help.contains("--dither"));
+
+    success(cli(&cwd, &["project", "close", "--discard"]));
+    std::fs::remove_dir_all(cwd).unwrap();
+}
+
+#[test]
 fn direct_edits_are_typed_and_check_does_not_commit() {
     let _session = CLI_SESSION
         .lock()

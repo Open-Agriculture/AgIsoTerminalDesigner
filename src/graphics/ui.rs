@@ -158,14 +158,6 @@ pub fn available_button(
         |ui, asset| {
             ui.label(format!("Replace the image in {}. The chosen graphic will be removed from Available. This is undoable.", object_picker::object_label(project, Some(target))));
             review_asset(ui, project, *asset)
-                && object_picker::impact::review_change(ui, project, |candidate| {
-                    GraphicService::convert_asset_into_picture_graphic(
-                        candidate,
-                        *asset,
-                        target.value(),
-                    )
-                    .map_err(|error| error.to_string())
-                })
         },
     )
 }
@@ -397,9 +389,10 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
                 object_picker::open(ui.ctx(), assign_key);
                 Ok(())
             }
-            Action::Create => GraphicService::create_picture_graphic_from_asset(project, id)
-                .map(|id| go_to_picture_graphic(project, ObjectId::new(id).unwrap()))
-                .map_err(|error| error.to_string()),
+            Action::Create => {
+                super::conversion_ui::open_for_asset(ui.ctx(), project, id, None);
+                Ok(())
+            }
             Action::Delete => GraphicService::delete_available_asset(project, id)
                 .map_err(|error| error.to_string()),
             Action::Download => {
@@ -422,24 +415,12 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
                 None,
                 false,
                 |object| object.object_type() == ObjectType::PictureGraphic,
-                |ui, choice| object_picker::impact::review_change(ui, project, |candidate| {
-                    let target = choice.0.ok_or("Choose a PictureGraphic")?;
-                    GraphicService::convert_asset_into_picture_graphic(candidate, asset_id, target.value()).map_err(|error| error.to_string())
-                }),
+                |ui, choice| object_picker::review_object(ui, project, choice),
             )
             .and_then(|id| id.0);
             if let Some(id) = selected {
-                match GraphicService::convert_asset_into_picture_graphic(
-                    project,
-                    asset_id,
-                    id.value(),
-                ) {
-                    Ok(()) => {
-                        go_to_picture_graphic(project, id);
-                        assigning = None;
-                    }
-                    Err(value) => error = Some(value.to_string()),
-                }
+                super::conversion_ui::open_for_asset(ui.ctx(), project, asset_id, Some(id));
+                assigning = None;
             }
             if !object_picker::is_open(ui.ctx(), assign_key) {
                 assigning = None;
@@ -493,7 +474,9 @@ pub fn select(
         Picture(ObjectId),
         Asset(GraphicAssetId),
     }
-    let key = ui.next_auto_id().with("select_graphic");
+    let key = ui
+        .next_auto_id()
+        .with(("select_graphic", project.ui_session_id()));
     if ui
         .button(value.as_u64().map_or_else(
             || "Select PictureGraphic…".to_owned(),
@@ -538,29 +521,124 @@ pub fn select(
                 }
                 Choice::Asset(id) => {
                     ui.label("Create a new PictureGraphic from this upload and use it for the graphic value. The upload will be removed from Available. Creation is undoable.");
-                    review_asset(ui, project, *id)
+                    return review_asset(ui, project, *id);
                 }
             };
             valid
                 && object_picker::impact::review_change(ui, project, |candidate| {
-                    let id = match choice {
-                        Choice::Picture(id) => id.value(),
-                        Choice::Asset(asset) => {
-                            GraphicService::create_picture_graphic_from_asset(candidate, *asset)
-                                .map_err(|error| error.to_string())?
-                        }
+                    let Choice::Picture(id) = choice else {
+                        unreachable!()
                     };
-                    preview_selection(candidate, id)
+                    preview_selection(candidate, id.value())
                 })
         },
     );
     match choice {
         Some(Choice::Picture(id)) => *value = serde_json::json!(id.value()),
         Some(Choice::Asset(asset)) => {
-            if let Ok(id) = GraphicService::create_picture_graphic_from_asset(project, asset) {
-                *value = serde_json::json!(id);
-            }
+            ui.data_mut(|data| data.insert_temp(key.with("conversion_asset"), asset));
+            super::conversion_ui::open_asset_options(
+                ui.ctx(),
+                project,
+                key,
+                asset,
+                super::PictureGraphicFormat::EightBit,
+            );
         }
         None => {}
+    }
+    if let Some(options) = super::conversion_ui::take_asset_options(ui.ctx(), key) {
+        if let Some(asset) =
+            ui.data_mut(|data| data.remove_temp::<GraphicAssetId>(key.with("conversion_asset")))
+        {
+            let result = create_and_select(project, asset, &options, &preview_selection);
+            match result {
+                Ok(id) => *value = serde_json::json!(id),
+                Err(error) => ui.data_mut(|data| data.insert_temp(key.with("error"), error)),
+            }
+        }
+    }
+    if let Some(error) = ui.data_mut(|data| data.get_temp::<String>(key.with("error"))) {
+        crate::ui_style::error_text(ui, &error);
+        if ui.button("Dismiss conversion error").clicked() {
+            ui.data_mut(|data| data.remove::<String>(key.with("error")));
+        }
+    }
+}
+
+fn create_and_select(
+    project: &mut EditorProject,
+    asset: GraphicAssetId,
+    options: &super::conversion::ConversionOptions,
+    select: impl FnOnce(&mut EditorProject, u16) -> Result<(), String>,
+) -> Result<u16, String> {
+    let mut created = None;
+    project.edit_batch(
+        "Create and select PictureGraphic",
+        |candidate| {
+            let id = GraphicService::create_picture_graphic_from_asset_with_options(
+                candidate, asset, options,
+            )
+            .map_err(|error| error.to_string())?;
+            select(candidate, id)?;
+            created = Some(id);
+            Ok(())
+        },
+        false,
+    )?;
+    Ok(created.expect("successful conversion creates a PictureGraphic"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creating_and_selecting_is_atomic_on_failure_and_undo() {
+        let mut pool = ag_iso_stack::object_pool::ObjectPool::default();
+        let mut pointer = crate::default_object(ObjectType::ObjectPointer);
+        pointer.mut_id().set_value(100).unwrap();
+        pool.add(pointer);
+        let mut project = EditorProject::from(pool);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 255, 255, 255]))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let asset = GraphicService::upload(&mut project, "test.png", bytes.into_inner()).unwrap();
+        let options = super::super::conversion::ConversionOptions::suggested(
+            super::super::PictureGraphicFormat::Monochrome,
+        );
+        let before = project.save_project().unwrap();
+        assert!(create_and_select(&mut project, asset, &options, |_, _| {
+            Err("Reference update failed".into())
+        })
+        .is_err());
+        assert_eq!(project.save_project().unwrap(), before);
+        let id = create_and_select(&mut project, asset, &options, |candidate, id| {
+            let mut transaction = crate::operations::OperationTransaction::new(None);
+            transaction.add_operation(crate::operations::Operation::SetObjectReference {
+                object: crate::operations::ObjectTarget::id(100),
+                property: crate::object_properties::PropertyKey::Value,
+                reference: Some(crate::operations::ObjectTarget::id(id)),
+            });
+            candidate
+                .execute_transaction(transaction)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert!(!project.graphic_library().assets.contains_key(&asset));
+        assert!(project
+            .get_pool()
+            .object_by_id(ObjectId::new(id).unwrap())
+            .is_some());
+        assert!(
+            matches!(project.get_pool().object_by_id(ObjectId::new(100).unwrap()),
+            Some(Object::ObjectPointer(pointer)) if pointer.value.0 == ObjectId::new(id).ok())
+        );
+        assert!(project.undo_operation());
+        assert_eq!(project.save_project().unwrap(), before);
+        assert!(project.redo_operation());
+        assert!(!project.graphic_library().assets.contains_key(&asset));
     }
 }

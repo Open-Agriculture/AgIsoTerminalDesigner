@@ -1574,6 +1574,11 @@ impl EditorProject {
         }
     }
 
+    /// Take an inspector choice so the caller can review conversion before applying it.
+    pub fn take_graphic_assignment(&self) -> Option<(crate::graphics::GraphicAssetId, ObjectId)> {
+        self.graphic_assign_request.take()
+    }
+
     /// Consume a pending hierarchy delete request.
     pub fn take_delete_request(&self) -> Option<ObjectId> {
         self.delete_request.replace(None)

@@ -177,12 +177,22 @@ creation or `object override-id NAME ID|automatic` for existing objects.
 instructions author Macro streams without byte payloads. Object-valued Macro
 arguments accept names; ordinary numeric values remain numeric. ZIP export
 rejects packed reference values with additional data that cannot be reproduced
-by a named argument. `graphic assign
-ASSET_NAME OBJECT_NAME` attaches an imported asset by name. Use the graphic
-authoring commands to import indexed PNG data into an existing PictureGraphic,
-retaining its palette indices. Four-bit and monochrome
-formats and run-length encoding are also supported. The PNG palette must match
-the project's effective palette. ZIP export compares regenerated picture bytes
+by a named argument. `graphic assign ASSET_NAME OBJECT_NAME` attaches an
+imported asset by name. `graphic create-picture ASSET_NAME` creates a
+PictureGraphic from an available asset, and `graphic convert OBJECT_NAME`
+converts an existing PictureGraphic. These commands accept `--format`
+(`monochrome`, `four_bit`, or `eight_bit`), `--mapping`
+(`nearest` or `luminance_threshold`), `--threshold` (0–255), `--invert`,
+`--transparency` (`preserve` or `flatten`), `--transparent-index INDEX`,
+`--background-index INDEX`, and `--alpha-cutoff` (0–255). Repeat `--map` to
+override source colours, such as `--map index:231=1` or
+`--map rgba:FFFFFFFF=1`; use `transparent` as a target to make that source
+colour transparent. If no conversion controls are supplied, assignment keeps
+its existing defaults. With conversion controls, an omitted format keeps the
+target PictureGraphic's format; newly created pictures default to eight-bit.
+Encoding is selected automatically from raw and run-length sizes.
+`graphic assign-file` remains available for lossless
+indexed PNG transport with an explicit format and encoding. ZIP export compares regenerated picture bytes
 and rejects non-reproducible encodings, unsupported binary content, and invalid
 drafts before showing the save dialog. Available graphic originals are converted
 to lossless PNG with their authoring metadata preserved.

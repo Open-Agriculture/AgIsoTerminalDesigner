@@ -321,9 +321,17 @@ pub enum EditActionKind {
     GraphicAssign {
         asset_id: crate::graphics::GraphicAssetId,
         object: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<crate::graphics::conversion::ConversionOptions>,
+    },
+    GraphicConvert {
+        object: u16,
+        options: crate::graphics::conversion::ConversionOptions,
     },
     GraphicCreatePicture {
         asset_id: crate::graphics::GraphicAssetId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<crate::graphics::conversion::ConversionOptions>,
     },
     GraphicRename {
         asset_id: crate::graphics::GraphicAssetId,
@@ -736,15 +744,28 @@ fn apply_kind(project: &mut EditorProject, action: EditActionKind) -> Result<(),
             tags,
             id_overridden,
         ),
-        A::GraphicAssign { asset_id, object } => {
-            GraphicService::convert_asset_into_picture_graphic(project, asset_id, object)
-                .map_err(|e| e.to_string())
+        A::GraphicAssign {
+            asset_id,
+            object,
+            options,
+        } => match options {
+            Some(options) => GraphicService::convert_asset_into_picture_graphic_with_options(
+                project, asset_id, object, &options,
+            ),
+            None => GraphicService::convert_asset_into_picture_graphic(project, asset_id, object),
         }
-        A::GraphicCreatePicture { asset_id } => {
-            GraphicService::create_picture_graphic_from_asset(project, asset_id)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string()),
+        A::GraphicConvert { object, options } => {
+            GraphicService::convert_picture(project, object, &options).map_err(|e| e.to_string())
         }
+        A::GraphicCreatePicture { asset_id, options } => match options {
+            Some(options) => GraphicService::create_picture_graphic_from_asset_with_options(
+                project, asset_id, &options,
+            ),
+            None => GraphicService::create_picture_graphic_from_asset(project, asset_id),
+        }
+        .map(|_| ())
+        .map_err(|e| e.to_string()),
         A::GraphicRename { asset_id, name } => {
             GraphicService::rename_available_asset(project, asset_id, name)
                 .map_err(|e| e.to_string())

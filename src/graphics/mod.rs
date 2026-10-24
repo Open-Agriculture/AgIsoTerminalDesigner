@@ -4,6 +4,8 @@ pub use ag_iso_stack::object_pool::object_attributes::{DataCodeType, PictureGrap
 use ag_iso_stack::object_pool::{object::Object, ObjectId, ObjectPool};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+pub mod conversion;
+pub mod conversion_ui;
 pub mod indexed_png;
 pub mod integration;
 pub mod preview;
@@ -195,65 +197,10 @@ pub fn convert_picture_graphic_format(
     target: PictureGraphicFormat,
     palette: &[[u8; 3]; 256],
 ) -> Result<(), String> {
-    let indices = indexed_png::pixel_indices(picture)?;
-    let source_key = picture.transparency_colour;
-    let transparent =
-        picture.options.transparent && indices.iter().any(|index| *index == source_key);
-    if picture.format == target {
-        if !transparent {
-            picture.options.transparent = false;
-        }
-        return Ok(());
-    }
-    let limit = match target {
-        PictureGraphicFormat::Monochrome => 2,
-        PictureGraphicFormat::FourBit => 16,
-        PictureGraphicFormat::EightBit => 256,
-    };
-    let source_key = usize::from(source_key);
-    let target_key = if transparent && target != PictureGraphicFormat::EightBit {
-        let rgb = palette[source_key];
-        (0..limit)
-            .min_by_key(|index| colour_distance(rgb, palette[*index]))
-            .unwrap_or(0)
-    } else if transparent {
-        source_key
-    } else {
-        0
-    };
-    let candidates: Vec<usize> = (0..limit)
-        .filter(|index| !transparent || *index != target_key)
-        .collect();
-    let mut converted = Vec::with_capacity(indices.len());
-    for index in indices {
-        if transparent && usize::from(index) == source_key {
-            converted.push(target_key as u8);
-            continue;
-        }
-        let mapped = if target == PictureGraphicFormat::EightBit {
-            usize::from(index)
-        } else {
-            let rgb = palette[usize::from(index)];
-            *candidates
-                .iter()
-                .min_by_key(|candidate| colour_distance(rgb, palette[**candidate]))
-                .ok_or_else(|| "No target colours remain after reserving transparency".to_owned())?
-        };
-        converted.push(mapped as u8);
-    }
-    let mut result = picture.clone();
-    result.options.transparent = transparent;
-    result.transparency_colour = target_key as u8;
-    indexed_png::encode_indices_optimized(&mut result, &converted, target)?;
-    *picture = result;
+    let options = conversion::ConversionOptions::suggested_with_palette(target, palette);
+    let preview = conversion::preview_picture(picture, &options, palette)?;
+    *picture = preview.picture;
     Ok(())
-}
-
-fn colour_distance(left: [u8; 3], right: [u8; 3]) -> u32 {
-    left.into_iter()
-        .zip(right)
-        .map(|(a, b)| (i32::from(a) - i32::from(b)).unsigned_abs().pow(2))
-        .sum()
 }
 
 /// Current-encoding size statistics: index pixels, packed raw bytes, stored bytes.

@@ -11,7 +11,7 @@ use ag_iso_stack::object_pool::{
     object_attributes::{DataCodeType, PictureGraphicFormat},
     ObjectType,
 };
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -881,6 +881,8 @@ pub enum GraphicsCommand {
         asset_id: String,
         #[arg(value_name = "NAME", allow_hyphen_values = true)]
         object: String,
+        #[command(flatten)]
+        conversion: GraphicConversionArgs,
     },
     /// Assign an indexed PNG directly, retaining palette indices and requested encoding.
     AssignFile {
@@ -896,6 +898,15 @@ pub enum GraphicsCommand {
     CreatePicture {
         #[arg(value_name = "GRAPHIC_NAME", allow_hyphen_values = true)]
         asset_id: String,
+        #[command(flatten)]
+        conversion: GraphicConversionArgs,
+    },
+    /// Convert an existing PictureGraphic using the active project palette.
+    Convert {
+        #[arg(value_name = "NAME", allow_hyphen_values = true)]
+        object: String,
+        #[command(flatten)]
+        conversion: GraphicConversionArgs,
     },
     Rename {
         #[arg(value_name = "GRAPHIC_NAME", allow_hyphen_values = true)]
@@ -908,6 +919,151 @@ pub enum GraphicsCommand {
         asset_id: String,
     },
 }
+
+/// Optional controls shared by configurable graphic conversion commands.
+#[derive(Debug, Clone, Default, Args, serde::Serialize, serde::Deserialize)]
+pub struct GraphicConversionArgs {
+    /// Target format: monochrome, four_bit, or eight_bit.
+    #[arg(long, value_parser = ["monochrome", "four_bit", "eight_bit"])]
+    format: Option<String>,
+    /// Mapping method: nearest or luminance_threshold.
+    #[arg(long, value_parser = ["nearest", "luminance_threshold"])]
+    mapping: Option<String>,
+    /// Monochrome threshold from 0 to 255; omitted selects an image-derived value.
+    #[arg(long, value_parser = clap::value_parser!(u8))]
+    threshold: Option<u8>,
+    /// Invert monochrome threshold output.
+    #[arg(long)]
+    invert: bool,
+    /// Preserve source transparency or flatten it against the selected background.
+    #[arg(long, value_parser = ["preserve", "flatten"])]
+    transparency: Option<String>,
+    /// Output transparency palette index (also reserves an unused key).
+    #[arg(long, value_parser = clap::value_parser!(u8))]
+    transparent_index: Option<u8>,
+    /// Palette index used as the flattening background.
+    #[arg(long, value_parser = clap::value_parser!(u8))]
+    background_index: Option<u8>,
+    /// Imported image alpha cutoff from 0 to 255.
+    #[arg(long, value_parser = clap::value_parser!(u8))]
+    alpha_cutoff: Option<u8>,
+    /// Repeatable source-to-target mappings, such as index:231=1 or rgba:FFFFFFFF=1.
+    #[arg(long = "map", value_name = "SOURCE=TARGET")]
+    mappings: Vec<String>,
+}
+
+impl GraphicConversionArgs {
+    fn has_options(&self) -> bool {
+        self.format.is_some()
+            || self.mapping.is_some()
+            || self.threshold.is_some()
+            || self.invert
+            || self.transparency.is_some()
+            || self.transparent_index.is_some()
+            || self.background_index.is_some()
+            || self.alpha_cutoff.is_some()
+            || !self.mappings.is_empty()
+    }
+
+    fn options(
+        &self,
+        default_target: PictureGraphicFormat,
+        force: bool,
+        palette: &[[u8; 3]; 256],
+    ) -> Result<Option<crate::graphics::conversion::ConversionOptions>, String> {
+        use crate::graphics::conversion::{
+            ColourMapping, ConversionOptions, MappingMethod, SourceColour, TransparencyMode,
+        };
+        if !force && !self.has_options() {
+            return Ok(None);
+        }
+        let target = match self.format.as_deref() {
+            None => default_target,
+            Some("monochrome") => PictureGraphicFormat::Monochrome,
+            Some("four_bit") => PictureGraphicFormat::FourBit,
+            Some("eight_bit") => PictureGraphicFormat::EightBit,
+            Some(value) => return Err(format!("Unknown picture format '{value}'")),
+        };
+        let mut options = ConversionOptions::suggested_with_palette(target, palette);
+        options.mapping = match self.mapping.as_deref() {
+            None if self.threshold.is_some() || self.invert => MappingMethod::LuminanceThreshold,
+            None | Some("nearest") => MappingMethod::Nearest,
+            Some("luminance_threshold") => MappingMethod::LuminanceThreshold,
+            Some(value) => return Err(format!("Unknown mapping method '{value}'")),
+        };
+        if options.mapping == MappingMethod::LuminanceThreshold
+            && target != PictureGraphicFormat::Monochrome
+        {
+            return Err(
+                "--mapping luminance_threshold is only available for monochrome output".into(),
+            );
+        }
+        if self.threshold.is_some() || self.invert {
+            if options.mapping != MappingMethod::LuminanceThreshold {
+                return Err(
+                    "--threshold and --invert require --mapping luminance_threshold".into(),
+                );
+            }
+        }
+        if let Some(threshold) = self.threshold {
+            options.threshold = threshold;
+            options.automatic_threshold = false;
+        }
+        options.invert = self.invert;
+        options.transparency = match self.transparency.as_deref() {
+            None | Some("preserve") => TransparencyMode::Preserve,
+            Some("flatten") => TransparencyMode::Flatten,
+            Some(value) => return Err(format!("Unknown transparency mode '{value}'")),
+        };
+        options.transparent_index = self.transparent_index;
+        if let Some(background) = self.background_index {
+            options.flatten_background = background;
+        }
+        if let Some(cutoff) = self.alpha_cutoff {
+            options.alpha_cutoff = cutoff;
+        }
+        for mapping in &self.mappings {
+            let (source, target) = mapping
+                .split_once('=')
+                .ok_or_else(|| format!("Invalid mapping '{mapping}'; expected SOURCE=TARGET"))?;
+            let source = if let Some(value) = source.strip_prefix("index:") {
+                SourceColour::Index(
+                    value
+                        .parse()
+                        .map_err(|_| format!("Invalid source index in mapping '{mapping}'"))?,
+                )
+            } else if let Some(value) = source.strip_prefix("rgba:") {
+                if value.len() != 8 || !value.is_ascii() {
+                    return Err(format!(
+                        "RGBA source in '{mapping}' must contain eight hex digits"
+                    ));
+                }
+                let mut rgba = [0; 4];
+                for (index, channel) in rgba.iter_mut().enumerate() {
+                    *channel = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                        .map_err(|_| format!("Invalid RGBA source in mapping '{mapping}'"))?;
+                }
+                SourceColour::Rgba(rgba)
+            } else {
+                return Err(format!(
+                    "Unknown mapping source in '{mapping}'; use index:N or rgba:RRGGBBAA"
+                ));
+            };
+            let target = if target == "transparent" {
+                ColourMapping::Transparent
+            } else {
+                ColourMapping::Index(
+                    target
+                        .parse()
+                        .map_err(|_| format!("Invalid target index in mapping '{mapping}'"))?,
+                )
+            };
+            options.mappings.insert(source, target);
+        }
+        Ok(Some(options))
+    }
+}
+
 #[derive(Debug, Subcommand, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ExportCommand {
     /// Validate and publish a new directory containing project.aitp and project.iop.
@@ -1190,6 +1346,24 @@ fn graphic_target(
             ))
         })
         .map_err(|message| error("INVALID_USAGE", message))
+}
+
+fn picture_format(
+    project: &crate::EditorProject,
+    object: u16,
+) -> Result<PictureGraphicFormat, Value> {
+    match ag_iso_stack::object_pool::ObjectId::new(object)
+        .ok()
+        .and_then(|id| project.get_pool().object_by_id(id))
+    {
+        Some(ag_iso_stack::object_pool::object::Object::PictureGraphic(picture)) => {
+            Ok(picture.format)
+        }
+        _ => Err(error(
+            "INVALID_ARGUMENTS",
+            format!("Object {object} is not a PictureGraphic"),
+        )),
+    }
 }
 
 fn typed_id<T: serde::de::DeserializeOwned>(value: &str, label: &str) -> Result<T, Value> {
@@ -2562,14 +2736,34 @@ fn command_edit_actions_now(
                     tags: tags.clone(),
                 })
             }
-            GraphicsCommand::Assign { asset_id, object } => one(EditActionKind::GraphicAssign {
-                asset_id: graphic_target(project, asset_id)?,
-                object: crate::cli::names::object_id(
-                    project.unwrap(),
+            GraphicsCommand::Assign {
+                asset_id,
+                object,
+                conversion,
+            } => {
+                let project = project.ok_or_else(|| {
+                    error(
+                        "PROJECT_REQUIRED",
+                        "Graphic assignment requires a loaded project",
+                    )
+                })?;
+                let object_id = crate::cli::names::object_id(
+                    project,
                     object.strip_prefix("name:").unwrap_or(object),
                 )
-                .map_err(|message| error("INVALID_USAGE", message))?,
-            }),
+                .map_err(|message| error("INVALID_USAGE", message))?;
+                let target = picture_format(project, object_id)?;
+                let palette = crate::effective_colour::colours(project.get_pool())
+                    .map(|colour| colour.as_rgb());
+                let options = conversion
+                    .options(target, false, &palette)
+                    .map_err(|message| error("INVALID_USAGE", message))?;
+                one(EditActionKind::GraphicAssign {
+                    asset_id: graphic_target(Some(project), asset_id)?,
+                    object: object_id,
+                    options,
+                })
+            }
             GraphicsCommand::AssignFile {
                 object,
                 file,
@@ -2600,9 +2794,48 @@ fn command_edit_actions_now(
                     encoding,
                 })
             }
-            GraphicsCommand::CreatePicture { asset_id } => {
+            GraphicsCommand::CreatePicture {
+                asset_id,
+                conversion,
+            } => {
+                let project = project.ok_or_else(|| {
+                    error(
+                        "PROJECT_REQUIRED",
+                        "Graphic creation requires a loaded project",
+                    )
+                })?;
+                let palette = crate::effective_colour::colours(project.get_pool())
+                    .map(|colour| colour.as_rgb());
+                let options = conversion
+                    .options(PictureGraphicFormat::EightBit, false, &palette)
+                    .map_err(|message| error("INVALID_USAGE", message))?;
                 one(EditActionKind::GraphicCreatePicture {
-                    asset_id: graphic_target(project, asset_id)?,
+                    asset_id: graphic_target(Some(project), asset_id)?,
+                    options,
+                })
+            }
+            GraphicsCommand::Convert { object, conversion } => {
+                let project = project.ok_or_else(|| {
+                    error(
+                        "PROJECT_REQUIRED",
+                        "Graphic conversion requires a loaded project",
+                    )
+                })?;
+                let object_id = crate::cli::names::object_id(
+                    project,
+                    object.strip_prefix("name:").unwrap_or(object),
+                )
+                .map_err(|message| error("INVALID_USAGE", message))?;
+                let target = picture_format(project, object_id)?;
+                let palette = crate::effective_colour::colours(project.get_pool())
+                    .map(|colour| colour.as_rgb());
+                let options = conversion
+                    .options(target, true, &palette)
+                    .map_err(|message| error("INVALID_USAGE", message))?
+                    .expect("forced conversion always returns options");
+                one(EditActionKind::GraphicConvert {
+                    object: object_id,
+                    options,
                 })
             }
             GraphicsCommand::Rename { asset_id, name } => one(EditActionKind::GraphicRename {
