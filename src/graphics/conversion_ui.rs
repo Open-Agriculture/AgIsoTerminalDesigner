@@ -37,6 +37,16 @@ struct Draft {
     filter: String,
     error: Option<String>,
     preview_cache: Option<(ConversionOptions, ConversionPreview)>,
+    /// The pool's size as an IOP when the dialog opened, for the picture's share.
+    pool_bytes: Option<usize>,
+    /// Stored bytes by format and scale, filled in by Compare sizes.
+    comparison: Option<Vec<SizeCandidate>>,
+}
+#[derive(Clone)]
+struct SizeCandidate {
+    target: PictureGraphicFormat,
+    stored_width: Option<u16>,
+    result: Result<usize, String>,
 }
 fn draft_key(ctx: &egui::Context) -> egui::Id {
     ctx.data(|d| d.get_temp::<egui::Id>(egui::Id::new("graphic_conversion_active")))
@@ -132,8 +142,187 @@ fn draft(project: &EditorProject, source: Source, format: PictureGraphicFormat) 
         filter: String::new(),
         error: None,
         preview_cache: None,
+        pool_bytes: None,
+        comparison: None,
     }
 }
+const STORED_PERCENTS: [u32; 5] = [100, 75, 50, 33, 25];
+
+fn percent_width(source_width: u16, percent: u32) -> u16 {
+    ((u32::from(source_width) * percent + 50) / 100).max(1) as u16
+}
+
+fn bytes_label(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} kB", bytes as f64 / 1024.0)
+    }
+}
+
+/// How many source pixels to store. The picture keeps its width, so the VT
+/// scales a smaller stored picture back up.
+fn stored_size_ui(ui: &mut egui::Ui, d: &mut Draft, p: &ConversionPreview) {
+    let source_width = p.source_width;
+    let stored = d
+        .options
+        .stored_width
+        .map_or(source_width, |width| width.min(source_width));
+    ui.horizontal(|ui| {
+        ui.label("Stored size:");
+        for percent in STORED_PERCENTS {
+            let width = percent_width(source_width, percent);
+            if ui
+                .selectable_label(stored == width, format!("{percent}%"))
+                .clicked()
+            {
+                d.options.stored_width = (width < source_width).then_some(width);
+            }
+        }
+        let mut width = stored;
+        if ui
+            .add(
+                egui::DragValue::new(&mut width)
+                    .range(1..=source_width.max(1))
+                    .suffix(" px wide")
+                    .update_while_editing(false),
+            )
+            .changed()
+        {
+            d.options.stored_width = (width < source_width).then_some(width);
+        }
+    });
+    let picture = &p.picture;
+    let shown_height =
+        conversion::scaled_height(picture.actual_width, picture.actual_height, picture.width);
+    let scaling = if picture.actual_width < picture.width {
+        "; the VT scales it up, how smoothly depends on the terminal"
+    } else {
+        ""
+    };
+    ui.label(
+        egui::RichText::new(format!(
+            "Stored {} × {}, shown {} × {}{scaling}",
+            picture.actual_width, picture.actual_height, picture.width, shown_height
+        ))
+        .weak(),
+    );
+}
+
+/// The picture's bytes against the whole pool, as an IOP.
+fn pool_impact_ui(
+    ui: &mut egui::Ui,
+    project: &EditorProject,
+    d: &mut Draft,
+    p: &ConversionPreview,
+) {
+    let pool = *d
+        .pool_bytes
+        .get_or_insert_with(|| project.get_pool().as_iop().len());
+    let target = match &d.source {
+        Source::Picture(id) | Source::Import { target: id, .. } => Some(*id),
+        Source::Asset { target, .. } => *target,
+        Source::AssetOptions { .. } => None,
+    };
+    let current = target
+        .and_then(|id| ObjectId::new(id).ok())
+        .and_then(|id| project.get_pool().object_by_id(id))
+        .map_or(0, |object| match object {
+            Object::PictureGraphic(picture) => picture.data.len(),
+            _ => 0,
+        });
+    let after = (pool + p.stored_size).saturating_sub(current).max(1);
+    let change = p.stored_size as i64 - current as i64;
+    let change = match change {
+        0 => "no change".to_owned(),
+        bytes if bytes < 0 => format!("saves {}", bytes_label(bytes.unsigned_abs() as usize)),
+        bytes => format!("adds {}", bytes_label(bytes as usize)),
+    };
+    ui.label(
+        egui::RichText::new(format!(
+            "Picture data {} of a {} pool ({:.0}%); {change}",
+            bytes_label(p.stored_size),
+            bytes_label(after),
+            100.0 * p.stored_size as f64 / after as f64
+        ))
+        .weak(),
+    );
+}
+
+/// Stored bytes for every format and scale, with the current transparency
+/// settings; clicking one uses it.
+fn comparison_ui(ui: &mut egui::Ui, project: &EditorProject, d: &mut Draft, source_width: u16) {
+    let formats = [
+        (PictureGraphicFormat::Monochrome, "Monochrome"),
+        (PictureGraphicFormat::FourBit, "4-bit"),
+        (PictureGraphicFormat::EightBit, "8-bit"),
+    ];
+    if ui
+        .button("Compare sizes")
+        .on_hover_text(
+            "Convert to every format at every stored size, with the current transparency \
+             settings, and list the bytes each one stores. Large images take a moment.",
+        )
+        .clicked()
+    {
+        let mut candidates = Vec::new();
+        for (target, _) in formats {
+            for percent in STORED_PERCENTS {
+                let width = percent_width(source_width, percent);
+                let mut candidate = d.clone();
+                candidate.options = ConversionOptions {
+                    transparency: d.options.transparency,
+                    alpha_cutoff: d.options.alpha_cutoff,
+                    stored_width: (width < source_width).then_some(width),
+                    ..suggested_options(project, target)
+                };
+                let stored_width = candidate.options.stored_width;
+                candidates.push(SizeCandidate {
+                    target,
+                    stored_width,
+                    result: preview_for(project, &candidate).map(|preview| preview.stored_size),
+                });
+            }
+        }
+        d.comparison = Some(candidates);
+    }
+    let Some(candidates) = d.comparison.clone() else {
+        return;
+    };
+    egui::Grid::new("stored_size_comparison")
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label("");
+            for percent in STORED_PERCENTS {
+                ui.label(format!("{percent}%"));
+            }
+            ui.end_row();
+            for (target, name) in formats {
+                ui.label(name);
+                for candidate in candidates.iter().filter(|c| c.target == target) {
+                    let current = d.options.target == target
+                        && d.options.stored_width == candidate.stored_width;
+                    match &candidate.result {
+                        Ok(bytes) => {
+                            if ui.selectable_label(current, bytes_label(*bytes)).clicked() {
+                                d.options = ConversionOptions {
+                                    transparency: d.options.transparency,
+                                    alpha_cutoff: d.options.alpha_cutoff,
+                                    stored_width: candidate.stored_width,
+                                    ..suggested_options(project, target)
+                                };
+                            }
+                        }
+                        Err(error) => {
+                            ui.weak("–").on_hover_text(error);
+                        }
+                    }
+                }
+                ui.end_row();
+            }
+        });
+}
+
 fn suggested_options(project: &EditorProject, format: PictureGraphicFormat) -> ConversionOptions {
     let palette = crate::effective_colour::colours(project.get_pool()).map(|c| c.as_rgb());
     ConversionOptions::suggested_with_palette(format, &palette)
@@ -346,10 +535,13 @@ pub fn show(ctx: &egui::Context, project: &mut EditorProject) {
                     (PictureGraphicFormat::EightBit, "8-bit"),
                 ] {
                     if ui.selectable_label(d.options.target == f, n).clicked() {
+                        let stored_width = d.options.stored_width;
                         d.options = suggested_options(project, f);
+                        d.options.stored_width = stored_width;
                     }
                 }
             });
+            stored_size_ui(ui, &mut d, p);
             ui.horizontal(|ui| {
                 ui.label("Mapping:");
                 egui::ComboBox::from_id_salt(key.with("mapping"))
@@ -514,6 +706,8 @@ pub fn show(ctx: &egui::Context, project: &mut EditorProject) {
             ));
             ui.label(egui::RichText::new(p.data_summary()).weak())
                 .on_hover_text(p.data_tooltip());
+            pool_impact_ui(ui, project, &mut d, p);
+            comparison_ui(ui, project, &mut d, p.source_width);
             ui.horizontal(|ui| {
                 ui.label("Colour mappings");
                 ui.add(egui::TextEdit::singleline(&mut d.filter).hint_text("Search colours…"));

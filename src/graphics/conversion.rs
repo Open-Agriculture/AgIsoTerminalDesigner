@@ -87,6 +87,12 @@ pub struct ConversionOptions {
     /// Imported alpha at or below this value is transparent in Preserve mode.
     pub alpha_cutoff: u8,
     pub mappings: BTreeMap<SourceColour, ColourMapping>,
+    /// Store the picture this many pixels wide, keeping its aspect ratio, while
+    /// it is still shown at its width: the VT scales a Picture Graphic from its
+    /// actual width to its width. `None`, or a width at or above the source's,
+    /// stores every source pixel.
+    #[serde(default)]
+    pub stored_width: Option<u16>,
 }
 
 impl ConversionOptions {
@@ -102,6 +108,7 @@ impl ConversionOptions {
             flatten_background: 1,
             alpha_cutoff: 0,
             mappings: BTreeMap::new(),
+            stored_width: None,
         }
     }
 
@@ -135,6 +142,9 @@ pub struct SourceColourCount {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConversionPreview {
     pub picture: PictureGraphic,
+    /// The source's size before any reduction to the stored width.
+    pub source_width: u16,
+    pub source_height: u16,
     pub colours: Vec<SourceColourCount>,
     pub threshold: u8,
     pub raw_size: usize,
@@ -298,6 +308,8 @@ fn convert(
     {
         return Err("Luminance threshold mapping is available only for Monochrome output".into());
     }
+    let (source_width, source_height) = source.dimensions();
+    let source = resampled(source, options.stored_width);
     let (width, height) = source.dimensions();
     let samples = source.samples();
     let limit = format_limit(options.target);
@@ -421,6 +433,8 @@ fn convert(
 
     let mut output = Vec::with_capacity(samples.len());
     let mut suggestions = BTreeMap::new();
+    // A key always has the same colour, so each is matched to the palette once
+    let mut matched = BTreeMap::new();
     for (i, (key, mut rgb, alpha)) in samples.iter().copied().enumerate() {
         if options.transparency == TransparencyMode::Flatten
             && matches!(source, Source::Rgba { .. })
@@ -448,7 +462,7 @@ fn convert(
         let suggestion = if is_transparent {
             ColourMapping::Transparent
         } else {
-            ColourMapping::Index(auto_mapping(key, rgb))
+            ColourMapping::Index(*matched.entry(key).or_insert_with(|| auto_mapping(key, rgb)))
         };
         suggestions.insert(key, suggestion);
         let mapped = if let Some(manual) = manual {
@@ -491,7 +505,7 @@ fn convert(
     result.actual_width = width;
     result.actual_height = height;
     if result.width == 0 {
-        result.width = width;
+        result.width = source_width;
     }
     result.format = options.target;
     result.options.transparent = active_transparency.is_some();
@@ -531,6 +545,8 @@ fn convert(
         .collect();
     Ok(ConversionPreview {
         picture: result,
+        source_width,
+        source_height,
         colours: colour_rows,
         threshold,
         raw_size,
@@ -538,6 +554,68 @@ fn convert(
         stored_size,
         rle_used: rle_size < raw_size,
     })
+}
+
+/// The height that keeps `width` × `height`'s aspect ratio at `new_width`.
+pub fn scaled_height(width: u16, height: u16, new_width: u16) -> u16 {
+    let width = u32::from(width.max(1));
+    ((u32::from(height) * u32::from(new_width) + width / 2) / width).clamp(1, u32::from(u16::MAX))
+        as u16
+}
+
+/// `source` reduced to `stored_width`, keeping its aspect ratio. Colours are
+/// resampled with a triangle filter; palette indices cannot be blended, so
+/// indexed pictures take the nearest pixel.
+fn resampled(source: Source, stored_width: Option<u16>) -> Source {
+    let (width, height) = source.dimensions();
+    let Some(new_width) = stored_width.filter(|new_width| (1..width).contains(new_width)) else {
+        return source;
+    };
+    let new_height = scaled_height(width, height, new_width);
+    match source {
+        Source::Rgba { pixels, .. } => {
+            let image = image::RgbaImage::from_raw(
+                u32::from(width),
+                u32::from(height),
+                pixels.into_iter().flatten().collect(),
+            )
+            .expect("pixels match the source dimensions");
+            let resized = image::imageops::resize(
+                &image,
+                u32::from(new_width),
+                u32::from(new_height),
+                image::imageops::FilterType::Triangle,
+            );
+            Source::Rgba {
+                width: new_width,
+                height: new_height,
+                pixels: resized.pixels().map(|pixel| pixel.0).collect(),
+            }
+        }
+        Source::Indexed {
+            indices,
+            transparent,
+            ..
+        } => {
+            // The source pixel under the centre of each stored pixel
+            let nearest = |stored: u16, stored_size: u16, size: u16| {
+                ((2 * usize::from(stored) + 1) * usize::from(size)) / (2 * usize::from(stored_size))
+            };
+            let indices = (0..new_height)
+                .flat_map(|y| (0..new_width).map(move |x| (x, y)))
+                .map(|(x, y)| {
+                    indices[nearest(y, new_height, height) * usize::from(width)
+                        + nearest(x, new_width, width)]
+                })
+                .collect();
+            Source::Indexed {
+                width: new_width,
+                height: new_height,
+                indices,
+                transparent,
+            }
+        }
+    }
 }
 
 fn suggest_transparency_index(
@@ -742,6 +820,80 @@ mod tests {
         colors[1] = [255; 3];
         colors[255] = [255, 0, 0];
         colors
+    }
+
+    fn checker_png(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            if (x + y) % 2 == 0 {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            }
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn a_smaller_stored_width_keeps_the_shown_width_and_aspect_ratio() {
+        let mut picture = template();
+        picture.width = 0;
+        let bytes = checker_png(80, 40);
+        let mut options = ConversionOptions::suggested(PictureGraphicFormat::EightBit);
+        let full = preview_image(&picture, &bytes, &options, &palette()).unwrap();
+        options.stored_width = Some(30);
+        let reduced = preview_image(&picture, &bytes, &options, &palette()).unwrap();
+
+        assert_eq!(
+            (reduced.picture.actual_width, reduced.picture.actual_height),
+            (30, 15)
+        );
+        assert_eq!(reduced.picture.width, 80);
+        assert_eq!((reduced.source_width, reduced.source_height), (80, 40));
+        assert!(reduced.raw_size < full.raw_size);
+    }
+
+    #[test]
+    fn a_stored_width_at_or_above_the_source_keeps_every_pixel() {
+        let bytes = checker_png(8, 4);
+        let mut options = ConversionOptions::suggested(PictureGraphicFormat::FourBit);
+        options.stored_width = Some(8);
+        let preview = preview_image(&template(), &bytes, &options, &palette()).unwrap();
+        assert_eq!(
+            (preview.picture.actual_width, preview.picture.actual_height),
+            (8, 4)
+        );
+    }
+
+    #[test]
+    fn indexed_pictures_are_reduced_to_their_nearest_pixels() {
+        let source = Source::Indexed {
+            width: 4,
+            height: 2,
+            indices: vec![0, 1, 2, 3, 4, 5, 6, 7],
+            transparent: None,
+        };
+        let Source::Indexed {
+            width,
+            height,
+            indices,
+            ..
+        } = resampled(source, Some(2))
+        else {
+            unreachable!()
+        };
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(indices, vec![5, 7]);
+    }
+
+    #[test]
+    fn scaled_heights_round_and_stay_at_least_one_pixel() {
+        assert_eq!(scaled_height(800, 600, 300), 225);
+        assert_eq!(scaled_height(3, 2, 2), 1);
+        assert_eq!(scaled_height(1000, 1, 10), 1);
     }
 
     #[test]
