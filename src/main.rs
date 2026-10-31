@@ -69,6 +69,8 @@ struct GroupRequest {
     parent_path: Vec<usize>,
     targets: Vec<PlacementTarget>,
     object_type: ObjectType,
+    /// Asked for on the canvas, which selects the new parent itself.
+    from_canvas: bool,
 }
 
 #[derive(Clone)]
@@ -254,6 +256,7 @@ fn hierarchy_group_menu(
                                 parent_path: parent_path.clone(),
                                 targets: targets.clone(),
                                 object_type: candidate.object_type,
+                                from_canvas: false,
                             },
                         )
                     });
@@ -389,6 +392,7 @@ enum FileDialogReason {
     LoadPool,
     LoadProject,
     OpenImagePictureGraphics(ObjectId),
+    OpenImageGraphicData(ObjectId),
 }
 
 #[derive(Clone)]
@@ -402,7 +406,21 @@ enum PendingAction {
     Exit,
 }
 
+/// The parts of a pool being imported, named and in the order they are joined,
+/// with the project name and the VT version to read them with.
+type PendingIopImport = (
+    Vec<(String, Vec<u8>)>,
+    String,
+    ag_iso_stack::object_pool::vt_version::VtVersion,
+);
+
 enum FileEvent {
+    /// One or more IOP files that hold one pool.
+    OpenedPool {
+        parts: Vec<(String, Vec<u8>)>,
+        #[cfg(not(target_arch = "wasm32"))]
+        path: PathBuf,
+    },
     Opened {
         reason: FileDialogReason,
         content: Vec<u8>,
@@ -449,11 +467,7 @@ pub struct DesignerApp {
     /// Where the canvas's Add object here places the object being named.
     new_object_placement: Option<ag_iso_terminal_designer::canvas::AddObjectRequest>,
     pending_hierarchy_selection: Option<PendingHierarchySelection>,
-    pending_iop_import: Option<(
-        Vec<u8>,
-        String,
-        ag_iso_stack::object_pool::vt_version::VtVersion,
-    )>,
+    pending_iop_import: Option<PendingIopImport>,
     apply_smart_naming_on_import: bool,
     #[cfg(not(target_arch = "wasm32"))]
     project_path: Option<PathBuf>,
@@ -652,7 +666,7 @@ impl DesignerApp {
     }
 
     fn show_iop_import(&mut self, ctx: &egui::Context) {
-        let Some((_, name, version)) = self.pending_iop_import.as_mut() else {
+        let Some((parts, name, version)) = self.pending_iop_import.as_mut() else {
             return;
         };
         let mut open = true;
@@ -662,7 +676,42 @@ impl DesignerApp {
             .open(&mut open)
             .collapsible(false)
             .show(ctx, |ui| {
-                ui.label(name.as_str());
+                if parts.len() == 1 {
+                    ui.label(name.as_str());
+                } else {
+                    ui.label(format!(
+                        "{} files, joined in this order as one pool:",
+                        parts.len()
+                    ));
+                    ui.weak("An object a later file defines again replaces the earlier one, as on a VT.");
+                    let mut swap = None;
+                    egui::Grid::new("import_iop_parts").striped(true).show(ui, |ui| {
+                        for (index, (file_name, bytes)) in parts.iter().enumerate() {
+                            ui.label(format!("{}.", index + 1));
+                            ui.label(file_name);
+                            ui.weak(format!("{} bytes", bytes.len()));
+                            if ui
+                                .add_enabled(index > 0, egui::Button::new("\u{23F6}"))
+                                .on_hover_text("Move up")
+                                .clicked()
+                            {
+                                swap = Some(index - 1);
+                            }
+                            if ui
+                                .add_enabled(index + 1 < parts.len(), egui::Button::new("\u{23F7}"))
+                                .on_hover_text("Move down")
+                                .clicked()
+                            {
+                                swap = Some(index);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                    if let Some(index) = swap {
+                        parts.swap(index, index + 1);
+                        *name = parts[0].0.clone();
+                    }
+                }
                 ui.label("Select the target VT version used to encode this pool.");
                 egui::ComboBox::from_id_salt("import_vt_version")
                     .icon(ag_iso_terminal_designer::ui_style::combo_box_icon)
@@ -687,7 +736,7 @@ impl DesignerApp {
             #[cfg(not(target_arch = "wasm32"))]
             let source_path = self.pending_iop_source_path.take();
             self.open_in_progress = false;
-            match EditorProject::import_iop_with_id_format(
+            match EditorProject::import_iop_parts_with_id_format(
                 content,
                 version,
                 self.preferences.object_id_format,
@@ -1012,7 +1061,11 @@ impl DesignerApp {
             }
             self.open_in_progress = true;
         }
-        let is_image_loading = matches!(reason, FileDialogReason::OpenImagePictureGraphics(_));
+        let is_image_loading = matches!(
+            reason,
+            FileDialogReason::OpenImagePictureGraphics(_)
+                | FileDialogReason::OpenImageGraphicData(_)
+        );
 
         let sender = self.file_channel.0.clone();
         let mut dialog = rfd::AsyncFileDialog::new();
@@ -1031,8 +1084,34 @@ impl DesignerApp {
             dialog = dialog.add_filter("ISOBUS Object Pool", &["iop"]);
         }
 
-        let task = dialog.pick_file();
         let ctx = ctx.clone();
+        if matches!(reason, FileDialogReason::LoadPool) {
+            // A pool may be split over several IOP files
+            let task = dialog.pick_files();
+            execute(async move {
+                let event = match task.await.filter(|files| !files.is_empty()) {
+                    Some(mut files) => {
+                        files.sort_by_cached_key(|file| natural_sort_key(&file.file_name()));
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let path = files[0].path().to_path_buf();
+                        let mut parts = Vec::with_capacity(files.len());
+                        for file in &files {
+                            parts.push((file.file_name(), file.read().await));
+                        }
+                        FileEvent::OpenedPool {
+                            parts,
+                            #[cfg(not(target_arch = "wasm32"))]
+                            path,
+                        }
+                    }
+                    None => FileEvent::OpenCancelled(reason),
+                };
+                let _ = sender.send(event);
+                ctx.request_repaint();
+            });
+            return;
+        }
+        let task = dialog.pick_file();
         execute(async move {
             if let Some(file) = task.await {
                 let content = file.read().await;
@@ -1062,6 +1141,23 @@ impl DesignerApp {
     fn handle_file_loaded(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.file_channel.1.try_recv() {
             match event {
+                FileEvent::OpenedPool {
+                    parts,
+                    #[cfg(not(target_arch = "wasm32"))]
+                    path,
+                } => {
+                    let version = self
+                        .project
+                        .as_ref()
+                        .map(EditorProject::vt_version)
+                        .unwrap_or(ag_iso_stack::object_pool::vt_version::VtVersion::Version6);
+                    let name = parts[0].0.clone();
+                    self.pending_iop_import = Some((parts, name, version));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        self.pending_iop_source_path = Some(absolute_project_path(&path));
+                    }
+                }
                 FileEvent::Opened {
                     reason,
                     content,
@@ -1075,7 +1171,8 @@ impl DesignerApp {
                             .as_ref()
                             .map(EditorProject::vt_version)
                             .unwrap_or(ag_iso_stack::object_pool::vt_version::VtVersion::Version6);
-                        self.pending_iop_import = Some((content, file_name, version));
+                        self.pending_iop_import =
+                            Some((vec![(file_name.clone(), content)], file_name, version));
                         #[cfg(not(target_arch = "wasm32"))]
                         {
                             self.pending_iop_source_path = Some(absolute_project_path(&path));
@@ -1130,6 +1227,27 @@ impl DesignerApp {
                             ag_iso_terminal_designer::graphics::conversion_ui::open_for_import(
                                 ctx, project, id, content, None,
                             );
+                        }
+                    }
+                    FileDialogReason::OpenImageGraphicData(id) => {
+                        match ag_iso_terminal_designer::graphics::graphic_data_png(&content) {
+                            Ok(png) => {
+                                if let Some(project) = &mut self.project {
+                                    project.queue_operation(Operation::SetProperty {
+                                        object: ag_iso_terminal_designer::ObjectTarget::id(
+                                            id.value(),
+                                        ),
+                                        property: ag_iso_terminal_designer::PropertyKey::Data,
+                                        value: serde_json::json!(png),
+                                    });
+                                    if !project.commit_queued("Load Graphic Data image") {
+                                        if let Some(error) = project.take_operation_error() {
+                                            self.error_message = Some(error);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => self.error_message = Some(error),
                         }
                     }
                 },
@@ -2900,7 +3018,13 @@ impl eframe::App for DesignerApp {
         // Check for image load requests
         if let Some(pool) = &self.project {
             if let Some(object_id) = pool.take_image_load_request() {
-                self.open_file_dialog(FileDialogReason::OpenImagePictureGraphics(object_id), ctx);
+                let reason = match pool.get_pool().object_by_id(object_id) {
+                    Some(Object::GraphicData(_)) => {
+                        FileDialogReason::OpenImageGraphicData(object_id)
+                    }
+                    _ => FileDialogReason::OpenImagePictureGraphics(object_id),
+                };
+                self.open_file_dialog(reason, ctx);
             }
         }
 
@@ -2984,6 +3108,9 @@ impl eframe::App for DesignerApp {
                             edits::group_placements(pool, &group.targets, object_type, &name)
                         };
                         match result {
+                            Ok(target) if group.from_canvas => {
+                                self.canvas.select_placement(pool, group.root, target);
+                            }
                             Ok(target) => {
                                 self.canvas.select_hierarchy_placement(
                                     pool,
@@ -3021,7 +3148,7 @@ impl eframe::App for DesignerApp {
                             {
                                 self.canvas.select_placement(
                                     pool,
-                                    placement.parent,
+                                    placement.root,
                                     PlacementTarget::Primitive {
                                         parent_id: placement.parent,
                                         child_index,
@@ -4052,6 +4179,27 @@ impl DesignerApp {
                 self.new_object_placement = Some(request);
             }
         }
+        if let Some(request) = ctx.data_mut(|data| {
+            let id = ag_iso_terminal_designer::canvas::GroupObjectsRequest::id();
+            let value = data.get_temp::<ag_iso_terminal_designer::canvas::GroupObjectsRequest>(id);
+            data.remove::<ag_iso_terminal_designer::canvas::GroupObjectsRequest>(id);
+            value
+        }) {
+            if let Some(project) = &self.project {
+                let name = project.generate_smart_name_for_new_object(request.object_type);
+                self.new_object_dialog = Some((request.object_type, name));
+                self.new_object_group = Some(GroupRequest {
+                    session: request.session,
+                    revision: request.revision,
+                    root: request.root,
+                    parent_path: Vec::new(),
+                    targets: request.targets,
+                    object_type: request.object_type,
+                    from_canvas: true,
+                });
+                self.new_object_placement = None;
+            }
+        }
         if !self.canvas_visible {
             self.canvas.cancel_interaction();
         }
@@ -4152,6 +4300,26 @@ impl DesignerApp {
         });
     }
 }
+/// Orders file names as people do, so "part2" comes before "part10".
+fn natural_sort_key(name: &str) -> Vec<(bool, u64, String)> {
+    let mut key = Vec::new();
+    let mut rest = name;
+    while let Some(first) = rest.chars().next() {
+        let digits = first.is_ascii_digit();
+        let end = rest
+            .find(|c: char| c.is_ascii_digit() != digits)
+            .unwrap_or(rest.len());
+        let (run, tail) = rest.split_at(end);
+        key.push(if digits {
+            (true, run.parse().unwrap_or(u64::MAX), String::new())
+        } else {
+            (false, 0, run.to_lowercase())
+        });
+        rest = tail;
+    }
+    key
+}
+
 struct PaneViewer<'a> {
     app: &'a mut DesignerApp,
 }

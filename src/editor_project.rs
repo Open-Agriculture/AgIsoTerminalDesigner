@@ -277,6 +277,56 @@ impl EditorProject {
         project.mark_saved();
         Ok(project)
     }
+    /// Import a pool stored in several IOP files, joined in the given order as
+    /// a VT joins a pool transferred in parts. A part may end in the middle of
+    /// an object, and an object a later part defines again replaces the
+    /// earlier one, as on a VT. Errors name the part and the byte in it.
+    pub fn import_iop_parts_with_id_format(
+        parts: Vec<(String, Vec<u8>)>,
+        version: VtVersion,
+        object_id_format: ObjectIdFormat,
+    ) -> Result<Self, String> {
+        if parts.len() == 1 {
+            let (_, data) = parts.into_iter().next().unwrap();
+            return Self::import_iop_with_id_format(data, version, object_id_format);
+        }
+        if !(2..=6).contains(&u8::from(version)) {
+            return Err("Choose VT2 through VT6".into());
+        }
+        let mut data = Vec::new();
+        let mut starts = Vec::new();
+        for (name, part) in &parts {
+            starts.push((data.len(), name.as_str()));
+            data.extend_from_slice(part);
+        }
+        let position = |offset: usize| {
+            let (start, name) = starts
+                .iter()
+                .rev()
+                .find(|(start, _)| *start <= offset)
+                .copied()
+                .unwrap_or((0, ""));
+            format!("{name}, byte {}", offset - start)
+        };
+        let pool =
+            ObjectPool::try_from_iop_for_version(data, version).map_err(|error| {
+                match error.object_id {
+                    Some(id) => format!(
+                        "object {} in {}: {:?}",
+                        object_id_format.format(id),
+                        position(error.offset),
+                        error.source
+                    ),
+                    None => format!("{}: {:?}", position(error.offset), error.source),
+                }
+            })?;
+        let mut project = Self::from(pool);
+        project.vt_version = version;
+        project.object_id_format = object_id_format;
+        project.mark_saved();
+        Ok(project)
+    }
+
     /// Copy authoritative canvas content without history, pending UI edits, or
     /// save checkpoints. Mutating this copy cannot change the source project.
     pub(crate) fn canvas_preview_copy(&self) -> Self {
@@ -1405,16 +1455,8 @@ impl EditorProject {
     ) -> Option<ObjectId> {
         let object_id = self.allocate_object_id(object_type).ok()?;
         let description = Some(format!("Create {object_type:?}"));
-        let place = |operations: &mut Vec<Operation>| {
-            if let Some((parent, x, y)) = placement {
-                operations.push(Operation::AddChild {
-                    parent: ObjectTarget::id(parent.value()),
-                    child: ObjectTarget::id(object_id.value()),
-                    x,
-                    y,
-                });
-            }
-        };
+        let placement = placement.map(|(parent, x, y)| self.placement(parent, object_id, x, y));
+        let place = |operations: &mut Vec<Operation>| operations.extend(placement.clone());
         if let Some(mut operations) = self.preset_creation(object_type, object_id, &name) {
             place(&mut operations);
             let transaction = OperationTransaction {
@@ -1449,6 +1491,44 @@ impl EditorProject {
 
         self.execute_ui_transaction(transaction)
             .then_some(object_id)
+    }
+
+    /// The operation adding `child` to `parent`: at `x`, `y` for positioned
+    /// children, otherwise at the end of the parent's list, such as the keys of
+    /// a Soft Key Mask.
+    fn placement(&self, parent: ObjectId, child: ObjectId, x: i16, y: i16) -> Operation {
+        use crate::operations::{ObjectReferenceList, ObjectTargetList};
+
+        let list = self
+            .get_pool()
+            .object_by_id(parent)
+            .filter(|parent| crate::operations::object_refs(parent).is_none())
+            .and_then(crate::operations::operation::object_list);
+        let target = |id: ObjectId| ObjectTarget::id(id.value());
+        match list {
+            Some(ObjectReferenceList::Required(ids)) => Operation::SetObjectList {
+                object: target(parent),
+                objects: ObjectTargetList::Required(
+                    ids.into_iter().chain([child]).map(target).collect(),
+                ),
+            },
+            Some(ObjectReferenceList::Nullable(ids)) => Operation::SetObjectList {
+                object: target(parent),
+                objects: ObjectTargetList::Nullable(
+                    ids.into_iter()
+                        .map(|id| id.0)
+                        .chain([Some(child)])
+                        .map(|id| id.map(target))
+                        .collect(),
+                ),
+            },
+            None => Operation::AddChild {
+                parent: target(parent),
+                child: target(child),
+                x,
+                y,
+            },
+        }
     }
 
     /// The operations creating an object with its creation presets, or None when

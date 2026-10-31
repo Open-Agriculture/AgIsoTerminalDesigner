@@ -49,6 +49,11 @@ const COMMANDS: &[(u8, &str)] = &[
     (0xBE, "execute-macro"),
 ];
 
+/// The names of every instruction [`encode_macro_instruction`] accepts.
+pub fn instruction_names() -> impl Iterator<Item = &'static str> {
+    COMMANDS.iter().map(|(_, name)| *name)
+}
+
 /// Encode one named Macro instruction into its exact command bytes.
 ///
 /// `change-numeric-value` accepts `OBJECT VALUE`, where the

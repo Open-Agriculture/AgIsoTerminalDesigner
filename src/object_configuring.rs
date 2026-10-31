@@ -461,6 +461,7 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                         ui.push_id(property_name, |ui| {
                             render_text(ui, &label, &text, id, property_key, design)
                         });
+                        render_string_length(ui, object, &text, design);
                     }
                     Err(message) => {
                         crate::ui_style::error_text(ui, &message);
@@ -609,6 +610,50 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                     render_polygon_points(ui, polygon, design);
                 }
             }
+            EditorKind::LanguageCodes => {
+                if let Object::WorkingSet(working_set) = object {
+                    render_language_codes(ui, &label, id, &working_set.language_codes, design);
+                }
+            }
+            EditorKind::LanguagePairs => {
+                if let Object::WorkingSetSpecialControls(controls) = object {
+                    render_language_pairs(ui, &label, id, &controls.language_pairs, design);
+                }
+            }
+            EditorKind::Name => match object {
+                Object::ExternalObjectDefinition(definition) => {
+                    render_name(ui, &label, id, definition.name, design)
+                }
+                Object::ExternalReferenceName(reference) => {
+                    render_name(ui, &label, id, reference.name, design)
+                }
+                _ => {}
+            },
+            EditorKind::PaletteColours => {
+                if let Object::ColourPalette(palette) = object {
+                    render_palette_colours(ui, &label, id, &palette.colours, design);
+                }
+            }
+            EditorKind::ColourMap => {
+                if let Object::ColourMap(map) = object {
+                    render_colour_map(ui, &label, id, &map.colour_map, design);
+                }
+            }
+            EditorKind::CodePlanes => {
+                if let Object::ExtendedInputAttributes(attributes) = object {
+                    render_code_planes(ui, &label, id, &attributes.code_planes, design);
+                }
+            }
+            EditorKind::MacroCommands => {
+                if let Object::Macro(macro_object) = object {
+                    render_macro_commands(ui, &label, id, &macro_object.commands, design);
+                }
+            }
+            EditorKind::GraphicData => {
+                if let Object::GraphicData(graphic) = object {
+                    render_graphic_data(ui, &label, graphic, design);
+                }
+            }
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
@@ -627,6 +672,10 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
         ui.separator();
         ui.label("Objects");
         render_object_list(ui, object, objects, design);
+    }
+    if let Object::ObjectLabelReferenceList(list) = object {
+        ui.separator();
+        render_object_labels(ui, list, design);
     }
     if crate::operations::operation::macro_refs(object).is_some() {
         ui.separator();
@@ -714,54 +763,67 @@ pub fn colour_index_picker(
             format!("{} · {current}", crate::isobus_colour::label(current)),
             |ui| {
                 ui.label("Resolved project palette (8-bit index)");
-                egui::ScrollArea::vertical()
-                    .max_height(420.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new(ui.next_auto_id())
-                            .spacing(egui::vec2(3.0, 3.0))
-                            .show(ui, |ui| {
-                                for (position, index) in permitted.enumerate() {
-                                    let [r, g, b] = palette[usize::from(index)];
-                                    let text_colour =
-                                        if 299 * r as u32 + 587 * g as u32 + 114 * b as u32
-                                            > 128_000
-                                        {
-                                            egui::Color32::BLACK
-                                        } else {
-                                            egui::Color32::WHITE
-                                        };
-                                    let mut button = egui::Button::new(
-                                        egui::RichText::new(index.to_string()).color(text_colour),
-                                    )
-                                    .fill(egui::Color32::from_rgb(r, g, b))
-                                    .min_size(egui::vec2(32.0, 24.0));
-                                    if index == current {
-                                        button = button.stroke(egui::Stroke::new(
-                                            2.0,
-                                            ui.visuals().selection.stroke.color,
-                                        ));
-                                    }
-                                    if ui
-                                        .add(button)
-                                        .on_hover_text(format!(
-                                            "{} · #{r:02X}{g:02X}{b:02X}",
-                                            crate::isobus_colour::label(index)
-                                        ))
-                                        .clicked()
-                                    {
-                                        selected = Some(index);
-                                        ui.close();
-                                    }
-                                    if (position + 1) % 8 == 0 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                    });
+                selected = colour_index_menu(ui, current, palette, permitted);
             },
         );
     });
     selected
+}
+
+/// The palette grid of a colour index menu; closes the menu on a pick.
+fn colour_index_menu(
+    ui: &mut egui::Ui,
+    current: u8,
+    palette: &[[u8; 3]; 256],
+    permitted: std::ops::RangeInclusive<u8>,
+) -> Option<u8> {
+    let mut selected = None;
+    egui::ScrollArea::vertical()
+        .max_height(420.0)
+        .show(ui, |ui| {
+            egui::Grid::new(ui.next_auto_id())
+                .spacing(egui::vec2(3.0, 3.0))
+                .show(ui, |ui| {
+                    for (position, index) in permitted.enumerate() {
+                        let [r, g, b] = palette[usize::from(index)];
+                        let mut button = egui::Button::new(
+                            egui::RichText::new(index.to_string()).color(text_on([r, g, b])),
+                        )
+                        .fill(egui::Color32::from_rgb(r, g, b))
+                        .min_size(egui::vec2(32.0, 24.0));
+                        if index == current {
+                            button = button.stroke(egui::Stroke::new(
+                                2.0,
+                                ui.visuals().selection.stroke.color,
+                            ));
+                        }
+                        if ui
+                            .add(button)
+                            .on_hover_text(format!(
+                                "{} · #{r:02X}{g:02X}{b:02X}",
+                                crate::isobus_colour::label(index)
+                            ))
+                            .clicked()
+                        {
+                            selected = Some(index);
+                            ui.close();
+                        }
+                        if (position + 1) % 8 == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    selected
+}
+
+/// Black or white, whichever reads on a `background` of this colour.
+fn text_on([r, g, b]: [u8; 3]) -> egui::Color32 {
+    if 299 * r as u32 + 587 * g as u32 + 114 * b as u32 > 128_000 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
 }
 
 /// Convert a snake_case property identifier to a title-cased editor label.
@@ -843,7 +905,12 @@ fn render_object_selector(
     allowed_types: &[ObjectType],
 ) -> Option<ObjectId> {
     let selected_text = design.get_pool().object_by_id(selected).map_or_else(
-        || format!("{}: Missing object", selected.value()),
+        || {
+            format!(
+                "{}: Missing object",
+                design.format_object_id(selected.value())
+            )
+        },
         |object| object_selector_label(design, object),
     );
     child_picker(
@@ -1334,6 +1401,234 @@ fn queue_object_list(design: &EditorProject, id: ObjectId, objects: ObjectRefere
                     .collect(),
             ),
         },
+    });
+}
+
+/// Each label names an object and gives it text from a String Variable, the
+/// font type of that text, and a graphic. Text and graphic are optional.
+fn render_object_labels(
+    ui: &mut egui::Ui,
+    list: &ag_iso_stack::object_pool::object::ObjectLabelReferenceList,
+    design: &EditorProject,
+) {
+    use crate::allowed_object_relationships::AllowedChildRefs;
+    use ag_iso_stack::object_pool::object_attributes::{FontType, ObjectLabel};
+
+    let list_id = list.id;
+    let labels = &list.object_labels;
+    let version = design.vt_version;
+    let labelled = crate::allowed_object_relationships::get_allowed_child_refs(
+        ObjectType::ObjectLabelReferenceList,
+        version,
+    );
+    let graphics = <ObjectLabel as AllowedChildRefs>::get_allowed_child_refs(version);
+    let font_type_label = |font_type: u8| {
+        crate::enum_labels::enum_choice_label(
+            ObjectType::FontAttributes,
+            PropertyKey::FontType,
+            &serde_json::to_value(FontType::from(font_type)).unwrap(),
+        )
+    };
+    let with_label = |index: usize, change: &dyn Fn(&mut ObjectLabel)| {
+        let mut labels = labels.clone();
+        change(&mut labels[index]);
+        labels
+    };
+    let mut updated = None;
+    let mut action = None;
+    ui.label("Object labels");
+    egui::Grid::new(("object_labels", list_id.value()))
+        .striped(true)
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            for heading in ["Object", "Text", "Font type", "Graphic", "", "", ""] {
+                ui.label(heading);
+            }
+            ui.end_row();
+            for (index, label) in labels.iter().enumerate() {
+                let others: Vec<ObjectId> = labels
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .map(|(_, label)| label.id)
+                    .collect();
+                if let Some(changed) = label_reference_picker(
+                    ui,
+                    ("label_object", index),
+                    design,
+                    list_id,
+                    Some(label.id),
+                    &labelled,
+                    false,
+                    |candidate| !others.contains(&candidate),
+                    |choice| {
+                        with_label(index, &|label| {
+                            if let Some(id) = choice.0 {
+                                label.id = id;
+                            }
+                        })
+                    },
+                ) {
+                    updated = Some(changed);
+                }
+                if let Some(changed) = label_reference_picker(
+                    ui,
+                    ("label_text", index),
+                    design,
+                    list_id,
+                    label.string_variable_reference.0,
+                    &[ObjectType::StringVariable],
+                    true,
+                    |_| true,
+                    |choice| with_label(index, &|label| label.string_variable_reference = choice),
+                ) {
+                    updated = Some(changed);
+                }
+                egui::ComboBox::from_id_salt(("label_font_type", index))
+                    .icon(crate::ui_style::combo_box_icon)
+                    .selected_text(font_type_label(label.font_type))
+                    .show_ui(ui, |ui| {
+                        for font_type in 0..=u8::MAX {
+                            let supported = crate::vt_compatibility::supported_font_type(
+                                FontType::from(font_type),
+                                version,
+                            );
+                            if (supported || font_type == label.font_type)
+                                && ui
+                                    .selectable_label(
+                                        font_type == label.font_type,
+                                        font_type_label(font_type),
+                                    )
+                                    .clicked()
+                                && font_type != label.font_type
+                            {
+                                updated =
+                                    Some(with_label(index, &|label| label.font_type = font_type));
+                            }
+                        }
+                    });
+                if let Some(changed) = label_reference_picker(
+                    ui,
+                    ("label_graphic", index),
+                    design,
+                    list_id,
+                    label.graphic_representation.0,
+                    &graphics,
+                    true,
+                    |_| true,
+                    |choice| with_label(index, &|label| label.graphic_representation = choice),
+                ) {
+                    updated = Some(changed);
+                }
+                row_actions(ui, index, labels.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = labels.clone();
+        apply_list_action(&mut changed, action);
+        updated = Some(changed);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Add label:");
+        let labelled_ids: Vec<ObjectId> = labels.iter().map(|label| label.id).collect();
+        if let Some(changed) = label_reference_picker(
+            ui,
+            ("add_label", list_id.value()),
+            design,
+            list_id,
+            None,
+            &labelled,
+            false,
+            |candidate| !labelled_ids.contains(&candidate),
+            |choice| {
+                let mut labels = labels.clone();
+                labels.extend(choice.0.map(|id| ObjectLabel {
+                    id,
+                    string_variable_reference: NullableObjectId(None),
+                    font_type: u8::from(FontType::Latin1),
+                    graphic_representation: NullableObjectId(None),
+                }));
+                labels
+            },
+        ) {
+            updated = Some(changed);
+        }
+    });
+    if let Some(labels) = updated {
+        queue_object_labels(design, list_id, labels);
+    }
+}
+
+/// Pick one reference of a label; `labels_with` builds the whole new list
+/// for both the impact preview and the edit.
+#[allow(clippy::too_many_arguments)]
+fn label_reference_picker(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    design: &EditorProject,
+    list_id: ObjectId,
+    current: Option<ObjectId>,
+    allowed: &[ObjectType],
+    allow_none: bool,
+    eligible: impl Fn(ObjectId) -> bool,
+    labels_with: impl Fn(
+        NullableObjectId,
+    ) -> Vec<ag_iso_stack::object_pool::object_attributes::ObjectLabel>,
+) -> Option<Vec<ag_iso_stack::object_pool::object_attributes::ObjectLabel>> {
+    let text = current.map_or_else(
+        || {
+            if allow_none {
+                "None".to_owned()
+            } else {
+                "Select object…".to_owned()
+            }
+        },
+        |id| {
+            design.get_pool().object_by_id(id).map_or_else(
+                || format!("Missing object #{}", design.format_object_id(id.value())),
+                |object| object_selector_label(design, object),
+            )
+        },
+    );
+    crate::object_picker::button(
+        ui,
+        salt,
+        &text,
+        &format!(
+            "Change object label on {}",
+            crate::object_picker::object_label(design, Some(list_id))
+        ),
+        design,
+        current,
+        allow_none,
+        |candidate| {
+            allowed.contains(&candidate.object_type())
+                && crate::vt_compatibility::supported_object_type(
+                    candidate.object_type(),
+                    design.vt_version,
+                )
+                && candidate.id() != list_id
+                && eligible(candidate.id())
+        },
+        |ui, choice| {
+            crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                queue_object_labels(candidate, list_id, labels_with(choice));
+            })
+        },
+    )
+    .filter(|choice| choice.0 != current)
+    .map(&labels_with)
+}
+
+fn queue_object_labels(
+    design: &EditorProject,
+    id: ObjectId,
+    labels: Vec<ag_iso_stack::object_pool::object_attributes::ObjectLabel>,
+) {
+    design.queue_operation(Operation::SetObjectLabels {
+        object_id: id.value(),
+        labels,
     });
 }
 
@@ -2140,6 +2435,1115 @@ fn render_auto(
         ),
         serde_json::Value::String(current) => render_text(ui, label, current, id, property, design),
         _ => render_json(ui, label, value, id, property, design),
+    }
+}
+
+/// The Length attribute of a string is the length of its value. Text set at
+/// runtime may be shorter, and the VT pads it with spaces, but not longer, so
+/// Length reserves room by padding the value with spaces.
+fn render_string_length(ui: &mut egui::Ui, object: &Object, text: &str, design: &EditorProject) {
+    let (uses_variable, max_bytes) = match object {
+        Object::InputString(o) => (o.variable_reference.0.is_some(), u8::MAX as usize),
+        Object::OutputString(o) => (o.variable_reference.0.is_some(), u16::MAX as usize),
+        Object::StringVariable(_) => (false, u16::MAX as usize),
+        _ => return,
+    };
+    // The referenced String Variable holds the value and so the length
+    if uses_variable {
+        return;
+    }
+    let id = object.id();
+    let length = text.chars().count();
+    let minimum = text.trim_end_matches(' ').chars().count();
+    let maximum = max_string_length(max_bytes, design.vt_version).max(length);
+    let key = ui.make_persistent_id((id.value(), "string_length"));
+    touch_draft(ui.ctx(), key);
+    let mut edited = ui
+        .data(|data| data.get_temp::<usize>(key))
+        .unwrap_or(length);
+    ui.horizontal(|ui| {
+        ui.label("Length").on_hover_text(
+            "Characters this string holds. Text set at runtime may be shorter, \
+             and the VT pads it with spaces, but not longer.",
+        );
+        let response = ui.add(egui::DragValue::new(&mut edited).range(minimum..=maximum));
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, edited));
+            update_draft(
+                ui.ctx(),
+                key,
+                design,
+                Some(property_operation(
+                    design,
+                    id,
+                    PropertyKey::Value,
+                    string_with_length(text, edited).into(),
+                )),
+            );
+        }
+        let cancelled =
+            response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if cancelled {
+            ui.data_mut(|data| data.remove::<usize>(key));
+            clear_draft(ui.ctx(), key);
+        } else if drag_value_finished(&response)
+            || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        {
+            if edited != length {
+                queue(
+                    design,
+                    id,
+                    PropertyKey::Value,
+                    string_with_length(text, edited).into(),
+                );
+            }
+            ui.data_mut(|data| data.remove::<usize>(key));
+            clear_draft(ui.ctx(), key);
+        }
+    });
+}
+
+/// Pad `text` with spaces, or drop its trailing spaces, to `length` characters.
+fn string_with_length(text: &str, length: usize) -> String {
+    let minimum = text.trim_end_matches(' ').chars().count();
+    text.chars()
+        .chain(std::iter::repeat(' '))
+        .take(length.max(minimum))
+        .collect()
+}
+
+/// Edited text is exported in 8-bit characters before VT4 and as a UTF-16
+/// WideString, two bytes per character after a two-byte mark, from VT4.
+fn max_string_length(max_bytes: usize, version: VtVersion) -> usize {
+    if version >= VtVersion::Version4 {
+        max_bytes.saturating_sub(2) / 2
+    } else {
+        max_bytes
+    }
+}
+
+/// A dropdown of `table`'s codes with a search field that matches codes and
+/// names. Returns the code clicked; `offered` hides codes that cannot be picked.
+fn code_picker(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    selected_text: &str,
+    table: &'static [(&'static str, &'static str)],
+    current: Option<&str>,
+    offered: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    let id = ui.make_persistent_id(salt);
+    let query_id = id.with("query");
+    let mut chosen = None;
+    let popup = egui::ComboBox::from_id_salt(id)
+        .icon(crate::ui_style::combo_box_icon)
+        .selected_text(selected_text)
+        .height(320.0)
+        .show_ui(ui, |ui| {
+            let opened = ui.data(|data| data.get_temp::<String>(query_id)).is_none();
+            let mut query = ui
+                .data(|data| data.get_temp::<String>(query_id))
+                .unwrap_or_default();
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut query)
+                    .hint_text("Search…")
+                    .desired_width(220.0),
+            );
+            if opened {
+                search.request_focus();
+            }
+            let needle = query.to_lowercase();
+            let mut first = None;
+            for (code, name) in table {
+                if !offered(code)
+                    || !code.to_lowercase().contains(&needle)
+                        && !name.to_lowercase().contains(&needle)
+                {
+                    continue;
+                }
+                first.get_or_insert(*code);
+                let selected = current.is_some_and(|current| current.eq_ignore_ascii_case(code));
+                let response = ui.selectable_label(selected, format!("{code} — {name}"));
+                if selected && opened {
+                    response.scroll_to_me(Some(egui::Align::Center));
+                }
+                if response.clicked() {
+                    chosen = Some(*code);
+                }
+            }
+            // Enter picks the first match, so typing a code is enough
+            if search.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                chosen = chosen.or(first);
+            }
+            ui.data_mut(|data| data.insert_temp(query_id, query));
+        });
+    if popup.inner.is_none() || chosen.is_some() {
+        ui.data_mut(|data| data.remove::<String>(query_id));
+    }
+    if chosen.is_some() {
+        // ComboBox keeps its popup state under its button id with "popup"
+        egui::Popup::close_id(ui.ctx(), ui.make_persistent_id(id).with("popup"));
+    }
+    chosen
+}
+
+/// The languages a Working Set supports, as ISO 639-1 codes.
+fn render_language_codes(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    codes: &[String],
+    design: &EditorProject,
+) {
+    use crate::iso_codes::{label as code_label, LANGUAGES};
+
+    let mut updated = None;
+    let mut action = None;
+    ui.label(label);
+    egui::Grid::new(("language_codes", id.value()))
+        .striped(true)
+        .show(ui, |ui| {
+            for (index, code) in codes.iter().enumerate() {
+                ui.label((index + 1).to_string());
+                if let Some(chosen) = code_picker(
+                    ui,
+                    ("language_code", index),
+                    &code_label(LANGUAGES, code),
+                    LANGUAGES,
+                    Some(code),
+                    |candidate| {
+                        !codes
+                            .iter()
+                            .any(|code| code.eq_ignore_ascii_case(candidate))
+                    },
+                ) {
+                    let mut changed = codes.to_vec();
+                    changed[index] = chosen.to_owned();
+                    updated = Some(changed);
+                }
+                row_actions(ui, index, codes.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = codes.to_vec();
+        apply_list_action(&mut changed, action);
+        updated = Some(changed);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Add language:");
+        if let Some(chosen) = code_picker(
+            ui,
+            ("add_language_code", id.value()),
+            "Select language…",
+            LANGUAGES,
+            None,
+            |candidate| {
+                !codes
+                    .iter()
+                    .any(|code| code.eq_ignore_ascii_case(candidate))
+            },
+        ) {
+            let mut changed = codes.to_vec();
+            changed.push(chosen.to_owned());
+            updated = Some(changed);
+        }
+    });
+    if let Some(codes) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::LanguageCodes,
+            serde_json::json!(codes),
+        );
+    }
+}
+
+/// Language and country pairs of Working Set Special Controls. Both codes
+/// are two characters on the wire, so a pair is added once both are picked.
+fn render_language_pairs(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    pairs: &[(String, String)],
+    design: &EditorProject,
+) {
+    use crate::iso_codes::{label as code_label, COUNTRIES, LANGUAGES};
+
+    let mut updated = None;
+    let mut action = None;
+    ui.label(label);
+    egui::Grid::new(("language_pairs", id.value()))
+        .striped(true)
+        .show(ui, |ui| {
+            for (index, (language, country)) in pairs.iter().enumerate() {
+                ui.label((index + 1).to_string());
+                let mut changed = None;
+                if let Some(chosen) = code_picker(
+                    ui,
+                    ("pair_language", index),
+                    &code_label(LANGUAGES, language),
+                    LANGUAGES,
+                    Some(language),
+                    |_| true,
+                ) {
+                    changed = Some((chosen.to_owned(), country.clone()));
+                }
+                if let Some(chosen) = code_picker(
+                    ui,
+                    ("pair_country", index),
+                    &code_label(COUNTRIES, country),
+                    COUNTRIES,
+                    Some(country),
+                    |_| true,
+                ) {
+                    changed = Some((language.clone(), chosen.to_owned()));
+                }
+                if let Some(pair) = changed {
+                    let mut changed = pairs.to_vec();
+                    changed[index] = pair;
+                    updated = Some(changed);
+                }
+                row_actions(ui, index, pairs.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = pairs.to_vec();
+        apply_list_action(&mut changed, action);
+        updated = Some(changed);
+    }
+    let pending_id = ui.make_persistent_id(("pending_language_pair", id.value()));
+    let (mut language, mut country) = ui
+        .data(|data| data.get_temp::<(Option<String>, Option<String>)>(pending_id))
+        .unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("Add pair:");
+        if let Some(chosen) = code_picker(
+            ui,
+            ("add_pair_language", id.value()),
+            &language.as_deref().map_or_else(
+                || "Language…".to_owned(),
+                |code| code_label(LANGUAGES, code),
+            ),
+            LANGUAGES,
+            language.as_deref(),
+            |_| true,
+        ) {
+            language = Some(chosen.to_owned());
+        }
+        if let Some(chosen) = code_picker(
+            ui,
+            ("add_pair_country", id.value()),
+            &country
+                .as_deref()
+                .map_or_else(|| "Country…".to_owned(), |code| code_label(COUNTRIES, code)),
+            COUNTRIES,
+            country.as_deref(),
+            |_| true,
+        ) {
+            country = Some(chosen.to_owned());
+        }
+    });
+    if let (Some(language), Some(country)) = (&language, &country) {
+        let mut changed = pairs.to_vec();
+        changed.push((language.clone(), country.clone()));
+        updated = Some(changed);
+        ui.data_mut(|data| data.remove::<(Option<String>, Option<String>)>(pending_id));
+    } else {
+        ui.data_mut(|data| data.insert_temp(pending_id, (language, country)));
+    }
+    if let Some(pairs) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::LanguagePairs,
+            serde_json::json!(pairs),
+        );
+    }
+}
+
+/// A NAME, ISO 11783-5, edited field by field or as its 64-bit value in hex.
+/// The value is kept as an integer: a number field would round it through f64.
+fn render_name(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    name: ag_iso_stack::network_management::name::NAME,
+    design: &EditorProject,
+) {
+    use ag_iso_stack::network_management::name::NAME;
+
+    type Field = (&'static str, u32, fn(&NAME) -> u32, fn(&mut NAME, u32));
+    let fields: [Field; 8] = [
+        (
+            "Identity number",
+            0x1F_FFFF,
+            |n| n.get_identity_number(),
+            |n, v| n.set_identity_number(v),
+        ),
+        (
+            "Manufacturer code",
+            0x7FF,
+            |n| n.get_manufacturer_code().into(),
+            |n, v| n.set_manufacturer_code(v as u16),
+        ),
+        (
+            "ECU instance",
+            0x7,
+            |n| n.get_ecu_instance().into(),
+            |n, v| n.set_ecu_instance(v as u8),
+        ),
+        (
+            "Function instance",
+            0x1F,
+            |n| n.get_function_instance().into(),
+            |n, v| n.set_function_instance(v as u8),
+        ),
+        (
+            "Function",
+            0xFF,
+            |n| n.get_function().into(),
+            |n, v| n.set_function(v as u8),
+        ),
+        (
+            "Device class",
+            0x7F,
+            |n| n.get_device_class().into(),
+            |n, v| n.set_device_class(v as u8),
+        ),
+        (
+            "Device class instance",
+            0xF,
+            |n| n.get_device_class_instance().into(),
+            |n, v| n.set_device_class_instance(v as u8),
+        ),
+        (
+            "Industry group",
+            0x7,
+            |n| n.get_industry_group().into(),
+            |n, v| n.set_industry_group(v as u8),
+        ),
+    ];
+    let mut updated = None;
+    ui.label(label);
+    egui::Grid::new(("name_fields", id.value())).show(ui, |ui| {
+        for (field, maximum, get, set) in fields {
+            ui.label(field);
+            let key = ui.make_persistent_id((id.value(), "name", field));
+            touch_draft(ui.ctx(), key);
+            let current = get(&name);
+            let mut edited = ui.data(|data| data.get_temp::<u32>(key)).unwrap_or(current);
+            let response = ui.add(egui::DragValue::new(&mut edited).range(0..=maximum));
+            if response.changed() {
+                ui.data_mut(|data| data.insert_temp(key, edited));
+            }
+            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                ui.data_mut(|data| data.remove::<u32>(key));
+            } else if drag_value_finished(&response)
+                || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            {
+                if edited != current {
+                    let mut changed = name;
+                    set(&mut changed, edited);
+                    updated = Some(changed);
+                }
+                ui.data_mut(|data| data.remove::<u32>(key));
+            }
+            clear_draft(ui.ctx(), key);
+            ui.end_row();
+        }
+        let mut self_configurable = name.get_self_configurable_address();
+        ui.label("Self-configurable address");
+        if ui.checkbox(&mut self_configurable, "").changed() {
+            let mut changed = name;
+            changed.set_self_configurable_address(self_configurable);
+            updated = Some(changed);
+        }
+        ui.end_row();
+
+        ui.label("NAME");
+        let key = ui.make_persistent_id((id.value(), "name_hex"));
+        touch_draft(ui.ctx(), key);
+        let current = format!("{:016X}", u64::from(name));
+        let mut edited = pending_text(ui, key).unwrap_or_else(|| current.clone());
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut edited)
+                .font(egui::TextStyle::Monospace)
+                .char_limit(19)
+                .desired_width(150.0),
+        );
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+        }
+        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+        } else if response.lost_focus() {
+            // Invalid text stays, with the error, until it is fixed or cancelled
+            if let Some(raw) = parse_name_hex(&edited) {
+                if raw != u64::from(name) {
+                    updated = Some(NAME::new(raw));
+                }
+                ui.data_mut(|data| data.remove::<PendingValue>(key));
+            }
+        }
+        clear_draft(ui.ctx(), key);
+        ui.end_row();
+        if pending_text(ui, key).is_some_and(|text| parse_name_hex(&text).is_none()) {
+            ui.label("");
+            crate::ui_style::error_text(ui, "Enter up to 16 hexadecimal digits");
+            ui.end_row();
+        }
+    });
+    if let Some(name) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::Name,
+            serde_json::json!(u64::from(name)),
+        );
+    }
+}
+
+/// A NAME in hexadecimal, with or without a 0x prefix and spaces.
+fn parse_name_hex(text: &str) -> Option<u64> {
+    let digits: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let digits = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+        .unwrap_or(&digits);
+    if digits.is_empty() || digits.len() > 16 {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
+}
+
+/// The colours of a Colour Palette as swatches, 16 to a row. Clicking one
+/// opens a picker below; a drag in it previews and is one undo step when the
+/// pointer is released.
+fn render_palette_colours(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    colours: &[ag_iso_stack::object_pool::Colour],
+    design: &EditorProject,
+) {
+    use ag_iso_stack::object_pool::Colour;
+
+    let as_json = |colours: &[Colour]| serde_json::to_value(colours).unwrap();
+    let rgb = |colour: &Colour| egui::Color32::from_rgb(colour.r, colour.g, colour.b);
+    let selected_id = ui.make_persistent_id((id.value(), "palette_selected"));
+    let mut selected = ui
+        .data(|data| data.get_temp::<usize>(selected_id))
+        .filter(|index| *index < colours.len());
+    let mut updated = None;
+    ui.label(format!("{label} ({})", colours.len()));
+    egui::Grid::new(("palette_colours", id.value()))
+        .spacing(egui::vec2(2.0, 2.0))
+        .show(ui, |ui| {
+            for (index, colour) in colours.iter().enumerate() {
+                let size = egui::vec2(16.0, 16.0);
+                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                ui.painter().rect_filled(rect, 2.0, rgb(colour));
+                if selected == Some(index) {
+                    ui.painter().rect_stroke(
+                        rect.expand(1.0),
+                        2.0,
+                        ui.visuals().selection.stroke,
+                        egui::StrokeKind::Outside,
+                    );
+                }
+                let response = response.on_hover_text(format!(
+                    "{index}: #{:02X}{:02X}{:02X}",
+                    colour.r, colour.g, colour.b
+                ));
+                if response.clicked() {
+                    selected = (selected != Some(index)).then_some(index);
+                }
+                if index % 16 == 15 {
+                    ui.end_row();
+                }
+            }
+        });
+    ui.data_mut(|data| match selected {
+        Some(index) => data.insert_temp(selected_id, index),
+        None => data.remove::<usize>(selected_id),
+    });
+    if let Some(index) = selected {
+        let key = ui.make_persistent_id((id.value(), "palette_colour"));
+        touch_draft(ui.ctx(), key);
+        let current = rgb(&colours[index]);
+        let mut edited = ui
+            .data(|data| data.get_temp::<egui::Color32>(key))
+            .unwrap_or(current);
+        ui.label(format!("Colour {index}"));
+        let with_colour = |colour: egui::Color32| {
+            let mut changed = colours.to_vec();
+            let mut value = serde_json::to_value(changed[index]).unwrap();
+            value["r"] = colour.r().into();
+            value["g"] = colour.g().into();
+            value["b"] = colour.b().into();
+            changed[index] = serde_json::from_value(value).unwrap();
+            changed
+        };
+        if egui::color_picker::color_picker_color32(
+            ui,
+            &mut edited,
+            egui::color_picker::Alpha::Opaque,
+        ) {
+            ui.data_mut(|data| data.insert_temp(key, edited));
+            update_draft(
+                ui.ctx(),
+                key,
+                design,
+                Some(property_operation(
+                    design,
+                    id,
+                    PropertyKey::Colours,
+                    as_json(&with_colour(edited)),
+                )),
+            );
+        }
+        if !ui.input(|input| input.pointer.any_down()) {
+            if edited != current {
+                updated = Some(with_colour(edited));
+            }
+            ui.data_mut(|data| data.remove::<egui::Color32>(key));
+            clear_draft(ui.ctx(), key);
+        }
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(colours.len() < 256, egui::Button::new("Add colour"))
+            .clicked()
+        {
+            let mut changed = colours.to_vec();
+            changed.push(Colour::COLOUR_PALETTE[changed.len()]);
+            updated = Some(changed);
+        }
+        if ui
+            .add_enabled(!colours.is_empty(), egui::Button::new("Remove last"))
+            .clicked()
+        {
+            updated = Some(colours[..colours.len() - 1].to_vec());
+        }
+        if ui
+            .button("Use standard colours")
+            .on_hover_text("Replace all colours with the 256 standard VT colours")
+            .clicked()
+        {
+            updated = Some(Colour::COLOUR_PALETTE.to_vec());
+        }
+    });
+    if let Some(colours) = updated {
+        queue(design, id, PropertyKey::Colours, as_json(&colours));
+    }
+}
+
+/// The entries of a Colour Map, 16 to a row: each shows the palette colour
+/// that colour index is drawn with, and picks another from the palette.
+fn render_colour_map(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    map: &[u8],
+    design: &EditorProject,
+) {
+    let palette =
+        crate::effective_colour::palette_colours(design.get_pool()).map(|colour| colour.as_rgb());
+    let mut updated = None;
+    ui.label(label);
+    ui.horizontal(|ui| {
+        ui.label("Entries:");
+        for size in [2, 16, 256] {
+            if ui
+                .selectable_label(map.len() == size, size.to_string())
+                .clicked()
+                && map.len() != size
+            {
+                updated = Some(colour_map_with_size(map, size));
+            }
+        }
+        if ui
+            .button("Reset")
+            .on_hover_text("Draw every colour index with its own palette colour")
+            .clicked()
+        {
+            updated = Some(colour_map_with_size(&[], map.len()));
+        }
+    });
+    if !matches!(map.len(), 2 | 16 | 256) {
+        crate::ui_style::error_text(ui, "A Colour Map has 2, 16 or 256 entries.");
+    }
+    egui::Grid::new(("colour_map", id.value()))
+        .spacing(egui::vec2(2.0, 2.0))
+        .show(ui, |ui| {
+            for (index, target) in map.iter().copied().enumerate() {
+                let colour = palette[usize::from(target)];
+                let button = egui::Button::new(
+                    egui::RichText::new(target.to_string())
+                        .small()
+                        .color(text_on(colour)),
+                )
+                .fill(egui::Color32::from_rgb(colour[0], colour[1], colour[2]))
+                .min_size(egui::vec2(28.0, 20.0));
+                let response =
+                    egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+                        ui.label(format!("Draw colour {index} with"));
+                        colour_index_menu(ui, target, &palette, 0..=u8::MAX)
+                    });
+                if let Some(Some(chosen)) = response.1.map(|inner| inner.inner) {
+                    if chosen != target {
+                        let mut changed = map.to_vec();
+                        changed[index] = chosen;
+                        updated = Some(changed);
+                    }
+                }
+                response
+                    .0
+                    .on_hover_text(format!("Colour {index} → {target}"));
+                if index % 16 == 15 {
+                    ui.end_row();
+                }
+            }
+        });
+    if let Some(map) = updated {
+        queue(design, id, PropertyKey::ColourMap, serde_json::json!(map));
+    }
+}
+
+/// `map` with `size` entries; added entries map each index to itself.
+fn colour_map_with_size(map: &[u8], size: usize) -> Vec<u8> {
+    (0..size)
+        .map(|index| map.get(index).copied().unwrap_or(index as u8))
+        .collect()
+}
+
+/// The code planes of Extended Input Attributes: each a Unicode plane, 0 to
+/// 16, with the character ranges that the validation type allows or rejects.
+fn render_code_planes(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    planes: &[ag_iso_stack::object_pool::object::CodePlane],
+    design: &EditorProject,
+) {
+    use ag_iso_stack::object_pool::object::{CharacterRange, CodePlane};
+
+    let mut updated: Option<Vec<CodePlane>> = None;
+    ui.label(label);
+    for (plane_index, plane) in planes.iter().enumerate() {
+        ui.push_id(("code_plane", plane_index), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Plane");
+                let key = ui.make_persistent_id("plane_number");
+                let mut number = ui
+                    .data(|data| data.get_temp::<u8>(key))
+                    .unwrap_or(plane.number);
+                let response = ui
+                    .add(egui::DragValue::new(&mut number).range(0..=16))
+                    .on_hover_text("Unicode plane: 0 is the Basic Multilingual Plane");
+                if response.changed() {
+                    ui.data_mut(|data| data.insert_temp(key, number));
+                }
+                if drag_value_finished(&response)
+                    || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
+                    ui.data_mut(|data| data.remove::<u8>(key));
+                    if number != plane.number {
+                        let mut changed = planes.to_vec();
+                        changed[plane_index].number = number;
+                        updated = Some(changed);
+                    }
+                }
+                if ui.button("Remove plane").clicked() {
+                    let mut changed = planes.to_vec();
+                    changed.remove(plane_index);
+                    updated = Some(changed);
+                }
+            });
+            let ranges = &plane.character_ranges;
+            let mut action = None;
+            egui::Grid::new("ranges").striped(true).show(ui, |ui| {
+                for heading in ["First", "Last", "Characters", "", "", ""] {
+                    ui.label(heading);
+                }
+                ui.end_row();
+                for (index, range) in ranges.iter().enumerate() {
+                    let first = hex_character_field(
+                        ui,
+                        ui.make_persistent_id(("first", index)),
+                        range.first_character,
+                    );
+                    let last = hex_character_field(
+                        ui,
+                        ui.make_persistent_id(("last", index)),
+                        range.last_character,
+                    );
+                    ui.label(range_preview(plane.number, range));
+                    if first.is_some() || last.is_some() {
+                        // Keep the range in order by moving its other end
+                        let first = first.unwrap_or(range.first_character);
+                        let last = last.unwrap_or(range.last_character);
+                        let (first, last) = if first > last {
+                            if last != range.last_character {
+                                (last, last)
+                            } else {
+                                (first, first)
+                            }
+                        } else {
+                            (first, last)
+                        };
+                        let mut changed = planes.to_vec();
+                        changed[plane_index].character_ranges[index] = CharacterRange {
+                            first_character: first,
+                            last_character: last,
+                        };
+                        updated = Some(changed);
+                    }
+                    row_actions(ui, index, ranges.len(), &mut action);
+                    ui.end_row();
+                }
+            });
+            if let Some(action) = action {
+                let mut changed = planes.to_vec();
+                apply_list_action(&mut changed[plane_index].character_ranges, action);
+                updated = Some(changed);
+            }
+            if ui.button("Add range").clicked() {
+                let mut changed = planes.to_vec();
+                changed[plane_index]
+                    .character_ranges
+                    .push(default_character_range(plane.number));
+                updated = Some(changed);
+            }
+        });
+        ui.separator();
+    }
+    let free_plane = (0..=16).find(|number| planes.iter().all(|plane| plane.number != *number));
+    if ui
+        .add_enabled(free_plane.is_some(), egui::Button::new("Add plane"))
+        .clicked()
+    {
+        if let Some(number) = free_plane {
+            let mut changed = planes.to_vec();
+            changed.push(CodePlane {
+                number,
+                character_ranges: vec![default_character_range(number)],
+            });
+            updated = Some(changed);
+        }
+    }
+    if let Some(planes) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::CodePlanes,
+            serde_json::to_value(planes).unwrap(),
+        );
+    }
+}
+
+/// Printable ASCII in the Basic Multilingual Plane, otherwise the whole plane.
+fn default_character_range(plane: u8) -> ag_iso_stack::object_pool::object::CharacterRange {
+    let (first_character, last_character) = if plane == 0 {
+        (0x20, 0x7E)
+    } else {
+        (0x0000, 0xFFFF)
+    };
+    ag_iso_stack::object_pool::object::CharacterRange {
+        first_character,
+        last_character,
+    }
+}
+
+/// The first and last characters of a range, "A – Z", when they print.
+fn range_preview(plane: u8, range: &ag_iso_stack::object_pool::object::CharacterRange) -> String {
+    let character = |value: u16| {
+        char::from_u32(u32::from(plane) << 16 | u32::from(value))
+            .filter(|character| !character.is_control() && !character.is_whitespace())
+    };
+    match (
+        character(range.first_character),
+        character(range.last_character),
+    ) {
+        (Some(first), Some(last)) if first == last => first.to_string(),
+        (Some(first), Some(last)) => format!("{first} – {last}"),
+        _ => String::new(),
+    }
+}
+
+/// A character code in hex; returns the new code once the edit is finished.
+fn hex_character_field(ui: &mut egui::Ui, key: egui::Id, current: u16) -> Option<u16> {
+    let mut edited = ui.data(|data| data.get_temp::<u16>(key)).unwrap_or(current);
+    let response = ui.add(
+        egui::DragValue::new(&mut edited)
+            .hexadecimal(4, false, true)
+            .prefix("U+"),
+    );
+    if response.changed() {
+        ui.data_mut(|data| data.insert_temp(key, edited));
+    }
+    if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|data| data.remove::<u16>(key));
+    } else if drag_value_finished(&response)
+        || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+    {
+        ui.data_mut(|data| data.remove::<u16>(key));
+        return (edited != current).then_some(edited);
+    }
+    None
+}
+
+/// The commands of a Macro as instructions: a command name and its arguments,
+/// as the CLI writes them. Every edit re-encodes the whole stream for the
+/// project's VT version; an instruction that does not encode is kept in its
+/// field with the error until it is fixed. Streams the decoder cannot read
+/// lossless stay raw JSON.
+fn render_macro_commands(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    commands: &[u8],
+    design: &EditorProject,
+) {
+    use crate::macro_authoring::{
+        decode_macro_commands, encode_macro_instruction, instruction_names, MacroInstruction,
+    };
+
+    let version = design.vt_version;
+    let instructions = match decode_macro_commands(commands, version) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            crate::ui_style::error_text(ui, &format!("Shown as bytes: {error}"));
+            render_json(
+                ui,
+                label,
+                &serde_json::json!(commands),
+                id,
+                PropertyKey::Commands,
+                design,
+            );
+            return;
+        }
+    };
+    let encode = |instructions: &[MacroInstruction]| -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        for (index, instruction) in instructions.iter().enumerate() {
+            bytes.extend(
+                encode_macro_instruction(&instruction.name, &instruction.arguments, version)
+                    .map_err(|error| format!("Instruction {}: {error}", index + 1))?,
+            );
+        }
+        Ok(bytes)
+    };
+    let mut updated = None;
+    let mut action = None;
+    let mut error = None;
+    ui.label(label);
+    egui::Grid::new(("macro_commands", id.value()))
+        .striped(true)
+        .show(ui, |ui| {
+            for (index, instruction) in instructions.iter().enumerate() {
+                ui.label((index + 1).to_string());
+                ui.label(&instruction.name);
+                let key = ui.make_persistent_id((id.value(), "macro_arguments", index));
+                let current = join_arguments(&instruction.arguments);
+                let mut edited = pending_text(ui, key).unwrap_or_else(|| current.clone());
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut edited)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(220.0),
+                );
+                if response.changed() {
+                    ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+                }
+                if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    ui.data_mut(|data| data.remove::<PendingValue>(key));
+                } else if response.lost_focus() && edited != current {
+                    let result = split_arguments(&edited).and_then(|arguments| {
+                        let mut changed = instructions.clone();
+                        changed[index].arguments = arguments;
+                        encode(&changed)
+                    });
+                    match result {
+                        Ok(bytes) => {
+                            updated = Some(bytes);
+                            ui.data_mut(|data| data.remove::<PendingValue>(key));
+                        }
+                        Err(message) => error = Some(message),
+                    }
+                }
+                // The object an instruction acts on comes first
+                match instruction
+                    .arguments
+                    .first()
+                    .and_then(|argument| argument.parse::<u16>().ok())
+                    .and_then(|object| ObjectId::new(object).ok())
+                    .and_then(|object| design.get_pool().object_by_id(object))
+                {
+                    Some(object) => {
+                        if ui.link(design.object_display_name(object)).clicked() {
+                            select_object(design, object.id());
+                        }
+                    }
+                    None => {
+                        ui.label("");
+                    }
+                }
+                row_actions(ui, index, instructions.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = instructions.clone();
+        apply_list_action(&mut changed, action);
+        match encode(&changed) {
+            Ok(bytes) => updated = Some(bytes),
+            Err(message) => error = Some(message),
+        }
+    }
+    let pending_id = ui.make_persistent_id((id.value(), "new_macro_instruction"));
+    let (mut name, mut arguments) = ui
+        .data(|data| data.get_temp::<(String, String)>(pending_id))
+        .unwrap_or_else(|| ("change-numeric-value".to_owned(), String::new()));
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(pending_id)
+            .icon(crate::ui_style::combo_box_icon)
+            .selected_text(&name)
+            .height(320.0)
+            .show_ui(ui, |ui| {
+                for candidate in instruction_names() {
+                    ui.selectable_value(&mut name, candidate.to_owned(), candidate);
+                }
+            });
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut arguments)
+                .font(egui::TextStyle::Monospace)
+                .hint_text("Arguments, such as 1000 5")
+                .desired_width(160.0),
+        );
+        let add = ui.button("Add").clicked()
+            || response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if add {
+            let result = split_arguments(&arguments).and_then(|parsed| {
+                let mut changed = instructions.clone();
+                changed.push(MacroInstruction {
+                    name: name.clone(),
+                    arguments: parsed,
+                });
+                encode(&changed)
+            });
+            match result {
+                Ok(bytes) => {
+                    updated = Some(bytes);
+                    arguments.clear();
+                }
+                Err(message) => error = Some(message),
+            }
+        }
+    });
+    ui.data_mut(|data| data.insert_temp(pending_id, (name, arguments)));
+    if let Some(message) = error {
+        ui.data_mut(|data| data.insert_temp(pending_id.with("error"), message));
+    } else if updated.is_some() {
+        ui.data_mut(|data| data.remove::<String>(pending_id.with("error")));
+    }
+    if let Some(message) = ui.data(|data| data.get_temp::<String>(pending_id.with("error"))) {
+        crate::ui_style::error_text(ui, &message);
+    }
+    if let Some(bytes) = updated {
+        queue(design, id, PropertyKey::Commands, serde_json::json!(bytes));
+    }
+}
+
+/// Arguments separated by spaces, quoting those that are empty or hold a
+/// space, a quote or a backslash.
+fn join_arguments(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .map(|argument| {
+            if argument.is_empty()
+                || argument
+                    .chars()
+                    .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+            {
+                format!(
+                    "\"{}\"",
+                    argument.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            } else {
+                argument.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The inverse of [`join_arguments`].
+fn split_arguments(text: &str) -> Result<Vec<String>, String> {
+    let mut arguments = Vec::new();
+    let mut characters = text.chars().peekable();
+    loop {
+        while characters.next_if(|c| c.is_whitespace()).is_some() {}
+        let Some(&first) = characters.peek() else {
+            return Ok(arguments);
+        };
+        let mut argument = String::new();
+        if first == '"' {
+            characters.next();
+            loop {
+                match characters.next() {
+                    Some('"') => break,
+                    Some('\\') => match characters.next() {
+                        Some(escaped) => argument.push(escaped),
+                        None => return Err("A quoted argument ends with a backslash".into()),
+                    },
+                    Some(c) => argument.push(c),
+                    None => return Err("A quoted argument has no closing quote".into()),
+                }
+            }
+        } else {
+            while let Some(c) = characters.next_if(|c| !c.is_whitespace()) {
+                argument.push(c);
+            }
+        }
+        arguments.push(argument);
+    }
+}
+
+/// The PNG of a Graphic Data object: a preview, its size, and a button that
+/// loads an image file in its place.
+fn render_graphic_data(
+    ui: &mut egui::Ui,
+    label: &str,
+    graphic: &ag_iso_stack::object_pool::object::GraphicData,
+    design: &EditorProject,
+) {
+    ui.label(label);
+    if graphic.data.is_empty() {
+        ui.weak("No image yet");
+    } else if let Some(texture) = crate::graphics::preview::graphic_data_texture(ui.ctx(), graphic)
+    {
+        let [width, height] = texture.size();
+        let scale = (160.0 / width.max(height) as f32).min(1.0);
+        ui.add(
+            egui::Image::new(&texture)
+                .fit_to_exact_size(egui::vec2(width as f32, height as f32) * scale),
+        );
+        ui.weak(format!(
+            "{width} × {height} px, {} bytes PNG",
+            graphic.data.len()
+        ));
+    } else {
+        crate::ui_style::error_text(ui, "The data is not a PNG this editor can read.");
+    }
+    if ui
+        .button("Load image…")
+        .on_hover_text("A PNG is kept as it is; other images are converted to PNG")
+        .clicked()
+    {
+        design.request_image_load(graphic.id);
     }
 }
 
@@ -3134,6 +4538,139 @@ mod tests {
 
         assert_eq!(direct_reference_count(&pool, target_id), 3);
         assert_eq!(direct_reference_count(&pool, unreferenced_id), 0);
+    }
+}
+
+#[cfg(test)]
+mod string_length_tests {
+    use super::{max_string_length, string_with_length};
+    use ag_iso_stack::object_pool::vt_version::VtVersion;
+
+    #[test]
+    fn length_pads_with_spaces_and_only_drops_trailing_spaces() {
+        assert_eq!(string_with_length("0", 4), "0   ");
+        assert_eq!(string_with_length("0   ", 2), "0 ");
+        assert_eq!(string_with_length("a b  ", 0), "a b");
+        assert_eq!(string_with_length("Ä", 2), "Ä ");
+    }
+
+    #[test]
+    fn wide_strings_hold_half_as_many_characters_after_the_byte_order_mark() {
+        assert_eq!(max_string_length(255, VtVersion::Version3), 255);
+        assert_eq!(max_string_length(255, VtVersion::Version4), 126);
+        assert_eq!(max_string_length(65535, VtVersion::Version6), 32766);
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::parse_name_hex;
+    use crate::{EditorProject, ObjectTarget, Operation, OperationTransaction, PropertyKey};
+    use ag_iso_stack::object_pool::{object::Object, ObjectType};
+
+    #[test]
+    fn hex_names_accept_a_prefix_and_spaces_but_no_more_than_64_bits() {
+        assert_eq!(
+            parse_name_hex("0xA00E 8400 00C0 FFEE"),
+            Some(0xA00E_8400_00C0_FFEE)
+        );
+        assert_eq!(parse_name_hex("ff"), Some(0xFF));
+        assert_eq!(parse_name_hex(""), None);
+        assert_eq!(parse_name_hex("1 0000 0000 0000 0000"), None);
+        assert_eq!(parse_name_hex("xyz"), None);
+    }
+
+    #[test]
+    fn a_name_above_53_bits_is_stored_exactly() {
+        let mut project = EditorProject::default();
+        let name = project.generate_smart_name_for_new_object(ObjectType::ExternalReferenceName);
+        let id = project
+            .create_object(ObjectType::ExternalReferenceName, name)
+            .unwrap();
+        let raw: u64 = 0xA00E_8400_00C0_FFEF;
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(id.value()),
+            property: PropertyKey::Name,
+            value: serde_json::json!(raw),
+        });
+        project.execute_transaction(transaction).unwrap();
+
+        let Some(Object::ExternalReferenceName(reference)) = project.get_pool().object_by_id(id)
+        else {
+            panic!("expected the External Reference Name");
+        };
+        assert_eq!(u64::from(reference.name), raw);
+        assert_eq!(reference.name.get_industry_group(), 2);
+    }
+}
+
+#[cfg(test)]
+mod colour_map_tests {
+    use super::colour_map_with_size;
+
+    #[test]
+    fn resizing_keeps_entries_and_maps_new_ones_to_themselves() {
+        assert_eq!(colour_map_with_size(&[5, 6], 4), vec![5, 6, 2, 3]);
+        assert_eq!(colour_map_with_size(&[5, 6, 7], 2), vec![5, 6]);
+        let identity = colour_map_with_size(&[], 256);
+        assert_eq!(identity.len(), 256);
+        assert!(identity.iter().enumerate().all(|(i, v)| i == *v as usize));
+    }
+}
+
+#[cfg(test)]
+mod code_plane_tests {
+    use super::{default_character_range, range_preview};
+    use ag_iso_stack::object_pool::object::CharacterRange;
+
+    #[test]
+    fn ranges_preview_their_printable_ends() {
+        let range = |first, last| CharacterRange {
+            first_character: first,
+            last_character: last,
+        };
+        assert_eq!(range_preview(0, &range(0x41, 0x5A)), "A – Z");
+        assert_eq!(range_preview(0, &range(0x20AC, 0x20AC)), "€");
+        assert_eq!(range_preview(0, &range(0x00, 0x1F)), "");
+        assert_eq!(range_preview(1, &range(0xF600, 0xF64F)), "😀 – 🙏");
+    }
+
+    #[test]
+    fn new_ranges_cover_printable_ascii_or_the_whole_plane() {
+        assert_eq!(default_character_range(0).first_character, 0x20);
+        assert_eq!(default_character_range(0).last_character, 0x7E);
+        assert_eq!(default_character_range(2).last_character, 0xFFFF);
+    }
+}
+
+#[cfg(test)]
+mod macro_command_tests {
+    use super::{join_arguments, split_arguments};
+    use crate::macro_authoring::{decode_macro_commands, encode_macro_instruction};
+    use ag_iso_stack::object_pool::vt_version::VtVersion;
+
+    #[test]
+    fn arguments_round_trip_through_their_text() {
+        let arguments: Vec<String> = ["1000", "Hello world", "", r#"say "hi""#, r"a\b"]
+            .map(str::to_owned)
+            .to_vec();
+        let text = join_arguments(&arguments);
+        assert_eq!(text, r#"1000 "Hello world" "" "say \"hi\"" "a\\b""#);
+        assert_eq!(split_arguments(&text).unwrap(), arguments);
+        assert_eq!(split_arguments("  7   show ").unwrap(), vec!["7", "show"]);
+        assert!(split_arguments("\"open").is_err());
+    }
+
+    #[test]
+    fn edited_instructions_encode_like_the_cli() {
+        let arguments = split_arguments("1000 42").unwrap();
+        let bytes =
+            encode_macro_instruction("change-numeric-value", &arguments, VtVersion::Version4)
+                .unwrap();
+        let decoded = decode_macro_commands(&bytes, VtVersion::Version4).unwrap();
+        assert_eq!(decoded[0].name, "change-numeric-value");
+        assert_eq!(join_arguments(&decoded[0].arguments), "1000 42");
     }
 }
 

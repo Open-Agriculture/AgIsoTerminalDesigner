@@ -42,8 +42,8 @@ pub struct CanvasState {
     snap_spacing: bool,
     grid_visible: bool,
     secondary_panned: bool,
-    /// Mask position of the last right click, where Add object here places the object
-    add_position: Option<(i16, i16)>,
+    /// What was under the last right click, where Add object here places the object
+    add_target: Option<AddTarget>,
     add_object_query: String,
     fit: Option<bool>,
     fit_all: bool,
@@ -60,9 +60,39 @@ pub struct CanvasState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddObjectRequest {
     pub object_type: ag_iso_stack::object_pool::ObjectType,
+    /// The mask shown on the canvas.
+    pub root: u16,
     pub parent: u16,
     pub x: i16,
     pub y: i16,
+}
+
+/// Asks the app to group placements under a new parent of `object_type`,
+/// after the user names it. Stored in the egui context's temporary data under
+/// [`GroupObjectsRequest::id`].
+#[derive(Clone, Debug)]
+pub struct GroupObjectsRequest {
+    pub session: uuid::Uuid,
+    pub revision: u64,
+    /// The mask shown on the canvas.
+    pub root: u16,
+    pub targets: Vec<PlacementTarget>,
+    pub object_type: ag_iso_stack::object_pool::ObjectType,
+}
+
+impl GroupObjectsRequest {
+    pub fn id() -> egui::Id {
+        egui::Id::new("canvas_group_objects_request")
+    }
+}
+
+/// The object under a right click that accepts new children, and the click's
+/// position in it. Soft Key Masks list their keys without positions.
+#[derive(Clone, Debug)]
+struct AddTarget {
+    parent: u16,
+    x: i16,
+    y: i16,
 }
 
 impl AddObjectRequest {
@@ -118,7 +148,7 @@ impl Default for CanvasState {
             snap_spacing: true,
             grid_visible: false,
             secondary_panned: false,
-            add_position: None,
+            add_target: None,
             add_object_query: String::new(),
             fit: None,
             fit_all: false,
@@ -1453,7 +1483,8 @@ impl CanvasState {
         if pointer.button_pressed(egui::PointerButton::Secondary) {
             self.secondary_panned = false;
             if response.hovered() {
-                self.add_position = hover.map(|p| (p.x.round() as i16, p.y.round() as i16));
+                self.add_target =
+                    hover.and_then(|p| Self::add_target(project, &scene, &softkeys, root, p));
                 self.add_object_query.clear();
             }
         }
@@ -1917,6 +1948,19 @@ impl CanvasState {
         if !self.secondary_panned {
             response.context_menu(|ui| {
                 self.add_object_menu(ui, project);
+                self.group_menu(ui, project, &items);
+                ui.add_enabled_ui(!items.is_empty(), |ui| {
+                    ui.menu_button("Align / distribute", |ui| {
+                        let edits = align_menu(ui, project, &items);
+                        if !edits.is_empty() {
+                            self.commit(project, "Align placements", edits);
+                        }
+                    })
+                })
+                .response
+                .on_disabled_hover_text(
+                    "Select objects to align, with Shift-click for more than one.",
+                );
                 ui.menu_button("Select layer", |ui| {
                     if let Some(pos) = hover {
                         for item in scene.items.iter().rev().filter(|i| {
@@ -2417,38 +2461,8 @@ impl CanvasState {
                         ui.label("Dimensions read-only");
                     }
                 }
-                let enabled = same_parent(items);
                 ui.menu_button("Align / distribute", |ui| {
-                    for (name, action) in [
-                        ("Left", 0),
-                        ("Horizontal center", 1),
-                        ("Right", 2),
-                        ("Top", 3),
-                        ("Vertical center", 4),
-                        ("Bottom", 5),
-                        ("Distribute horizontally", 6),
-                        ("Distribute vertically", 7),
-                    ] {
-                        if ui
-                            .add_enabled(
-                                enabled && (action < 6 || items.len() >= 3),
-                                egui::Button::new(name),
-                            )
-                            .clicked()
-                        {
-                            commands.extend(align_edits(
-                                project,
-                                items,
-                                action,
-                                ui.input(|i| i.modifiers.shift),
-                            ));
-                            ui.close();
-                        }
-                    }
-                    if !enabled {
-                        ui.label("Select placements with the same parent.");
-                    }
-                    ui.label("Shift-align: align selection as a group to parent");
+                    commands.extend(align_menu(ui, project, items));
                 });
             });
         }
@@ -2488,6 +2502,26 @@ impl CanvasState {
         }
         if take(Key::Num2, Modifiers::SHIFT) {
             self.fit = Some(true);
+        }
+        if take(Key::G, Modifiers::COMMAND) {
+            let targets = group_targets(&self.selection(scene));
+            let container = edits::grouping_candidates(project, &targets)
+                .into_iter()
+                .find(|candidate| {
+                    candidate.object_type == ag_iso_stack::object_pool::ObjectType::Container
+                });
+            match container {
+                Some(candidate) if candidate.enabled => {
+                    self.request_group(ui.ctx(), project, targets, candidate.object_type)
+                }
+                Some(candidate) => self.error = candidate.reason,
+                None if !targets.is_empty() => {
+                    self.error = Some(
+                        "These objects cannot be grouped into a Container. Select siblings that a Container can hold.".to_owned(),
+                    )
+                }
+                None => {}
+            }
         }
         if take(Key::A, Modifiers::COMMAND) {
             self.selected = scene
@@ -2565,20 +2599,75 @@ impl CanvasState {
     }
     /// The Add object here submenu: object types the shown mask accepts, placed
     /// where the menu was opened.
+    /// The innermost object under `p` that can take a new child: a key in its
+    /// soft key slot, the Soft Key Mask for an empty slot, otherwise the
+    /// innermost editable object with positioned children, or the mask.
+    fn add_target(
+        project: &EditorProject,
+        scene: &Scene,
+        softkeys: &super::softkeys::SoftKeys,
+        root: u16,
+        p: Pos2,
+    ) -> Option<AddTarget> {
+        let pool = project.get_pool();
+        let at = |parent: u16, origin: Pos2| AddTarget {
+            parent,
+            x: (p.x - origin.x).round().max(0.0) as i16,
+            y: (p.y - origin.y).round().max(0.0) as i16,
+        };
+        if let Some(slot) = softkeys.slots.iter().find(|slot| slot.rect.contains(p)) {
+            return match slot.content {
+                super::softkeys::SlotContent::Key { id, .. } => Some(at(id, slot.rect.min)),
+                super::softkeys::SlotContent::Empty | super::softkeys::SlotContent::Invalid => {
+                    softkeys.mask_id.map(|mask| AddTarget {
+                        parent: mask,
+                        x: 0,
+                        y: 0,
+                    })
+                }
+                super::softkeys::SlotContent::Previous | super::softkeys::SlotContent::Next => None,
+            };
+        }
+        let positions_children = |id: u16| {
+            ObjectId::new(id)
+                .ok()
+                .and_then(|id| pool.object_by_id(id))
+                .and_then(crate::operations::object_refs)
+                .is_some()
+        };
+        scene
+            .items
+            .iter()
+            .filter(|item| {
+                item.path.first() != Some(&super::softkeys::PATH_PREFIX)
+                    && item.hit_rect.contains(p)
+                    && (item.path.is_empty()
+                        || matches!(item.target, Some(PlacementTarget::Primitive { .. })))
+                    && positions_children(item.object_id)
+            })
+            .max_by_key(|item| item.path.len())
+            .map(|item| at(item.object_id, item.rect.min))
+            .or_else(|| positions_children(root).then(|| at(root, Pos2::ZERO)))
+    }
+
     fn add_object_menu(&mut self, ui: &mut egui::Ui, project: &EditorProject) {
         let version = project.vt_version();
-        let mask = self.mask.and_then(|id| {
+        let parent = self.add_target.as_ref().and_then(|target| {
             project
                 .get_pool()
-                .object_by_id(ObjectId::new(id).ok()?)
-                .map(|object| (id, object.object_type()))
+                .object_by_id(ObjectId::new(target.parent).ok()?)
         });
-        let allowed = mask.map_or_else(Vec::new, |(_, mask_type)| {
-            crate::allowed_object_relationships::get_allowed_child_refs(mask_type, version)
+        let allowed = parent.map_or_else(Vec::new, |parent| {
+            crate::allowed_object_relationships::get_allowed_child_refs(
+                parent.object_type(),
+                version,
+            )
         });
-        let enabled = !allowed.is_empty() && self.add_position.is_some();
-        ui.add_enabled_ui(enabled, |ui| {
+        let response = ui.add_enabled_ui(!allowed.is_empty() && self.mask.is_some(), |ui| {
             ui.menu_button("Add object here", |ui| {
+                if let Some(parent) = parent {
+                    ui.weak(format!("In {}", project.object_display_name(parent)));
+                }
                 let focus = self.add_object_query.is_empty();
                 if let Some(object_type) = crate::object_picker::object_type_list(
                     ui,
@@ -2587,15 +2676,16 @@ impl CanvasState {
                     version,
                     |object_type| allowed.contains(&object_type),
                 ) {
-                    if let (Some((parent, _)), Some((x, y))) = (mask, self.add_position) {
+                    if let (Some(root), Some(target)) = (self.mask, &self.add_target) {
                         ui.ctx().data_mut(|data| {
                             data.insert_temp(
                                 AddObjectRequest::id(),
                                 AddObjectRequest {
                                     object_type,
-                                    parent,
-                                    x: x.max(0),
-                                    y: y.max(0),
+                                    root,
+                                    parent: target.parent,
+                                    x: target.x,
+                                    y: target.y,
                                 },
                             )
                         });
@@ -2604,7 +2694,83 @@ impl CanvasState {
                 }
             });
         });
+        if allowed.is_empty() {
+            response
+                .response
+                .on_disabled_hover_text("Nothing can be added where you right-clicked.");
+        }
     }
+    /// Group the selected placements under a new parent, offering the types
+    /// that can hold them all. A Container is the usual choice, also on Ctrl+G.
+    fn group_menu(&mut self, ui: &mut egui::Ui, project: &EditorProject, items: &[SceneItem]) {
+        let targets = group_targets(items);
+        let response = ui.add_enabled_ui(!targets.is_empty(), |ui| {
+            ui.menu_button("Group into", |ui| {
+                let candidates = edits::grouping_candidates(project, &targets);
+                if candidates.is_empty() {
+                    ui.add_enabled(
+                        false,
+                        egui::Label::new("No parent type can hold these objects"),
+                    );
+                }
+                for candidate in candidates {
+                    let shortcut = if candidate.object_type
+                        == ag_iso_stack::object_pool::ObjectType::Container
+                    {
+                        " · Ctrl+G"
+                    } else {
+                        ""
+                    };
+                    let response = ui.add_enabled(
+                        candidate.enabled,
+                        egui::Button::new(format!("{:?}{shortcut}", candidate.object_type)),
+                    );
+                    if let Some(reason) = candidate.reason {
+                        response.clone().on_disabled_hover_text(reason);
+                    }
+                    if response.clicked() {
+                        self.request_group(
+                            ui.ctx(),
+                            project,
+                            targets.clone(),
+                            candidate.object_type,
+                        );
+                        ui.close();
+                    }
+                }
+            });
+        });
+        if targets.is_empty() {
+            response.response.on_disabled_hover_text(
+                "Select objects, with Shift-click for more than one, to group them.",
+            );
+        }
+    }
+
+    fn request_group(
+        &self,
+        ctx: &egui::Context,
+        project: &EditorProject,
+        targets: Vec<PlacementTarget>,
+        object_type: ag_iso_stack::object_pool::ObjectType,
+    ) {
+        let Some(root) = self.mask else {
+            return;
+        };
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                GroupObjectsRequest::id(),
+                GroupObjectsRequest {
+                    session: project.ui_session_id(),
+                    revision: project.revision(),
+                    root,
+                    targets,
+                    object_type,
+                },
+            )
+        });
+    }
+
     /// Moves the selection by 1 pixel per arrow key, or 10 with Shift.
     fn nudge(
         &self,
@@ -2956,6 +3122,47 @@ fn softkey_object_id(project: &EditorProject, root: u16, slot: usize) -> Option<
     mask.objects.get(slot).map(|id| id.value())
 }
 
+/// The alignment and distribution actions for the selected items, shared by
+/// the toolbar and the context menu. Returns the edits of the action clicked.
+fn align_menu(ui: &mut egui::Ui, project: &EditorProject, items: &[SceneItem]) -> Vec<CanvasEdit> {
+    let enabled = same_parent(items);
+    let mut edits = Vec::new();
+    for (name, action) in [
+        ("Left", 0),
+        ("Horizontal center", 1),
+        ("Right", 2),
+        ("Top", 3),
+        ("Vertical center", 4),
+        ("Bottom", 5),
+        ("Distribute horizontally", 6),
+        ("Distribute vertically", 7),
+    ] {
+        if ui
+            .add_enabled(
+                enabled && (action < 6 || items.len() >= 3),
+                egui::Button::new(name),
+            )
+            .clicked()
+        {
+            edits = align_edits(project, items, action, ui.input(|i| i.modifiers.shift));
+            ui.close();
+        }
+    }
+    if !enabled {
+        ui.label("Select placements with the same parent.");
+    }
+    ui.label("Shift-align: align selection as a group to parent");
+    edits
+}
+
+/// The placements of the outermost selected items, which grouping moves.
+fn group_targets(items: &[SceneItem]) -> Vec<PlacementTarget> {
+    root_items(items.to_vec())
+        .into_iter()
+        .filter_map(|item| item.target)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2964,6 +3171,12 @@ mod tests {
     };
 
     fn repeated_parent_project() -> EditorProject {
+        let mut project = EditorProject::from(repeated_parent_pool());
+        project.mask_size = 500;
+        project
+    }
+
+    fn repeated_parent_pool() -> ObjectPool {
         let mut pool = ObjectPool::default();
         for (id, kind) in [
             (2, ObjectType::DataMask),
@@ -2998,9 +3211,62 @@ mod tests {
         {
             pointer.value = ObjectId::new(100).unwrap().into();
         }
+        pool
+    }
+
+    #[test]
+    fn add_object_here_offers_the_innermost_object_that_takes_children() {
+        let mut pool = repeated_parent_pool();
+        for (id, kind) in [(3, ObjectType::SoftKeyMask), (4, ObjectType::Key)] {
+            let mut object = crate::default_object(kind);
+            object.mut_id().set_value(id).unwrap();
+            pool.add(object);
+        }
+        if let Some(Object::SoftKeyMask(mask)) = pool.object_mut_by_id(ObjectId::new(3).unwrap()) {
+            mask.objects.push(ObjectId::new(4).unwrap());
+        }
+        if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(2).unwrap()) {
+            mask.soft_key_mask = ObjectId::new(3).unwrap().into();
+        }
         let mut project = EditorProject::from(pool);
         project.mask_size = 500;
-        project
+        let materialized = project.materialize_shared().unwrap();
+        let scene = geometry::build_page(&project, &materialized, 2, 0);
+        let softkeys = super::super::softkeys::build(&project, project.get_pool(), 2, 0);
+        let target = |x: f32, y: f32| {
+            CanvasState::add_target(&project, &scene, &softkeys, 2, Pos2::new(x, y))
+                .map(|target| (target.parent, target.x, target.y))
+        };
+
+        // Inside each occurrence of the container, also over its Output String
+        assert_eq!(target(10.0, 10.0), Some((100, 10, 10)));
+        assert_eq!(target(110.0, 5.0), Some((100, 10, 5)));
+        assert_eq!(target(6.0, 6.0), Some((100, 6, 6)));
+        assert_eq!(target(300.0, 300.0), Some((2, 300, 300)));
+
+        let slot = |key: bool| {
+            softkeys
+                .slots
+                .iter()
+                .find(|slot| {
+                    matches!(
+                        slot.content,
+                        super::super::softkeys::SlotContent::Key { .. }
+                    ) == key
+                        && !matches!(
+                            slot.content,
+                            super::super::softkeys::SlotContent::Previous
+                                | super::super::softkeys::SlotContent::Next
+                        )
+                })
+                .unwrap()
+                .rect
+        };
+        let key = slot(true);
+        let in_key = key.min + egui::vec2(3.0, 2.0);
+        assert_eq!(target(in_key.x, in_key.y), Some((4, 3, 2)));
+        let empty = slot(false).center();
+        assert_eq!(target(empty.x, empty.y), Some((3, 0, 0)));
     }
 
     #[test]
