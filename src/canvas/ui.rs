@@ -1313,6 +1313,10 @@ impl CanvasState {
         let can_key = self.mask.is_some() && (response.has_focus() || self.gesture.is_some());
         if can_key {
             self.keys(ui, project, &scene, modifiers, &mut commands);
+        } else if self.mask.is_some() && response.hovered() && !ui.ctx().wants_keyboard_input() {
+            // Arrow keys also move the selection while the pointer is over the canvas, so an
+            // object selected in the hierarchy or Properties can be nudged without clicking it
+            self.nudge(ui, project, &scene, modifiers, &mut commands);
         }
         if pointer.button_pressed(egui::PointerButton::Primary)
             && response.hovered()
@@ -2530,6 +2534,18 @@ impl CanvasState {
                     .filter_map(|i| i.target.clone().map(|target| CanvasEdit::Remove { target })),
             );
         }
+        self.nudge(ui, project, scene, modifiers, commands);
+    }
+    /// Moves the selection by 1 pixel per arrow key, or 10 with Shift.
+    fn nudge(
+        &self,
+        ui: &mut egui::Ui,
+        project: &EditorProject,
+        scene: &Scene,
+        modifiers: Modifiers,
+        commands: &mut Vec<CanvasEdit>,
+    ) {
+        let items = root_items(self.selection(scene));
         let mut nudge = Vec2::ZERO;
         for (key, delta) in [
             (Key::ArrowLeft, egui::vec2(-1.0, 0.0)),
@@ -2542,7 +2558,7 @@ impl CanvasState {
                 alt: modifiers.alt,
                 ..Default::default()
             };
-            if take(key, mods) {
+            if ui.input_mut(|i| i.consume_key(mods, key)) {
                 nudge += delta * if modifiers.shift { 10.0 } else { 1.0 };
             }
         }
