@@ -234,6 +234,8 @@ pub enum EditorKind {
     Justification,
     PolygonPoints,
     MacroReferences,
+    /// ISO 639-1 language codes, picked from a searchable list.
+    LanguageCodes,
 }
 
 /// UI schemas for every writable property of an object type.
@@ -275,6 +277,7 @@ fn default_editor(semantic: &PropertySemantic) -> EditorKind {
 fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<EditorKind> {
     match (object_type, property) {
         (ObjectType::OutputPolygon, PropertyKey::Points) => Some(EditorKind::PolygonPoints),
+        (ObjectType::WorkingSet, PropertyKey::LanguageCodes) => Some(EditorKind::LanguageCodes),
         (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }

@@ -610,6 +610,11 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                     render_polygon_points(ui, polygon, design);
                 }
             }
+            EditorKind::LanguageCodes => {
+                if let Object::WorkingSet(working_set) = object {
+                    render_language_codes(ui, &label, id, &working_set.language_codes, design);
+                }
+            }
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
@@ -2457,6 +2462,143 @@ fn max_string_length(max_bytes: usize, version: VtVersion) -> usize {
         max_bytes.saturating_sub(2) / 2
     } else {
         max_bytes
+    }
+}
+
+/// A dropdown of `table`'s codes with a search field that matches codes and
+/// names. Returns the code clicked; `offered` hides codes that cannot be picked.
+fn code_picker(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    selected_text: &str,
+    table: &'static [(&'static str, &'static str)],
+    current: Option<&str>,
+    offered: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    let id = ui.make_persistent_id(salt);
+    let query_id = id.with("query");
+    let mut chosen = None;
+    let popup = egui::ComboBox::from_id_salt(id)
+        .icon(crate::ui_style::combo_box_icon)
+        .selected_text(selected_text)
+        .height(320.0)
+        .show_ui(ui, |ui| {
+            let opened = ui.data(|data| data.get_temp::<String>(query_id)).is_none();
+            let mut query = ui
+                .data(|data| data.get_temp::<String>(query_id))
+                .unwrap_or_default();
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut query)
+                    .hint_text("Search…")
+                    .desired_width(220.0),
+            );
+            if opened {
+                search.request_focus();
+            }
+            let needle = query.to_lowercase();
+            let mut first = None;
+            for (code, name) in table {
+                if !offered(code)
+                    || !code.to_lowercase().contains(&needle)
+                        && !name.to_lowercase().contains(&needle)
+                {
+                    continue;
+                }
+                first.get_or_insert(*code);
+                let selected = current.is_some_and(|current| current.eq_ignore_ascii_case(code));
+                let response = ui.selectable_label(selected, format!("{code} — {name}"));
+                if selected && opened {
+                    response.scroll_to_me(Some(egui::Align::Center));
+                }
+                if response.clicked() {
+                    chosen = Some(*code);
+                }
+            }
+            // Enter picks the first match, so typing a code is enough
+            if search.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                chosen = chosen.or(first);
+            }
+            ui.data_mut(|data| data.insert_temp(query_id, query));
+        });
+    if popup.inner.is_none() || chosen.is_some() {
+        ui.data_mut(|data| data.remove::<String>(query_id));
+    }
+    if chosen.is_some() {
+        // ComboBox keeps its popup state under its button id with "popup"
+        egui::Popup::close_id(ui.ctx(), ui.make_persistent_id(id).with("popup"));
+    }
+    chosen
+}
+
+/// The languages a Working Set supports, as ISO 639-1 codes.
+fn render_language_codes(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    codes: &[String],
+    design: &EditorProject,
+) {
+    use crate::iso_codes::{label as code_label, LANGUAGES};
+
+    let mut updated = None;
+    let mut action = None;
+    ui.label(label);
+    egui::Grid::new(("language_codes", id.value()))
+        .striped(true)
+        .show(ui, |ui| {
+            for (index, code) in codes.iter().enumerate() {
+                ui.label((index + 1).to_string());
+                if let Some(chosen) = code_picker(
+                    ui,
+                    ("language_code", index),
+                    &code_label(LANGUAGES, code),
+                    LANGUAGES,
+                    Some(code),
+                    |candidate| {
+                        !codes
+                            .iter()
+                            .any(|code| code.eq_ignore_ascii_case(candidate))
+                    },
+                ) {
+                    let mut changed = codes.to_vec();
+                    changed[index] = chosen.to_owned();
+                    updated = Some(changed);
+                }
+                row_actions(ui, index, codes.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = codes.to_vec();
+        apply_list_action(&mut changed, action);
+        updated = Some(changed);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Add language:");
+        if let Some(chosen) = code_picker(
+            ui,
+            ("add_language_code", id.value()),
+            "Select language…",
+            LANGUAGES,
+            None,
+            |candidate| {
+                !codes
+                    .iter()
+                    .any(|code| code.eq_ignore_ascii_case(candidate))
+            },
+        ) {
+            let mut changed = codes.to_vec();
+            changed.push(chosen.to_owned());
+            updated = Some(changed);
+        }
+    });
+    if let Some(codes) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::LanguageCodes,
+            serde_json::json!(codes),
+        );
     }
 }
 
