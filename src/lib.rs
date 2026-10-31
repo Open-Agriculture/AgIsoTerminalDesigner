@@ -4,6 +4,7 @@
 
 mod allowed_object_relationships;
 mod button_geometry;
+mod creation_presets;
 mod editor_project;
 mod enum_labels;
 mod graphic_rendering;

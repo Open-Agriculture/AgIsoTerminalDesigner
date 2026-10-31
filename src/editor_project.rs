@@ -1375,11 +1375,29 @@ impl EditorProject {
     /// UI callers should use this instead of inserting into the draft pool: the
     /// creation is immediately undoable and does not depend on the end-of-frame
     /// draft diff finding the new object again.
+    /// Create an object from the editor, starting from the creation presets so it
+    /// has a usable size and its required attributes. Font and Line Attributes
+    /// references reuse the pool's most used one, or a new one when there is none.
+    /// Everything is one undo step. Should the presets be rejected, the object is
+    /// created with its ISO defaults instead.
     pub fn create_object(&mut self, object_type: ObjectType, name: String) -> Option<ObjectId> {
         let object_id = self.allocate_object_id(object_type).ok()?;
+        let description = Some(format!("Create {object_type:?}"));
+        if let Some(operations) = self.preset_creation(object_type, object_id, &name) {
+            let transaction = OperationTransaction {
+                schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+                description: description.clone(),
+                operations,
+            };
+            if let Ok(prepared) = self.prepare_transaction(&transaction) {
+                if self.commit_prepared_transaction(prepared).is_ok() {
+                    return Some(object_id);
+                }
+            }
+        }
         let transaction = OperationTransaction {
             schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
-            description: Some(format!("Create {object_type:?}")),
+            description,
             operations: vec![Operation::CreateObject {
                 object_id: None,
                 object_type,
@@ -1389,6 +1407,79 @@ impl EditorProject {
 
         self.execute_ui_transaction(transaction)
             .then_some(object_id)
+    }
+
+    /// The operations creating an object with its creation presets, or None when
+    /// it has none or no ID is free for an attribute object it needs.
+    fn preset_creation(
+        &self,
+        object_type: ObjectType,
+        object_id: ObjectId,
+        name: &str,
+    ) -> Option<Vec<Operation>> {
+        use crate::creation_presets::{most_used_attribute, presets, Preset};
+
+        let presets = presets(object_type);
+        if presets.is_empty() {
+            return None;
+        }
+        // An explicit ID reserves the allocated range ID; the assignment is reset
+        // so it still behaves like an automatic one.
+        let create = |id: ObjectId, object_type: ObjectType, name: String| {
+            [
+                Operation::CreateObject {
+                    object_id: Some(id.value()),
+                    object_type,
+                    name,
+                },
+                Operation::SetObjectIdAssignment {
+                    object_id: id.value(),
+                    new_id: id.value(),
+                    overridden: false,
+                },
+            ]
+        };
+        let set = |id: ObjectId, property, value| Operation::SetProperty {
+            object: ObjectTarget::id(id.value()),
+            property,
+            value,
+        };
+
+        let mut operations = create(object_id, object_type, name.to_owned()).to_vec();
+        for preset in presets {
+            match preset {
+                Preset::Value(property, value) => operations.push(set(object_id, property, value)),
+                Preset::Attribute(property, attribute_type) => {
+                    let attribute = match most_used_attribute(&self.pool, attribute_type) {
+                        Some(id) => id,
+                        None => {
+                            let range = self.object_id_ranges.range_for(attribute_type);
+                            let reserved = self.reserved_object_ids();
+                            let id = (range.start..=range.end)
+                                .find(|id| !reserved.contains(id) && *id != object_id.value())
+                                .and_then(|id| ObjectId::new(id).ok())?;
+                            operations.extend(create(
+                                id,
+                                attribute_type,
+                                self.generate_smart_name_for_new_object(attribute_type),
+                            ));
+                            for preset in crate::creation_presets::presets(attribute_type) {
+                                if let Preset::Value(property, value) = preset {
+                                    operations.push(set(id, property, value));
+                                }
+                            }
+                            id
+                        }
+                    };
+                    operations.push(Operation::SetObjectReference {
+                        object: ObjectTarget::id(object_id.value()),
+                        property,
+                        reference: Some(ObjectTarget::id(attribute.value())),
+                    });
+                }
+            }
+        }
+        Some(operations)
     }
 
     /// Duplicate a shared Font, Line, or Fill Attribute as one undoable action.
