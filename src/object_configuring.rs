@@ -2677,9 +2677,26 @@ fn render_reference(
     };
     let selected = value.as_u64();
     ui.horizontal(|ui| {
-        ui.label(label);
         let selected_id = selected.and_then(|id| ObjectId::new(id as u16).ok());
         let referenced_object = selected_id.and_then(|id| design.get_pool().object_by_id(id));
+        let allow_none = design.get_pool().object_by_id(id).is_some_and(|object| {
+            crate::object_properties::property_accepts_null(object, property)
+        });
+        // A reference to a missing object or one of the wrong type is as good as none
+        let usable = referenced_object.is_some_and(|object| {
+            allowed_types.is_empty() || allowed_types.contains(&object.object_type())
+        });
+        if usable || (selected_id.is_none() && allow_none) {
+            ui.label(label);
+        } else {
+            let wanted = allowed_types
+                .iter()
+                .map(|object_type| format!("{object_type:?}"))
+                .collect::<Vec<_>>()
+                .join(" or ");
+            ui.colored_label(ui.visuals().warn_fg_color, format!("{label} (required)"))
+                .on_hover_text(format!("Required: select a {wanted} object"));
+        }
         let label = selected_id.map_or_else(
             || "None".into(),
             |id| {
@@ -2689,9 +2706,6 @@ fn render_reference(
                 )
             },
         );
-        let allow_none = design.get_pool().object_by_id(id).is_some_and(|object| {
-            crate::object_properties::property_accepts_null(object, property)
-        });
         if let Some(reference) = crate::object_picker::button(
             ui,
             (id.value(), property),
