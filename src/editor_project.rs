@@ -277,6 +277,56 @@ impl EditorProject {
         project.mark_saved();
         Ok(project)
     }
+    /// Import a pool stored in several IOP files, joined in the given order as
+    /// a VT joins a pool transferred in parts. A part may end in the middle of
+    /// an object, and an object a later part defines again replaces the
+    /// earlier one, as on a VT. Errors name the part and the byte in it.
+    pub fn import_iop_parts_with_id_format(
+        parts: Vec<(String, Vec<u8>)>,
+        version: VtVersion,
+        object_id_format: ObjectIdFormat,
+    ) -> Result<Self, String> {
+        if parts.len() == 1 {
+            let (_, data) = parts.into_iter().next().unwrap();
+            return Self::import_iop_with_id_format(data, version, object_id_format);
+        }
+        if !(2..=6).contains(&u8::from(version)) {
+            return Err("Choose VT2 through VT6".into());
+        }
+        let mut data = Vec::new();
+        let mut starts = Vec::new();
+        for (name, part) in &parts {
+            starts.push((data.len(), name.as_str()));
+            data.extend_from_slice(part);
+        }
+        let position = |offset: usize| {
+            let (start, name) = starts
+                .iter()
+                .rev()
+                .find(|(start, _)| *start <= offset)
+                .copied()
+                .unwrap_or((0, ""));
+            format!("{name}, byte {}", offset - start)
+        };
+        let pool =
+            ObjectPool::try_from_iop_for_version(data, version).map_err(|error| {
+                match error.object_id {
+                    Some(id) => format!(
+                        "object {} in {}: {:?}",
+                        object_id_format.format(id),
+                        position(error.offset),
+                        error.source
+                    ),
+                    None => format!("{}: {:?}", position(error.offset), error.source),
+                }
+            })?;
+        let mut project = Self::from(pool);
+        project.vt_version = version;
+        project.object_id_format = object_id_format;
+        project.mark_saved();
+        Ok(project)
+    }
+
     /// Copy authoritative canvas content without history, pending UI edits, or
     /// save checkpoints. Mutating this copy cannot change the source project.
     pub(crate) fn canvas_preview_copy(&self) -> Self {
