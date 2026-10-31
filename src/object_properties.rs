@@ -240,6 +240,8 @@ pub enum EditorKind {
     LanguagePairs,
     /// A 64-bit ISO 11783-5 NAME, edited by field.
     Name,
+    /// The colours of a Colour Palette, as swatches.
+    PaletteColours,
 }
 
 /// UI schemas for every writable property of an object type.
@@ -289,6 +291,7 @@ fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<Edi
             ObjectType::ExternalObjectDefinition | ObjectType::ExternalReferenceName,
             PropertyKey::Name,
         ) => Some(EditorKind::Name),
+        (ObjectType::ColourPalette, PropertyKey::Colours) => Some(EditorKind::PaletteColours),
         (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }

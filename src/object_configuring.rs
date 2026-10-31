@@ -629,6 +629,11 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                 }
                 _ => {}
             },
+            EditorKind::PaletteColours => {
+                if let Object::ColourPalette(palette) = object {
+                    render_palette_colours(ui, &label, id, &palette.colours, design);
+                }
+            }
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
@@ -2873,6 +2878,128 @@ fn parse_name_hex(text: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(digits, 16).ok()
+}
+
+/// The colours of a Colour Palette as swatches, 16 to a row. Clicking one
+/// opens a picker below; a drag in it previews and is one undo step when the
+/// pointer is released.
+fn render_palette_colours(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    colours: &[ag_iso_stack::object_pool::Colour],
+    design: &EditorProject,
+) {
+    use ag_iso_stack::object_pool::Colour;
+
+    let as_json = |colours: &[Colour]| serde_json::to_value(colours).unwrap();
+    let rgb = |colour: &Colour| egui::Color32::from_rgb(colour.r, colour.g, colour.b);
+    let selected_id = ui.make_persistent_id((id.value(), "palette_selected"));
+    let mut selected = ui
+        .data(|data| data.get_temp::<usize>(selected_id))
+        .filter(|index| *index < colours.len());
+    let mut updated = None;
+    ui.label(format!("{label} ({})", colours.len()));
+    egui::Grid::new(("palette_colours", id.value()))
+        .spacing(egui::vec2(2.0, 2.0))
+        .show(ui, |ui| {
+            for (index, colour) in colours.iter().enumerate() {
+                let size = egui::vec2(16.0, 16.0);
+                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                ui.painter().rect_filled(rect, 2.0, rgb(colour));
+                if selected == Some(index) {
+                    ui.painter().rect_stroke(
+                        rect.expand(1.0),
+                        2.0,
+                        ui.visuals().selection.stroke,
+                        egui::StrokeKind::Outside,
+                    );
+                }
+                let response = response.on_hover_text(format!(
+                    "{index}: #{:02X}{:02X}{:02X}",
+                    colour.r, colour.g, colour.b
+                ));
+                if response.clicked() {
+                    selected = (selected != Some(index)).then_some(index);
+                }
+                if index % 16 == 15 {
+                    ui.end_row();
+                }
+            }
+        });
+    ui.data_mut(|data| match selected {
+        Some(index) => data.insert_temp(selected_id, index),
+        None => data.remove::<usize>(selected_id),
+    });
+    if let Some(index) = selected {
+        let key = ui.make_persistent_id((id.value(), "palette_colour"));
+        touch_draft(ui.ctx(), key);
+        let current = rgb(&colours[index]);
+        let mut edited = ui
+            .data(|data| data.get_temp::<egui::Color32>(key))
+            .unwrap_or(current);
+        ui.label(format!("Colour {index}"));
+        let with_colour = |colour: egui::Color32| {
+            let mut changed = colours.to_vec();
+            let mut value = serde_json::to_value(changed[index]).unwrap();
+            value["r"] = colour.r().into();
+            value["g"] = colour.g().into();
+            value["b"] = colour.b().into();
+            changed[index] = serde_json::from_value(value).unwrap();
+            changed
+        };
+        if egui::color_picker::color_picker_color32(
+            ui,
+            &mut edited,
+            egui::color_picker::Alpha::Opaque,
+        ) {
+            ui.data_mut(|data| data.insert_temp(key, edited));
+            update_draft(
+                ui.ctx(),
+                key,
+                design,
+                Some(property_operation(
+                    design,
+                    id,
+                    PropertyKey::Colours,
+                    as_json(&with_colour(edited)),
+                )),
+            );
+        }
+        if !ui.input(|input| input.pointer.any_down()) {
+            if edited != current {
+                updated = Some(with_colour(edited));
+            }
+            ui.data_mut(|data| data.remove::<egui::Color32>(key));
+            clear_draft(ui.ctx(), key);
+        }
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(colours.len() < 256, egui::Button::new("Add colour"))
+            .clicked()
+        {
+            let mut changed = colours.to_vec();
+            changed.push(Colour::COLOUR_PALETTE[changed.len()]);
+            updated = Some(changed);
+        }
+        if ui
+            .add_enabled(!colours.is_empty(), egui::Button::new("Remove last"))
+            .clicked()
+        {
+            updated = Some(colours[..colours.len() - 1].to_vec());
+        }
+        if ui
+            .button("Use standard colours")
+            .on_hover_text("Replace all colours with the 256 standard VT colours")
+            .clicked()
+        {
+            updated = Some(Colour::COLOUR_PALETTE.to_vec());
+        }
+    });
+    if let Some(colours) = updated {
+        queue(design, id, PropertyKey::Colours, as_json(&colours));
+    }
 }
 
 fn render_text(
