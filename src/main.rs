@@ -2799,7 +2799,10 @@ impl eframe::App for DesignerApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui_style::error_text(ui, &error);
+                    // Long diagnostic lists scroll so the buttons stay on screen
+                    egui::ScrollArea::vertical()
+                        .max_height(ctx.screen_rect().height() * 0.6)
+                        .show(ui, |ui| ui_style::error_text(ui, &error));
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
                             self.error_message = None;
