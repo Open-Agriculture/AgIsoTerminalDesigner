@@ -900,7 +900,12 @@ fn render_object_selector(
     allowed_types: &[ObjectType],
 ) -> Option<ObjectId> {
     let selected_text = design.get_pool().object_by_id(selected).map_or_else(
-        || format!("{}: Missing object", selected.value()),
+        || {
+            format!(
+                "{}: Missing object",
+                design.format_object_id(selected.value())
+            )
+        },
         |object| object_selector_label(design, object),
     );
     child_picker(
