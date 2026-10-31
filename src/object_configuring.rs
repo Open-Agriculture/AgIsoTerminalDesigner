@@ -620,6 +620,15 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                     render_language_pairs(ui, &label, id, &controls.language_pairs, design);
                 }
             }
+            EditorKind::Name => match object {
+                Object::ExternalObjectDefinition(definition) => {
+                    render_name(ui, &label, id, definition.name, design)
+                }
+                Object::ExternalReferenceName(reference) => {
+                    render_name(ui, &label, id, reference.name, design)
+                }
+                _ => {}
+            },
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
@@ -2711,6 +2720,161 @@ fn render_language_pairs(
     }
 }
 
+/// A NAME, ISO 11783-5, edited field by field or as its 64-bit value in hex.
+/// The value is kept as an integer: a number field would round it through f64.
+fn render_name(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    name: ag_iso_stack::network_management::name::NAME,
+    design: &EditorProject,
+) {
+    use ag_iso_stack::network_management::name::NAME;
+
+    type Field = (&'static str, u32, fn(&NAME) -> u32, fn(&mut NAME, u32));
+    let fields: [Field; 8] = [
+        (
+            "Identity number",
+            0x1F_FFFF,
+            |n| n.get_identity_number(),
+            |n, v| n.set_identity_number(v),
+        ),
+        (
+            "Manufacturer code",
+            0x7FF,
+            |n| n.get_manufacturer_code().into(),
+            |n, v| n.set_manufacturer_code(v as u16),
+        ),
+        (
+            "ECU instance",
+            0x7,
+            |n| n.get_ecu_instance().into(),
+            |n, v| n.set_ecu_instance(v as u8),
+        ),
+        (
+            "Function instance",
+            0x1F,
+            |n| n.get_function_instance().into(),
+            |n, v| n.set_function_instance(v as u8),
+        ),
+        (
+            "Function",
+            0xFF,
+            |n| n.get_function().into(),
+            |n, v| n.set_function(v as u8),
+        ),
+        (
+            "Device class",
+            0x7F,
+            |n| n.get_device_class().into(),
+            |n, v| n.set_device_class(v as u8),
+        ),
+        (
+            "Device class instance",
+            0xF,
+            |n| n.get_device_class_instance().into(),
+            |n, v| n.set_device_class_instance(v as u8),
+        ),
+        (
+            "Industry group",
+            0x7,
+            |n| n.get_industry_group().into(),
+            |n, v| n.set_industry_group(v as u8),
+        ),
+    ];
+    let mut updated = None;
+    ui.label(label);
+    egui::Grid::new(("name_fields", id.value())).show(ui, |ui| {
+        for (field, maximum, get, set) in fields {
+            ui.label(field);
+            let key = ui.make_persistent_id((id.value(), "name", field));
+            touch_draft(ui.ctx(), key);
+            let current = get(&name);
+            let mut edited = ui.data(|data| data.get_temp::<u32>(key)).unwrap_or(current);
+            let response = ui.add(egui::DragValue::new(&mut edited).range(0..=maximum));
+            if response.changed() {
+                ui.data_mut(|data| data.insert_temp(key, edited));
+            }
+            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                ui.data_mut(|data| data.remove::<u32>(key));
+            } else if drag_value_finished(&response)
+                || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            {
+                if edited != current {
+                    let mut changed = name;
+                    set(&mut changed, edited);
+                    updated = Some(changed);
+                }
+                ui.data_mut(|data| data.remove::<u32>(key));
+            }
+            clear_draft(ui.ctx(), key);
+            ui.end_row();
+        }
+        let mut self_configurable = name.get_self_configurable_address();
+        ui.label("Self-configurable address");
+        if ui.checkbox(&mut self_configurable, "").changed() {
+            let mut changed = name;
+            changed.set_self_configurable_address(self_configurable);
+            updated = Some(changed);
+        }
+        ui.end_row();
+
+        ui.label("NAME");
+        let key = ui.make_persistent_id((id.value(), "name_hex"));
+        touch_draft(ui.ctx(), key);
+        let current = format!("{:016X}", u64::from(name));
+        let mut edited = pending_text(ui, key).unwrap_or_else(|| current.clone());
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut edited)
+                .font(egui::TextStyle::Monospace)
+                .char_limit(19)
+                .desired_width(150.0),
+        );
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+        }
+        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+        } else if response.lost_focus() {
+            // Invalid text stays, with the error, until it is fixed or cancelled
+            if let Some(raw) = parse_name_hex(&edited) {
+                if raw != u64::from(name) {
+                    updated = Some(NAME::new(raw));
+                }
+                ui.data_mut(|data| data.remove::<PendingValue>(key));
+            }
+        }
+        clear_draft(ui.ctx(), key);
+        ui.end_row();
+        if pending_text(ui, key).is_some_and(|text| parse_name_hex(&text).is_none()) {
+            ui.label("");
+            crate::ui_style::error_text(ui, "Enter up to 16 hexadecimal digits");
+            ui.end_row();
+        }
+    });
+    if let Some(name) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::Name,
+            serde_json::json!(u64::from(name)),
+        );
+    }
+}
+
+/// A NAME in hexadecimal, with or without a 0x prefix and spaces.
+fn parse_name_hex(text: &str) -> Option<u64> {
+    let digits: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let digits = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+        .unwrap_or(&digits);
+    if digits.is_empty() || digits.len() > 16 {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
+}
+
 fn render_text(
     ui: &mut egui::Ui,
     label: &str,
@@ -3723,6 +3887,49 @@ mod string_length_tests {
         assert_eq!(max_string_length(255, VtVersion::Version3), 255);
         assert_eq!(max_string_length(255, VtVersion::Version4), 126);
         assert_eq!(max_string_length(65535, VtVersion::Version6), 32766);
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::parse_name_hex;
+    use crate::{EditorProject, ObjectTarget, Operation, OperationTransaction, PropertyKey};
+    use ag_iso_stack::object_pool::{object::Object, ObjectType};
+
+    #[test]
+    fn hex_names_accept_a_prefix_and_spaces_but_no_more_than_64_bits() {
+        assert_eq!(
+            parse_name_hex("0xA00E 8400 00C0 FFEE"),
+            Some(0xA00E_8400_00C0_FFEE)
+        );
+        assert_eq!(parse_name_hex("ff"), Some(0xFF));
+        assert_eq!(parse_name_hex(""), None);
+        assert_eq!(parse_name_hex("1 0000 0000 0000 0000"), None);
+        assert_eq!(parse_name_hex("xyz"), None);
+    }
+
+    #[test]
+    fn a_name_above_53_bits_is_stored_exactly() {
+        let mut project = EditorProject::default();
+        let name = project.generate_smart_name_for_new_object(ObjectType::ExternalReferenceName);
+        let id = project
+            .create_object(ObjectType::ExternalReferenceName, name)
+            .unwrap();
+        let raw: u64 = 0xA00E_8400_00C0_FFEF;
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(id.value()),
+            property: PropertyKey::Name,
+            value: serde_json::json!(raw),
+        });
+        project.execute_transaction(transaction).unwrap();
+
+        let Some(Object::ExternalReferenceName(reference)) = project.get_pool().object_by_id(id)
+        else {
+            panic!("expected the External Reference Name");
+        };
+        assert_eq!(u64::from(reference.name), raw);
+        assert_eq!(reference.name.get_industry_group(), 2);
     }
 }
 

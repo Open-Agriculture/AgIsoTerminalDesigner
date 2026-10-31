@@ -238,6 +238,8 @@ pub enum EditorKind {
     LanguageCodes,
     /// ISO 639-1 language and ISO 3166-1 country code pairs.
     LanguagePairs,
+    /// A 64-bit ISO 11783-5 NAME, edited by field.
+    Name,
 }
 
 /// UI schemas for every writable property of an object type.
@@ -283,6 +285,10 @@ fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<Edi
         (ObjectType::WorkingSetSpecialControls, PropertyKey::LanguagePairs) => {
             Some(EditorKind::LanguagePairs)
         }
+        (
+            ObjectType::ExternalObjectDefinition | ObjectType::ExternalReferenceName,
+            PropertyKey::Name,
+        ) => Some(EditorKind::Name),
         (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }
