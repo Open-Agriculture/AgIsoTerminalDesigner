@@ -11,6 +11,69 @@ pub mod integration;
 pub mod preview;
 pub mod ui;
 
+/// An image file as Graphic Data, whose only format is PNG (ISO 11783-6:2018,
+/// Table B.74): a valid PNG is kept byte for byte, any other image the
+/// `image` crate reads is converted to an 8-bit-per-channel PNG.
+pub fn graphic_data_png(content: &[u8]) -> Result<Vec<u8>, String> {
+    if crate::pool_validation::validate_graphic_data_png(content).is_ok() {
+        return Ok(content.to_vec());
+    }
+    let image = image::load_from_memory(content)
+        .map_err(|error| format!("The file is not an image this editor can read: {error}"))?;
+    // Graphic Data allows at most 32 bits per pixel
+    let image = if image.color().bits_per_pixel() > 32 {
+        image::DynamicImage::ImageRgba8(image.to_rgba8())
+    } else {
+        image
+    };
+    let mut png = Vec::new();
+    image
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|error| format!("The image could not be converted to PNG: {error}"))?;
+    crate::pool_validation::validate_graphic_data_png(&png)?;
+    Ok(png)
+}
+
+#[cfg(test)]
+mod graphic_data_tests {
+    use super::graphic_data_png;
+
+    fn encoded(image: image::DynamicImage, format: image::ImageFormat) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn png_is_kept_and_other_images_become_png() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(3, 2));
+        let png = encoded(image.clone(), image::ImageFormat::Png);
+        assert_eq!(graphic_data_png(&png).unwrap(), png);
+
+        let bmp = encoded(image, image::ImageFormat::Bmp);
+        let converted = graphic_data_png(&bmp).unwrap();
+        assert!(converted.starts_with(&[0x89, b'P', b'N', b'G']));
+        let decoded = image::load_from_memory(&converted).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (3, 2));
+    }
+
+    #[test]
+    fn deep_images_are_reduced_to_eight_bits_per_channel() {
+        let deep = image::DynamicImage::ImageRgba16(image::ImageBuffer::new(2, 2));
+        let png = encoded(deep, image::ImageFormat::Png);
+        let converted = graphic_data_png(&png).unwrap();
+        assert_ne!(converted, png);
+        assert!(crate::pool_validation::validate_graphic_data_png(&converted).is_ok());
+    }
+
+    #[test]
+    fn other_files_are_rejected() {
+        assert!(graphic_data_png(b"not an image").is_err());
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct GraphicAssetId(pub uuid::Uuid);

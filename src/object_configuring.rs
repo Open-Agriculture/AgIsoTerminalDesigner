@@ -649,6 +649,11 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                     render_macro_commands(ui, &label, id, &macro_object.commands, design);
                 }
             }
+            EditorKind::GraphicData => {
+                if let Object::GraphicData(graphic) = object {
+                    render_graphic_data(ui, &label, graphic, design);
+                }
+            }
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
@@ -3504,6 +3509,41 @@ fn split_arguments(text: &str) -> Result<Vec<String>, String> {
             }
         }
         arguments.push(argument);
+    }
+}
+
+/// The PNG of a Graphic Data object: a preview, its size, and a button that
+/// loads an image file in its place.
+fn render_graphic_data(
+    ui: &mut egui::Ui,
+    label: &str,
+    graphic: &ag_iso_stack::object_pool::object::GraphicData,
+    design: &EditorProject,
+) {
+    ui.label(label);
+    if graphic.data.is_empty() {
+        ui.weak("No image yet");
+    } else if let Some(texture) = crate::graphics::preview::graphic_data_texture(ui.ctx(), graphic)
+    {
+        let [width, height] = texture.size();
+        let scale = (160.0 / width.max(height) as f32).min(1.0);
+        ui.add(
+            egui::Image::new(&texture)
+                .fit_to_exact_size(egui::vec2(width as f32, height as f32) * scale),
+        );
+        ui.weak(format!(
+            "{width} × {height} px, {} bytes PNG",
+            graphic.data.len()
+        ));
+    } else {
+        crate::ui_style::error_text(ui, "The data is not a PNG this editor can read.");
+    }
+    if ui
+        .button("Load image…")
+        .on_hover_text("A PNG is kept as it is; other images are converted to PNG")
+        .clicked()
+    {
+        design.request_image_load(graphic.id);
     }
 }
 

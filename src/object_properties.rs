@@ -248,6 +248,8 @@ pub enum EditorKind {
     CodePlanes,
     /// The command stream of a Macro, as readable instructions.
     MacroCommands,
+    /// The PNG of a Graphic Data object, previewed and loaded from a file.
+    GraphicData,
 }
 
 /// UI schemas for every writable property of an object type.
@@ -303,6 +305,7 @@ fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<Edi
             Some(EditorKind::CodePlanes)
         }
         (ObjectType::Macro, PropertyKey::Commands) => Some(EditorKind::MacroCommands),
+        (ObjectType::GraphicData, PropertyKey::Data) => Some(EditorKind::GraphicData),
         (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }

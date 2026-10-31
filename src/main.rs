@@ -392,6 +392,7 @@ enum FileDialogReason {
     LoadPool,
     LoadProject,
     OpenImagePictureGraphics(ObjectId),
+    OpenImageGraphicData(ObjectId),
 }
 
 #[derive(Clone)]
@@ -1015,7 +1016,11 @@ impl DesignerApp {
             }
             self.open_in_progress = true;
         }
-        let is_image_loading = matches!(reason, FileDialogReason::OpenImagePictureGraphics(_));
+        let is_image_loading = matches!(
+            reason,
+            FileDialogReason::OpenImagePictureGraphics(_)
+                | FileDialogReason::OpenImageGraphicData(_)
+        );
 
         let sender = self.file_channel.0.clone();
         let mut dialog = rfd::AsyncFileDialog::new();
@@ -1133,6 +1138,27 @@ impl DesignerApp {
                             ag_iso_terminal_designer::graphics::conversion_ui::open_for_import(
                                 ctx, project, id, content, None,
                             );
+                        }
+                    }
+                    FileDialogReason::OpenImageGraphicData(id) => {
+                        match ag_iso_terminal_designer::graphics::graphic_data_png(&content) {
+                            Ok(png) => {
+                                if let Some(project) = &mut self.project {
+                                    project.queue_operation(Operation::SetProperty {
+                                        object: ag_iso_terminal_designer::ObjectTarget::id(
+                                            id.value(),
+                                        ),
+                                        property: ag_iso_terminal_designer::PropertyKey::Data,
+                                        value: serde_json::json!(png),
+                                    });
+                                    if !project.commit_queued("Load Graphic Data image") {
+                                        if let Some(error) = project.take_operation_error() {
+                                            self.error_message = Some(error);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(error) => self.error_message = Some(error),
                         }
                     }
                 },
@@ -2903,7 +2929,13 @@ impl eframe::App for DesignerApp {
         // Check for image load requests
         if let Some(pool) = &self.project {
             if let Some(object_id) = pool.take_image_load_request() {
-                self.open_file_dialog(FileDialogReason::OpenImagePictureGraphics(object_id), ctx);
+                let reason = match pool.get_pool().object_by_id(object_id) {
+                    Some(Object::GraphicData(_)) => {
+                        FileDialogReason::OpenImageGraphicData(object_id)
+                    }
+                    _ => FileDialogReason::OpenImagePictureGraphics(object_id),
+                };
+                self.open_file_dialog(reason, ctx);
             }
         }
 
