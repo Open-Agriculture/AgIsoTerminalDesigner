@@ -634,6 +634,11 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                     render_palette_colours(ui, &label, id, &palette.colours, design);
                 }
             }
+            EditorKind::ColourMap => {
+                if let Object::ColourMap(map) = object {
+                    render_colour_map(ui, &label, id, &map.colour_map, design);
+                }
+            }
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
@@ -743,54 +748,67 @@ pub fn colour_index_picker(
             format!("{} · {current}", crate::isobus_colour::label(current)),
             |ui| {
                 ui.label("Resolved project palette (8-bit index)");
-                egui::ScrollArea::vertical()
-                    .max_height(420.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new(ui.next_auto_id())
-                            .spacing(egui::vec2(3.0, 3.0))
-                            .show(ui, |ui| {
-                                for (position, index) in permitted.enumerate() {
-                                    let [r, g, b] = palette[usize::from(index)];
-                                    let text_colour =
-                                        if 299 * r as u32 + 587 * g as u32 + 114 * b as u32
-                                            > 128_000
-                                        {
-                                            egui::Color32::BLACK
-                                        } else {
-                                            egui::Color32::WHITE
-                                        };
-                                    let mut button = egui::Button::new(
-                                        egui::RichText::new(index.to_string()).color(text_colour),
-                                    )
-                                    .fill(egui::Color32::from_rgb(r, g, b))
-                                    .min_size(egui::vec2(32.0, 24.0));
-                                    if index == current {
-                                        button = button.stroke(egui::Stroke::new(
-                                            2.0,
-                                            ui.visuals().selection.stroke.color,
-                                        ));
-                                    }
-                                    if ui
-                                        .add(button)
-                                        .on_hover_text(format!(
-                                            "{} · #{r:02X}{g:02X}{b:02X}",
-                                            crate::isobus_colour::label(index)
-                                        ))
-                                        .clicked()
-                                    {
-                                        selected = Some(index);
-                                        ui.close();
-                                    }
-                                    if (position + 1) % 8 == 0 {
-                                        ui.end_row();
-                                    }
-                                }
-                            });
-                    });
+                selected = colour_index_menu(ui, current, palette, permitted);
             },
         );
     });
     selected
+}
+
+/// The palette grid of a colour index menu; closes the menu on a pick.
+fn colour_index_menu(
+    ui: &mut egui::Ui,
+    current: u8,
+    palette: &[[u8; 3]; 256],
+    permitted: std::ops::RangeInclusive<u8>,
+) -> Option<u8> {
+    let mut selected = None;
+    egui::ScrollArea::vertical()
+        .max_height(420.0)
+        .show(ui, |ui| {
+            egui::Grid::new(ui.next_auto_id())
+                .spacing(egui::vec2(3.0, 3.0))
+                .show(ui, |ui| {
+                    for (position, index) in permitted.enumerate() {
+                        let [r, g, b] = palette[usize::from(index)];
+                        let mut button = egui::Button::new(
+                            egui::RichText::new(index.to_string()).color(text_on([r, g, b])),
+                        )
+                        .fill(egui::Color32::from_rgb(r, g, b))
+                        .min_size(egui::vec2(32.0, 24.0));
+                        if index == current {
+                            button = button.stroke(egui::Stroke::new(
+                                2.0,
+                                ui.visuals().selection.stroke.color,
+                            ));
+                        }
+                        if ui
+                            .add(button)
+                            .on_hover_text(format!(
+                                "{} · #{r:02X}{g:02X}{b:02X}",
+                                crate::isobus_colour::label(index)
+                            ))
+                            .clicked()
+                        {
+                            selected = Some(index);
+                            ui.close();
+                        }
+                        if (position + 1) % 8 == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+    selected
+}
+
+/// Black or white, whichever reads on a `background` of this colour.
+fn text_on([r, g, b]: [u8; 3]) -> egui::Color32 {
+    if 299 * r as u32 + 587 * g as u32 + 114 * b as u32 > 128_000 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
 }
 
 /// Convert a snake_case property identifier to a title-cased editor label.
@@ -3002,6 +3020,85 @@ fn render_palette_colours(
     }
 }
 
+/// The entries of a Colour Map, 16 to a row: each shows the palette colour
+/// that colour index is drawn with, and picks another from the palette.
+fn render_colour_map(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    map: &[u8],
+    design: &EditorProject,
+) {
+    let palette =
+        crate::effective_colour::palette_colours(design.get_pool()).map(|colour| colour.as_rgb());
+    let mut updated = None;
+    ui.label(label);
+    ui.horizontal(|ui| {
+        ui.label("Entries:");
+        for size in [2, 16, 256] {
+            if ui
+                .selectable_label(map.len() == size, size.to_string())
+                .clicked()
+                && map.len() != size
+            {
+                updated = Some(colour_map_with_size(map, size));
+            }
+        }
+        if ui
+            .button("Reset")
+            .on_hover_text("Draw every colour index with its own palette colour")
+            .clicked()
+        {
+            updated = Some(colour_map_with_size(&[], map.len()));
+        }
+    });
+    if !matches!(map.len(), 2 | 16 | 256) {
+        crate::ui_style::error_text(ui, "A Colour Map has 2, 16 or 256 entries.");
+    }
+    egui::Grid::new(("colour_map", id.value()))
+        .spacing(egui::vec2(2.0, 2.0))
+        .show(ui, |ui| {
+            for (index, target) in map.iter().copied().enumerate() {
+                let colour = palette[usize::from(target)];
+                let button = egui::Button::new(
+                    egui::RichText::new(target.to_string())
+                        .small()
+                        .color(text_on(colour)),
+                )
+                .fill(egui::Color32::from_rgb(colour[0], colour[1], colour[2]))
+                .min_size(egui::vec2(28.0, 20.0));
+                let response =
+                    egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+                        ui.label(format!("Draw colour {index} with"));
+                        colour_index_menu(ui, target, &palette, 0..=u8::MAX)
+                    });
+                if let Some(Some(chosen)) = response.1.map(|inner| inner.inner) {
+                    if chosen != target {
+                        let mut changed = map.to_vec();
+                        changed[index] = chosen;
+                        updated = Some(changed);
+                    }
+                }
+                response
+                    .0
+                    .on_hover_text(format!("Colour {index} → {target}"));
+                if index % 16 == 15 {
+                    ui.end_row();
+                }
+            }
+        });
+    if let Some(map) = updated {
+        queue(design, id, PropertyKey::ColourMap, serde_json::json!(map));
+    }
+}
+
+/// `map` with `size` entries; added entries map each index to itself.
+fn colour_map_with_size(map: &[u8], size: usize) -> Vec<u8> {
+    (0..size)
+        .map(|index| map.get(index).copied().unwrap_or(index as u8))
+        .collect()
+}
+
 fn render_text(
     ui: &mut egui::Ui,
     label: &str,
@@ -4057,6 +4154,20 @@ mod name_tests {
         };
         assert_eq!(u64::from(reference.name), raw);
         assert_eq!(reference.name.get_industry_group(), 2);
+    }
+}
+
+#[cfg(test)]
+mod colour_map_tests {
+    use super::colour_map_with_size;
+
+    #[test]
+    fn resizing_keeps_entries_and_maps_new_ones_to_themselves() {
+        assert_eq!(colour_map_with_size(&[5, 6], 4), vec![5, 6, 2, 3]);
+        assert_eq!(colour_map_with_size(&[5, 6, 7], 2), vec![5, 6]);
+        let identity = colour_map_with_size(&[], 256);
+        assert_eq!(identity.len(), 256);
+        assert!(identity.iter().enumerate().all(|(i, v)| i == *v as usize));
     }
 }
 

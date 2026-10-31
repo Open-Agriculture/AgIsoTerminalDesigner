@@ -63,6 +63,16 @@ pub fn colour(pool: &ObjectPool, index: u8) -> Colour {
     ColourResolver::new(pool).colour(index)
 }
 
+/// The active palette's colours by palette index, before the Colour Map:
+/// what a Colour Map entry points at.
+pub fn palette_colours(pool: &ObjectPool) -> [Colour; 256] {
+    let resolver = ColourResolver {
+        colour_map: None,
+        ..ColourResolver::new(pool)
+    };
+    std::array::from_fn(|index| resolver.colour(index as u8))
+}
+
 /// Effective RGBA colours indexed by the 8-bit VT colour index.
 pub fn colours(pool: &ObjectPool) -> [Colour; 256] {
     let resolver = ColourResolver::new(pool);

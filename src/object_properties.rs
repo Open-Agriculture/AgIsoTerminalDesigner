@@ -242,6 +242,8 @@ pub enum EditorKind {
     Name,
     /// The colours of a Colour Palette, as swatches.
     PaletteColours,
+    /// The entries of a Colour Map, as palette colours.
+    ColourMap,
 }
 
 /// UI schemas for every writable property of an object type.
@@ -292,6 +294,7 @@ fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<Edi
             PropertyKey::Name,
         ) => Some(EditorKind::Name),
         (ObjectType::ColourPalette, PropertyKey::Colours) => Some(EditorKind::PaletteColours),
+        (ObjectType::ColourMap, PropertyKey::ColourMap) => Some(EditorKind::ColourMap),
         (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }
