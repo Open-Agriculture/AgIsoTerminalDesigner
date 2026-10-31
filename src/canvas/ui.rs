@@ -67,6 +67,25 @@ pub struct AddObjectRequest {
     pub y: i16,
 }
 
+/// Asks the app to group placements under a new parent of `object_type`,
+/// after the user names it. Stored in the egui context's temporary data under
+/// [`GroupObjectsRequest::id`].
+#[derive(Clone, Debug)]
+pub struct GroupObjectsRequest {
+    pub session: uuid::Uuid,
+    pub revision: u64,
+    /// The mask shown on the canvas.
+    pub root: u16,
+    pub targets: Vec<PlacementTarget>,
+    pub object_type: ag_iso_stack::object_pool::ObjectType,
+}
+
+impl GroupObjectsRequest {
+    pub fn id() -> egui::Id {
+        egui::Id::new("canvas_group_objects_request")
+    }
+}
+
 /// The object under a right click that accepts new children, and the click's
 /// position in it. Soft Key Masks list their keys without positions.
 #[derive(Clone, Debug)]
@@ -1929,6 +1948,7 @@ impl CanvasState {
         if !self.secondary_panned {
             response.context_menu(|ui| {
                 self.add_object_menu(ui, project);
+                self.group_menu(ui, project, &items);
                 ui.menu_button("Select layer", |ui| {
                     if let Some(pos) = hover {
                         for item in scene.items.iter().rev().filter(|i| {
@@ -2501,6 +2521,26 @@ impl CanvasState {
         if take(Key::Num2, Modifiers::SHIFT) {
             self.fit = Some(true);
         }
+        if take(Key::G, Modifiers::COMMAND) {
+            let targets = group_targets(&self.selection(scene));
+            let container = edits::grouping_candidates(project, &targets)
+                .into_iter()
+                .find(|candidate| {
+                    candidate.object_type == ag_iso_stack::object_pool::ObjectType::Container
+                });
+            match container {
+                Some(candidate) if candidate.enabled => {
+                    self.request_group(ui.ctx(), project, targets, candidate.object_type)
+                }
+                Some(candidate) => self.error = candidate.reason,
+                None if !targets.is_empty() => {
+                    self.error = Some(
+                        "These objects cannot be grouped into a Container. Select siblings that a Container can hold.".to_owned(),
+                    )
+                }
+                None => {}
+            }
+        }
         if take(Key::A, Modifiers::COMMAND) {
             self.selected = scene
                 .items
@@ -2678,6 +2718,77 @@ impl CanvasState {
                 .on_disabled_hover_text("Nothing can be added where you right-clicked.");
         }
     }
+    /// Group the selected placements under a new parent, offering the types
+    /// that can hold them all. A Container is the usual choice, also on Ctrl+G.
+    fn group_menu(&mut self, ui: &mut egui::Ui, project: &EditorProject, items: &[SceneItem]) {
+        let targets = group_targets(items);
+        let response = ui.add_enabled_ui(!targets.is_empty(), |ui| {
+            ui.menu_button("Group into", |ui| {
+                let candidates = edits::grouping_candidates(project, &targets);
+                if candidates.is_empty() {
+                    ui.add_enabled(
+                        false,
+                        egui::Label::new("No parent type can hold these objects"),
+                    );
+                }
+                for candidate in candidates {
+                    let shortcut = if candidate.object_type
+                        == ag_iso_stack::object_pool::ObjectType::Container
+                    {
+                        " · Ctrl+G"
+                    } else {
+                        ""
+                    };
+                    let response = ui.add_enabled(
+                        candidate.enabled,
+                        egui::Button::new(format!("{:?}{shortcut}", candidate.object_type)),
+                    );
+                    if let Some(reason) = candidate.reason {
+                        response.clone().on_disabled_hover_text(reason);
+                    }
+                    if response.clicked() {
+                        self.request_group(
+                            ui.ctx(),
+                            project,
+                            targets.clone(),
+                            candidate.object_type,
+                        );
+                        ui.close();
+                    }
+                }
+            });
+        });
+        if targets.is_empty() {
+            response.response.on_disabled_hover_text(
+                "Select objects, with Shift-click for more than one, to group them.",
+            );
+        }
+    }
+
+    fn request_group(
+        &self,
+        ctx: &egui::Context,
+        project: &EditorProject,
+        targets: Vec<PlacementTarget>,
+        object_type: ag_iso_stack::object_pool::ObjectType,
+    ) {
+        let Some(root) = self.mask else {
+            return;
+        };
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                GroupObjectsRequest::id(),
+                GroupObjectsRequest {
+                    session: project.ui_session_id(),
+                    revision: project.revision(),
+                    root,
+                    targets,
+                    object_type,
+                },
+            )
+        });
+    }
+
     /// Moves the selection by 1 pixel per arrow key, or 10 with Shift.
     fn nudge(
         &self,
@@ -3027,6 +3138,14 @@ fn softkey_object_id(project: &EditorProject, root: u16, slot: usize) -> Option<
         return None;
     };
     mask.objects.get(slot).map(|id| id.value())
+}
+
+/// The placements of the outermost selected items, which grouping moves.
+fn group_targets(items: &[SceneItem]) -> Vec<PlacementTarget> {
+    root_items(items.to_vec())
+        .into_iter()
+        .filter_map(|item| item.target)
+        .collect()
 }
 
 #[cfg(test)]

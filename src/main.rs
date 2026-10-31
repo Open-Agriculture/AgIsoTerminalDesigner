@@ -69,6 +69,8 @@ struct GroupRequest {
     parent_path: Vec<usize>,
     targets: Vec<PlacementTarget>,
     object_type: ObjectType,
+    /// Asked for on the canvas, which selects the new parent itself.
+    from_canvas: bool,
 }
 
 #[derive(Clone)]
@@ -254,6 +256,7 @@ fn hierarchy_group_menu(
                                 parent_path: parent_path.clone(),
                                 targets: targets.clone(),
                                 object_type: candidate.object_type,
+                                from_canvas: false,
                             },
                         )
                     });
@@ -2984,6 +2987,9 @@ impl eframe::App for DesignerApp {
                             edits::group_placements(pool, &group.targets, object_type, &name)
                         };
                         match result {
+                            Ok(target) if group.from_canvas => {
+                                self.canvas.select_placement(pool, group.root, target);
+                            }
                             Ok(target) => {
                                 self.canvas.select_hierarchy_placement(
                                     pool,
@@ -4050,6 +4056,27 @@ impl DesignerApp {
                 self.new_object_dialog = Some((request.object_type, name));
                 self.new_object_group = None;
                 self.new_object_placement = Some(request);
+            }
+        }
+        if let Some(request) = ctx.data_mut(|data| {
+            let id = ag_iso_terminal_designer::canvas::GroupObjectsRequest::id();
+            let value = data.get_temp::<ag_iso_terminal_designer::canvas::GroupObjectsRequest>(id);
+            data.remove::<ag_iso_terminal_designer::canvas::GroupObjectsRequest>(id);
+            value
+        }) {
+            if let Some(project) = &self.project {
+                let name = project.generate_smart_name_for_new_object(request.object_type);
+                self.new_object_dialog = Some((request.object_type, name));
+                self.new_object_group = Some(GroupRequest {
+                    session: request.session,
+                    revision: request.revision,
+                    root: request.root,
+                    parent_path: Vec::new(),
+                    targets: request.targets,
+                    object_type: request.object_type,
+                    from_canvas: true,
+                });
+                self.new_object_placement = None;
             }
         }
         if !self.canvas_visible {
