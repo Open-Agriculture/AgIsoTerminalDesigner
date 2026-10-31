@@ -246,6 +246,8 @@ pub enum EditorKind {
     ColourMap,
     /// Code planes and character ranges of Extended Input Attributes.
     CodePlanes,
+    /// The command stream of a Macro, as readable instructions.
+    MacroCommands,
 }
 
 /// UI schemas for every writable property of an object type.
@@ -300,6 +302,7 @@ fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<Edi
         (ObjectType::ExtendedInputAttributes, PropertyKey::CodePlanes) => {
             Some(EditorKind::CodePlanes)
         }
+        (ObjectType::Macro, PropertyKey::Commands) => Some(EditorKind::MacroCommands),
         (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }

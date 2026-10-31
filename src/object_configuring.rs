@@ -644,6 +644,11 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                     render_code_planes(ui, &label, id, &attributes.code_planes, design);
                 }
             }
+            EditorKind::MacroCommands => {
+                if let Object::Macro(macro_object) = object {
+                    render_macro_commands(ui, &label, id, &macro_object.commands, design);
+                }
+            }
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
@@ -3280,6 +3285,223 @@ fn hex_character_field(ui: &mut egui::Ui, key: egui::Id, current: u16) -> Option
     None
 }
 
+/// The commands of a Macro as instructions: a command name and its arguments,
+/// as the CLI writes them. Every edit re-encodes the whole stream for the
+/// project's VT version; an instruction that does not encode is kept in its
+/// field with the error until it is fixed. Streams the decoder cannot read
+/// lossless stay raw JSON.
+fn render_macro_commands(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    commands: &[u8],
+    design: &EditorProject,
+) {
+    use crate::macro_authoring::{
+        decode_macro_commands, encode_macro_instruction, instruction_names, MacroInstruction,
+    };
+
+    let version = design.vt_version;
+    let instructions = match decode_macro_commands(commands, version) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            crate::ui_style::error_text(ui, &format!("Shown as bytes: {error}"));
+            render_json(
+                ui,
+                label,
+                &serde_json::json!(commands),
+                id,
+                PropertyKey::Commands,
+                design,
+            );
+            return;
+        }
+    };
+    let encode = |instructions: &[MacroInstruction]| -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        for (index, instruction) in instructions.iter().enumerate() {
+            bytes.extend(
+                encode_macro_instruction(&instruction.name, &instruction.arguments, version)
+                    .map_err(|error| format!("Instruction {}: {error}", index + 1))?,
+            );
+        }
+        Ok(bytes)
+    };
+    let mut updated = None;
+    let mut action = None;
+    let mut error = None;
+    ui.label(label);
+    egui::Grid::new(("macro_commands", id.value()))
+        .striped(true)
+        .show(ui, |ui| {
+            for (index, instruction) in instructions.iter().enumerate() {
+                ui.label((index + 1).to_string());
+                ui.label(&instruction.name);
+                let key = ui.make_persistent_id((id.value(), "macro_arguments", index));
+                let current = join_arguments(&instruction.arguments);
+                let mut edited = pending_text(ui, key).unwrap_or_else(|| current.clone());
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut edited)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(220.0),
+                );
+                if response.changed() {
+                    ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+                }
+                if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    ui.data_mut(|data| data.remove::<PendingValue>(key));
+                } else if response.lost_focus() && edited != current {
+                    let result = split_arguments(&edited).and_then(|arguments| {
+                        let mut changed = instructions.clone();
+                        changed[index].arguments = arguments;
+                        encode(&changed)
+                    });
+                    match result {
+                        Ok(bytes) => {
+                            updated = Some(bytes);
+                            ui.data_mut(|data| data.remove::<PendingValue>(key));
+                        }
+                        Err(message) => error = Some(message),
+                    }
+                }
+                // The object an instruction acts on comes first
+                match instruction
+                    .arguments
+                    .first()
+                    .and_then(|argument| argument.parse::<u16>().ok())
+                    .and_then(|object| ObjectId::new(object).ok())
+                    .and_then(|object| design.get_pool().object_by_id(object))
+                {
+                    Some(object) => {
+                        if ui.link(design.object_display_name(object)).clicked() {
+                            select_object(design, object.id());
+                        }
+                    }
+                    None => {
+                        ui.label("");
+                    }
+                }
+                row_actions(ui, index, instructions.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = instructions.clone();
+        apply_list_action(&mut changed, action);
+        match encode(&changed) {
+            Ok(bytes) => updated = Some(bytes),
+            Err(message) => error = Some(message),
+        }
+    }
+    let pending_id = ui.make_persistent_id((id.value(), "new_macro_instruction"));
+    let (mut name, mut arguments) = ui
+        .data(|data| data.get_temp::<(String, String)>(pending_id))
+        .unwrap_or_else(|| ("change-numeric-value".to_owned(), String::new()));
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(pending_id)
+            .icon(crate::ui_style::combo_box_icon)
+            .selected_text(&name)
+            .height(320.0)
+            .show_ui(ui, |ui| {
+                for candidate in instruction_names() {
+                    ui.selectable_value(&mut name, candidate.to_owned(), candidate);
+                }
+            });
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut arguments)
+                .font(egui::TextStyle::Monospace)
+                .hint_text("Arguments, such as 1000 5")
+                .desired_width(160.0),
+        );
+        let add = ui.button("Add").clicked()
+            || response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if add {
+            let result = split_arguments(&arguments).and_then(|parsed| {
+                let mut changed = instructions.clone();
+                changed.push(MacroInstruction {
+                    name: name.clone(),
+                    arguments: parsed,
+                });
+                encode(&changed)
+            });
+            match result {
+                Ok(bytes) => {
+                    updated = Some(bytes);
+                    arguments.clear();
+                }
+                Err(message) => error = Some(message),
+            }
+        }
+    });
+    ui.data_mut(|data| data.insert_temp(pending_id, (name, arguments)));
+    if let Some(message) = error {
+        ui.data_mut(|data| data.insert_temp(pending_id.with("error"), message));
+    } else if updated.is_some() {
+        ui.data_mut(|data| data.remove::<String>(pending_id.with("error")));
+    }
+    if let Some(message) = ui.data(|data| data.get_temp::<String>(pending_id.with("error"))) {
+        crate::ui_style::error_text(ui, &message);
+    }
+    if let Some(bytes) = updated {
+        queue(design, id, PropertyKey::Commands, serde_json::json!(bytes));
+    }
+}
+
+/// Arguments separated by spaces, quoting those that are empty or hold a
+/// space, a quote or a backslash.
+fn join_arguments(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .map(|argument| {
+            if argument.is_empty()
+                || argument
+                    .chars()
+                    .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+            {
+                format!(
+                    "\"{}\"",
+                    argument.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            } else {
+                argument.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The inverse of [`join_arguments`].
+fn split_arguments(text: &str) -> Result<Vec<String>, String> {
+    let mut arguments = Vec::new();
+    let mut characters = text.chars().peekable();
+    loop {
+        while characters.next_if(|c| c.is_whitespace()).is_some() {}
+        let Some(&first) = characters.peek() else {
+            return Ok(arguments);
+        };
+        let mut argument = String::new();
+        if first == '"' {
+            characters.next();
+            loop {
+                match characters.next() {
+                    Some('"') => break,
+                    Some('\\') => match characters.next() {
+                        Some(escaped) => argument.push(escaped),
+                        None => return Err("A quoted argument ends with a backslash".into()),
+                    },
+                    Some(c) => argument.push(c),
+                    None => return Err("A quoted argument has no closing quote".into()),
+                }
+            }
+        } else {
+            while let Some(c) = characters.next_if(|c| !c.is_whitespace()) {
+                argument.push(c);
+            }
+        }
+        arguments.push(argument);
+    }
+}
+
 fn render_text(
     ui: &mut egui::Ui,
     label: &str,
@@ -4374,6 +4596,36 @@ mod code_plane_tests {
         assert_eq!(default_character_range(0).first_character, 0x20);
         assert_eq!(default_character_range(0).last_character, 0x7E);
         assert_eq!(default_character_range(2).last_character, 0xFFFF);
+    }
+}
+
+#[cfg(test)]
+mod macro_command_tests {
+    use super::{join_arguments, split_arguments};
+    use crate::macro_authoring::{decode_macro_commands, encode_macro_instruction};
+    use ag_iso_stack::object_pool::vt_version::VtVersion;
+
+    #[test]
+    fn arguments_round_trip_through_their_text() {
+        let arguments: Vec<String> = ["1000", "Hello world", "", r#"say "hi""#, r"a\b"]
+            .map(str::to_owned)
+            .to_vec();
+        let text = join_arguments(&arguments);
+        assert_eq!(text, r#"1000 "Hello world" "" "say \"hi\"" "a\\b""#);
+        assert_eq!(split_arguments(&text).unwrap(), arguments);
+        assert_eq!(split_arguments("  7   show ").unwrap(), vec!["7", "show"]);
+        assert!(split_arguments("\"open").is_err());
+    }
+
+    #[test]
+    fn edited_instructions_encode_like_the_cli() {
+        let arguments = split_arguments("1000 42").unwrap();
+        let bytes =
+            encode_macro_instruction("change-numeric-value", &arguments, VtVersion::Version4)
+                .unwrap();
+        let decoded = decode_macro_commands(&bytes, VtVersion::Version4).unwrap();
+        assert_eq!(decoded[0].name, "change-numeric-value");
+        assert_eq!(join_arguments(&decoded[0].arguments), "1000 42");
     }
 }
 
