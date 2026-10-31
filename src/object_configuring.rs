@@ -461,6 +461,7 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                         ui.push_id(property_name, |ui| {
                             render_text(ui, &label, &text, id, property_key, design)
                         });
+                        render_string_length(ui, object, &text, design);
                     }
                     Err(message) => {
                         crate::ui_style::error_text(ui, &message);
@@ -2375,6 +2376,90 @@ fn render_auto(
     }
 }
 
+/// The Length attribute of a string is the length of its value. Text set at
+/// runtime may be shorter, and the VT pads it with spaces, but not longer, so
+/// Length reserves room by padding the value with spaces.
+fn render_string_length(ui: &mut egui::Ui, object: &Object, text: &str, design: &EditorProject) {
+    let (uses_variable, max_bytes) = match object {
+        Object::InputString(o) => (o.variable_reference.0.is_some(), u8::MAX as usize),
+        Object::OutputString(o) => (o.variable_reference.0.is_some(), u16::MAX as usize),
+        Object::StringVariable(_) => (false, u16::MAX as usize),
+        _ => return,
+    };
+    // The referenced String Variable holds the value and so the length
+    if uses_variable {
+        return;
+    }
+    let id = object.id();
+    let length = text.chars().count();
+    let minimum = text.trim_end_matches(' ').chars().count();
+    let maximum = max_string_length(max_bytes, design.vt_version).max(length);
+    let key = ui.make_persistent_id((id.value(), "string_length"));
+    touch_draft(ui.ctx(), key);
+    let mut edited = ui
+        .data(|data| data.get_temp::<usize>(key))
+        .unwrap_or(length);
+    ui.horizontal(|ui| {
+        ui.label("Length").on_hover_text(
+            "Characters this string holds. Text set at runtime may be shorter, \
+             and the VT pads it with spaces, but not longer.",
+        );
+        let response = ui.add(egui::DragValue::new(&mut edited).range(minimum..=maximum));
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, edited));
+            update_draft(
+                ui.ctx(),
+                key,
+                design,
+                Some(property_operation(
+                    design,
+                    id,
+                    PropertyKey::Value,
+                    string_with_length(text, edited).into(),
+                )),
+            );
+        }
+        let cancelled =
+            response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if cancelled {
+            ui.data_mut(|data| data.remove::<usize>(key));
+            clear_draft(ui.ctx(), key);
+        } else if drag_value_finished(&response)
+            || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        {
+            if edited != length {
+                queue(
+                    design,
+                    id,
+                    PropertyKey::Value,
+                    string_with_length(text, edited).into(),
+                );
+            }
+            ui.data_mut(|data| data.remove::<usize>(key));
+            clear_draft(ui.ctx(), key);
+        }
+    });
+}
+
+/// Pad `text` with spaces, or drop its trailing spaces, to `length` characters.
+fn string_with_length(text: &str, length: usize) -> String {
+    let minimum = text.trim_end_matches(' ').chars().count();
+    text.chars()
+        .chain(std::iter::repeat(' '))
+        .take(length.max(minimum))
+        .collect()
+}
+
+/// Edited text is exported in 8-bit characters before VT4 and as a UTF-16
+/// WideString, two bytes per character after a two-byte mark, from VT4.
+fn max_string_length(max_bytes: usize, version: VtVersion) -> usize {
+    if version >= VtVersion::Version4 {
+        max_bytes.saturating_sub(2) / 2
+    } else {
+        max_bytes
+    }
+}
+
 fn render_text(
     ui: &mut egui::Ui,
     label: &str,
@@ -3366,6 +3451,27 @@ mod tests {
 
         assert_eq!(direct_reference_count(&pool, target_id), 3);
         assert_eq!(direct_reference_count(&pool, unreferenced_id), 0);
+    }
+}
+
+#[cfg(test)]
+mod string_length_tests {
+    use super::{max_string_length, string_with_length};
+    use ag_iso_stack::object_pool::vt_version::VtVersion;
+
+    #[test]
+    fn length_pads_with_spaces_and_only_drops_trailing_spaces() {
+        assert_eq!(string_with_length("0", 4), "0   ");
+        assert_eq!(string_with_length("0   ", 2), "0 ");
+        assert_eq!(string_with_length("a b  ", 0), "a b");
+        assert_eq!(string_with_length("Ä", 2), "Ä ");
+    }
+
+    #[test]
+    fn wide_strings_hold_half_as_many_characters_after_the_byte_order_mark() {
+        assert_eq!(max_string_length(255, VtVersion::Version3), 255);
+        assert_eq!(max_string_length(255, VtVersion::Version4), 126);
+        assert_eq!(max_string_length(65535, VtVersion::Version6), 32766);
     }
 }
 
