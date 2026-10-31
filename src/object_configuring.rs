@@ -628,6 +628,10 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
         ui.label("Objects");
         render_object_list(ui, object, objects, design);
     }
+    if let Object::ObjectLabelReferenceList(list) = object {
+        ui.separator();
+        render_object_labels(ui, list, design);
+    }
     if crate::operations::operation::macro_refs(object).is_some() {
         ui.separator();
         render_macro_references(ui, object, id, design);
@@ -1334,6 +1338,234 @@ fn queue_object_list(design: &EditorProject, id: ObjectId, objects: ObjectRefere
                     .collect(),
             ),
         },
+    });
+}
+
+/// Each label names an object and gives it text from a String Variable, the
+/// font type of that text, and a graphic. Text and graphic are optional.
+fn render_object_labels(
+    ui: &mut egui::Ui,
+    list: &ag_iso_stack::object_pool::object::ObjectLabelReferenceList,
+    design: &EditorProject,
+) {
+    use crate::allowed_object_relationships::AllowedChildRefs;
+    use ag_iso_stack::object_pool::object_attributes::{FontType, ObjectLabel};
+
+    let list_id = list.id;
+    let labels = &list.object_labels;
+    let version = design.vt_version;
+    let labelled = crate::allowed_object_relationships::get_allowed_child_refs(
+        ObjectType::ObjectLabelReferenceList,
+        version,
+    );
+    let graphics = <ObjectLabel as AllowedChildRefs>::get_allowed_child_refs(version);
+    let font_type_label = |font_type: u8| {
+        crate::enum_labels::enum_choice_label(
+            ObjectType::FontAttributes,
+            PropertyKey::FontType,
+            &serde_json::to_value(FontType::from(font_type)).unwrap(),
+        )
+    };
+    let with_label = |index: usize, change: &dyn Fn(&mut ObjectLabel)| {
+        let mut labels = labels.clone();
+        change(&mut labels[index]);
+        labels
+    };
+    let mut updated = None;
+    let mut action = None;
+    ui.label("Object labels");
+    egui::Grid::new(("object_labels", list_id.value()))
+        .striped(true)
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            for heading in ["Object", "Text", "Font type", "Graphic", "", "", ""] {
+                ui.label(heading);
+            }
+            ui.end_row();
+            for (index, label) in labels.iter().enumerate() {
+                let others: Vec<ObjectId> = labels
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .map(|(_, label)| label.id)
+                    .collect();
+                if let Some(changed) = label_reference_picker(
+                    ui,
+                    ("label_object", index),
+                    design,
+                    list_id,
+                    Some(label.id),
+                    &labelled,
+                    false,
+                    |candidate| !others.contains(&candidate),
+                    |choice| {
+                        with_label(index, &|label| {
+                            if let Some(id) = choice.0 {
+                                label.id = id;
+                            }
+                        })
+                    },
+                ) {
+                    updated = Some(changed);
+                }
+                if let Some(changed) = label_reference_picker(
+                    ui,
+                    ("label_text", index),
+                    design,
+                    list_id,
+                    label.string_variable_reference.0,
+                    &[ObjectType::StringVariable],
+                    true,
+                    |_| true,
+                    |choice| with_label(index, &|label| label.string_variable_reference = choice),
+                ) {
+                    updated = Some(changed);
+                }
+                egui::ComboBox::from_id_salt(("label_font_type", index))
+                    .icon(crate::ui_style::combo_box_icon)
+                    .selected_text(font_type_label(label.font_type))
+                    .show_ui(ui, |ui| {
+                        for font_type in 0..=u8::MAX {
+                            let supported = crate::vt_compatibility::supported_font_type(
+                                FontType::from(font_type),
+                                version,
+                            );
+                            if (supported || font_type == label.font_type)
+                                && ui
+                                    .selectable_label(
+                                        font_type == label.font_type,
+                                        font_type_label(font_type),
+                                    )
+                                    .clicked()
+                                && font_type != label.font_type
+                            {
+                                updated =
+                                    Some(with_label(index, &|label| label.font_type = font_type));
+                            }
+                        }
+                    });
+                if let Some(changed) = label_reference_picker(
+                    ui,
+                    ("label_graphic", index),
+                    design,
+                    list_id,
+                    label.graphic_representation.0,
+                    &graphics,
+                    true,
+                    |_| true,
+                    |choice| with_label(index, &|label| label.graphic_representation = choice),
+                ) {
+                    updated = Some(changed);
+                }
+                row_actions(ui, index, labels.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = labels.clone();
+        apply_list_action(&mut changed, action);
+        updated = Some(changed);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Add label:");
+        let labelled_ids: Vec<ObjectId> = labels.iter().map(|label| label.id).collect();
+        if let Some(changed) = label_reference_picker(
+            ui,
+            ("add_label", list_id.value()),
+            design,
+            list_id,
+            None,
+            &labelled,
+            false,
+            |candidate| !labelled_ids.contains(&candidate),
+            |choice| {
+                let mut labels = labels.clone();
+                labels.extend(choice.0.map(|id| ObjectLabel {
+                    id,
+                    string_variable_reference: NullableObjectId(None),
+                    font_type: u8::from(FontType::Latin1),
+                    graphic_representation: NullableObjectId(None),
+                }));
+                labels
+            },
+        ) {
+            updated = Some(changed);
+        }
+    });
+    if let Some(labels) = updated {
+        queue_object_labels(design, list_id, labels);
+    }
+}
+
+/// Pick one reference of a label; `labels_with` builds the whole new list
+/// for both the impact preview and the edit.
+#[allow(clippy::too_many_arguments)]
+fn label_reference_picker(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    design: &EditorProject,
+    list_id: ObjectId,
+    current: Option<ObjectId>,
+    allowed: &[ObjectType],
+    allow_none: bool,
+    eligible: impl Fn(ObjectId) -> bool,
+    labels_with: impl Fn(
+        NullableObjectId,
+    ) -> Vec<ag_iso_stack::object_pool::object_attributes::ObjectLabel>,
+) -> Option<Vec<ag_iso_stack::object_pool::object_attributes::ObjectLabel>> {
+    let text = current.map_or_else(
+        || {
+            if allow_none {
+                "None".to_owned()
+            } else {
+                "Select object…".to_owned()
+            }
+        },
+        |id| {
+            design.get_pool().object_by_id(id).map_or_else(
+                || format!("Missing object #{}", design.format_object_id(id.value())),
+                |object| object_selector_label(design, object),
+            )
+        },
+    );
+    crate::object_picker::button(
+        ui,
+        salt,
+        &text,
+        &format!(
+            "Change object label on {}",
+            crate::object_picker::object_label(design, Some(list_id))
+        ),
+        design,
+        current,
+        allow_none,
+        |candidate| {
+            allowed.contains(&candidate.object_type())
+                && crate::vt_compatibility::supported_object_type(
+                    candidate.object_type(),
+                    design.vt_version,
+                )
+                && candidate.id() != list_id
+                && eligible(candidate.id())
+        },
+        |ui, choice| {
+            crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                queue_object_labels(candidate, list_id, labels_with(choice));
+            })
+        },
+    )
+    .filter(|choice| choice.0 != current)
+    .map(&labels_with)
+}
+
+fn queue_object_labels(
+    design: &EditorProject,
+    id: ObjectId,
+    labels: Vec<ag_iso_stack::object_pool::object_attributes::ObjectLabel>,
+) {
+    design.queue_operation(Operation::SetObjectLabels {
+        object_id: id.value(),
+        labels,
     });
 }
 
