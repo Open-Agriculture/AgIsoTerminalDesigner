@@ -446,6 +446,8 @@ pub struct DesignerApp {
     show_development_popup: bool,
     new_object_dialog: Option<(ObjectType, String)>,
     new_object_group: Option<GroupRequest>,
+    /// Where the canvas's Add object here places the object being named.
+    new_object_placement: Option<ag_iso_terminal_designer::canvas::AddObjectRequest>,
     pending_hierarchy_selection: Option<PendingHierarchySelection>,
     pending_iop_import: Option<(
         Vec<u8>,
@@ -952,6 +954,7 @@ impl DesignerApp {
             show_development_popup: true,
             new_object_dialog: None,
             new_object_group: None,
+            new_object_placement: None,
             pending_hierarchy_selection: None,
             pending_iop_import: None,
             apply_smart_naming_on_import: true, // Default to true for better UX
@@ -1319,6 +1322,7 @@ impl DesignerApp {
                 self.project_display_name = "Untitled.aitp".to_owned();
                 self.new_object_dialog = None;
                 self.new_object_group = None;
+                self.new_object_placement = None;
                 self.pending_hierarchy_selection = None;
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -2799,7 +2803,10 @@ impl eframe::App for DesignerApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui_style::error_text(ui, &error);
+                    // Long diagnostic lists scroll so the buttons stay on screen
+                    egui::ScrollArea::vertical()
+                        .max_height(ctx.screen_rect().height() * 0.6)
+                        .show(ui, |ui| ui_style::error_text(ui, &error));
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
                             self.error_message = None;
@@ -2994,6 +3001,36 @@ impl eframe::App for DesignerApp {
                             }
                             Err(error) => self.error_message = Some(error),
                         }
+                    } else if let Some(placement) = self.new_object_placement.take() {
+                        let parent = ObjectId::new(placement.parent).unwrap();
+                        if let Some(id) = pool.create_object_at(
+                            object_type,
+                            name,
+                            parent,
+                            placement.x,
+                            placement.y,
+                        ) {
+                            pool.get_mut_selected()
+                                .set(NullableObjectId::new(id.value()));
+                            // The new object is the parent's last child
+                            if let Some(child_index) = pool
+                                .get_pool()
+                                .object_by_id(parent)
+                                .and_then(ag_iso_terminal_designer::operations::object_refs)
+                                .and_then(|references| references.len().checked_sub(1))
+                            {
+                                self.canvas.select_placement(
+                                    pool,
+                                    placement.parent,
+                                    PlacementTarget::Primitive {
+                                        parent_id: placement.parent,
+                                        child_index,
+                                    },
+                                );
+                            }
+                        } else if let Some(error) = pool.take_operation_error() {
+                            self.error_message = Some(error);
+                        }
                     } else if let Some(id) = pool.create_object(object_type, name) {
                         pool.get_mut_selected()
                             .set(NullableObjectId::new(id.value()));
@@ -3003,6 +3040,7 @@ impl eframe::App for DesignerApp {
             } else if should_cancel {
                 self.new_object_dialog = None;
                 self.new_object_group = None;
+                self.new_object_placement = None;
             } else {
                 // Update the name in the dialog state
                 self.new_object_dialog = Some((object_type, name));
@@ -3998,6 +4036,20 @@ impl DesignerApp {
                 let name = project.generate_smart_name_for_new_object(request.object_type);
                 self.new_object_dialog = Some((request.object_type, name));
                 self.new_object_group = Some(request);
+                self.new_object_placement = None;
+            }
+        }
+        if let Some(request) = ctx.data_mut(|data| {
+            let id = ag_iso_terminal_designer::canvas::AddObjectRequest::id();
+            let value = data.get_temp::<ag_iso_terminal_designer::canvas::AddObjectRequest>(id);
+            data.remove::<ag_iso_terminal_designer::canvas::AddObjectRequest>(id);
+            value
+        }) {
+            if let Some(project) = &self.project {
+                let name = project.generate_smart_name_for_new_object(request.object_type);
+                self.new_object_dialog = Some((request.object_type, name));
+                self.new_object_group = None;
+                self.new_object_placement = Some(request);
             }
         }
         if !self.canvas_visible {
@@ -4011,48 +4063,23 @@ impl DesignerApp {
         }
         self.add_object_menu_seen = true;
         let version = self.project.as_ref().unwrap().vt_version();
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut self.add_object_query)
-                .hint_text("Search object types…")
-                .desired_width(ui.available_width()),
-        );
-        if opening && !response.has_focus() {
-            response.request_focus();
+        if let Some(object_type) = ag_iso_terminal_designer::object_picker::object_type_list(
+            ui,
+            &mut self.add_object_query,
+            opening,
+            version,
+            |_| true,
+        ) {
+            let default_name = self
+                .project
+                .as_ref()
+                .unwrap()
+                .generate_smart_name_for_new_object(object_type);
+            self.new_object_group = None;
+            self.new_object_placement = None;
+            self.new_object_dialog = Some((object_type, default_name));
+            ui.close();
         }
-        let query = self.add_object_query.to_lowercase();
-        egui::ScrollArea::vertical()
-            .max_height(400.0)
-            .show(ui, |ui| {
-                for object_type in ObjectType::values() {
-                    if !format!("{object_type:?}").to_lowercase().contains(&query) {
-                        continue;
-                    }
-                    let supported = ag_iso_terminal_designer::vt_compatibility::supported_object_type(
-                        object_type, version,
-                    );
-                    let response = ui.add_enabled(
-                        supported,
-                        egui::Button::new(format!("{object_type:?}")),
-                    );
-                    if !supported && response.contains_pointer() {
-                        if let Some(availability) = ag_iso_terminal_designer::vt_compatibility::availability_description(|v| {
-                            ag_iso_terminal_designer::vt_compatibility::supported_object_type(object_type, v)
-                        }) {
-                            response.show_tooltip_text(availability);
-                        }
-                    }
-                    if response.clicked() {
-                        let default_name = self
-                            .project
-                            .as_ref()
-                            .unwrap()
-                            .generate_smart_name_for_new_object(object_type);
-                        self.new_object_group = None;
-                        self.new_object_dialog = Some((object_type, default_name));
-                        ui.close();
-                    }
-                }
-            });
     }
 
     fn show_view_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

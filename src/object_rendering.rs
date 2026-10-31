@@ -338,20 +338,6 @@ impl Colorable for Colour {
     }
 }
 
-// Helper function to lighten a color by a certain amount
-fn lighten_color(color: egui::Color32, amount: f32) -> egui::Color32 {
-    let [r, g, b, a] = color.to_srgba_unmultiplied();
-    let brighten = |value| (value as f32 + 255.0 * amount).min(255.0) as u8;
-    egui::Color32::from_rgba_unmultiplied(brighten(r), brighten(g), brighten(b), a)
-}
-
-// Helper function to darken a color by a certain amount
-fn darken_color(color: egui::Color32, amount: f32) -> egui::Color32 {
-    let [r, g, b, a] = color.to_srgba_unmultiplied();
-    let darken = |value| (value as f32 * (1.0 - amount)).max(0.0) as u8;
-    egui::Color32::from_rgba_unmultiplied(darken(r), darken(g), darken(b), a)
-}
-
 fn create_relative_rect(ui: &mut egui::Ui, position: Point<i16>, size: egui::Vec2) -> egui::Rect {
     egui::Rect::from_min_size(
         ui.max_rect().min + egui::vec2(position.x as f32, position.y as f32),
@@ -474,8 +460,6 @@ impl RenderableObject for Button {
             egui::Sense::click(),
         );
 
-        // Determine the current visual state
-        // Priority: latched > pressed > hovered > normal
         let is_pressed_state = latched
             || (response.is_pointer_button_down_on() && !latchable)
             || preview_session(ui).is_some_and(|session| {
@@ -483,60 +467,57 @@ impl RenderableObject for Button {
                     .lock()
                     .is_ok_and(|session| session.button_is_pressed(self.id.value()))
             });
-        let is_hovered_state = response.hovered();
-        // TODO: better visuals for latched states
 
-        let background_color = if transparent_background {
-            egui::Color32::TRANSPARENT
-        } else {
-            let color = crate::effective_colour::colour(pool, self.background_colour).convert();
-            if is_pressed_state {
-                darken_color(color, 0.2)
-            } else if is_hovered_state {
-                lighten_color(color, 0.1)
-            } else {
-                color
-            }
-        };
+        // A disabled Button is drawn at half opacity, children included
+        let opacity = if disabled { 0.5 } else { 1.0 };
+        let mut painter = ui.painter().clone();
+        painter.multiply_opacity(opacity);
 
-        let border_color = if suppress_border {
-            egui::Color32::TRANSPARENT
-        } else {
-            let color = crate::effective_colour::colour(pool, self.border_colour).convert();
-            if is_pressed_state {
-                lighten_color(color, 0.1)
-            } else if is_hovered_state {
-                darken_color(color, 0.05)
-            } else {
-                color
-            }
-        };
-
-        if !no_border {
-            ui.painter().rect_stroke(
+        // The background fills the whole Button Area, so a suppressed border shows it
+        if !transparent_background {
+            painter.rect_filled(
                 rect,
                 0.0,
-                egui::Stroke::new(BUTTON_BORDER_INSET, border_color),
-                egui::StrokeKind::Inside,
+                crate::effective_colour::colour(pool, self.background_colour).convert(),
             );
         }
 
-        ui.painter().rect_filled(face_rect, 0.0, background_color);
-
         // Child objects are clipped to the face area
         ui.scope_builder(UiBuilder::new().max_rect(face_rect), |ui| {
+            ui.multiply_opacity(opacity);
             ui.shrink_clip_rect(face_rect);
             render_object_refs(ui, pool, &self.object_refs);
         });
 
-        // If disabled, we overlay a semi-transparent gray:
-        if disabled {
-            ui.painter().rect_filled(
-                face_rect,
+        // Only the border shows the pressed or latched state, so a Button without one shows neither
+        if !no_border && !suppress_border {
+            let border_colour = crate::effective_colour::colour(pool, self.border_colour).convert();
+            painter.rect_stroke(
+                rect,
                 0.0,
-                egui::Color32::from_rgba_premultiplied(128, 128, 128, 100),
+                egui::Stroke::new(
+                    BUTTON_BORDER_INSET,
+                    if is_pressed_state {
+                        contrasting_colour(border_colour)
+                    } else {
+                        border_colour
+                    },
+                ),
+                egui::StrokeKind::Inside,
             );
         }
+    }
+}
+
+/// Black on bright colours and white on dark ones, by perceived brightness.
+fn contrasting_colour(colour: egui::Color32) -> egui::Color32 {
+    let [r, g, b, _] = colour.to_srgba_unmultiplied();
+    let channel = |value: u8| (value as f32 / 255.0).powi(2);
+    let brightness = (0.241 * channel(r) + 0.691 * channel(g) + 0.068 * channel(b)).sqrt();
+    if brightness >= 0.5 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
     }
 }
 
