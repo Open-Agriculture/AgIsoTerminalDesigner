@@ -639,6 +639,11 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                     render_colour_map(ui, &label, id, &map.colour_map, design);
                 }
             }
+            EditorKind::CodePlanes => {
+                if let Object::ExtendedInputAttributes(attributes) = object {
+                    render_code_planes(ui, &label, id, &attributes.code_planes, design);
+                }
+            }
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
@@ -3099,6 +3104,182 @@ fn colour_map_with_size(map: &[u8], size: usize) -> Vec<u8> {
         .collect()
 }
 
+/// The code planes of Extended Input Attributes: each a Unicode plane, 0 to
+/// 16, with the character ranges that the validation type allows or rejects.
+fn render_code_planes(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    planes: &[ag_iso_stack::object_pool::object::CodePlane],
+    design: &EditorProject,
+) {
+    use ag_iso_stack::object_pool::object::{CharacterRange, CodePlane};
+
+    let mut updated: Option<Vec<CodePlane>> = None;
+    ui.label(label);
+    for (plane_index, plane) in planes.iter().enumerate() {
+        ui.push_id(("code_plane", plane_index), |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Plane");
+                let key = ui.make_persistent_id("plane_number");
+                let mut number = ui
+                    .data(|data| data.get_temp::<u8>(key))
+                    .unwrap_or(plane.number);
+                let response = ui
+                    .add(egui::DragValue::new(&mut number).range(0..=16))
+                    .on_hover_text("Unicode plane: 0 is the Basic Multilingual Plane");
+                if response.changed() {
+                    ui.data_mut(|data| data.insert_temp(key, number));
+                }
+                if drag_value_finished(&response)
+                    || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
+                    ui.data_mut(|data| data.remove::<u8>(key));
+                    if number != plane.number {
+                        let mut changed = planes.to_vec();
+                        changed[plane_index].number = number;
+                        updated = Some(changed);
+                    }
+                }
+                if ui.button("Remove plane").clicked() {
+                    let mut changed = planes.to_vec();
+                    changed.remove(plane_index);
+                    updated = Some(changed);
+                }
+            });
+            let ranges = &plane.character_ranges;
+            let mut action = None;
+            egui::Grid::new("ranges").striped(true).show(ui, |ui| {
+                for heading in ["First", "Last", "Characters", "", "", ""] {
+                    ui.label(heading);
+                }
+                ui.end_row();
+                for (index, range) in ranges.iter().enumerate() {
+                    let first = hex_character_field(
+                        ui,
+                        ui.make_persistent_id(("first", index)),
+                        range.first_character,
+                    );
+                    let last = hex_character_field(
+                        ui,
+                        ui.make_persistent_id(("last", index)),
+                        range.last_character,
+                    );
+                    ui.label(range_preview(plane.number, range));
+                    if first.is_some() || last.is_some() {
+                        // Keep the range in order by moving its other end
+                        let first = first.unwrap_or(range.first_character);
+                        let last = last.unwrap_or(range.last_character);
+                        let (first, last) = if first > last {
+                            if last != range.last_character {
+                                (last, last)
+                            } else {
+                                (first, first)
+                            }
+                        } else {
+                            (first, last)
+                        };
+                        let mut changed = planes.to_vec();
+                        changed[plane_index].character_ranges[index] = CharacterRange {
+                            first_character: first,
+                            last_character: last,
+                        };
+                        updated = Some(changed);
+                    }
+                    row_actions(ui, index, ranges.len(), &mut action);
+                    ui.end_row();
+                }
+            });
+            if let Some(action) = action {
+                let mut changed = planes.to_vec();
+                apply_list_action(&mut changed[plane_index].character_ranges, action);
+                updated = Some(changed);
+            }
+            if ui.button("Add range").clicked() {
+                let mut changed = planes.to_vec();
+                changed[plane_index]
+                    .character_ranges
+                    .push(default_character_range(plane.number));
+                updated = Some(changed);
+            }
+        });
+        ui.separator();
+    }
+    let free_plane = (0..=16).find(|number| planes.iter().all(|plane| plane.number != *number));
+    if ui
+        .add_enabled(free_plane.is_some(), egui::Button::new("Add plane"))
+        .clicked()
+    {
+        if let Some(number) = free_plane {
+            let mut changed = planes.to_vec();
+            changed.push(CodePlane {
+                number,
+                character_ranges: vec![default_character_range(number)],
+            });
+            updated = Some(changed);
+        }
+    }
+    if let Some(planes) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::CodePlanes,
+            serde_json::to_value(planes).unwrap(),
+        );
+    }
+}
+
+/// Printable ASCII in the Basic Multilingual Plane, otherwise the whole plane.
+fn default_character_range(plane: u8) -> ag_iso_stack::object_pool::object::CharacterRange {
+    let (first_character, last_character) = if plane == 0 {
+        (0x20, 0x7E)
+    } else {
+        (0x0000, 0xFFFF)
+    };
+    ag_iso_stack::object_pool::object::CharacterRange {
+        first_character,
+        last_character,
+    }
+}
+
+/// The first and last characters of a range, "A – Z", when they print.
+fn range_preview(plane: u8, range: &ag_iso_stack::object_pool::object::CharacterRange) -> String {
+    let character = |value: u16| {
+        char::from_u32(u32::from(plane) << 16 | u32::from(value))
+            .filter(|character| !character.is_control() && !character.is_whitespace())
+    };
+    match (
+        character(range.first_character),
+        character(range.last_character),
+    ) {
+        (Some(first), Some(last)) if first == last => first.to_string(),
+        (Some(first), Some(last)) => format!("{first} – {last}"),
+        _ => String::new(),
+    }
+}
+
+/// A character code in hex; returns the new code once the edit is finished.
+fn hex_character_field(ui: &mut egui::Ui, key: egui::Id, current: u16) -> Option<u16> {
+    let mut edited = ui.data(|data| data.get_temp::<u16>(key)).unwrap_or(current);
+    let response = ui.add(
+        egui::DragValue::new(&mut edited)
+            .hexadecimal(4, false, true)
+            .prefix("U+"),
+    );
+    if response.changed() {
+        ui.data_mut(|data| data.insert_temp(key, edited));
+    }
+    if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|data| data.remove::<u16>(key));
+    } else if drag_value_finished(&response)
+        || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+    {
+        ui.data_mut(|data| data.remove::<u16>(key));
+        return (edited != current).then_some(edited);
+    }
+    None
+}
+
 fn render_text(
     ui: &mut egui::Ui,
     label: &str,
@@ -4168,6 +4349,31 @@ mod colour_map_tests {
         let identity = colour_map_with_size(&[], 256);
         assert_eq!(identity.len(), 256);
         assert!(identity.iter().enumerate().all(|(i, v)| i == *v as usize));
+    }
+}
+
+#[cfg(test)]
+mod code_plane_tests {
+    use super::{default_character_range, range_preview};
+    use ag_iso_stack::object_pool::object::CharacterRange;
+
+    #[test]
+    fn ranges_preview_their_printable_ends() {
+        let range = |first, last| CharacterRange {
+            first_character: first,
+            last_character: last,
+        };
+        assert_eq!(range_preview(0, &range(0x41, 0x5A)), "A – Z");
+        assert_eq!(range_preview(0, &range(0x20AC, 0x20AC)), "€");
+        assert_eq!(range_preview(0, &range(0x00, 0x1F)), "");
+        assert_eq!(range_preview(1, &range(0xF600, 0xF64F)), "😀 – 🙏");
+    }
+
+    #[test]
+    fn new_ranges_cover_printable_ascii_or_the_whole_plane() {
+        assert_eq!(default_character_range(0).first_character, 0x20);
+        assert_eq!(default_character_range(0).last_character, 0x7E);
+        assert_eq!(default_character_range(2).last_character, 0xFFFF);
     }
 }
 
