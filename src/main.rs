@@ -3021,7 +3021,7 @@ impl eframe::App for DesignerApp {
                             {
                                 self.canvas.select_placement(
                                     pool,
-                                    placement.parent,
+                                    placement.root,
                                     PlacementTarget::Primitive {
                                         parent_id: placement.parent,
                                         child_index,

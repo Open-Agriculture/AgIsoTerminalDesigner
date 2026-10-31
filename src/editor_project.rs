@@ -1405,16 +1405,8 @@ impl EditorProject {
     ) -> Option<ObjectId> {
         let object_id = self.allocate_object_id(object_type).ok()?;
         let description = Some(format!("Create {object_type:?}"));
-        let place = |operations: &mut Vec<Operation>| {
-            if let Some((parent, x, y)) = placement {
-                operations.push(Operation::AddChild {
-                    parent: ObjectTarget::id(parent.value()),
-                    child: ObjectTarget::id(object_id.value()),
-                    x,
-                    y,
-                });
-            }
-        };
+        let placement = placement.map(|(parent, x, y)| self.placement(parent, object_id, x, y));
+        let place = |operations: &mut Vec<Operation>| operations.extend(placement.clone());
         if let Some(mut operations) = self.preset_creation(object_type, object_id, &name) {
             place(&mut operations);
             let transaction = OperationTransaction {
@@ -1449,6 +1441,44 @@ impl EditorProject {
 
         self.execute_ui_transaction(transaction)
             .then_some(object_id)
+    }
+
+    /// The operation adding `child` to `parent`: at `x`, `y` for positioned
+    /// children, otherwise at the end of the parent's list, such as the keys of
+    /// a Soft Key Mask.
+    fn placement(&self, parent: ObjectId, child: ObjectId, x: i16, y: i16) -> Operation {
+        use crate::operations::{ObjectReferenceList, ObjectTargetList};
+
+        let list = self
+            .get_pool()
+            .object_by_id(parent)
+            .filter(|parent| crate::operations::object_refs(parent).is_none())
+            .and_then(crate::operations::operation::object_list);
+        let target = |id: ObjectId| ObjectTarget::id(id.value());
+        match list {
+            Some(ObjectReferenceList::Required(ids)) => Operation::SetObjectList {
+                object: target(parent),
+                objects: ObjectTargetList::Required(
+                    ids.into_iter().chain([child]).map(target).collect(),
+                ),
+            },
+            Some(ObjectReferenceList::Nullable(ids)) => Operation::SetObjectList {
+                object: target(parent),
+                objects: ObjectTargetList::Nullable(
+                    ids.into_iter()
+                        .map(|id| id.0)
+                        .chain([Some(child)])
+                        .map(|id| id.map(target))
+                        .collect(),
+                ),
+            },
+            None => Operation::AddChild {
+                parent: target(parent),
+                child: target(child),
+                x,
+                y,
+            },
+        }
     }
 
     /// The operations creating an object with its creation presets, or None when
