@@ -615,6 +615,11 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
                     render_language_codes(ui, &label, id, &working_set.language_codes, design);
                 }
             }
+            EditorKind::LanguagePairs => {
+                if let Object::WorkingSetSpecialControls(controls) = object {
+                    render_language_pairs(ui, &label, id, &controls.language_pairs, design);
+                }
+            }
             EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
             EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
         });
@@ -2598,6 +2603,110 @@ fn render_language_codes(
             id,
             PropertyKey::LanguageCodes,
             serde_json::json!(codes),
+        );
+    }
+}
+
+/// Language and country pairs of Working Set Special Controls. Both codes
+/// are two characters on the wire, so a pair is added once both are picked.
+fn render_language_pairs(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    pairs: &[(String, String)],
+    design: &EditorProject,
+) {
+    use crate::iso_codes::{label as code_label, COUNTRIES, LANGUAGES};
+
+    let mut updated = None;
+    let mut action = None;
+    ui.label(label);
+    egui::Grid::new(("language_pairs", id.value()))
+        .striped(true)
+        .show(ui, |ui| {
+            for (index, (language, country)) in pairs.iter().enumerate() {
+                ui.label((index + 1).to_string());
+                let mut changed = None;
+                if let Some(chosen) = code_picker(
+                    ui,
+                    ("pair_language", index),
+                    &code_label(LANGUAGES, language),
+                    LANGUAGES,
+                    Some(language),
+                    |_| true,
+                ) {
+                    changed = Some((chosen.to_owned(), country.clone()));
+                }
+                if let Some(chosen) = code_picker(
+                    ui,
+                    ("pair_country", index),
+                    &code_label(COUNTRIES, country),
+                    COUNTRIES,
+                    Some(country),
+                    |_| true,
+                ) {
+                    changed = Some((language.clone(), chosen.to_owned()));
+                }
+                if let Some(pair) = changed {
+                    let mut changed = pairs.to_vec();
+                    changed[index] = pair;
+                    updated = Some(changed);
+                }
+                row_actions(ui, index, pairs.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = pairs.to_vec();
+        apply_list_action(&mut changed, action);
+        updated = Some(changed);
+    }
+    let pending_id = ui.make_persistent_id(("pending_language_pair", id.value()));
+    let (mut language, mut country) = ui
+        .data(|data| data.get_temp::<(Option<String>, Option<String>)>(pending_id))
+        .unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("Add pair:");
+        if let Some(chosen) = code_picker(
+            ui,
+            ("add_pair_language", id.value()),
+            &language.as_deref().map_or_else(
+                || "Language…".to_owned(),
+                |code| code_label(LANGUAGES, code),
+            ),
+            LANGUAGES,
+            language.as_deref(),
+            |_| true,
+        ) {
+            language = Some(chosen.to_owned());
+        }
+        if let Some(chosen) = code_picker(
+            ui,
+            ("add_pair_country", id.value()),
+            &country
+                .as_deref()
+                .map_or_else(|| "Country…".to_owned(), |code| code_label(COUNTRIES, code)),
+            COUNTRIES,
+            country.as_deref(),
+            |_| true,
+        ) {
+            country = Some(chosen.to_owned());
+        }
+    });
+    if let (Some(language), Some(country)) = (&language, &country) {
+        let mut changed = pairs.to_vec();
+        changed.push((language.clone(), country.clone()));
+        updated = Some(changed);
+        ui.data_mut(|data| data.remove::<(Option<String>, Option<String>)>(pending_id));
+    } else {
+        ui.data_mut(|data| data.insert_temp(pending_id, (language, country)));
+    }
+    if let Some(pairs) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::LanguagePairs,
+            serde_json::json!(pairs),
         );
     }
 }

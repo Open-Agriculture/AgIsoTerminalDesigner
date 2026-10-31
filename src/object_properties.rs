@@ -236,6 +236,8 @@ pub enum EditorKind {
     MacroReferences,
     /// ISO 639-1 language codes, picked from a searchable list.
     LanguageCodes,
+    /// ISO 639-1 language and ISO 3166-1 country code pairs.
+    LanguagePairs,
 }
 
 /// UI schemas for every writable property of an object type.
@@ -278,6 +280,9 @@ fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<Edi
     match (object_type, property) {
         (ObjectType::OutputPolygon, PropertyKey::Points) => Some(EditorKind::PolygonPoints),
         (ObjectType::WorkingSet, PropertyKey::LanguageCodes) => Some(EditorKind::LanguageCodes),
+        (ObjectType::WorkingSetSpecialControls, PropertyKey::LanguagePairs) => {
+            Some(EditorKind::LanguagePairs)
+        }
         (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }
