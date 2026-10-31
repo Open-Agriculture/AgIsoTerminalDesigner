@@ -1949,6 +1949,18 @@ impl CanvasState {
             response.context_menu(|ui| {
                 self.add_object_menu(ui, project);
                 self.group_menu(ui, project, &items);
+                ui.add_enabled_ui(!items.is_empty(), |ui| {
+                    ui.menu_button("Align / distribute", |ui| {
+                        let edits = align_menu(ui, project, &items);
+                        if !edits.is_empty() {
+                            self.commit(project, "Align placements", edits);
+                        }
+                    })
+                })
+                .response
+                .on_disabled_hover_text(
+                    "Select objects to align, with Shift-click for more than one.",
+                );
                 ui.menu_button("Select layer", |ui| {
                     if let Some(pos) = hover {
                         for item in scene.items.iter().rev().filter(|i| {
@@ -2449,38 +2461,8 @@ impl CanvasState {
                         ui.label("Dimensions read-only");
                     }
                 }
-                let enabled = same_parent(items);
                 ui.menu_button("Align / distribute", |ui| {
-                    for (name, action) in [
-                        ("Left", 0),
-                        ("Horizontal center", 1),
-                        ("Right", 2),
-                        ("Top", 3),
-                        ("Vertical center", 4),
-                        ("Bottom", 5),
-                        ("Distribute horizontally", 6),
-                        ("Distribute vertically", 7),
-                    ] {
-                        if ui
-                            .add_enabled(
-                                enabled && (action < 6 || items.len() >= 3),
-                                egui::Button::new(name),
-                            )
-                            .clicked()
-                        {
-                            commands.extend(align_edits(
-                                project,
-                                items,
-                                action,
-                                ui.input(|i| i.modifiers.shift),
-                            ));
-                            ui.close();
-                        }
-                    }
-                    if !enabled {
-                        ui.label("Select placements with the same parent.");
-                    }
-                    ui.label("Shift-align: align selection as a group to parent");
+                    commands.extend(align_menu(ui, project, items));
                 });
             });
         }
@@ -3138,6 +3120,39 @@ fn softkey_object_id(project: &EditorProject, root: u16, slot: usize) -> Option<
         return None;
     };
     mask.objects.get(slot).map(|id| id.value())
+}
+
+/// The alignment and distribution actions for the selected items, shared by
+/// the toolbar and the context menu. Returns the edits of the action clicked.
+fn align_menu(ui: &mut egui::Ui, project: &EditorProject, items: &[SceneItem]) -> Vec<CanvasEdit> {
+    let enabled = same_parent(items);
+    let mut edits = Vec::new();
+    for (name, action) in [
+        ("Left", 0),
+        ("Horizontal center", 1),
+        ("Right", 2),
+        ("Top", 3),
+        ("Vertical center", 4),
+        ("Bottom", 5),
+        ("Distribute horizontally", 6),
+        ("Distribute vertically", 7),
+    ] {
+        if ui
+            .add_enabled(
+                enabled && (action < 6 || items.len() >= 3),
+                egui::Button::new(name),
+            )
+            .clicked()
+        {
+            edits = align_edits(project, items, action, ui.input(|i| i.modifiers.shift));
+            ui.close();
+        }
+    }
+    if !enabled {
+        ui.label("Select placements with the same parent.");
+    }
+    ui.label("Shift-align: align selection as a group to parent");
+    edits
 }
 
 /// The placements of the outermost selected items, which grouping moves.
