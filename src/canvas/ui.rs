@@ -42,6 +42,9 @@ pub struct CanvasState {
     snap_spacing: bool,
     grid_visible: bool,
     secondary_panned: bool,
+    /// Mask position of the last right click, where Add object here places the object
+    add_position: Option<(i16, i16)>,
+    add_object_query: String,
     fit: Option<bool>,
     fit_all: bool,
     initially_fitted: bool,
@@ -49,6 +52,23 @@ pub struct CanvasState {
     preferred_slot: Option<(u16, usize, Option<u16>)>,
     pair_layout: Vec<(u16, Vec2, Rect)>,
     preview: Option<super::preview::PreviewMode>,
+}
+
+/// Asks the app to create an object of `object_type` as a child of `parent` at
+/// `x`, `y`, after the user names it. Stored in the egui context's temporary data
+/// under [`AddObjectRequest::id`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddObjectRequest {
+    pub object_type: ag_iso_stack::object_pool::ObjectType,
+    pub parent: u16,
+    pub x: i16,
+    pub y: i16,
+}
+
+impl AddObjectRequest {
+    pub fn id() -> egui::Id {
+        egui::Id::new("canvas_add_object_request")
+    }
 }
 
 /// Identity and edit information for one visible hierarchy occurrence.
@@ -98,6 +118,8 @@ impl Default for CanvasState {
             snap_spacing: true,
             grid_visible: false,
             secondary_panned: false,
+            add_position: None,
+            add_object_query: String::new(),
             fit: None,
             fit_all: false,
             initially_fitted: false,
@@ -1430,6 +1452,10 @@ impl CanvasState {
         }
         if pointer.button_pressed(egui::PointerButton::Secondary) {
             self.secondary_panned = false;
+            if response.hovered() {
+                self.add_position = hover.map(|p| (p.x.round() as i16, p.y.round() as i16));
+                self.add_object_query.clear();
+            }
         }
         if (pointer.button_pressed(egui::PointerButton::Middle)
             || pointer.button_pressed(egui::PointerButton::Secondary))
@@ -1890,6 +1916,7 @@ impl CanvasState {
         let hit_tolerance = 3.0 / self.zoom;
         if !self.secondary_panned {
             response.context_menu(|ui| {
+                self.add_object_menu(ui, project);
                 ui.menu_button("Select layer", |ui| {
                     if let Some(pos) = hover {
                         for item in scene.items.iter().rev().filter(|i| {
@@ -2535,6 +2562,48 @@ impl CanvasState {
             );
         }
         self.nudge(ui, project, scene, modifiers, commands);
+    }
+    /// The Add object here submenu: object types the shown mask accepts, placed
+    /// where the menu was opened.
+    fn add_object_menu(&mut self, ui: &mut egui::Ui, project: &EditorProject) {
+        let version = project.vt_version();
+        let mask = self.mask.and_then(|id| {
+            project
+                .get_pool()
+                .object_by_id(ObjectId::new(id).ok()?)
+                .map(|object| (id, object.object_type()))
+        });
+        let allowed = mask.map_or_else(Vec::new, |(_, mask_type)| {
+            crate::allowed_object_relationships::get_allowed_child_refs(mask_type, version)
+        });
+        let enabled = !allowed.is_empty() && self.add_position.is_some();
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.menu_button("Add object here", |ui| {
+                let focus = self.add_object_query.is_empty();
+                if let Some(object_type) = crate::object_picker::object_type_list(
+                    ui,
+                    &mut self.add_object_query,
+                    focus,
+                    version,
+                    |object_type| allowed.contains(&object_type),
+                ) {
+                    if let (Some((parent, _)), Some((x, y))) = (mask, self.add_position) {
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                AddObjectRequest::id(),
+                                AddObjectRequest {
+                                    object_type,
+                                    parent,
+                                    x: x.max(0),
+                                    y: y.max(0),
+                                },
+                            )
+                        });
+                    }
+                    ui.close();
+                }
+            });
+        });
     }
     /// Moves the selection by 1 pixel per arrow key, or 10 with Shift.
     fn nudge(

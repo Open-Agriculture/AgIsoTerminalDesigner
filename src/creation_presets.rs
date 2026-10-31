@@ -229,3 +229,39 @@ mod tests {
         assert_eq!(project.get_pool().objects().len(), before);
     }
 }
+
+#[cfg(test)]
+mod placement_tests {
+    use crate::EditorProject;
+    use ag_iso_stack::object_pool::{object::Object, ObjectType};
+
+    #[test]
+    fn create_object_at_places_the_object_on_its_parent_in_one_undo_step() {
+        let mut project = EditorProject::default();
+        let mask_name = project.generate_smart_name_for_new_object(ObjectType::DataMask);
+        let mask = project
+            .create_object(ObjectType::DataMask, mask_name)
+            .unwrap();
+        let before = project.get_pool().objects().len();
+
+        let name = project.generate_smart_name_for_new_object(ObjectType::Button);
+        let button = project
+            .create_object_at(ObjectType::Button, name, mask, 12, 34)
+            .unwrap();
+        let Some(Object::DataMask(data_mask)) = project.get_pool().object_by_id(mask) else {
+            panic!("expected the Data Mask");
+        };
+        let placed = data_mask.object_refs.last().unwrap();
+        assert_eq!(
+            (placed.id, placed.offset.x, placed.offset.y),
+            (button, 12, 34)
+        );
+
+        project.undo();
+        assert_eq!(project.get_pool().objects().len(), before);
+        let Some(Object::DataMask(data_mask)) = project.get_pool().object_by_id(mask) else {
+            panic!("expected the Data Mask");
+        };
+        assert!(data_mask.object_refs.is_empty());
+    }
+}

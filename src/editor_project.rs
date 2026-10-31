@@ -1381,9 +1381,42 @@ impl EditorProject {
     /// Everything is one undo step. Should the presets be rejected, the object is
     /// created with its ISO defaults instead.
     pub fn create_object(&mut self, object_type: ObjectType, name: String) -> Option<ObjectId> {
+        self.create_object_placed(object_type, name, None)
+    }
+
+    /// Like [`Self::create_object`], also placing the new object as the last
+    /// child of `parent` at `x`, `y` in the same undo step.
+    pub fn create_object_at(
+        &mut self,
+        object_type: ObjectType,
+        name: String,
+        parent: ObjectId,
+        x: i16,
+        y: i16,
+    ) -> Option<ObjectId> {
+        self.create_object_placed(object_type, name, Some((parent, x, y)))
+    }
+
+    fn create_object_placed(
+        &mut self,
+        object_type: ObjectType,
+        name: String,
+        placement: Option<(ObjectId, i16, i16)>,
+    ) -> Option<ObjectId> {
         let object_id = self.allocate_object_id(object_type).ok()?;
         let description = Some(format!("Create {object_type:?}"));
-        if let Some(operations) = self.preset_creation(object_type, object_id, &name) {
+        let place = |operations: &mut Vec<Operation>| {
+            if let Some((parent, x, y)) = placement {
+                operations.push(Operation::AddChild {
+                    parent: ObjectTarget::id(parent.value()),
+                    child: ObjectTarget::id(object_id.value()),
+                    x,
+                    y,
+                });
+            }
+        };
+        if let Some(mut operations) = self.preset_creation(object_type, object_id, &name) {
+            place(&mut operations);
             let transaction = OperationTransaction {
                 schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
                 description: description.clone(),
@@ -1395,14 +1428,23 @@ impl EditorProject {
                 }
             }
         }
+        let mut operations = vec![
+            Operation::CreateObject {
+                object_id: Some(object_id.value()),
+                object_type,
+                name,
+            },
+            Operation::SetObjectIdAssignment {
+                object_id: object_id.value(),
+                new_id: object_id.value(),
+                overridden: false,
+            },
+        ];
+        place(&mut operations);
         let transaction = OperationTransaction {
             schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
             description,
-            operations: vec![Operation::CreateObject {
-                object_id: None,
-                object_type,
-                name,
-            }],
+            operations,
         };
 
         self.execute_ui_transaction(transaction)

@@ -2,7 +2,7 @@
 use crate::EditorProject;
 use ag_iso_stack::object_pool::{
     object::Object, object_attributes::Point, vt_version::VtVersion, NullableObjectId, ObjectId,
-    ObjectPool,
+    ObjectPool, ObjectType,
 };
 use egui::{self, Rect, Vec2};
 
@@ -441,4 +441,54 @@ pub fn button(
         eligible,
         impact,
     )
+}
+
+/// The searchable list of object types in the Add Object menus.
+///
+/// Types the VT version does not support are shown disabled with the versions
+/// that do; types `offered` rejects are left out. Returns the type clicked.
+pub fn object_type_list(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    focus: bool,
+    version: VtVersion,
+    offered: impl Fn(ObjectType) -> bool,
+) -> Option<ObjectType> {
+    use crate::vt_compatibility::{availability_description, supported_object_type};
+
+    let response = ui.add(
+        egui::TextEdit::singleline(query)
+            .hint_text("Search object types…")
+            .desired_width(ui.available_width()),
+    );
+    if focus && !response.has_focus() {
+        response.request_focus();
+    }
+    let query = query.to_lowercase();
+    let mut chosen = None;
+    egui::ScrollArea::vertical()
+        .max_height(400.0)
+        .show(ui, |ui| {
+            for object_type in ObjectType::values() {
+                if !offered(object_type)
+                    || !format!("{object_type:?}").to_lowercase().contains(&query)
+                {
+                    continue;
+                }
+                let supported = supported_object_type(object_type, version);
+                let response =
+                    ui.add_enabled(supported, egui::Button::new(format!("{object_type:?}")));
+                if !supported && response.contains_pointer() {
+                    if let Some(availability) =
+                        availability_description(|v| supported_object_type(object_type, v))
+                    {
+                        response.show_tooltip_text(availability);
+                    }
+                }
+                if response.clicked() {
+                    chosen = Some(object_type);
+                }
+            }
+        });
+    chosen
 }
