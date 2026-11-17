@@ -2597,8 +2597,6 @@ impl CanvasState {
         }
         self.nudge(ui, project, scene, modifiers, commands);
     }
-    /// The Add object here submenu: object types the shown mask accepts, placed
-    /// where the menu was opened.
     /// The innermost object under `p` that can take a new child: a key in its
     /// soft key slot, the Soft Key Mask for an empty slot, otherwise the
     /// innermost editable object with positioned children, or the mask.
@@ -2646,10 +2644,21 @@ impl CanvasState {
                     && positions_children(item.object_id)
             })
             .max_by_key(|item| item.path.len())
-            .map(|item| at(item.object_id, item.rect.min))
+            .map(|item| {
+                // A Button places its children from its face, inside the border
+                let inset = ObjectId::new(item.object_id)
+                    .ok()
+                    .and_then(|id| pool.object_by_id(id))
+                    .map_or(0.0, |object| {
+                        crate::button_geometry::object_face_inset(object, project.vt_version)
+                    });
+                at(item.object_id, item.rect.min + egui::vec2(inset, inset))
+            })
             .or_else(|| positions_children(root).then(|| at(root, Pos2::ZERO)))
     }
 
+    /// The Add object here submenu: object types the target under the pointer
+    /// accepts, placed where the menu was opened.
     fn add_object_menu(&mut self, ui: &mut egui::Ui, project: &EditorProject) {
         let version = project.vt_version();
         let parent = self.add_target.as_ref().and_then(|target| {
@@ -3217,7 +3226,11 @@ mod tests {
     #[test]
     fn add_object_here_offers_the_innermost_object_that_takes_children() {
         let mut pool = repeated_parent_pool();
-        for (id, kind) in [(3, ObjectType::SoftKeyMask), (4, ObjectType::Key)] {
+        for (id, kind) in [
+            (3, ObjectType::SoftKeyMask),
+            (4, ObjectType::Key),
+            (5, ObjectType::Button),
+        ] {
             let mut object = crate::default_object(kind);
             object.mut_id().set_value(id).unwrap();
             pool.add(object);
@@ -3225,8 +3238,16 @@ mod tests {
         if let Some(Object::SoftKeyMask(mask)) = pool.object_mut_by_id(ObjectId::new(3).unwrap()) {
             mask.objects.push(ObjectId::new(4).unwrap());
         }
+        if let Some(Object::Button(button)) = pool.object_mut_by_id(ObjectId::new(5).unwrap()) {
+            button.width = 80;
+            button.height = 40;
+        }
         if let Some(Object::DataMask(mask)) = pool.object_mut_by_id(ObjectId::new(2).unwrap()) {
             mask.soft_key_mask = ObjectId::new(3).unwrap().into();
+            mask.object_refs.push(ObjectRef {
+                id: ObjectId::new(5).unwrap(),
+                offset: Point { x: 0, y: 200 },
+            });
         }
         let mut project = EditorProject::from(pool);
         project.mask_size = 500;
@@ -3243,6 +3264,14 @@ mod tests {
         assert_eq!(target(110.0, 5.0), Some((100, 10, 5)));
         assert_eq!(target(6.0, 6.0), Some((100, 6, 6)));
         assert_eq!(target(300.0, 300.0), Some((2, 300, 300)));
+        // A Button's children are placed from its face
+        let button = project
+            .get_pool()
+            .object_by_id(ObjectId::new(5).unwrap())
+            .unwrap();
+        let inset = crate::button_geometry::object_face_inset(button, project.vt_version) as i16;
+        assert!(inset > 0);
+        assert_eq!(target(10.0, 210.0), Some((5, 10 - inset, 10 - inset)));
 
         let slot = |key: bool| {
             softkeys
