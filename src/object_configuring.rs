@@ -1508,15 +1508,15 @@ fn render_object_labels(
                                 FontType::from(font_type),
                                 version,
                             );
-                            if (supported || font_type == label.font_type)
-                                && ui
-                                    .selectable_label(
-                                        font_type == label.font_type,
-                                        font_type_label(font_type),
-                                    )
-                                    .clicked()
-                                && font_type != label.font_type
-                            {
+                            let current = font_type == label.font_type;
+                            // An unsupported font type is listed only when it is set
+                            if !supported && !current {
+                                continue;
+                            }
+                            let clicked = ui
+                                .selectable_label(current, font_type_label(font_type))
+                                .clicked();
+                            if clicked && !current {
                                 updated =
                                     Some(with_label(index, &|label| label.font_type = font_type));
                             }
@@ -4914,7 +4914,7 @@ mod polygon_draft_tests {
         project.execute_transaction(transaction).unwrap();
 
         let ctx = egui::Context::default();
-        let mut frame = |project: &mut EditorProject, shown: bool, events: Vec<egui::Event>| {
+        let frame = |project: &mut EditorProject, shown: bool, events: Vec<egui::Event>| {
             let output = ctx.run(input(events), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     if shown {
