@@ -1240,6 +1240,14 @@ impl DesignerApp {
                                         property: ag_iso_terminal_designer::PropertyKey::Data,
                                         value: serde_json::json!(png),
                                     });
+                                    // PNG is format 0, the only one ISO 11783-6 defines
+                                    project.queue_operation(Operation::SetProperty {
+                                        object: ag_iso_terminal_designer::ObjectTarget::id(
+                                            id.value(),
+                                        ),
+                                        property: ag_iso_terminal_designer::PropertyKey::Format,
+                                        value: serde_json::json!(0),
+                                    });
                                     if !project.commit_queued("Load Graphic Data image") {
                                         if let Some(error) = project.take_operation_error() {
                                             self.error_message = Some(error);
