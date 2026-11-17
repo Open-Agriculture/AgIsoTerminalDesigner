@@ -853,6 +853,17 @@ enum ListAction {
 }
 
 fn row_actions(ui: &mut egui::Ui, index: usize, len: usize, action: &mut Option<ListAction>) {
+    row_actions_keeping(ui, index, len, 0, action);
+}
+
+/// [`row_actions`] for a list that must keep at least `minimum` entries.
+fn row_actions_keeping(
+    ui: &mut egui::Ui,
+    index: usize,
+    len: usize,
+    minimum: usize,
+    action: &mut Option<ListAction>,
+) {
     if ui
         .add_enabled(index > 0, egui::Button::new("\u{23F6}"))
         .on_hover_text("Move up")
@@ -867,7 +878,11 @@ fn row_actions(ui: &mut egui::Ui, index: usize, len: usize, action: &mut Option<
     {
         *action = Some(ListAction::MoveDown(index));
     }
-    if ui.button("\u{1F5D9}").on_hover_text("Remove").clicked() {
+    if ui
+        .add_enabled(len > minimum, egui::Button::new("\u{1F5D9}"))
+        .on_hover_text("Remove")
+        .clicked()
+    {
         *action = Some(ListAction::Remove(index));
     }
 }
@@ -3156,36 +3171,73 @@ fn render_code_planes(
     let mut updated: Option<Vec<CodePlane>> = None;
     ui.label(label);
     for (plane_index, plane) in planes.iter().enumerate() {
-        ui.push_id(("code_plane", plane_index), |ui| {
+        // Keyed by object: unfinished edits must not show on another object
+        ui.push_id(("code_plane", id.value(), plane_index), |ui| {
             ui.horizontal(|ui| {
-                ui.label("Plane");
-                let key = ui.make_persistent_id("plane_number");
-                let mut number = ui
-                    .data(|data| data.get_temp::<u8>(key))
-                    .unwrap_or(plane.number);
-                let response = ui
-                    .add(egui::DragValue::new(&mut number).range(0..=16))
+                ui.label("Plane")
                     .on_hover_text("Unicode plane: 0 is the Basic Multilingual Plane");
-                if response.changed() {
-                    ui.data_mut(|data| data.insert_temp(key, number));
-                }
-                if drag_value_finished(&response)
-                    || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                // Only planes not used by another entry, so none is listed twice
+                egui::ComboBox::from_id_salt("plane_number")
+                    .icon(crate::ui_style::combo_box_icon)
+                    .selected_text(plane.number.to_string())
+                    .show_ui(ui, |ui| {
+                        for number in 0..=16u8 {
+                            let used = planes.iter().enumerate().any(|(other, candidate)| {
+                                other != plane_index && candidate.number == number
+                            });
+                            if !used
+                                && ui
+                                    .selectable_label(number == plane.number, number.to_string())
+                                    .clicked()
+                                && number != plane.number
+                            {
+                                let mut changed = planes.to_vec();
+                                changed[plane_index].number = number;
+                                updated = Some(changed);
+                            }
+                        }
+                    });
+                // Extended Input Attributes need at least one plane
+                if ui
+                    .add_enabled(planes.len() > 1, egui::Button::new("Remove plane"))
+                    .clicked()
                 {
-                    ui.data_mut(|data| data.remove::<u8>(key));
-                    if number != plane.number {
-                        let mut changed = planes.to_vec();
-                        changed[plane_index].number = number;
-                        updated = Some(changed);
-                    }
-                }
-                if ui.button("Remove plane").clicked() {
                     let mut changed = planes.to_vec();
                     changed.remove(plane_index);
                     updated = Some(changed);
                 }
             });
             let ranges = &plane.character_ranges;
+            // The planes with range `index` set to `first`–`last`, kept in
+            // order by moving the end that was not edited
+            let with_range = |index: usize, first: Option<u16>, last: Option<u16>| {
+                let range = &ranges[index];
+                let first = first.unwrap_or(range.first_character);
+                let last = last.unwrap_or(range.last_character);
+                let (first, last) = if first > last {
+                    if last != range.last_character {
+                        (last, last)
+                    } else {
+                        (first, first)
+                    }
+                } else {
+                    (first, last)
+                };
+                let mut changed = planes.to_vec();
+                changed[plane_index].character_ranges[index] = CharacterRange {
+                    first_character: first,
+                    last_character: last,
+                };
+                changed
+            };
+            let operation = |changed: Vec<CodePlane>| {
+                property_operation(
+                    design,
+                    id,
+                    PropertyKey::CodePlanes,
+                    serde_json::to_value(changed).unwrap(),
+                )
+            };
             let mut action = None;
             egui::Grid::new("ranges").striped(true).show(ui, |ui| {
                 for heading in ["First", "Last", "Characters", "", "", ""] {
@@ -3197,34 +3249,22 @@ fn render_code_planes(
                         ui,
                         ui.make_persistent_id(("first", index)),
                         range.first_character,
+                        design,
+                        |first| operation(with_range(index, Some(first), None)),
                     );
                     let last = hex_character_field(
                         ui,
                         ui.make_persistent_id(("last", index)),
                         range.last_character,
+                        design,
+                        |last| operation(with_range(index, None, Some(last))),
                     );
                     ui.label(range_preview(plane.number, range));
                     if first.is_some() || last.is_some() {
-                        // Keep the range in order by moving its other end
-                        let first = first.unwrap_or(range.first_character);
-                        let last = last.unwrap_or(range.last_character);
-                        let (first, last) = if first > last {
-                            if last != range.last_character {
-                                (last, last)
-                            } else {
-                                (first, first)
-                            }
-                        } else {
-                            (first, last)
-                        };
-                        let mut changed = planes.to_vec();
-                        changed[plane_index].character_ranges[index] = CharacterRange {
-                            first_character: first,
-                            last_character: last,
-                        };
-                        updated = Some(changed);
+                        updated = Some(with_range(index, first, last));
                     }
-                    row_actions(ui, index, ranges.len(), &mut action);
+                    // A plane needs at least one range
+                    row_actions_keeping(ui, index, ranges.len(), 1, &mut action);
                     ui.end_row();
                 }
             });
@@ -3233,7 +3273,11 @@ fn render_code_planes(
                 apply_list_action(&mut changed[plane_index].character_ranges, action);
                 updated = Some(changed);
             }
-            if ui.button("Add range").clicked() {
+            if ui
+                .add_enabled(ranges.len() < 255, egui::Button::new("Add range"))
+                .on_disabled_hover_text("A code plane holds at most 255 ranges")
+                .clicked()
+            {
                 let mut changed = planes.to_vec();
                 changed[plane_index]
                     .character_ranges
@@ -3297,7 +3341,16 @@ fn range_preview(plane: u8, range: &ag_iso_stack::object_pool::object::Character
 }
 
 /// A character code in hex; returns the new code once the edit is finished.
-fn hex_character_field(ui: &mut egui::Ui, key: egui::Id, current: u16) -> Option<u16> {
+/// An unfinished edit is kept as a draft, `operation` of the edited code, and
+/// committed if the field disappears first.
+fn hex_character_field(
+    ui: &mut egui::Ui,
+    key: egui::Id,
+    current: u16,
+    design: &EditorProject,
+    operation: impl FnOnce(u16) -> Operation,
+) -> Option<u16> {
+    touch_draft(ui.ctx(), key);
     let mut edited = ui.data(|data| data.get_temp::<u16>(key)).unwrap_or(current);
     let response = ui.add(
         egui::DragValue::new(&mut edited)
@@ -3306,13 +3359,16 @@ fn hex_character_field(ui: &mut egui::Ui, key: egui::Id, current: u16) -> Option
     );
     if response.changed() {
         ui.data_mut(|data| data.insert_temp(key, edited));
+        update_draft(ui.ctx(), key, design, Some(operation(edited)));
     }
     if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
         ui.data_mut(|data| data.remove::<u16>(key));
+        clear_draft(ui.ctx(), key);
     } else if drag_value_finished(&response)
         || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
     {
         ui.data_mut(|data| data.remove::<u16>(key));
+        clear_draft(ui.ctx(), key);
         return (edited != current).then_some(edited);
     }
     None
