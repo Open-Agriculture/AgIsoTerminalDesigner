@@ -40,9 +40,46 @@ struct Draft {
     /// The pool's size as an IOP when the dialog opened, for the picture's
     /// share; `Some(None)` when it does not serialize.
     pool_bytes: Option<Option<usize>>,
-    /// Stored bytes by format and scale, filled in by Compare sizes.
-    comparison: Option<Vec<SizeCandidate>>,
+    /// Stored bytes by format and scale, filled in by Compare sizes, with the
+    /// transparency settings they were converted with.
+    comparison: Option<(TransparencySettings, Vec<SizeCandidate>)>,
 }
+type TransparencySettings = (TransparencyMode, u8, u8, Option<u8>);
+
+fn transparency_settings(options: &ConversionOptions) -> TransparencySettings {
+    (
+        options.transparency,
+        options.alpha_cutoff,
+        options.flatten_background,
+        options.transparent_index,
+    )
+}
+
+/// `base`, another format's suggested options, with the transparency settings
+/// of `current`. An index the format cannot hold keeps `base`'s.
+fn with_transparency_of(
+    mut base: ConversionOptions,
+    current: &ConversionOptions,
+) -> ConversionOptions {
+    let limit = match base.target {
+        PictureGraphicFormat::Monochrome => 2,
+        PictureGraphicFormat::FourBit => 16,
+        PictureGraphicFormat::EightBit => 256,
+    };
+    base.transparency = current.transparency;
+    base.alpha_cutoff = current.alpha_cutoff;
+    if usize::from(current.flatten_background) < limit {
+        base.flatten_background = current.flatten_background;
+    }
+    if current
+        .transparent_index
+        .is_none_or(|index| usize::from(index) < limit)
+    {
+        base.transparent_index = current.transparent_index;
+    }
+    base
+}
+
 #[derive(Clone)]
 struct SizeCandidate {
     target: PictureGraphicFormat,
@@ -280,10 +317,8 @@ fn comparison_ui(ui: &mut egui::Ui, project: &EditorProject, d: &mut Draft, sour
                 let width = percent_width(source_width, percent);
                 let mut candidate = d.clone();
                 candidate.options = ConversionOptions {
-                    transparency: d.options.transparency,
-                    alpha_cutoff: d.options.alpha_cutoff,
                     stored_width: (width < source_width).then_some(width),
-                    ..suggested_options(project, target)
+                    ..with_transparency_of(suggested_options(project, target), &d.options)
                 };
                 let stored_width = candidate.options.stored_width;
                 candidates.push(SizeCandidate {
@@ -293,11 +328,16 @@ fn comparison_ui(ui: &mut egui::Ui, project: &EditorProject, d: &mut Draft, sour
                 });
             }
         }
-        d.comparison = Some(candidates);
+        d.comparison = Some((transparency_settings(&d.options), candidates));
     }
-    let Some(candidates) = d.comparison.clone() else {
+    // Sizes found with other transparency settings no longer apply
+    let Some((settings, candidates)) = d.comparison.clone() else {
         return;
     };
+    if settings != transparency_settings(&d.options) {
+        d.comparison = None;
+        return;
+    }
     egui::Grid::new("stored_size_comparison")
         .striped(true)
         .show(ui, |ui| {
@@ -315,10 +355,11 @@ fn comparison_ui(ui: &mut egui::Ui, project: &EditorProject, d: &mut Draft, sour
                         Ok(bytes) => {
                             if ui.selectable_label(current, bytes_label(*bytes)).clicked() {
                                 d.options = ConversionOptions {
-                                    transparency: d.options.transparency,
-                                    alpha_cutoff: d.options.alpha_cutoff,
                                     stored_width: candidate.stored_width,
-                                    ..suggested_options(project, target)
+                                    ..with_transparency_of(
+                                        suggested_options(project, target),
+                                        &d.options,
+                                    )
                                 };
                             }
                         }
