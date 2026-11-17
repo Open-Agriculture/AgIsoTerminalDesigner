@@ -574,10 +574,22 @@ fn resampled(source: Source, stored_width: Option<u16>) -> Source {
     let new_height = scaled_height(width, height, new_width);
     match source {
         Source::Rgba { pixels, .. } => {
-            let image = image::RgbaImage::from_raw(
+            // The filter expects premultiplied alpha. Otherwise the hidden
+            // colour of transparent pixels, often black, darkens the edges.
+            let image = image::Rgba32FImage::from_raw(
                 u32::from(width),
                 u32::from(height),
-                pixels.into_iter().flatten().collect(),
+                pixels
+                    .into_iter()
+                    .flat_map(|[r, g, b, a]| {
+                        // Floating-point images hold 0.0 to 1.0
+                        let alpha = f32::from(a) / 255.0;
+                        [r, g, b]
+                            .map(|c| f32::from(c) / 255.0 * alpha)
+                            .into_iter()
+                            .chain([alpha])
+                    })
+                    .collect(),
             )
             .expect("pixels match the source dimensions");
             let resized = image::imageops::resize(
@@ -586,10 +598,20 @@ fn resampled(source: Source, stored_width: Option<u16>) -> Source {
                 u32::from(new_height),
                 image::imageops::FilterType::Triangle,
             );
+            let channel = |value: f32| value.round().clamp(0.0, 255.0) as u8;
             Source::Rgba {
                 width: new_width,
                 height: new_height,
-                pixels: resized.pixels().map(|pixel| pixel.0).collect(),
+                pixels: resized
+                    .pixels()
+                    .map(|pixel| {
+                        let [r, g, b, alpha] = pixel.0;
+                        if alpha <= 0.0 {
+                            return [0, 0, 0, 0];
+                        }
+                        [r / alpha, g / alpha, b / alpha, alpha].map(|c| channel(c * 255.0))
+                    })
+                    .collect(),
             }
         }
         Source::Indexed {
@@ -854,6 +876,25 @@ mod tests {
         assert_eq!(reduced.picture.width, 80);
         assert_eq!((reduced.source_width, reduced.source_height), (80, 40));
         assert!(reduced.raw_size < full.raw_size);
+    }
+
+    #[test]
+    fn shrinking_does_not_blend_in_the_colour_of_transparent_pixels() {
+        // Opaque red between transparent black, as on an icon's edge
+        let clear = [0, 0, 0, 0];
+        let red = [255, 0, 0, 255];
+        let source = Source::Rgba {
+            width: 4,
+            height: 1,
+            pixels: vec![clear, red, red, clear],
+        };
+        let Source::Rgba { pixels, .. } = resampled(source, Some(2)) else {
+            unreachable!()
+        };
+        for [r, g, b, a] in pixels {
+            assert!(a > 0 && a < 255, "the edge is partly transparent");
+            assert_eq!([r, g, b], [255, 0, 0], "and still red");
+        }
     }
 
     #[test]
