@@ -3166,9 +3166,13 @@ fn align_menu(ui: &mut egui::Ui, project: &EditorProject, items: &[SceneItem]) -
 
 /// The placements of the outermost selected items, which grouping moves.
 fn group_targets(items: &[SceneItem]) -> Vec<PlacementTarget> {
+    // The same child of a shared parent can be selected in two occurrences
+    // of that parent; it is grouped once.
+    let mut seen = std::collections::HashSet::new();
     root_items(items.to_vec())
         .into_iter()
         .filter_map(|item| item.target)
+        .filter(|target| seen.insert(target.clone()))
         .collect()
 }
 
@@ -3221,6 +3225,23 @@ mod tests {
             pointer.value = ObjectId::new(100).unwrap().into();
         }
         pool
+    }
+
+    #[test]
+    fn a_child_selected_in_two_occurrences_of_its_parent_is_grouped_once() {
+        let project = repeated_parent_project();
+        let materialized = project.materialize_shared().unwrap();
+        let scene = geometry::build_page(&project, &materialized, 2, 0);
+        let selected: Vec<_> = scene
+            .items
+            .iter()
+            .filter(|item| item.object_id == 101 && item.path.len() == 2)
+            .take(2)
+            .cloned()
+            .collect();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].target, selected[1].target);
+        assert_eq!(group_targets(&selected).len(), 1);
     }
 
     #[test]
