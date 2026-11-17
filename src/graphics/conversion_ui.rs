@@ -37,8 +37,9 @@ struct Draft {
     filter: String,
     error: Option<String>,
     preview_cache: Option<(ConversionOptions, ConversionPreview)>,
-    /// The pool's size as an IOP when the dialog opened, for the picture's share.
-    pool_bytes: Option<usize>,
+    /// The pool's size as an IOP when the dialog opened, for the picture's
+    /// share; `Some(None)` when it does not serialize.
+    pool_bytes: Option<Option<usize>>,
     /// Stored bytes by format and scale, filled in by Compare sizes.
     comparison: Option<Vec<SizeCandidate>>,
 }
@@ -216,9 +217,14 @@ fn pool_impact_ui(
     d: &mut Draft,
     p: &ConversionPreview,
 ) {
-    let pool = *d
-        .pool_bytes
-        .get_or_insert_with(|| project.get_pool().as_iop().len());
+    // A pool kept for repair may not serialize; then only the picture is shown
+    let pool = *d.pool_bytes.get_or_insert_with(|| {
+        project
+            .get_pool()
+            .try_as_iop_for_version(project.vt_version)
+            .ok()
+            .map(|iop| iop.len())
+    });
     let target = match &d.source {
         Source::Picture(id) | Source::Import { target: id, .. } => Some(*id),
         Source::Asset { target, .. } => *target,
@@ -231,22 +237,25 @@ fn pool_impact_ui(
             Object::PictureGraphic(picture) => picture.data.len(),
             _ => 0,
         });
-    let after = (pool + p.stored_size).saturating_sub(current).max(1);
     let change = p.stored_size as i64 - current as i64;
     let change = match change {
         0 => "no change".to_owned(),
         bytes if bytes < 0 => format!("saves {}", bytes_label(bytes.unsigned_abs() as usize)),
         bytes => format!("adds {}", bytes_label(bytes as usize)),
     };
-    ui.label(
-        egui::RichText::new(format!(
-            "Picture data {} of a {} pool ({:.0}%); {change}",
-            bytes_label(p.stored_size),
-            bytes_label(after),
-            100.0 * p.stored_size as f64 / after as f64
-        ))
-        .weak(),
-    );
+    let text = match pool {
+        Some(pool) => {
+            let after = (pool + p.stored_size).saturating_sub(current).max(1);
+            format!(
+                "Picture data {} of a {} pool ({:.0}%); {change}",
+                bytes_label(p.stored_size),
+                bytes_label(after),
+                100.0 * p.stored_size as f64 / after as f64
+            )
+        }
+        None => format!("Picture data {}; {change}", bytes_label(p.stored_size)),
+    };
+    ui.label(egui::RichText::new(text).weak());
 }
 
 /// Stored bytes for every format and scale, with the current transparency
