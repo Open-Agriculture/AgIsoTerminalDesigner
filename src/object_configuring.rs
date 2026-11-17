@@ -2835,22 +2835,35 @@ fn render_name(
             let current = get(&name);
             let mut edited = ui.data(|data| data.get_temp::<u32>(key)).unwrap_or(current);
             let response = ui.add(egui::DragValue::new(&mut edited).range(0..=maximum));
+            let mut changed = name;
+            set(&mut changed, edited);
             if response.changed() {
                 ui.data_mut(|data| data.insert_temp(key, edited));
+                // Committed if the editor disappears before the edit is finished
+                update_draft(
+                    ui.ctx(),
+                    key,
+                    design,
+                    Some(property_operation(
+                        design,
+                        id,
+                        PropertyKey::Name,
+                        serde_json::json!(u64::from(changed)),
+                    )),
+                );
             }
             if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                 ui.data_mut(|data| data.remove::<u32>(key));
+                clear_draft(ui.ctx(), key);
             } else if drag_value_finished(&response)
                 || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
             {
                 if edited != current {
-                    let mut changed = name;
-                    set(&mut changed, edited);
                     updated = Some(changed);
                 }
                 ui.data_mut(|data| data.remove::<u32>(key));
+                clear_draft(ui.ctx(), key);
             }
-            clear_draft(ui.ctx(), key);
             ui.end_row();
         }
         let mut self_configurable = name.get_self_configurable_address();
@@ -2867,17 +2880,27 @@ fn render_name(
         touch_draft(ui.ctx(), key);
         let current = format!("{:016X}", u64::from(name));
         let mut edited = pending_text(ui, key).unwrap_or_else(|| current.clone());
+        // No character limit: a pasted "0x…" NAME with spaces would be cut
+        // short and still parse; parse_name_hex rejects over 16 digits.
         let response = ui.add(
             egui::TextEdit::singleline(&mut edited)
                 .font(egui::TextStyle::Monospace)
-                .char_limit(19)
                 .desired_width(150.0),
         );
         if response.changed() {
             ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+            update_draft(
+                ui.ctx(),
+                key,
+                design,
+                parse_name_hex(&edited).map(|raw| {
+                    property_operation(design, id, PropertyKey::Name, serde_json::json!(raw))
+                }),
+            );
         }
         if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
             ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
         } else if response.lost_focus() {
             // Invalid text stays, with the error, until it is fixed or cancelled
             if let Some(raw) = parse_name_hex(&edited) {
@@ -2885,9 +2908,9 @@ fn render_name(
                     updated = Some(NAME::new(raw));
                 }
                 ui.data_mut(|data| data.remove::<PendingValue>(key));
+                clear_draft(ui.ctx(), key);
             }
         }
-        clear_draft(ui.ctx(), key);
         ui.end_row();
         if pending_text(ui, key).is_some_and(|text| parse_name_hex(&text).is_none()) {
             ui.label("");
