@@ -3427,6 +3427,7 @@ fn render_macro_commands(
                 ui.label((index + 1).to_string());
                 ui.label(&instruction.name);
                 let key = ui.make_persistent_id((id.value(), "macro_arguments", index));
+                touch_draft(ui.ctx(), key);
                 let current = join_arguments(&instruction.arguments);
                 let mut edited = pending_text(ui, key).unwrap_or_else(|| current.clone());
                 let response = ui.add(
@@ -3434,29 +3435,45 @@ fn render_macro_commands(
                         .font(egui::TextStyle::Monospace)
                         .desired_width(220.0),
                 );
-                if response.changed() {
-                    ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
-                }
-                if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-                    ui.data_mut(|data| data.remove::<PendingValue>(key));
-                } else if response.lost_focus() && edited != current {
-                    let result = split_arguments(&edited).and_then(|arguments| {
+                let encoded = |text: &str| {
+                    split_arguments(text).and_then(|arguments| {
                         let mut changed = instructions.clone();
                         changed[index].arguments = arguments;
                         encode(&changed)
-                    });
-                    match result {
+                    })
+                };
+                if response.changed() {
+                    ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+                    // Committed if the editor disappears first, when it encodes
+                    update_draft(
+                        ui.ctx(),
+                        key,
+                        design,
+                        encoded(&edited).ok().map(|bytes| {
+                            property_operation(
+                                design,
+                                id,
+                                PropertyKey::Commands,
+                                serde_json::json!(bytes),
+                            )
+                        }),
+                    );
+                }
+                if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    ui.data_mut(|data| data.remove::<PendingValue>(key));
+                    clear_draft(ui.ctx(), key);
+                } else if response.lost_focus() && edited != current {
+                    match encoded(&edited) {
                         Ok(bytes) => {
                             updated = Some(bytes);
                             ui.data_mut(|data| data.remove::<PendingValue>(key));
+                            clear_draft(ui.ctx(), key);
                         }
                         Err(message) => error = Some(message),
                     }
                 }
-                // The object an instruction acts on comes first
-                match instruction
-                    .arguments
-                    .first()
+                match macro_target_argument(&instruction.name)
+                    .and_then(|position| instruction.arguments.get(position))
                     .and_then(|argument| argument.parse::<u16>().ok())
                     .and_then(|object| ObjectId::new(object).ok())
                     .and_then(|object| design.get_pool().object_by_id(object))
@@ -3533,6 +3550,17 @@ fn render_macro_commands(
     }
     if let Some(bytes) = updated {
         queue(design, id, PropertyKey::Commands, serde_json::json!(bytes));
+    }
+}
+
+/// The argument holding the object a Macro instruction acts on, if any.
+fn macro_target_argument(name: &str) -> Option<usize> {
+    match name {
+        // A NAME, an activation count and a volume: no object
+        "select-active-working-set" | "control-audio-signal" | "set-audio-volume" => None,
+        // After the mask type or the lock state
+        "change-soft-key-mask" | "lock-unlock-mask" => Some(1),
+        _ => Some(0),
     }
 }
 
@@ -4785,5 +4813,108 @@ mod polygon_draft_tests {
         finish_property_edits(&ctx, &project);
         assert!(!project.commit_queued("Finish hidden editor"));
         assert_eq!(project.save_project().unwrap(), before);
+    }
+    fn input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// Typing in a Macro's arguments and then selecting another object, so
+    /// the field disappears before it loses focus, still commits the edit.
+    #[test]
+    fn unfinished_macro_arguments_commit_when_the_editor_disappears() {
+        let mut project = EditorProject::default();
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::CreateObject {
+            object_id: Some(7),
+            object_type: ObjectType::Macro,
+            name: "Macro".into(),
+        });
+        let bytes = crate::macro_authoring::encode_macro_instruction(
+            "change-numeric-value",
+            &["1000".into(), "42".into()],
+            project.vt_version,
+        )
+        .unwrap();
+        transaction.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(7),
+            property: PropertyKey::Commands,
+            value: serde_json::json!(bytes),
+        });
+        project.execute_transaction(transaction).unwrap();
+
+        let ctx = egui::Context::default();
+        let mut frame = |project: &mut EditorProject, shown: bool, events: Vec<egui::Event>| {
+            let output = ctx.run(input(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if shown {
+                        let object = project
+                            .get_pool()
+                            .object_by_id(ObjectId::new(7).unwrap())
+                            .unwrap()
+                            .clone();
+                        render_property_editor(ui, &object, project);
+                    }
+                });
+                finish_property_edits(ctx, project);
+            });
+            project.commit_queued("Edit");
+            output
+        };
+        frame(&mut project, true, Vec::new());
+        // The grid lays itself out on the first frame
+        let output = frame(&mut project, true, Vec::new());
+        let field = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "1000 42" => {
+                    Some(text.pos + egui::vec2(10.0, 6.0))
+                }
+                _ => None,
+            })
+            .expect("the arguments field shows the instruction's arguments");
+        let click = |pressed| egui::Event::PointerButton {
+            pos: field,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut project, true, vec![egui::Event::PointerMoved(field)]);
+        frame(&mut project, true, vec![click(true)]);
+        frame(&mut project, true, vec![click(false)]);
+        frame(
+            &mut project,
+            true,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::End,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Text("0".into()),
+            ],
+        );
+        // Another object is selected: the editor is gone
+        frame(&mut project, false, Vec::new());
+        frame(&mut project, false, Vec::new());
+
+        let Some(Object::Macro(stored)) =
+            project.get_pool().object_by_id(ObjectId::new(7).unwrap())
+        else {
+            panic!("the macro exists");
+        };
+        let decoded =
+            crate::macro_authoring::decode_macro_commands(&stored.commands, project.vt_version)
+                .unwrap();
+        assert_eq!(join_arguments(&decoded[0].arguments), "1000 420");
     }
 }
