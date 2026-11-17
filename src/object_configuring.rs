@@ -2569,6 +2569,7 @@ fn code_picker(
             }
             let needle = query.to_lowercase();
             let mut first = None;
+            let mut exact = None;
             for (code, name) in table {
                 if !offered(code)
                     || !code.to_lowercase().contains(&needle)
@@ -2577,6 +2578,9 @@ fn code_picker(
                     continue;
                 }
                 first.get_or_insert(*code);
+                if code.eq_ignore_ascii_case(&needle) {
+                    exact = Some(*code);
+                }
                 let selected = current.is_some_and(|current| current.eq_ignore_ascii_case(code));
                 let response = ui.selectable_label(selected, format!("{code} — {name}"));
                 if selected && opened {
@@ -2586,9 +2590,17 @@ fn code_picker(
                     chosen = Some(*code);
                 }
             }
-            // Enter picks the first match, so typing a code is enough
-            if search.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                chosen = chosen.or(first);
+            // Enter picks the code typed, else the first match, so typing a
+            // code is enough. Without a search, or with the current code
+            // typed, Enter picks nothing.
+            let typed_current =
+                current.is_some_and(|current| current.eq_ignore_ascii_case(&needle));
+            if search.lost_focus()
+                && !needle.is_empty()
+                && !typed_current
+                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            {
+                chosen = chosen.or(exact).or(first);
             }
             ui.data_mut(|data| data.insert_temp(query_id, query));
         });
