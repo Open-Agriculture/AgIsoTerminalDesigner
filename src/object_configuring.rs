@@ -2457,16 +2457,9 @@ fn render_auto(
 /// runtime may be shorter, and the VT pads it with spaces, but not longer, so
 /// Length reserves room by padding the value with spaces.
 fn render_string_length(ui: &mut egui::Ui, object: &Object, text: &str, design: &EditorProject) {
-    let (uses_variable, max_bytes) = match object {
-        Object::InputString(o) => (o.variable_reference.0.is_some(), u8::MAX as usize),
-        Object::OutputString(o) => (o.variable_reference.0.is_some(), u16::MAX as usize),
-        Object::StringVariable(_) => (false, u16::MAX as usize),
-        _ => return,
-    };
-    // The referenced String Variable holds the value and so the length
-    if uses_variable {
+    let Some(max_bytes) = string_value_max_bytes(object, design.get_pool()) else {
         return;
-    }
+    };
     let id = object.id();
     let length = text.chars().count();
     let minimum = text.trim_end_matches(' ').chars().count();
@@ -2516,6 +2509,32 @@ fn render_string_length(ui: &mut egui::Ui, object: &Object, text: &str, design: 
             clear_draft(ui.ctx(), key);
         }
     });
+}
+
+/// The most bytes the value of a string object takes on the wire, or `None`
+/// when it has no value of its own: a String Variable holds it instead.
+fn string_value_max_bytes(
+    object: &Object,
+    pool: &ag_iso_stack::object_pool::ObjectPool,
+) -> Option<usize> {
+    match object {
+        Object::InputString(o) if o.variable_reference.0.is_none() => Some(u8::MAX.into()),
+        Object::OutputString(o) if o.variable_reference.0.is_none() => Some(u16::MAX.into()),
+        Object::StringVariable(variable) => {
+            // An Input String's value is at most 255 bytes, also when a
+            // String Variable holds it
+            let input = pool.objects().iter().any(|candidate| {
+                matches!(candidate, Object::InputString(input)
+                    if input.variable_reference.0 == Some(variable.id))
+            });
+            Some(if input {
+                u8::MAX.into()
+            } else {
+                u16::MAX.into()
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Pad `text` with spaces, or drop its trailing spaces, to `length` characters.
@@ -4680,6 +4699,37 @@ mod string_length_tests {
         assert_eq!(max_string_length(255, VtVersion::Version3), 255);
         assert_eq!(max_string_length(255, VtVersion::Version4), 126);
         assert_eq!(max_string_length(65535, VtVersion::Version6), 32766);
+    }
+
+    #[test]
+    fn a_string_variable_of_an_input_string_holds_at_most_255_bytes() {
+        use super::string_value_max_bytes;
+        use crate::default_object;
+        use ag_iso_stack::object_pool::object::Object;
+        use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectPool, ObjectType};
+
+        let mut pool = ObjectPool::new();
+        let Object::StringVariable(mut variable) = default_object(ObjectType::StringVariable)
+        else {
+            unreachable!()
+        };
+        variable.id = ObjectId::new(5).unwrap();
+        pool.add(Object::StringVariable(variable.clone()));
+        let variable = Object::StringVariable(variable);
+        assert_eq!(string_value_max_bytes(&variable, &pool), Some(65535));
+
+        let Object::InputString(mut input) = default_object(ObjectType::InputString) else {
+            unreachable!()
+        };
+        input.id = ObjectId::new(6).unwrap();
+        input.variable_reference = NullableObjectId(Some(ObjectId::new(5).unwrap()));
+        pool.add(Object::InputString(input.clone()));
+        assert_eq!(string_value_max_bytes(&variable, &pool), Some(255));
+        // The Input String has no value of its own
+        assert_eq!(
+            string_value_max_bytes(&Object::InputString(input), &pool),
+            None
+        );
     }
 }
 
