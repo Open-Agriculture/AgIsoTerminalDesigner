@@ -2728,7 +2728,8 @@ fn render_language_pairs(
         apply_list_action(&mut changed, action);
         updated = Some(changed);
     }
-    let pending_id = ui.make_persistent_id(("pending_language_pair", id.value()));
+    // Outside the revision scope, so another edit keeps a half-picked pair
+    let pending_id = egui::Id::new(("pending_language_pair", design.ui_session_id(), id.value()));
     let (mut language, mut country) = ui
         .data(|data| data.get_temp::<(Option<String>, Option<String>)>(pending_id))
         .unwrap_or_default();
@@ -2970,7 +2971,8 @@ fn render_palette_colours(
 
     let as_json = |colours: &[Colour]| serde_json::to_value(colours).unwrap();
     let rgb = |colour: &Colour| egui::Color32::from_rgb(colour.r, colour.g, colour.b);
-    let selected_id = ui.make_persistent_id((id.value(), "palette_selected"));
+    // Outside the revision scope, so the picker stays open after each change
+    let selected_id = egui::Id::new(("palette_selected", design.ui_session_id(), id.value()));
     let mut selected = ui
         .data(|data| data.get_temp::<usize>(selected_id))
         .filter(|index| *index < colours.len());
