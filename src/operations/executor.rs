@@ -399,7 +399,7 @@ impl OperationExecutor {
                 related_objects: vec![],
             }));
         }
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         let mut candidate_pool = pool.clone();
         let mut candidate_info = object_info.clone();
         let mut placements = PlacementProvenance::new(pool);
