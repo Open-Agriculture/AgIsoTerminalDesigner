@@ -2,6 +2,7 @@
 name = "ag-iso-terminal-designer"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.95"
 default-run = "ag-iso-terminal-designer"
 authors = ["Daan Steenbergen <d.steenbergen@student.tue.nl>"]
 
@@ -17,7 +18,7 @@ egui = "0.32"
 egui_dock = { version = "0.17", features = ["serde"] }
 eframe = { version = "0.32", features = ["persistence"] }
 ag-iso-stack = { git = "https://github.com/Open-Agriculture/AgIsoStack-rs", rev = "c59744087cc3b0ae01c8fe476dcf444182cd5182" }
-rfd = "0.13"
+rfd = "0.18"
 image = "0.25.1"
 png = "0.18"
 log = "0.4.27"
@@ -25,8 +26,8 @@ uuid = { version = "1.17.0", features = ["v4", "v7", "js", "serde"] }
 getrandom = { version = "0.2", features = ["js"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-base64 = "0.22"
-zip = { version = "2", default-features = false }
+base64 = "0.23"
+zip = { version = "9", default-features = false }
 # std::time panics in the browser; this is std::time on native
 web-time = "1.1"
 
