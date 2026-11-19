@@ -62,6 +62,13 @@ pub struct ObjectSnapshot {
     pub macro_references: Vec<MacroReferenceSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parents: Vec<ObjectSummary>,
+    /// For an Object Pointer: the objects it may show, in authored order.
+    /// Empty means the pointer is unrestricted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_targets: Vec<ObjectSummary>,
+    /// Object Pointers that list this object as an allowed target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_by: Vec<ObjectSummary>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectReferenceSnapshot {
@@ -255,6 +262,19 @@ pub(crate) fn object_snapshot_sections(
     .collect();
     parents.sort_by_key(|p| p.id);
     parents.dedup_by_key(|p| p.id);
+    let allowed_targets = info
+        .get(&id)
+        .map(|meta| meta.allowed_references.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|target| summary(pool, info, *target))
+        .collect();
+    let mut allowed_by: Vec<_> = info
+        .iter()
+        .filter(|(pointer, meta)| **pointer != id && meta.allowed_references.contains(&id))
+        .filter_map(|(pointer, _)| summary(pool, info, *pointer))
+        .collect();
+    allowed_by.sort_by_key(|p| p.id);
     Some(ObjectSnapshot {
         id: s.id,
         name: s.name,
@@ -265,6 +285,8 @@ pub(crate) fn object_snapshot_sections(
         object_list,
         macro_references,
         parents,
+        allowed_targets,
+        allowed_by,
     })
 }
 fn sanitize_binary(name: PropertyKey, value: Value) -> Value {

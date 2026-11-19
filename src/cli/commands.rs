@@ -219,9 +219,22 @@ pub enum ObjectCommand {
         /// Read all matching pages.
         #[arg(long)]
         all: bool,
+        /// Only objects nothing points to: no parent, attribute, variable or
+        /// pointer reference, event macro or macro command. Top-level types
+        /// (Working Set, Window Mask, Key Group, auxiliary objects, ...) are
+        /// skipped. Objects only the ECU uses at runtime (a mask it activates,
+        /// a value it writes into an Object Pointer) still appear.
+        #[arg(long)]
+        unused: bool,
+        /// Comma-separated columns, in order: id, name, type, c_ident (the
+        /// identifier the C header export uses).
+        #[arg(long, value_delimiter = ',', value_name = "COLUMNS")]
+        columns: Option<Vec<String>>,
     },
+    /// Inspect an object by name, or by numeric object ID when no object has
+    /// that name (this also reaches component instance objects).
     Get {
-        #[arg(value_name = "NAME", allow_hyphen_values = true)]
+        #[arg(value_name = "NAME|ID", allow_hyphen_values = true)]
         id: String,
         #[arg(long)]
         parents: bool,
@@ -290,6 +303,14 @@ pub enum ObjectCommand {
     Delete {
         #[arg(value_name = "NAME", allow_hyphen_values = true)]
         id: String,
+        /// Keep a deleted PictureGraphic's image as an available graphic
+        /// instead of removing it.
+        #[arg(long)]
+        keep_image: bool,
+        /// Remove the object from every parent that places it, then delete
+        /// it. Other references (fonts, variables, pointers) still block.
+        #[arg(long)]
+        unplace: bool,
     },
     Order {
         #[arg(value_name = "NAMES", allow_hyphen_values = true)]
@@ -484,11 +505,18 @@ pub enum ComponentCommand {
         #[arg(value_name = "PARAMETER_NAME", allow_hyphen_values = true)]
         parameter_id: String,
     },
+    /// Turn an object and its descendants into a new component with one
+    /// instance in their place. The output names the created instance.
     Capture {
-        #[arg(value_name = "NAME", allow_hyphen_values = true)]
+        #[arg(value_name = "OBJECT_NAME", allow_hyphen_values = true)]
         root: String,
-        #[arg(allow_hyphen_values = true)]
+        #[arg(value_name = "COMPONENT_NAME", allow_hyphen_values = true)]
         name: String,
+        /// Keep objects the subtree uses but does not place (fonts, line/fill
+        /// attributes, pictures, variables, macros) as references to the
+        /// existing objects instead of copying them into every instance.
+        #[arg(long)]
+        keep_shared_references: bool,
     },
     ParameterAdd {
         #[arg(value_name = "COMPONENT_NAME", allow_hyphen_values = true)]
@@ -706,6 +734,14 @@ pub enum ComponentCommand {
         )]
         compiled_ids: Vec<String>,
     },
+    /// Rename a component instance. Header names of its objects follow
+    /// (`<instance>_<node>`).
+    InstanceRename {
+        #[arg(value_name = "INSTANCE_NAME", allow_hyphen_values = true)]
+        instance_id: String,
+        #[arg(value_name = "NEW_NAME", allow_hyphen_values = true)]
+        name: String,
+    },
     InstanceMetadata {
         #[arg(value_name = "INSTANCE_NAME", allow_hyphen_values = true)]
         instance_id: String,
@@ -835,6 +871,22 @@ pub enum PlacementCommand {
         parent: String,
         #[arg(allow_hyphen_values = true)]
         children: Vec<String>,
+    },
+    /// Move children of PARENT by DX, DY. Name the children (objects or
+    /// component instances; every placement of a named object moves), or use
+    /// --all for every placement and component instance under PARENT.
+    Shift {
+        #[arg(value_name = "OBJECT_NAME", allow_hyphen_values = true)]
+        parent: String,
+        #[arg(allow_negative_numbers = true)]
+        dx: i32,
+        #[arg(allow_negative_numbers = true)]
+        dy: i32,
+        /// Put `--` before a name that starts with a hyphen.
+        #[arg(value_name = "CHILD_NAME")]
+        children: Vec<String>,
+        #[arg(long, conflicts_with = "children")]
+        all: bool,
     },
 }
 #[derive(Debug, Subcommand, Clone, serde::Serialize, serde::Deserialize)]
@@ -1392,6 +1444,8 @@ pub fn typed_target(value: &str) -> ObjectTarget {
 fn typed_parameter_target(value: &str) -> Result<ComponentParameterTarget, Value> {
     if value == "graphic" {
         Ok(ComponentParameterTarget::Graphic)
+    } else if value == "position" {
+        Ok(ComponentParameterTarget::Position)
     } else {
         typed_property(value).map(ComponentParameterTarget::Property)
     }
@@ -1516,6 +1570,9 @@ fn parse_parameter_default(
                 typed_target(raw)
             };
             serde_json::to_value(target).map_err(|e| error("INVALID_USAGE", e.to_string()))
+        }
+        K::Position => {
+            crate::cli::editing::parse_position(raw).map_err(|m| error("INVALID_USAGE", m))
         }
         _ => parse_typed_json(raw, "parameter default"),
     }
@@ -1801,9 +1858,15 @@ fn command_edit_actions_now(
                     new_id,
                 })
             }
-            ObjectCommand::Delete { id } => one(EditActionKind::Relationship {
+            ObjectCommand::Delete {
+                id,
+                keep_image,
+                unplace,
+            } => one(EditActionKind::Relationship {
                 object: Some(typed_target(id)),
                 operation: Operation::DeleteObject { object_id: 0 },
+                keep_image: *keep_image,
+                unplace: *unplace,
             }),
             ObjectCommand::Duplicate { id, name } => one(EditActionKind::ObjectDuplicate {
                 object: typed_target(id),
@@ -1984,6 +2047,29 @@ fn command_edit_actions_now(
                     occurrence: *occurrence,
                 },
             }),
+            PlacementCommand::Shift {
+                parent,
+                dx,
+                dy,
+                children,
+                all,
+            } => {
+                if !*all && children.is_empty() {
+                    return Err(error(
+                        "INVALID_USAGE",
+                        "placement shift needs child names or --all",
+                    ));
+                }
+                one(EditActionKind::RelationshipEdit {
+                    edit: RelationshipEdit::PlacementShift {
+                        parent: typed_target(parent),
+                        dx: *dx,
+                        dy: *dy,
+                        children: children.clone(),
+                        all: *all,
+                    },
+                })
+            }
             PlacementCommand::Remove {
                 parent,
                 child,
@@ -2271,14 +2357,18 @@ fn command_edit_actions_now(
                 component_id: component_target(project, component_id)?,
                 parameter_id: parameter_target(project, component_id, parameter_id)?,
             }),
-            ComponentCommand::Capture { root, name } => one(EditActionKind::ComponentCapture {
+            ComponentCommand::Capture {
+                root,
+                name,
+                keep_shared_references,
+            } => one(EditActionKind::ComponentCapture {
                 root: crate::cli::names::object_id(
                     project.unwrap(),
                     root.strip_prefix("name:").unwrap_or(root),
                 )
                 .map_err(|message| error("INVALID_USAGE", message))?,
                 name: name.clone(),
-                keep_external_references: false,
+                keep_external_references: *keep_shared_references,
             }),
             ComponentCommand::ParameterAdd {
                 component_id,
@@ -2628,6 +2718,12 @@ fn command_edit_actions_now(
                     },
                 )
             }
+            ComponentCommand::InstanceRename { instance_id, name } => author_component(
+                crate::cli::component_authoring::ComponentAuthoringAction::InstanceRename {
+                    instance_id: instance_target(project, instance_id)?,
+                    name: name.clone(),
+                },
+            ),
             ComponentCommand::InstanceMetadata {
                 instance_id,
                 child_index,
@@ -2689,17 +2785,41 @@ fn command_edit_actions_now(
                             format!("Unknown component instance '{instance_id}'"),
                         )
                     })?;
-                let parsed: Value = parse_typed_json(value, "component override")?;
-                let component_name = project_ref.component_source().definitions
-                    [&instance.component_id]
-                    .name
-                    .clone();
-                let resolved = resolve_named_parameter_value(
-                    Some(project_ref),
-                    &component_name,
-                    resolved_parameter,
-                    parsed,
-                )?;
+                let definition =
+                    &project_ref.component_source().definitions[&instance.component_id];
+                let kind = definition
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.id == resolved_parameter)
+                    .map(|parameter| parameter.kind);
+                let resolved = match kind {
+                    // Object and graphic values are names, as in parameter-add;
+                    // a JSON-quoted name is still accepted.
+                    Some(
+                        kind @ (crate::components::ComponentParameterKind::ObjectReference
+                        | crate::components::ComponentParameterKind::Graphic),
+                    ) => {
+                        let text = if value.trim_start().starts_with('"') {
+                            parse_typed_json::<String>(value, "component override")?
+                        } else {
+                            value.clone()
+                        };
+                        parse_parameter_default(Some(project_ref), kind, &text)?
+                    }
+                    Some(crate::components::ComponentParameterKind::Position) => {
+                        crate::cli::editing::parse_position(value)
+                            .map_err(|message| error("INVALID_USAGE", message))?
+                    }
+                    _ => {
+                        let parsed: Value = parse_typed_json(value, "component override")?;
+                        resolve_named_parameter_value(
+                            Some(project_ref),
+                            &definition.name.clone(),
+                            resolved_parameter,
+                            parsed,
+                        )?
+                    }
+                };
                 author_component(
                     crate::cli::component_authoring::ComponentAuthoringAction::OverrideSet {
                         instance_id: instance.id,

@@ -162,7 +162,11 @@ pub struct EditorProject {
     >,
     /// A hierarchy context-menu delete, consumed by the app after draft edits
     /// from the same frame have been committed.
-    delete_request: RefCell<Option<ObjectId>>,
+    /// `true` also removes the object from every parent that places it.
+    delete_request: RefCell<Option<(ObjectId, bool)>>,
+    /// While set, a deleted PictureGraphic's image is kept as an available
+    /// graphic instead of disappearing with it. Undo restores it either way.
+    keep_deleted_graphics: Cell<bool>,
     /// A hierarchy inline rename, consumed after same-frame draft edits.
     rename_request: RefCell<Option<(ObjectId, String)>>,
     /// Operations queued by UI widgets that only hold a shared project reference.
@@ -228,6 +232,7 @@ impl From<ObjectPool> for EditorProject {
             graphic_options_request: RefCell::new(None),
             graphic_format_request: RefCell::new(None),
             delete_request: RefCell::new(None),
+            keep_deleted_graphics: Cell::new(false),
             rename_request: RefCell::new(None),
             queued_operations: RefCell::new(Vec::new()),
             last_operation_error: RefCell::new(None),
@@ -820,7 +825,12 @@ impl EditorProject {
             self.soft_key_size,
             self.vt_version,
         )
-        .map_err(containment_component_error)?;
+        .map_err(|error| {
+            let message = error.describe(|id| candidate_project.containment_label(&candidate, id));
+            let mut diagnostic = ComponentError::new(error.code(), message);
+            diagnostic.object_id = Some(error.child_id);
+            diagnostic
+        })?;
         after
             .info
             .retain(|id, _| after.pool.object_by_id(*id).is_some());
@@ -1741,14 +1751,81 @@ impl EditorProject {
         Ok(new_id)
     }
 
-    /// Delete an object through a reversible operation.
+    /// Delete an object through a reversible operation. A PictureGraphic's
+    /// image goes with it; see [`Self::delete_object_keeping_image`].
     pub fn delete_object(&mut self, object_id: ObjectId) -> bool {
+        self.delete_object_with(object_id, false)
+    }
+
+    /// Remove the object from every parent that places it and delete it, as
+    /// one undo step. Other uses still block the delete.
+    pub fn delete_object_and_placements(&mut self, object_id: ObjectId) -> bool {
+        self.delete_object_with(object_id, true)
+    }
+
+    /// Delete a PictureGraphic but keep its image as an available graphic.
+    pub fn delete_object_keeping_image(&mut self, object_id: ObjectId) -> bool {
+        self.with_deleted_graphics_kept(|project| project.delete_object(object_id))
+    }
+
+    /// Run `edit` with deleted PictureGraphic images kept as available graphics.
+    pub(crate) fn with_deleted_graphics_kept<R>(&mut self, edit: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = self.keep_deleted_graphics.replace(true);
+        let result = edit(self);
+        self.keep_deleted_graphics.set(previous);
+        result
+    }
+
+    fn delete_object_with(&mut self, object_id: ObjectId, unplace: bool) -> bool {
+        let blockers = self.delete_blockers(object_id, unplace);
+        if !blockers.is_empty() {
+            let name = self
+                .pool
+                .object_by_id(object_id)
+                .map(|object| self.get_object_info(object).get_name(object))
+                .unwrap_or_else(|| object_id.value().to_string());
+            self.last_operation_error.replace(Some(format!(
+                "Cannot delete {name}: it is {}.",
+                blockers.join("; ")
+            )));
+            return false;
+        }
+        // One SetChildren per parent: its inverse restores the full list, so
+        // undo keeps the original stacking order.
+        let mut operations: Vec<_> = Vec::new();
+        if unplace {
+            let mut parents = self.placing_parents(object_id);
+            parents.dedup();
+            for parent_id in parents {
+                let Some(parent) = ObjectId::new(parent_id)
+                    .ok()
+                    .and_then(|id| self.pool.object_by_id(id))
+                else {
+                    continue;
+                };
+                let children = crate::operations::object_refs(parent)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|placement| placement.id != object_id)
+                    .map(|placement| crate::operations::ChildPlacement {
+                        child: ObjectTarget::id(placement.id.value()),
+                        x: placement.offset.x,
+                        y: placement.offset.y,
+                    })
+                    .collect();
+                operations.push(Operation::SetChildren {
+                    parent: ObjectTarget::id(parent_id),
+                    children,
+                });
+            }
+        }
+        operations.push(Operation::DeleteObject {
+            object_id: object_id.value(),
+        });
         let deleted = self.execute_ui_transaction(OperationTransaction {
             schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
             description: Some(format!("Delete object {}", object_id.value())),
-            operations: vec![Operation::DeleteObject {
-                object_id: object_id.value(),
-            }],
+            operations,
         });
         if deleted && self.get_selected().0 == Some(object_id) {
             self.pending_selected_object.set(NullableObjectId::NULL);
@@ -1756,9 +1833,127 @@ impl EditorProject {
         deleted
     }
 
+    /// One parent ID per placement of `object_id`, repeated placements included.
+    pub fn placing_parents(&self, object_id: ObjectId) -> Vec<u16> {
+        self.pool
+            .objects()
+            .iter()
+            .flat_map(|parent| {
+                let count = crate::operations::object_refs(parent)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|placement| placement.id == object_id)
+                    .count();
+                std::iter::repeat_n(parent.id().value(), count)
+            })
+            .collect()
+    }
+
+    /// Why `object_id` cannot be deleted: every use that the delete operation
+    /// rejects, described with names (for example `placed in Main (2×)`
+    /// or `an allowed target of pointer Selector`). Empty when it can
+    /// be deleted. With `ignore_placements`, placements are not listed.
+    pub fn delete_blockers(&self, object_id: ObjectId, ignore_placements: bool) -> Vec<String> {
+        use crate::object_properties::{get_object_property, get_property_descriptors};
+        let name = |object: &Object| self.get_object_info(object).get_name(object);
+        let mut uses = Vec::new();
+        for referrer in crate::pool_validation::get_referencing_objects(&self.pool, object_id) {
+            let Some(object) = self.pool.object_by_id(referrer) else {
+                continue;
+            };
+            let before = uses.len();
+            let placements = crate::operations::object_refs(object)
+                .unwrap_or_default()
+                .iter()
+                .filter(|placement| placement.id == object_id)
+                .count();
+            if placements > 0 && !ignore_placements {
+                uses.push(match placements {
+                    1 => format!("placed in {}", name(object)),
+                    n => format!("placed in {} ({n}×)", name(object)),
+                });
+            }
+            for descriptor in get_property_descriptors(object.object_type()) {
+                if matches!(
+                    descriptor.semantic,
+                    crate::PropertySemantic::ObjectReference { .. }
+                ) && get_object_property(object, descriptor.name)
+                    .ok()
+                    .and_then(|value| value.as_u64())
+                    == Some(u64::from(object_id.value()))
+                {
+                    uses.push(format!("the {} of {}", descriptor.name, name(object)));
+                }
+            }
+            let listed = crate::operations::object_list(object).is_some_and(|list| match list {
+                crate::operations::ObjectReferenceList::Required(ids) => ids.contains(&object_id),
+                crate::operations::ObjectReferenceList::Nullable(ids) => {
+                    ids.iter().any(|id| id.0 == Some(object_id))
+                }
+            });
+            if listed {
+                uses.push(format!("listed in {}", name(object)));
+            }
+            if crate::operations::macro_refs(object)
+                .is_some_and(|refs| refs.iter().any(|r| r.macro_id == object_id.value()))
+            {
+                uses.push(format!("an event macro of {}", name(object)));
+            }
+            if uses.len() == before && !(placements > 0 && ignore_placements) {
+                uses.push(format!("used by {}", name(object)));
+            }
+        }
+        // Uses through component instances: objects they generate that refer
+        // to this one (shared references), and instances placed in it.
+        if let Ok(materialized) = self.materialize_shared() {
+            let generated = crate::components::component_object_names(
+                &self.components,
+                &materialized.source_map,
+            );
+            for referrer in
+                crate::pool_validation::get_referencing_objects(&materialized.pool, object_id)
+            {
+                if let Some(name) = generated.get(&referrer.value()) {
+                    uses.push(format!("used by component object {name}"));
+                }
+            }
+        }
+        for instance in &self.components.instances {
+            // `ignore_placements` covers ordinary placements only; an
+            // instance must be moved or deleted first.
+            if instance.parent == crate::components::EditorParentRef::Primitive(object_id.value()) {
+                uses.push(format!(
+                    "the parent of component instance {}",
+                    instance.name
+                ));
+            }
+        }
+        let mut pointers: Vec<_> = self
+            .object_info
+            .borrow()
+            .iter()
+            .filter(|(pointer, info)| {
+                **pointer != object_id && info.allowed_references.contains(&object_id)
+            })
+            .map(|(pointer, _)| *pointer)
+            .collect();
+        pointers.sort_by_key(|id| id.value());
+        for pointer in pointers {
+            if let Some(object) = self.pool.object_by_id(pointer) {
+                uses.push(format!("an allowed target of pointer {}", name(object)));
+            }
+        }
+        uses
+    }
+
     /// Request deletion from UI code that only has a shared project reference.
     pub fn request_delete_object(&self, object_id: ObjectId) {
-        self.delete_request.replace(Some(object_id));
+        self.delete_request.replace(Some((object_id, false)));
+    }
+
+    /// Like [`Self::request_delete_object`], also removing its placements.
+    pub fn request_delete_object_and_placements(&self, object_id: ObjectId) {
+        self.delete_request.replace(Some((object_id, true)));
     }
 
     /// Defer inspector assignment until same-frame property edits are committed.
@@ -1792,8 +1987,8 @@ impl EditorProject {
         self.graphic_assign_request.take()
     }
 
-    /// Consume a pending hierarchy delete request.
-    pub fn take_delete_request(&self) -> Option<ObjectId> {
+    /// Consume a pending hierarchy delete request; `true` removes placements.
+    pub fn take_delete_request(&self) -> Option<(ObjectId, bool)> {
         self.delete_request.replace(None)
     }
 
@@ -2315,11 +2510,17 @@ impl EditorProject {
             ..
         } = prepared;
 
-        // A deleted graphic becomes an available PNG. Stage all exports before
+        // When asked to keep it (`with_deleted_graphics_kept`), a deleted
+        // graphic becomes an available PNG. Stage all exports before
         // changing the project, then use the existing full-project history for
         // the pool deletion and library insertion as a single undo step.
         let mut recovered = Vec::new();
-        for operation in &applied.inverse_operations {
+        let recoverable: &[Operation] = if self.keep_deleted_graphics.get() {
+            &applied.inverse_operations
+        } else {
+            &[]
+        };
+        for operation in recoverable {
             if let Operation::RestoreObject {
                 object: Object::PictureGraphic(picture),
                 info,
@@ -2811,17 +3012,48 @@ impl EditorProject {
         }
     }
 
+    /// Names of objects generated by component instances (`<instance>/<node>`),
+    /// by object ID. See [`crate::components::component_object_names`].
+    pub fn component_object_names(&self) -> std::collections::BTreeMap<u16, String> {
+        self.materialize_shared()
+            .map(|materialized| {
+                crate::components::component_object_names(
+                    &self.components,
+                    &materialized.source_map,
+                )
+            })
+            .unwrap_or_default()
+    }
+
     /// Capture owned, UI-free materialized content for factual inspection.
     pub fn ai_design_state(&self) -> AiDesignState {
+        let materialized = self
+            .materialize()
+            .expect("Committed source must materialize");
+        // Generated component objects get their `<instance>/<node>` name, so
+        // inspection lists, shows and finds them by name.
+        let mut object_info = self.object_info.borrow().clone();
+        for (id, name) in
+            crate::components::component_object_names(&self.components, &materialized.source_map)
+        {
+            let Some(object) = ObjectId::new(id)
+                .ok()
+                .and_then(|id| materialized.pool.object_by_id(id))
+            else {
+                continue;
+            };
+            object_info.entry(object.id()).or_insert_with(|| {
+                let mut info = ObjectInfo::new(object);
+                info.name = Some(name);
+                info
+            });
+        }
         AiDesignState {
             revision: self.revision(),
             components: self.components.clone(),
             graphics: self.graphics.clone(),
-            pool: self
-                .materialize()
-                .expect("Committed source must materialize")
-                .pool,
-            object_info: self.object_info.borrow().clone(),
+            pool: materialized.pool,
+            object_info,
             vt_version: self.vt_version,
             mask_size: self.mask_size,
             soft_key_size: self.soft_key_size,
@@ -2881,13 +3113,14 @@ impl EditorProject {
 
     /// Run normal editor services on an isolated copy and commit all authoring
     /// content and settings as one undoable edit. Errors and check-only execution
-    /// leave the live project, revision, and history unchanged. No-ops return None.
+    /// leave the live project, revision, and history unchanged, but a check still
+    /// reports the objects the edit would change. No-ops have no transaction.
     pub(crate) fn edit_batch(
         &mut self,
         description: &str,
         edit: impl FnOnce(&mut EditorProject) -> Result<(), String>,
         check: bool,
-    ) -> Result<Option<AppliedTransaction>, String> {
+    ) -> Result<BatchOutcome, String> {
         let before = self.component_checkpoint();
         let before_dimensions = self.dimensions();
         let mut candidate = self.canvas_preview_copy();
@@ -2900,12 +3133,53 @@ impl EditorProject {
             .retain(|id, _| candidate.pool.object_by_id(*id).is_some());
         let after = candidate.component_checkpoint();
         let after_dimensions = candidate.dimensions();
-        if check || (before.content_eq(&after) && before_dimensions == after_dimensions) {
-            return Ok(None);
+        if before.content_eq(&after) && before_dimensions == after_dimensions {
+            return Ok(BatchOutcome::default());
         }
         let affected_objects = self
             .changed_object_ids(&candidate)
             .map_err(|error| error.to_string())?;
+        let existing: std::collections::HashSet<_> = self
+            .pool
+            .objects()
+            .iter()
+            .map(|object| object.id())
+            .collect();
+        let allocated_objects = candidate
+            .pool
+            .objects()
+            .iter()
+            .map(|object| object.id())
+            .filter(|id| !existing.contains(id))
+            .map(|id| id.value())
+            .collect();
+        if check {
+            // Instance objects are named after the edited instance and node.
+            let mut names: std::collections::BTreeMap<u16, String> = candidate
+                .component_object_names()
+                .into_iter()
+                .filter(|(id, _)| affected_objects.contains(id))
+                .collect();
+            names.extend(
+                candidate
+                    .pool
+                    .objects()
+                    .iter()
+                    .filter(|object| affected_objects.contains(&object.id().value()))
+                    .map(|object| {
+                        (
+                            object.id().value(),
+                            candidate.get_object_info(object).get_name(object),
+                        )
+                    }),
+            );
+            return Ok(BatchOutcome {
+                applied: None,
+                changed_objects: affected_objects,
+                allocated_objects,
+                names,
+            });
+        }
         let transaction_id = uuid::Uuid::new_v4().to_string();
         self.batch_history.insert(
             transaction_id.clone(),
@@ -2927,7 +3201,12 @@ impl EditorProject {
         self.operation_history.borrow_mut().push(applied.clone());
         self.prune_checkpoint_history();
         self.restore_batch_checkpoint(after, after_dimensions);
-        Ok(Some(applied))
+        Ok(BatchOutcome {
+            changed_objects: applied.affected_objects.clone(),
+            applied: Some(applied),
+            allocated_objects,
+            names: Default::default(),
+        })
     }
 
     fn validate_batch_candidate(&self, candidate: &EditorProject) -> ComponentResult<()> {
@@ -3024,17 +3303,37 @@ impl EditorProject {
             Some((self.soft_key_size, candidate.soft_key_size)),
             candidate.vt_version,
         )
-        .map_err(containment_component_error)?;
+        .map_err(|error| {
+            let name = |id: u16| candidate.containment_label(&materialized, id);
+            let message = error.describe(name);
+            let mut diagnostic = ComponentError::new(error.code(), message);
+            diagnostic.object_id = Some(error.child_id);
+            diagnostic
+        })?;
         Ok(())
     }
-}
 
-fn containment_component_error(
-    error: crate::layout_containment::ContainmentError,
-) -> ComponentError {
-    let mut diagnostic = ComponentError::new(error.code(), error.message);
-    diagnostic.object_id = Some(error.child_id);
-    diagnostic
+    /// `'Name' (ID)` for containment messages. Objects generated by a
+    /// component instance are named `<instance>/<node>`.
+    fn containment_label(&self, materialized: &MaterializedProject, id: u16) -> String {
+        let object = ObjectId::new(id)
+            .ok()
+            .and_then(|object_id| materialized.pool.object_by_id(object_id));
+        let named = object.and_then(|object| {
+            self.object_info
+                .borrow()
+                .get(&object.id())
+                .map(|info| info.get_name(object))
+        });
+        let name = named.or_else(|| {
+            crate::components::component_object_names(&self.components, &materialized.source_map)
+                .remove(&id)
+        });
+        match name {
+            Some(name) => format!("'{name}' ({id})"),
+            None => id.to_string(),
+        }
+    }
 }
 
 pub(crate) fn new_or_worsened_project_errors(
@@ -3091,4 +3390,18 @@ pub(crate) fn component_transaction_error(error: ComponentError) -> TransactionD
             .filter(|name| crate::PropertyKey::parse(name).is_none()),
         related_objects: error.object_id.into_iter().collect(),
     }])
+}
+
+/// What [`EditorProject::edit_batch`] did, or would do for a check.
+#[derive(Debug, Default)]
+pub(crate) struct BatchOutcome {
+    /// The committed transaction; `None` for a check or a no-op.
+    pub applied: Option<AppliedTransaction>,
+    /// Sorted IDs whose materialized values, metadata, or component source change.
+    pub changed_objects: Vec<u16>,
+    /// IDs that exist only after the edit.
+    pub allocated_objects: Vec<u16>,
+    /// For a check, the names changed objects would have afterwards, since
+    /// the live project still has the old names (or none, for new objects).
+    pub names: std::collections::BTreeMap<u16, String>,
 }

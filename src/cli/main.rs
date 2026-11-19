@@ -27,7 +27,17 @@ mod native {
         machine: bool,
     }
     impl Client {
-        fn request(&self, action: AutomationAction, mut args: Value) -> Result<Value, Value> {
+        fn request(&self, action: AutomationAction, args: Value) -> Result<Value, Value> {
+            self.request_as(action, args, !self.machine)
+        }
+        /// `readable` swaps protocol IDs for names; skip it when the caller
+        /// asked for ID columns explicitly.
+        fn request_as(
+            &self,
+            action: AutomationAction,
+            mut args: Value,
+            readable: bool,
+        ) -> Result<Value, Value> {
             let session = self.session.borrow();
             let project = session
                 .project()
@@ -42,7 +52,7 @@ mod native {
             };
             if let Some(field) = object_field {
                 if let Some(name) = args[field].as_str() {
-                    args[field] = json!(names::object_id(
+                    args[field] = json!(names::readable_object_id(
                         project,
                         name.strip_prefix("name:").unwrap_or(name)
                     )
@@ -101,10 +111,10 @@ mod native {
             let result =
                 ag_iso_terminal_designer::cli::automation_service::execute(project, action, args)
                     .map_err(|e| error(e.code, e.message))?;
-            let result = if self.machine {
-                result
-            } else {
+            let result = if readable {
                 readable_result(project, result, Default::default())
+            } else {
+                result
             };
             Ok(json!({"success":true,"result":result}))
         }
@@ -180,6 +190,19 @@ mod native {
                 project.get_object_info(object).get_name(object),
             );
         }
+        // Capture reuses the captured objects' IDs; their current generated
+        // names replace the pre-edit ones.
+        for (id, name) in project.component_object_names() {
+            identities.insert(id.to_string(), name);
+        }
+        // A check reports the names its edit would produce; prefer those.
+        if let Some(Value::Object(names)) = value.as_object_mut().and_then(|v| v.remove("names")) {
+            for (id, name) in names {
+                if let Value::String(name) = name {
+                    identities.insert(id, name);
+                }
+            }
+        }
         for definition in project.component_source().definitions.values() {
             identities.insert(definition.id.to_string(), definition.name.clone());
             for node in &definition.nodes {
@@ -227,6 +250,16 @@ mod native {
                     }
                     if fields.get("macro_name").is_some_and(|name| !name.is_null()) {
                         fields.remove("macro_id");
+                    }
+                    // Pointer target lists read as plain names.
+                    for key in ["allowed_targets", "allowed_by"] {
+                        if let Some(Value::Array(items)) = fields.get_mut(key) {
+                            for item in items.iter_mut() {
+                                if let Some(name) = item.get("name").cloned() {
+                                    *item = name;
+                                }
+                            }
+                        }
                     }
                     for (key, item) in fields.iter_mut() {
                         // Property values and schema defaults are literal data.
@@ -293,7 +326,7 @@ mod native {
         match &cli.command {
             Command::Capabilities => {
                 return Ok(json!({"success":true,"result":{
-                    "cli_api_version":5,"json_input":false,"atomic_command_files":true,"max_edit_actions":MAX_EDIT_ACTIONS,
+                    "cli_api_version":6,"json_input":false,"atomic_command_files":true,"max_edit_actions":MAX_EDIT_ACTIONS,
                     "commands":Cli::command().get_subcommands().map(|c|json!({"name":c.get_name(),"description":c.get_about().map(ToString::to_string),"subcommands":c.get_subcommands().map(|s|s.get_name()).collect::<Vec<_>>()})).collect::<Vec<_>>()
                 }}))
             }
@@ -396,13 +429,14 @@ mod native {
                 else {client.request(A::GetObjectSchema,json!({"object_types":object_types,"properties":properties}))}
             }
             Command::Object {command} => match command {
-                ObjectCommand::List {query,object_type,parent,offset,limit,all} => {
-                    let mut args=json!({"query":query,"type":object_type,"parent_id":parent,"offset":offset,"limit":limit});
-                    let mut response=client.request(A::ListObjects,args.clone())?;
+                ObjectCommand::List {query,object_type,parent,offset,limit,all,unused,columns} => {
+                    let readable=!client.machine && columns.is_none();
+                    let mut args=json!({"query":query,"type":object_type,"parent_id":parent,"offset":offset,"limit":limit,"unused":unused,"columns":columns});
+                    let mut response=client.request_as(A::ListObjects,args.clone(),readable)?;
                     let mut objects=response["result"]["objects"].as_array().ok_or_else(||error("AUTOMATION_FAILED","Object list missing"))?.clone();
                     while all && response["result"]["has_more"].as_bool()==Some(true) {
                         args["offset"]=json!(offset+objects.len());
-                        response=client.request(A::ListObjects,args.clone())?;
+                        response=client.request_as(A::ListObjects,args.clone(),readable)?;
                         let page=response["result"]["objects"].as_array().ok_or_else(||error("AUTOMATION_FAILED","Object list missing"))?;
                         if page.is_empty() { return Err(error("AUTOMATION_FAILED","Object pagination did not advance")); }
                         objects.extend(page.iter().cloned());
@@ -737,19 +771,33 @@ mod native {
         } else if let Some(result) = value.get("result") {
             let mut lines = Vec::new();
             if let Some(fields) = result.as_object() {
+                // An explicit `columns` list orders table cells; JSON maps
+                // are otherwise sorted alphabetically.
+                let ordered: Option<Vec<String>> = fields
+                    .get("columns")
+                    .and_then(|columns| serde_json::from_value(columns.clone()).ok());
                 for (key, value) in fields {
+                    if key == "columns" && ordered.is_some() {
+                        continue;
+                    }
                     if let Some(rows) = value
                         .as_array()
                         .filter(|rows| !rows.is_empty() && rows[0].is_object())
                     {
                         lines.push(format!("{key}:"));
-                        let columns: Vec<_> = rows
+                        let present: std::collections::BTreeSet<String> = rows
                             .iter()
                             .filter_map(Value::as_object)
-                            .flat_map(|row| row.keys())
-                            .collect::<std::collections::BTreeSet<_>>()
-                            .into_iter()
+                            .flat_map(|row| row.keys().cloned())
                             .collect();
+                        let columns: Vec<String> = match &ordered {
+                            Some(order) => order
+                                .iter()
+                                .filter(|c| present.contains(*c))
+                                .cloned()
+                                .collect(),
+                            None => present.into_iter().collect(),
+                        };
                         lines.push(format!(
                             "  {}",
                             columns
@@ -763,7 +811,7 @@ mod native {
                                 "  {}",
                                 columns
                                     .iter()
-                                    .map(|c| display_cell(&row[*c]))
+                                    .map(|c| display_cell(&row[c.as_str()]))
                                     .collect::<Vec<_>>()
                                     .join("  ")
                             ));

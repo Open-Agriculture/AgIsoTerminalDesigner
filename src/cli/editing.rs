@@ -49,19 +49,29 @@ pub fn execute_batch(
         });
     }
 
-    let before: std::collections::HashSet<_> = project
-        .get_pool()
-        .objects()
+    let mut report = BatchReport::default();
+    let existing_instances: std::collections::HashSet<_> = project
+        .component_source()
+        .instances
         .iter()
-        .map(|object| object.id().value())
+        .map(|instance| instance.id)
         .collect();
-    let applied = project
+    let outcome = project
         .edit_batch(
             "CLI edit",
             |scratch| {
                 for action in args.actions {
-                    apply(scratch, action)?;
+                    apply(scratch, action, &mut report)?;
                 }
+                // Capture, instantiate and duplicate generate instance names;
+                // report them so the next command can address the instance.
+                report.created_instances = scratch
+                    .component_source()
+                    .instances
+                    .iter()
+                    .filter(|instance| !existing_instances.contains(&instance.id))
+                    .map(|instance| instance.name.clone())
+                    .collect();
                 Ok(())
             },
             args.check,
@@ -70,20 +80,37 @@ pub fn execute_batch(
             code: "VALIDATION_FAILED",
             message,
         })?;
-    let allocated: Vec<_> = project
-        .get_pool()
-        .objects()
-        .iter()
-        .map(|object| object.id().value())
-        .filter(|id| !before.contains(id))
-        .collect();
 
-    Ok(json!({
-        "transaction_id": applied.as_ref().map(|transaction| &transaction.transaction_id),
-        "changed_ids": applied.as_ref().map(|transaction| transaction.affected_objects.as_slice()).unwrap_or_default(),
-        "allocated_ids": allocated,
+    let mut result = json!({
+        "transaction_id": outcome.applied.as_ref().map(|transaction| &transaction.transaction_id),
+        "changed_ids": outcome.changed_objects,
+        "allocated_ids": outcome.allocated_objects,
         "check": args.check,
-    }))
+    });
+    if args.check {
+        result["names"] = json!(outcome.names);
+    }
+    if !report.created_instances.is_empty() {
+        result["created_instances"] = json!(report.created_instances);
+    }
+    if !report.removed_assets.is_empty() {
+        result["removed_assets"] = json!(report.removed_assets);
+    }
+    if !report.recovered_assets.is_empty() {
+        result["recovered_assets"] = json!(report.recovered_assets);
+    }
+    Ok(result)
+}
+
+/// Side effects of a batch that are not object changes.
+#[derive(Default)]
+pub(crate) struct BatchReport {
+    /// Images of deleted PictureGraphics that were discarded with them.
+    removed_assets: Vec<String>,
+    /// Images of deleted PictureGraphics kept as available graphics.
+    recovered_assets: Vec<String>,
+    /// Names of component instances the batch created, in creation order.
+    created_instances: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +149,12 @@ pub enum EditActionKind {
         #[serde(default)]
         object: Option<ObjectTarget>,
         operation: Operation,
+        /// Keep a deleted PictureGraphic's image as an available graphic.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep_image: bool,
+        /// Remove the deleted object's placements in its parents first.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unplace: bool,
     },
     RelationshipEdit {
         edit: RelationshipEdit,
@@ -411,6 +444,17 @@ pub enum RelationshipEdit {
         child: ObjectTarget,
         occurrence: Option<usize>,
     },
+    /// Move named children (objects or component instances) of `parent`, or
+    /// all of them, by a relative offset.
+    PlacementShift {
+        parent: ObjectTarget,
+        dx: i32,
+        dy: i32,
+        #[serde(default)]
+        children: Vec<String>,
+        #[serde(default)]
+        all: bool,
+    },
     PlacementOrder {
         parent: ObjectTarget,
         children: Vec<ObjectTarget>,
@@ -460,7 +504,7 @@ pub(crate) mod base64_bytes {
 use crate::graphics::integration::GraphicService;
 use crate::{
     components::{
-        plan_component_capture, ComponentDefinition, ComponentId, ComponentInstanceId,
+        plan_component_capture_with, ComponentDefinition, ComponentId, ComponentInstanceId,
         ComponentIntent, ComponentNodeId, ComponentParameter, ComponentParameterId,
         ComponentParameterKind, ComponentParameterTarget, ComponentService,
     },
@@ -478,7 +522,11 @@ use ag_iso_stack::object_pool::{
     object::Object, object_attributes::ObjectLabel, NullableObjectId, ObjectId,
 };
 // Dispatch commands through the same services used by the editor.
-fn apply_kind(project: &mut EditorProject, action: EditActionKind) -> Result<(), String> {
+fn apply_kind(
+    project: &mut EditorProject,
+    action: EditActionKind,
+    report: &mut BatchReport,
+) -> Result<(), String> {
     use EditActionKind as A;
     match action {
         A::DeferredCommand {
@@ -490,7 +538,7 @@ fn apply_kind(project: &mut EditorProject, action: EditActionKind) -> Result<(),
                 crate::cli::commands::apply_deferred_command(project, command, base, assets)
                     .map_err(|error| error.to_string())?;
             for action in actions {
-                apply_kind(project, action.kind)?;
+                apply_kind(project, action.kind, report)?;
             }
             Ok(())
         }
@@ -677,7 +725,12 @@ fn apply_kind(project: &mut EditorProject, action: EditActionKind) -> Result<(),
             bytes,
         } => object_bytes_set(project, object, property, bytes),
         A::RelationshipEdit { edit } => relationship_edit(project, edit),
-        A::Relationship { object, operation } => apply_relationship(project, object, operation),
+        A::Relationship {
+            object,
+            operation,
+            keep_image,
+            unplace,
+        } => apply_relationship(project, object, operation, keep_image, unplace, report),
         A::IdRangeSet {
             object_type,
             start,
@@ -831,10 +884,15 @@ fn component_node_reference(
     {
         return Err(format!("'{property}' is not a writable reference"));
     }
+    // `node:NAME` and `object:NAME` select one namespace; a bare name prefers
+    // a node of this component and falls back to a pool object.
     let reference = if target == "null" {
         ComponentReference::Null
+    } else if let Some(object_name) = target.strip_prefix("object:") {
+        ComponentReference::ExternalObject(object_target(project, object_name)?)
     } else {
-        let node_name = target.strip_prefix("node:").unwrap_or(target);
+        let explicit_node = target.strip_prefix("node:");
+        let node_name = explicit_node.unwrap_or(target);
         let matches: Vec<_> = definition
             .nodes
             .iter()
@@ -843,6 +901,9 @@ fn component_node_reference(
             .collect();
         match matches.as_slice() {
             [id] => ComponentReference::Internal(*id),
+            [] if explicit_node.is_some() => {
+                return Err(format!("No component node named '{node_name}'"))
+            }
             [] => ComponentReference::ExternalObject(object_target(project, target)?),
             _ => return Err(format!("Ambiguous component node name '{node_name}'")),
         }
@@ -883,7 +944,38 @@ fn component_capture(
     name: &str,
     keep_external_references: bool,
 ) -> Result<(), String> {
-    let plan = plan_component_capture(project, root, name.to_owned()).map_err(|e| e.to_string())?;
+    // Keeping references means the planner leaves shared dependencies in the
+    // pool, and the resulting external references are accepted.
+    let plan =
+        plan_component_capture_with(project, root, name.to_owned(), keep_external_references)
+            .map_err(|e| e.to_string())?;
+    if !keep_external_references && !plan.external_references.is_empty() {
+        let pool = project.get_pool();
+        let listed: Vec<_> = plan
+            .external_references
+            .iter()
+            .map(|(node, property, target)| {
+                let node = plan
+                    .definition
+                    .nodes
+                    .iter()
+                    .find(|candidate| candidate.id == *node)
+                    .map_or("?", |candidate| candidate.name.as_str());
+                let target = ag_iso_stack::object_pool::ObjectId::new(*target)
+                    .ok()
+                    .and_then(|id| pool.object_by_id(id))
+                    .map_or_else(
+                        || target.to_string(),
+                        |object| project.get_object_info(object).get_name(object),
+                    );
+                format!("{node} {property} -> {target}")
+            })
+            .collect();
+        return Err(format!(
+            "The captured objects use objects outside the subtree ({}). Add --keep-shared-references to keep them as references to the existing objects",
+            listed.join("; ")
+        ));
+    }
     ComponentService::create_component_from_selection(project, plan, keep_external_references)
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -1222,15 +1314,38 @@ fn coerce_parameter_value(
             }
         }
         ComponentParameterKind::Colour => colour_value(project, lexical),
+        ComponentParameterKind::Position => parse_position(lexical),
         ComponentParameterKind::Enum => match target {
             ComponentParameterTarget::Property(property) => {
                 parse_node_property_value(project, node, property, lexical)
             }
-            ComponentParameterTarget::Graphic => {
-                Err("Graphic parameters do not accept enum values".into())
+            ComponentParameterTarget::Graphic | ComponentParameterTarget::Position => {
+                Err("Graphic and position parameters do not accept enum values".into())
             }
         },
     }
+}
+
+/// Parse a position parameter value written as `X,Y` or `{"x":X,"y":Y}`.
+pub(crate) fn parse_position(lexical: &str) -> Result<Value, String> {
+    let position = if lexical.trim_start().starts_with('{') {
+        serde_json::from_str::<crate::components::ComponentPosition>(lexical)
+            .map_err(|e| format!("Invalid position '{lexical}': {e}"))?
+    } else {
+        let (x, y) = lexical
+            .split_once(',')
+            .ok_or_else(|| format!("Position '{lexical}' must be X,Y"))?;
+        let coordinate = |raw: &str| {
+            raw.trim()
+                .parse::<i32>()
+                .map_err(|_| format!("Position '{lexical}' must be X,Y with whole numbers"))
+        };
+        crate::components::ComponentPosition {
+            x: coordinate(x)?,
+            y: coordinate(y)?,
+        }
+    };
+    serde_json::to_value(position).map_err(|e| e.to_string())
 }
 
 fn parse_node_property_value(
@@ -1454,13 +1569,70 @@ fn apply_relationship(
     project: &mut EditorProject,
     target: Option<ObjectTarget>,
     mut op: Operation,
+    keep_image: bool,
+    unplace: bool,
+    report: &mut BatchReport,
 ) -> Result<(), String> {
-    if let Operation::DeleteObject { object_id } = &mut op {
-        if let Some(target) = target {
-            *object_id = resolve_object(project, &target)?;
+    let Operation::DeleteObject { object_id } = &mut op else {
+        return operation(project, &op);
+    };
+    if let Some(target) = target {
+        *object_id = resolve_object(project, &target)?;
+    }
+    let id = ag_iso_stack::object_pool::ObjectId::new(*object_id)
+        .map_err(|_| format!("Invalid object ID {object_id}"))?;
+    let blockers = project.delete_blockers(id, unplace);
+    let object = project.get_pool().object_by_id(id);
+    let name = object
+        .map(|object| project.get_object_info(object).get_name(object))
+        .unwrap_or_else(|| object_id.to_string());
+    if !blockers.is_empty() {
+        let hint = if !unplace && !project.placing_parents(id).is_empty() {
+            " Add --unplace to remove its placements as part of the delete."
+        } else {
+            ""
+        };
+        return Err(format!(
+            "Cannot delete {name}: it is {}.{hint}",
+            blockers.join("; ")
+        ));
+    }
+    // A PictureGraphic with an image; an empty one has nothing to keep.
+    let has_image = matches!(
+        object,
+        Some(ag_iso_stack::object_pool::object::Object::PictureGraphic(picture))
+            if picture.actual_width > 0 && picture.actual_height > 0
+    );
+    if unplace {
+        for parent_id in project.placing_parents(id) {
+            operation(
+                project,
+                &Operation::RemoveChild {
+                    parent_id,
+                    child_id: *object_id,
+                },
+            )?;
         }
     }
-    operation(project, &op)
+    if !keep_image {
+        operation(project, &op)?;
+        if has_image {
+            report.removed_assets.push(name);
+        }
+        return Ok(());
+    }
+    let assets_before: std::collections::HashSet<_> =
+        project.graphic_library().assets.keys().copied().collect();
+    project.with_deleted_graphics_kept(|project| operation(project, &op))?;
+    report.recovered_assets.extend(
+        project
+            .graphic_library()
+            .assets
+            .values()
+            .filter(|asset| !assets_before.contains(&asset.id))
+            .map(|asset| asset.name.clone()),
+    );
+    Ok(())
 }
 
 fn relationship_edit(project: &mut EditorProject, edit: RelationshipEdit) -> Result<(), String> {
@@ -1657,6 +1829,13 @@ fn relationship_edit(project: &mut EditorProject, edit: RelationshipEdit) -> Res
             child,
             occurrence,
         } => update_placement(project, parent, child, occurrence, None),
+        R::PlacementShift {
+            parent,
+            dx,
+            dy,
+            children,
+            all,
+        } => shift_placements(project, parent, dx, dy, &children, all),
         R::PlacementOrder { parent, children } => {
             let parent_id = resolve_object(project, &parent)?;
             let mut remaining = current_placements(project, parent_id)?;
@@ -1709,6 +1888,111 @@ fn update_placement(
             children: placements,
         },
     )
+}
+
+fn shift_placements(
+    project: &mut EditorProject,
+    parent: ObjectTarget,
+    dx: i32,
+    dy: i32,
+    children: &[String],
+    all: bool,
+) -> Result<(), String> {
+    let parent_id = resolve_object(project, &parent)?;
+    let parent_name = project
+        .get_pool()
+        .object_by_id(ObjectId::new(parent_id).map_err(|e| format!("Invalid object ID: {e:?}"))?)
+        .map(|object| project.get_object_info(object).get_name(object))
+        .unwrap_or_else(|| parent_id.to_string());
+    let mut placements = current_placements(project, parent_id)?;
+    let instances: Vec<_> = project
+        .component_source()
+        .instances
+        .iter()
+        .filter(|instance| {
+            instance.parent == crate::components::EditorParentRef::Primitive(parent_id)
+        })
+        .map(|instance| (instance.id, instance.name.clone(), instance.x, instance.y))
+        .collect();
+    // Which placements and instances move.
+    let mut move_children: Vec<ObjectTarget> = Vec::new();
+    let mut move_instances = Vec::new();
+    if all {
+        move_children.extend(placements.iter().map(|placement| placement.child.clone()));
+        move_instances.extend(instances.iter().cloned());
+    } else {
+        for name in children {
+            if let Some(instance) = instances
+                .iter()
+                .find(|instance| crate::smart_naming::names_equal(&instance.1, name))
+            {
+                move_instances.push(instance.clone());
+                continue;
+            }
+            let child = ObjectTarget::id(resolve_object(
+                project,
+                &crate::cli::commands::typed_target(name),
+            )?);
+            if !placements.iter().any(|placement| placement.child == child) {
+                return Err(format!(
+                    "'{name}' is neither placed in {parent_name} nor a component instance there"
+                ));
+            }
+            move_children.push(child);
+        }
+    }
+    if move_children.is_empty() && move_instances.is_empty() {
+        return Err(format!(
+            "{parent_name} has no placements or component instances to shift"
+        ));
+    }
+    let shifted = |value: i32, by: i32, what: &str| -> Result<i32, String> {
+        value
+            .checked_add(by)
+            .filter(|value| i16::try_from(*value).is_ok())
+            .ok_or_else(|| format!("Shifting {what} by {by} leaves the 16-bit coordinate range"))
+    };
+    for placement in placements
+        .iter_mut()
+        .filter(|placement| move_children.contains(&placement.child))
+    {
+        placement.x = shifted(placement.x.into(), dx, "x")? as i16;
+        placement.y = shifted(placement.y.into(), dy, "y")? as i16;
+    }
+    let mut moved_instances = Vec::new();
+    for (id, _, x, y) in move_instances {
+        moved_instances.push((id, shifted(x, dx, "x")?, shifted(y, dy, "y")?));
+    }
+    // One source edit for placements and instances, validated once, so an
+    // overflow error lists everything the shift would push out.
+    let mut context = crate::operations::OperationContext {
+        vt_version: project.vt_version(),
+        ..Default::default()
+    };
+    project
+        .edit_source("Shift placements", |pool, source, _, info| {
+            if !move_children.is_empty() {
+                Operation::SetChildren {
+                    parent: ObjectTarget::id(parent_id),
+                    children: placements,
+                }
+                .apply(pool, info, &mut context)
+                .map_err(|e| {
+                    crate::components::ComponentError::new("PLACEMENT_SHIFT_INVALID", e.to_string())
+                })?;
+            }
+            for (id, x, y) in moved_instances {
+                let instance = source
+                    .instances
+                    .iter_mut()
+                    .find(|instance| instance.id == id)
+                    .expect("instance listed above");
+                instance.x = x;
+                instance.y = y;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
 }
 
 fn current_object_list(
@@ -1936,8 +2220,12 @@ fn definition(project: &EditorProject, id: ComponentId) -> Result<ComponentDefin
 }
 
 /// Apply one command through the normal editor services.
-pub(crate) fn apply(project: &mut EditorProject, action: EditAction) -> Result<(), String> {
-    apply_kind(project, action.kind).map_err(|error| match action.line {
+pub(crate) fn apply(
+    project: &mut EditorProject,
+    action: EditAction,
+    report: &mut BatchReport,
+) -> Result<(), String> {
+    apply_kind(project, action.kind, report).map_err(|error| match action.line {
         Some(line) => format!("line {line}: {error}"),
         None => error,
     })
@@ -1949,7 +2237,43 @@ fn operation(project: &mut EditorProject, op: &Operation) -> Result<(), String> 
     project
         .execute_transaction(transaction)
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|error| match &error {
+            // The reported name is not always the missing one (it can be the
+            // parent): explain a component object name if the operation has
+            // one, else report its first name target that does not resolve.
+            crate::operations::OperationError::ObjectNameNotFound(_) => {
+                fn name_targets<'a>(value: &'a Value, found: &mut Vec<&'a str>) {
+                    match value {
+                        Value::Array(items) => {
+                            items.iter().for_each(|item| name_targets(item, found))
+                        }
+                        Value::Object(fields) => match (fields.len(), fields.get("name")) {
+                            // An untagged ObjectTarget::Name.
+                            (1, Some(Value::String(name))) => found.push(name),
+                            _ => fields.values().for_each(|item| name_targets(item, found)),
+                        },
+                        _ => {}
+                    }
+                }
+                let value = serde_json::to_value(op).unwrap_or_default();
+                let mut found = Vec::new();
+                name_targets(&value, &mut found);
+                let unresolved: Vec<_> = found
+                    .into_iter()
+                    .filter(|name| crate::cli::names::object_id(project, name).is_err())
+                    .collect();
+                unresolved
+                    .iter()
+                    .find_map(|name| crate::cli::names::component_object_guidance(project, name))
+                    .or_else(|| {
+                        unresolved
+                            .first()
+                            .and_then(|name| crate::cli::names::object_id(project, name).err())
+                    })
+                    .unwrap_or_else(|| error.to_string())
+            }
+            _ => error.to_string(),
+        })
 }
 
 fn parse_number(raw: &str) -> Result<Value, String> {

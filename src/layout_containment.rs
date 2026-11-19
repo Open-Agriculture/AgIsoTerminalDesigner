@@ -30,17 +30,82 @@ pub(crate) struct OriginRange {
     pub max_y: i32,
 }
 
-/// Error returned when a placement exceeds its parent's content bounds.
+/// One placement that sticks out of its parent's content bounds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Overflow {
+    pub child_id: u16,
+    pub parent_id: u16,
+    /// Offset within the parent.
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub edge: &'static str,
+}
+
+/// Error returned when placements exceed their parents' content bounds.
+/// `child_id`/`parent_id` name the first; `overflows` lists every one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContainmentError {
     pub child_id: u16,
     pub parent_id: u16,
     pub message: String,
+    pub overflows: Vec<Overflow>,
 }
 
 impl ContainmentError {
     pub(crate) fn code(&self) -> &'static str {
         OBJECT_OUTSIDE_PARENT
+    }
+
+    fn new(overflows: Vec<Overflow>) -> Self {
+        let first = overflows[0].clone();
+        let mut error = Self {
+            child_id: first.child_id,
+            parent_id: first.parent_id,
+            message: String::new(),
+            overflows,
+        };
+        error.message = error.describe(|id| id.to_string());
+        error
+    }
+
+    /// Describe the overflow; with several, list each with its size so the
+    /// whole impact of a change is visible at once.
+    pub(crate) fn describe(&self, name: impl Fn(u16) -> String) -> String {
+        if let [overflow] = self.overflows.as_slice() {
+            return format!(
+                "Object {} {}×{} is outside parent {} on the {} edge at ({}, {}).",
+                name(overflow.child_id),
+                overflow.width,
+                overflow.height,
+                name(overflow.parent_id),
+                overflow.edge,
+                overflow.x,
+                overflow.y
+            );
+        }
+        let listed: Vec<_> = self
+            .overflows
+            .iter()
+            .map(|overflow| {
+                format!(
+                    "{} {}×{} at ({}, {}) past the {} edge of {}",
+                    name(overflow.child_id),
+                    overflow.width,
+                    overflow.height,
+                    overflow.x,
+                    overflow.y,
+                    overflow.edge,
+                    name(overflow.parent_id)
+                )
+            })
+            .collect();
+        format!(
+            "{} objects would be outside their parents: {}.",
+            self.overflows.len(),
+            listed.join("; ")
+        )
     }
 }
 
@@ -198,25 +263,29 @@ pub(crate) fn validate_change_with_id_changes_and_soft_key_size(
         soft_key_sizes.map(|sizes| sizes.1),
         version,
     );
+    let mut overflows = Vec::new();
     for (key, current) in after_placements {
         let previous = before_placements
             .get(&key)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        if let Some(index) = unmatched_overflow(&current, previous) {
-            let placement = &current[index];
-            let edge = overflow_edge(placement.overflow, previous);
-            return Err(ContainmentError {
-                child_id: placement.child_id,
-                parent_id: placement.parent_id,
-                message: format!(
-                    "Object {} is outside parent {} on the {edge} edge at ({}, {}).",
-                    placement.child_id, placement.parent_id, placement.x, placement.y
-                ),
-            });
+        // Report every placement that has no prior allowance, not just the first.
+        let mut remaining: Vec<usize> = (0..current.len()).collect();
+        loop {
+            let subset: Vec<_> = remaining.iter().map(|i| current[*i].clone()).collect();
+            let Some(index) = unmatched_overflow(&subset, previous) else {
+                break;
+            };
+            let placement = &current[remaining.remove(index)];
+            overflows.push(placement.overflow_report(overflow_edge(placement.overflow, previous)));
         }
     }
-    Ok(())
+    if overflows.is_empty() {
+        return Ok(());
+    }
+    // Stable order: by parent, then child, then position.
+    overflows.sort_by_key(|o| (o.parent_id, o.child_id, o.y, o.x));
+    Err(ContainmentError::new(overflows))
 }
 
 fn remap_placement_ids(
@@ -257,24 +326,21 @@ pub(crate) fn validate_new_placements_with_soft_key_size(
     soft_key_size: Option<(u16, u16)>,
     version: VtVersion,
 ) -> Result<(), ContainmentError> {
+    let mut overflows = Vec::new();
     for placements in placements(after, mask_size, soft_key_size, version).into_values() {
         for placement in placements {
             if new_refs.contains(&(placement.parent_id, placement.child_index))
                 && placement.overflow != [0; 4]
             {
-                let edge = overflow_edge(placement.overflow, &[]);
-                return Err(ContainmentError {
-                    child_id: placement.child_id,
-                    parent_id: placement.parent_id,
-                    message: format!(
-                        "Object {} is outside parent {} on the {edge} edge at ({}, {}).",
-                        placement.child_id, placement.parent_id, placement.x, placement.y
-                    ),
-                });
+                overflows.push(placement.overflow_report(overflow_edge(placement.overflow, &[])));
             }
         }
     }
-    Ok(())
+    if overflows.is_empty() {
+        return Ok(());
+    }
+    overflows.sort_by_key(|o| (o.parent_id, o.child_id, o.y, o.x));
+    Err(ContainmentError::new(overflows))
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -291,7 +357,23 @@ struct Placement {
     child_index: usize,
     x: i32,
     y: i32,
+    width: i32,
+    height: i32,
     overflow: [i32; 4],
+}
+
+impl Placement {
+    fn overflow_report(&self, edge: &'static str) -> Overflow {
+        Overflow {
+            child_id: self.child_id,
+            parent_id: self.parent_id,
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            edge,
+        }
+    }
 }
 
 fn placements(
@@ -440,6 +522,8 @@ fn traverse_parent(
             child_index,
             x: reference.offset.x as i32,
             y: reference.offset.y as i32,
+            width: child_size.width,
+            height: child_size.height,
             overflow: edge_overflow(parent_content, child_outer),
         });
 

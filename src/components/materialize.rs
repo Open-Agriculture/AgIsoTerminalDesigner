@@ -536,11 +536,10 @@ fn compile_nodes(
                 .overrides
                 .get(&parameter.id)
                 .unwrap_or(&parameter.default_value);
-            if parameter.kind == ComponentParameterKind::Graphic {
-                continue;
-            }
+            // Graphic parameters are applied with the picture; position
+            // parameters when the parent node places this node.
             let ComponentParameterTarget::Property(property) = parameter.property else {
-                unreachable!("graphic parameters are skipped above");
+                continue;
             };
             let op = if parameter.kind == ComponentParameterKind::ObjectReference {
                 let target = external_value(value, canonical, info).map_err(|e| {
@@ -643,14 +642,39 @@ fn compile_nodes(
             .map_err(|e| locate(e, definition, instance, node.id, Some("macro_refs")))?;
         }
         for child in &node.children {
+            let (x, y) = match definition.parameters.iter().find(|p| {
+                p.target_node == child.child && p.property == ComponentParameterTarget::Position
+            }) {
+                Some(parameter) => {
+                    let value = instance
+                        .overrides
+                        .get(&parameter.id)
+                        .unwrap_or(&parameter.default_value);
+                    let value: ComponentPosition =
+                        serde_json::from_value(value.clone()).map_err(|e| {
+                            locate(
+                                ComponentError::new(
+                                    "COMPONENT_PARAMETER_INVALID",
+                                    format!("Invalid position value: {e}"),
+                                ),
+                                definition,
+                                instance,
+                                child.child,
+                                Some("position"),
+                            )
+                        })?;
+                    (value.x, value.y)
+                }
+                None => (child.x, child.y),
+            };
             apply(
                 pool,
                 version,
                 Operation::AddChild {
                     parent: ObjectTarget::id(id),
                     child: ObjectTarget::id(instance.compiled_ids[&child.child]),
-                    x: position(child.x)?,
-                    y: position(child.y)?,
+                    x: position(x)?,
+                    y: position(y)?,
                 },
             )
             .map_err(|e| locate(e, definition, instance, node.id, None))?;
@@ -778,6 +802,28 @@ pub fn validate_definition(definition: &ComponentDefinition) -> ComponentResult<
                 return Err(ComponentError::new(
                     "COMPONENT_PARAMETER_INVALID",
                     "Graphic parameters must target a PictureGraphic node with property graphic",
+                ));
+            }
+            validate_value(p, &p.default_value)?;
+            continue;
+        }
+        if p.kind == ComponentParameterKind::Position
+            || p.property == ComponentParameterTarget::Position
+        {
+            let placements = definition
+                .nodes
+                .iter()
+                .flat_map(|parent| &parent.children)
+                .filter(|child| child.child == p.target_node)
+                .count();
+            if p.kind != ComponentParameterKind::Position
+                || p.property != ComponentParameterTarget::Position
+                || p.target_node == definition.root_node
+                || placements != 1
+            {
+                return Err(ComponentError::new(
+                    "COMPONENT_PARAMETER_INVALID",
+                    "Position parameters use kind Position with property position, and target a non-root node that its parent places exactly once",
                 ));
             }
             validate_value(p, &p.default_value)?;
@@ -911,6 +957,11 @@ fn validate_value(parameter: &ComponentParameter, value: &Value) -> ComponentRes
         }
         ComponentParameterKind::Number => value.is_number(),
         ComponentParameterKind::Boolean => value.is_boolean(),
+        ComponentParameterKind::Position => {
+            serde_json::from_value::<ComponentPosition>(value.clone()).is_ok_and(|position| {
+                i16::try_from(position.x).is_ok() && i16::try_from(position.y).is_ok()
+            })
+        }
         ComponentParameterKind::Colour => value.as_u64().is_some_and(|n| n <= 255),
         ComponentParameterKind::ObjectReference => {
             value.is_null()

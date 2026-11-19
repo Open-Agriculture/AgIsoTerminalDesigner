@@ -150,3 +150,62 @@ fn deleting_an_object_in_an_allowed_list_is_blocked() {
     assert!(!project.delete_object(object_id(target)));
     assert!(project.get_pool().object_by_id(object_id(target)).is_some());
 }
+
+#[test]
+fn delete_names_what_blocks_it_and_can_remove_placements_in_one_undo_step() {
+    let (mut project, pointer, allowed_target, placed) = fixture();
+    assert!(transact(
+        &mut project,
+        vec![allowed(pointer, &[allowed_target])]
+    ));
+    let mask = 65001;
+    // Another child sits between the two placements, so undo must restore
+    // the exact stacking order, not append.
+    for (child, y) in [(placed, 0), (pointer, 0), (placed, 0)] {
+        project
+            .execute_transaction(OperationTransaction {
+                schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+                description: None,
+                operations: vec![Operation::AddChild {
+                    parent: ObjectTarget::id(mask),
+                    child: ObjectTarget::id(child),
+                    x: 0,
+                    y,
+                }],
+            })
+            .unwrap();
+    }
+    let mask_children = |project: &EditorProject| -> Vec<(u16, i16)> {
+        ag_iso_terminal_designer::operations::object_refs(
+            project.get_pool().object_by_id(object_id(mask)).unwrap(),
+        )
+        .unwrap()
+        .iter()
+        .map(|placement| (placement.id.value(), placement.offset.y))
+        .collect()
+    };
+    let before = mask_children(&project);
+
+    // An allowed pointer target is in use and the reason is named.
+    let blockers = project.delete_blockers(object_id(allowed_target), false);
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(
+        blockers[0].contains("allowed target of pointer"),
+        "{blockers:?}"
+    );
+    assert!(!project.delete_object(object_id(allowed_target)));
+    let message = project.take_operation_error().unwrap();
+    assert!(message.contains("allowed target of pointer"), "{message}");
+
+    // A plain delete names both placements; unplacing deletes in one step.
+    assert!(!project.delete_object(object_id(placed)));
+    let message = project.take_operation_error().unwrap();
+    assert!(message.contains("(2×)"), "{message}");
+    assert_eq!(project.placing_parents(object_id(placed)), [mask, mask]);
+    assert!(project.delete_blockers(object_id(placed), true).is_empty());
+    assert!(project.delete_object_and_placements(object_id(placed)));
+    assert!(project.get_pool().object_by_id(object_id(placed)).is_none());
+    assert_eq!(mask_children(&project), [(pointer, 0)]);
+    assert!(project.undo_operation());
+    assert_eq!(mask_children(&project), before);
+}

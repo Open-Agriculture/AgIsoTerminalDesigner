@@ -122,6 +122,22 @@ fn source_project() -> (EditorProject, ComponentParameterId, GraphicAssetId) {
         .find(|node| node.object_type == ObjectType::OutputString)
         .unwrap()
         .id;
+    // Authored before the ordinary parameters: the rebuild must keep this order.
+    let position_parameter_id = ComponentParameterId(Uuid::from_u128(0x9a5));
+    ComponentService::add_component_parameter(
+        &mut project,
+        component_id,
+        ComponentParameter {
+            id: position_parameter_id,
+            name: "Caption position".into(),
+            description: None,
+            target_node: text_node,
+            property: ComponentParameterTarget::Position,
+            kind: ComponentParameterKind::Position,
+            default_value: json!({"x": 0, "y": 8}),
+        },
+    )
+    .unwrap();
     let parameter_id = ComponentParameterId(Uuid::from_u128(0xabc));
     let value = PropertyKey::parse("value").unwrap();
     ComponentService::add_component_parameter(
@@ -181,6 +197,14 @@ fn source_project() -> (EditorProject, ComponentParameterId, GraphicAssetId) {
             (parameter_id, json!("Save")),
             (reference_parameter_id, json!(103)),
         ]),
+    )
+    .unwrap();
+    // A per-instance child position must survive the command-file rebuild.
+    ComponentService::set_component_override(
+        &mut project,
+        second,
+        position_parameter_id,
+        json!({"x": 0, "y": 10}),
     )
     .unwrap();
     let instances = &project.component_source().instances;
@@ -337,6 +361,18 @@ fn exported_zip_rebuilds_components_masks_shared_resources_and_iop_from_another_
             .id_overridden
     );
     assert_eq!(fs::read(&built_iop).unwrap(), rebuilt.export_iop().unwrap());
+    let position_overrides = |project: &EditorProject| -> Vec<serde_json::Value> {
+        project
+            .component_source()
+            .instances
+            .iter()
+            .flat_map(|instance| instance.overrides.values())
+            .filter(|value| value.get("x").is_some())
+            .cloned()
+            .collect()
+    };
+    assert_eq!(position_overrides(&rebuilt), position_overrides(&project));
+    assert_eq!(position_overrides(&project), [json!({"x": 0, "y": 10})]);
 
     // The script must keep existing build outputs intact on a second run.
     let existing_project = fs::read(&built_project).unwrap();

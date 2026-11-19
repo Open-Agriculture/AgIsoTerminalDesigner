@@ -95,7 +95,23 @@ fn save_reload_keeps_only_unconsumed_uploads() {
 }
 
 #[test]
-fn deleting_picture_recovers_current_image_and_is_one_undo_step() {
+fn deleting_picture_removes_its_image_and_undo_restores_it() {
+    let mut project = fixture();
+    let picture_id = ObjectId::new(120).unwrap();
+    let asset = upload(&mut project, "Part.png");
+    GraphicService::convert_asset_into_picture_graphic(&mut project, asset, 120).unwrap();
+    let before = picture(&project, 120);
+    assert!(project.graphic_library().assets.is_empty());
+    assert!(project.delete_object(picture_id));
+    // No leftover available graphic by default.
+    assert!(project.graphic_library().assets.is_empty());
+    assert!(project.undo_operation());
+    assert_eq!(picture(&project, 120), before);
+    assert!(project.graphic_library().assets.is_empty());
+}
+
+#[test]
+fn deleting_picture_can_keep_current_image_as_one_undo_step() {
     use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
     use ag_iso_terminal_designer::graphics::preview;
     let mut pool = fixture().get_pool().clone();
@@ -136,7 +152,7 @@ fn deleting_picture_recovers_current_image_and_is_one_undo_step() {
     assert_eq!(png.get_pixel(0, 0).0[3], 0);
     assert_eq!(png.get_pixel(1, 0).0[3], 255);
     let other = upload(&mut project, "Keep.png");
-    assert!(project.delete_object(ObjectId::new(120).unwrap()));
+    assert!(project.delete_object_keeping_image(ObjectId::new(120).unwrap()));
     assert!(project
         .get_pool()
         .object_by_id(ObjectId::new(120).unwrap())

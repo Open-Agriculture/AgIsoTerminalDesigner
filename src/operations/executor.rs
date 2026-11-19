@@ -109,10 +109,20 @@ pub(crate) fn containment_transaction_error(
         .ok()
         .and_then(|id| object_info.get(&id))
         .and_then(|info| info.name.clone());
+    let message = error.describe(|id| {
+        match ObjectId::new(id)
+            .ok()
+            .and_then(|object_id| object_info.get(&object_id))
+            .and_then(|info| info.name.clone())
+        {
+            Some(name) => format!("'{name}' ({id})"),
+            None => id.to_string(),
+        }
+    });
     TransactionDiagnostics(vec![TransactionDiagnostic {
         severity: DiagnosticSeverity::Error,
         code: error.code().into(),
-        message: error.message,
+        message,
         operation_index: None,
         operation_type: None,
         object_id: Some(error.child_id),
