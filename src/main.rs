@@ -942,6 +942,15 @@ impl DesignerApp {
         //     .unwrap()
         //     .insert(0, "iso_greek".to_owned());
 
+        // eframe starts egui's memory from scratch when an egui upgrade changed its format.
+        // Restore it before installing the styles, which live in that memory too.
+        if let Some(memory) = _cc.storage.and_then(|storage| {
+            ag_iso_terminal_designer::egui_memory::migrate(
+                &storage.get_string(ag_iso_terminal_designer::egui_memory::STORAGE_KEY)?,
+            )
+        }) {
+            _cc.egui_ctx.memory_mut(|stored| *stored = memory);
+        }
         ag_iso_terminal_designer::ui_style::install(&_cc.egui_ctx);
         let preferences: AppPreferences = _cc
             .storage
@@ -1050,6 +1059,11 @@ impl DesignerApp {
 }
 
 impl DesignerApp {
+    /// An OS file dialog is open, or a save that continues into another action is pending.
+    fn file_dialog_open(&self) -> bool {
+        self.open_in_progress || self.save_in_progress || self.save_then_continue.is_some()
+    }
+
     /// Open a file dialog
     fn open_file_dialog(&mut self, reason: FileDialogReason, ctx: &egui::Context) {
         if matches!(
@@ -3030,16 +3044,16 @@ impl eframe::App for DesignerApp {
                 });
         }
 
-        if self.pending_action.is_some()
-            || self.confirm_discard_recovery.is_some()
-            || self.save_then_continue.is_some()
-            || self.save_in_progress
-            || self.open_in_progress
-        {
+        if self.pending_action.is_some() || self.confirm_discard_recovery.is_some() {
             #[cfg(target_arch = "wasm32")]
             self.browser_dirty
                 .set(self.project.as_ref().is_some_and(EditorProject::is_dirty));
             return;
+        }
+        if self.file_dialog_open() {
+            // Keep the workspace visible behind the OS file dialog; `raw_input_hook` withholds
+            // input until the dialog closes, so nothing can change underneath it.
+            ui.disable();
         }
 
         if let Some(project) = &mut self.project {
@@ -3562,6 +3576,72 @@ impl eframe::App for DesignerApp {
     fn persist_egui_memory(&self) -> bool {
         // Dock windows keep their position and resize state in egui memory.
         true
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.file_dialog_open() {
+            withhold_user_input(raw_input);
+        }
+    }
+}
+
+/// Drop pointer, keyboard and file-drop input, keeping only window state changes.
+fn withhold_user_input(raw_input: &mut egui::RawInput) {
+    raw_input.events.retain(|event| {
+        matches!(
+            event,
+            egui::Event::WindowFocused(_)
+                | egui::Event::PointerGone
+                | egui::Event::ModifiersChanged(_)
+                | egui::Event::Screenshot { .. }
+        )
+    });
+    raw_input.hovered_files.clear();
+    raw_input.dropped_files.clear();
+}
+
+#[cfg(test)]
+mod withhold_user_input_tests {
+    use super::*;
+
+    #[test]
+    fn only_window_state_survives_while_a_file_dialog_is_open() {
+        let modifiers = egui::Modifiers::CTRL;
+        let mut raw_input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(1.0, 2.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(1.0, 2.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                },
+                egui::Event::Key {
+                    key: egui::Key::Delete,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                egui::Event::Text("x".into()),
+                egui::Event::Paste("pasted".into()),
+                egui::Event::WindowFocused(false),
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::PointerGone,
+            ],
+            hovered_files: vec![egui::HoveredFile::default()],
+            ..Default::default()
+        };
+        withhold_user_input(&mut raw_input);
+        assert_eq!(
+            raw_input.events,
+            vec![
+                egui::Event::WindowFocused(false),
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::PointerGone,
+            ]
+        );
+        assert!(raw_input.hovered_files.is_empty());
     }
 }
 
