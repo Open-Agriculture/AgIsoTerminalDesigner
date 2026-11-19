@@ -1050,12 +1050,10 @@ impl DesignerApp {
 }
 
 impl DesignerApp {
-    /// An OS file dialog is open, or a save that continues into another action is pending.
-    /// The IOP import window keeps `open_in_progress` set but needs input itself.
-    fn file_dialog_open(&self) -> bool {
-        (self.open_in_progress && self.pending_iop_import.is_none())
-            || self.save_in_progress
-            || self.save_then_continue.is_some()
+    /// A file picker for opening a project or pool is up. The IOP import window keeps
+    /// `open_in_progress` set but needs input itself.
+    fn open_dialog_pending(&self) -> bool {
+        self.open_in_progress && self.pending_iop_import.is_none()
     }
 
     /// Open a file dialog
@@ -3038,18 +3036,22 @@ impl eframe::App for DesignerApp {
                 });
         }
 
+        // Saves draw nothing: panes can change the project, e.g. by applying a finished
+        // graphics upload, after the save serialized it.
         if self.pending_action.is_some()
             || self.confirm_discard_recovery.is_some()
             || self.pending_iop_import.is_some()
+            || self.save_then_continue.is_some()
+            || self.save_in_progress
         {
             #[cfg(target_arch = "wasm32")]
             self.browser_dirty
                 .set(self.project.as_ref().is_some_and(EditorProject::is_dirty));
             return;
         }
-        if self.file_dialog_open() {
-            // Keep the workspace visible behind the OS file dialog; `raw_input_hook` withholds
-            // input until the dialog closes, so nothing can change underneath it.
+        if self.open_dialog_pending() {
+            // Keep the workspace visible behind the file picker; `raw_input_hook` withholds
+            // new input until it closes.
             ui.disable();
         }
 
@@ -3576,13 +3578,14 @@ impl eframe::App for DesignerApp {
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        if self.file_dialog_open() {
+        if self.open_dialog_pending() {
             withhold_user_input(raw_input);
         }
     }
 }
 
-/// Drop pointer, keyboard and file-drop input, keeping only window state changes.
+/// Drop new pointer, keyboard and file-drop input. Releases and window state changes pass,
+/// so keys and buttons pressed before the picker opened are not left held down.
 fn withhold_user_input(raw_input: &mut egui::RawInput) {
     raw_input.events.retain(|event| {
         matches!(
@@ -3591,6 +3594,8 @@ fn withhold_user_input(raw_input: &mut egui::RawInput) {
                 | egui::Event::PointerGone
                 | egui::Event::ModifiersChanged(_)
                 | egui::Event::Screenshot { .. }
+                | egui::Event::Key { pressed: false, .. }
+                | egui::Event::PointerButton { pressed: false, .. }
         )
     });
     raw_input.hovered_files.clear();
@@ -3601,29 +3606,38 @@ fn withhold_user_input(raw_input: &mut egui::RawInput) {
 mod withhold_user_input_tests {
     use super::*;
 
+    fn key(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn button(pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: egui::pos2(1.0, 2.0),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
     #[test]
-    fn only_window_state_survives_while_a_file_dialog_is_open() {
-        let modifiers = egui::Modifiers::CTRL;
+    fn only_releases_and_window_state_pass_while_a_picker_is_open() {
         let mut raw_input = egui::RawInput {
             events: vec![
                 egui::Event::PointerMoved(egui::pos2(1.0, 2.0)),
-                egui::Event::PointerButton {
-                    pos: egui::pos2(1.0, 2.0),
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers,
-                },
-                egui::Event::Key {
-                    key: egui::Key::Delete,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers,
-                },
+                button(true),
+                key(egui::Key::Delete, true),
                 egui::Event::Text("x".into()),
                 egui::Event::Paste("pasted".into()),
+                key(egui::Key::Space, false),
+                button(false),
                 egui::Event::WindowFocused(false),
-                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
                 egui::Event::PointerGone,
             ],
             hovered_files: vec![egui::HoveredFile::default()],
@@ -3633,12 +3647,34 @@ mod withhold_user_input_tests {
         assert_eq!(
             raw_input.events,
             vec![
+                key(egui::Key::Space, false),
+                button(false),
                 egui::Event::WindowFocused(false),
-                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
                 egui::Event::PointerGone,
             ]
         );
         assert!(raw_input.hovered_files.is_empty());
+    }
+
+    /// Space held for panning must not stay down when it is released while a picker is open.
+    #[test]
+    fn a_key_pressed_before_the_picker_is_released_during_it() {
+        let ctx = egui::Context::default();
+        let pass = |events: Vec<egui::Event>, withheld: bool| {
+            let mut raw_input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            if withheld {
+                withhold_user_input(&mut raw_input);
+            }
+            ctx.run_ui(raw_input, |_| {}).drop_without_applying_deltas();
+        };
+        pass(vec![key(egui::Key::Space, true)], false);
+        assert!(ctx.input(|input| input.key_down(egui::Key::Space)));
+        pass(vec![key(egui::Key::Space, false)], true);
+        assert!(!ctx.input(|input| input.key_down(egui::Key::Space)));
     }
 }
 
