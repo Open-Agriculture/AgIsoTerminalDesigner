@@ -250,10 +250,18 @@ fn themed_style(theme: Theme) -> egui::Style {
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, p.accent);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, p.text);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(5);
-    visuals.widgets.active.bg_fill = p.accent;
+    // egui also uses the active text colour as `strong_text_color`, e.g. for `ui.strong`
+    // labels and the focused dock tab, so it must contrast with the panel. White text on
+    // a solid accent only works in the dark theme.
+    if theme == Theme::Dark {
+        visuals.widgets.active.bg_fill = p.accent;
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    } else {
+        visuals.widgets.active.bg_fill = p.accent_soft;
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::BLACK);
+    }
     visuals.widgets.active.weak_bg_fill = p.accent_soft;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
     visuals.widgets.active.corner_radius = CornerRadius::same(5);
     visuals.widgets.open.bg_fill = p.accent_soft;
     visuals.widgets.open.weak_bg_fill = p.accent_soft;
@@ -359,4 +367,46 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str) -> egui::Response {
         }
     }
     response.on_hover_text(tooltip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn luminance(colour: Color32) -> f32 {
+        let channel = |c: u8| {
+            let c = f32::from(c) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(colour.r()) + 0.7152 * channel(colour.g()) + 0.0722 * channel(colour.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (light, dark) = {
+            let (a, b) = (luminance(a), luminance(b));
+            (a.max(b), a.min(b))
+        };
+        (light + 0.05) / (dark + 0.05)
+    }
+
+    /// `ui.strong` labels and the focused dock tab draw egui's strong text colour, which is
+    /// the active widget colour, directly on panels.
+    #[test]
+    fn strong_text_is_readable_in_both_themes() {
+        for theme in [Theme::Light, Theme::Dark] {
+            let visuals = themed_style(theme).visuals;
+            let strong = visuals.strong_text_color();
+            for background in [visuals.panel_fill, visuals.faint_bg_color] {
+                let ratio = contrast(strong, background);
+                assert!(
+                    ratio >= 4.5,
+                    "{theme:?}: strong text {strong:?} on {background:?} has contrast {ratio:.1}"
+                );
+            }
+        }
+    }
 }
