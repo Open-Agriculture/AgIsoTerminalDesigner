@@ -52,10 +52,18 @@ pub(crate) fn remap_component_source(
             }
         }
     }
+    // Object reference values are stored either as a bare ID or as an
+    // `ObjectTarget` (`{"id": n}`), as the component override picker writes.
     let map_value = |value: &mut serde_json::Value| {
         if let Some(id) = value.as_u64().and_then(|id| u16::try_from(id).ok()) {
             if let Some(new_id) = map.get(&id) {
                 *value = serde_json::Value::from(*new_id);
+            }
+        } else if let Ok(ObjectTarget::Id { id }) =
+            serde_json::from_value::<ObjectTarget>(value.clone())
+        {
+            if let Some(new_id) = map.get(&id) {
+                *value = serde_json::json!(ObjectTarget::id(*new_id));
             }
         }
     };
@@ -303,5 +311,66 @@ impl IdReassignmentPlan {
             target_types,
             includes_overrides: include_overrides,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn remaps_object_target_overrides_and_defaults() {
+        let parameter_id = ComponentParameterId::default();
+        let node_id = ComponentNodeId::default();
+        let definition = ComponentDefinition {
+            schema_version: 1,
+            id: ComponentId::default(),
+            name: "Label".into(),
+            description: String::new(),
+            category_path: Vec::new(),
+            tags: Vec::new(),
+            revision: 1,
+            root_node: node_id,
+            nodes: Vec::new(),
+            parameters: vec![ComponentParameter {
+                id: parameter_id,
+                name: "Font".into(),
+                description: None,
+                target_node: node_id,
+                property: ComponentParameterTarget::Graphic,
+                kind: ComponentParameterKind::ObjectReference,
+                default_value: json!({ "id": 102 }),
+            }],
+        };
+        let mut source = ComponentSource::default();
+        source.instances.push(ComponentInstance {
+            id: ComponentInstanceId::default(),
+            component_id: definition.id,
+            name: "Label".into(),
+            parent: EditorParentRef::Primitive(2),
+            child_index: None,
+            x: 0,
+            y: 0,
+            overrides: [(parameter_id, json!({ "id": 102 }))].into(),
+            compiled_ids: BTreeMap::new(),
+        });
+        source.definitions.insert(definition.id, definition);
+
+        remap_component_source(
+            &mut source,
+            &[(102, 103), (103, 102)],
+            &ObjectPool::default(),
+            VtVersion::default(),
+        )
+        .unwrap();
+
+        let definition = source.definitions.values().next().unwrap();
+        assert_eq!(definition.parameters[0].default_value, json!({ "id": 103 }));
+        assert_eq!(
+            source.instances[0].overrides[&parameter_id],
+            json!({ "id": 103 })
+        );
     }
 }
