@@ -1,5 +1,17 @@
 use super::*;
 
+/// Runs one headless egui pass. Nothing uploads the output's texture deltas, so they are
+/// cleared here: egui asserts that a `TexturesDelta` is never dropped with deltas pending.
+fn pass(
+    ctx: &egui::Context,
+    input: egui::RawInput,
+    run_ui: impl FnMut(&mut egui::Ui),
+) -> egui::FullOutput {
+    let mut output = ctx.run_ui(input, run_ui);
+    output.textures_delta.clear();
+    output
+}
+
 fn input(events: Vec<egui::Event>) -> egui::RawInput {
     egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
@@ -35,8 +47,8 @@ fn render_name_frame(
     draft: &mut Option<ObjectNameDraft>,
     events: Vec<egui::Event>,
 ) {
-    let _ = ctx.run(input(events), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    let _ = pass(&ctx, input(events), |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             finish_object_name_on_switch(project, draft);
             render_object_name(ui, project, original, draft);
         });
@@ -213,8 +225,8 @@ fn clicking_rows_selects_the_painted_row_in_flat_expanded_and_scrolled_layouts()
         let mut clicked = Vec::new();
         let mut frame = |events| {
             rows.clear();
-            let _ = ctx.run(input(events), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = pass(&ctx, input(events), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .vertical_scroll_offset(scroll)
                         .show(ui, |ui| {
@@ -305,9 +317,9 @@ fn drag_zones_choose_sibling_slots_or_parent_without_consuming_payload() {
             child_index: 2,
         },
     };
-    let draw = |ctx: &egui::Context| {
+    let draw = |ui: &mut egui::Ui| {
         let mut rect = egui::Rect::NOTHING;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let row = tree_row_with_id(ui, egui::Id::new("destination"), false, "Destination");
             rect = row.rect;
             hierarchy_drag_row(ui, &row, Some(&source), Some((1, 7, vec![0, 3])));
@@ -315,8 +327,8 @@ fn drag_zones_choose_sibling_slots_or_parent_without_consuming_payload() {
         rect
     };
     let mut rect = egui::Rect::NOTHING;
-    let _ = ctx.run(input(Vec::new()), |ctx| {
-        rect = draw(ctx);
+    pass(&ctx, input(Vec::new()), |ui| {
+        rect = draw(ui);
     });
     for (y, expected_slot, expected_parent) in [
         (rect.top() + 1.0, Some(2), 1),
@@ -324,13 +336,14 @@ fn drag_zones_choose_sibling_slots_or_parent_without_consuming_payload() {
         (rect.bottom() - 1.0, Some(3), 1),
     ] {
         egui::DragAndDrop::set_payload(&ctx, source.clone());
-        let _ = ctx.run(
+        pass(
+            &ctx,
             input(vec![egui::Event::PointerMoved(egui::pos2(
                 rect.center().x,
                 y,
             ))]),
-            |ctx| {
-                draw(ctx);
+            |ui| {
+                draw(ui);
             },
         );
         let candidate = ctx
@@ -387,8 +400,8 @@ fn pointer_and_target_share_one_selectable_hierarchy_row() {
     let ctx = egui::Context::default();
     let mut canvas = CanvasState::default();
     let mut masks = MaskViewState::default();
-    let output = ctx.run(input(Vec::new()), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    let output = pass(&ctx, input(Vec::new()), |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             render_mask_object_hierarchy(
                 ui,
                 egui::Id::new("tree"),
@@ -425,8 +438,8 @@ fn pointer_and_target_share_one_selectable_hierarchy_row() {
         vec![egui::Event::PointerMoved(click), pointer_event(click, true)],
         vec![pointer_event(click, false)],
     ] {
-        let _ = ctx.run(input(events), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = pass(&ctx, input(events), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 render_mask_object_hierarchy(
                     ui,
                     egui::Id::new("tree"),
@@ -517,8 +530,8 @@ fn hierarchy_pointer_gestures_select_exact_rows_and_preserve_context_selection()
     masks.focus(1);
     let mut frame = |raw: egui::RawInput| {
         project.update_selected();
-        ctx.run(raw, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        pass(&ctx, raw, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 begin_hierarchy_frame(ui, &project, &mut canvas);
                 render_focused_mask_hierarchy(ui, &project, &mut masks, &mut canvas);
                 finish_hierarchy_click(ui, &project, &mut canvas);
@@ -564,7 +577,8 @@ fn hierarchy_pointer_gestures_select_exact_rows_and_preserve_context_selection()
                     modifiers,
                 },
             ]);
-            raw.modifiers = modifiers;
+            raw.events
+                .insert(0, egui::Event::ModifiersChanged(modifiers));
             frame(raw);
         }
     };

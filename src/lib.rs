@@ -29,6 +29,8 @@ mod project_file;
 pub mod replacement;
 mod smart_naming;
 mod soft_key_layout;
+#[cfg(test)]
+mod test_support;
 
 // Operation system and automation support
 pub mod canvas;

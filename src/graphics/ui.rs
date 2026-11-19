@@ -142,7 +142,7 @@ fn graphics_card(
 /// Waiting uploads use the same searchable window and preview rows as objects.
 pub fn available_button(
     ui: &mut egui::Ui,
-    salt: impl std::hash::Hash,
+    salt: impl egui::AsIdSalt,
     project: &EditorProject,
     target: ObjectId,
 ) -> Option<GraphicAssetId> {
@@ -554,7 +554,9 @@ pub fn select(
             let result = create_and_select(project, asset, &options, &preview_selection);
             match result {
                 Ok(id) => *value = serde_json::json!(id),
-                Err(error) => ui.data_mut(|data| data.insert_temp(key.with("error"), error)),
+                Err(error) => {
+                    ui.data_mut(|data| data.insert_temp(key.with("error"), error));
+                }
             }
         }
     }

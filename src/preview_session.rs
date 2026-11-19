@@ -1195,11 +1195,12 @@ impl PreviewSession {
                     .map_err(|e| diag(source, e.to_string()))?;
                 let ctx = eframe::egui::Context::default();
                 let mut extent = eframe::egui::Vec2::ZERO;
-                let _ = ctx.run(Default::default(), |ctx| {
-                    eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                ctx.run_ui(Default::default(), |ui| {
+                    eframe::egui::CentralPanel::default().show(ui, |ui| {
                         extent = crate::output_string_rendering::text_extent(ui, font, &decoded);
                     });
-                });
+                })
+                .drop_without_applying_deltas();
                 let width = extent.x.ceil().clamp(0.0, u16::MAX as f32) as u16;
                 let height = extent.y.ceil().clamp(0.0, u16::MAX as f32) as u16;
                 if width > 0 && height > 0 {

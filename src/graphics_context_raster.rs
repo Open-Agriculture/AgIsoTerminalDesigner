@@ -42,7 +42,7 @@ pub(crate) fn rasterize_paint(
         .ok_or_else(|| format!("Raster exceeds the {max_pixels} pixel limit"))?;
 
     let ctx = egui::Context::default();
-    let output = ctx.run(
+    let output = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(
                 Pos2::ZERO,
@@ -50,10 +50,10 @@ pub(crate) fn rasterize_paint(
             )),
             ..Default::default()
         },
-        |ctx| {
+        |ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     paint(ui);
                 });
         },
@@ -63,12 +63,15 @@ pub(crate) fn rasterize_paint(
 
 fn rasterize_output(
     ctx: &egui::Context,
-    output: egui::FullOutput,
+    mut output: egui::FullOutput,
     size: [usize; 2],
     pixel_count: usize,
 ) -> Result<egui::ColorImage, String> {
+    let deltas = std::mem::take(&mut output.textures_delta.set);
+    // The rasterizer owns no textures to free; clear so the delta doesn't assert on drop.
+    output.textures_delta.clear();
     let primitives = ctx.tessellate(output.shapes, output.pixels_per_point);
-    let textures = apply_texture_deltas(output.textures_delta.set)?;
+    let textures = apply_texture_deltas(deltas)?;
     rasterize_primitives(
         size,
         pixel_count,
@@ -79,10 +82,18 @@ fn rasterize_output(
 }
 
 fn apply_texture_deltas(
-    deltas: Vec<(egui::TextureId, egui::epaint::ImageDelta)>,
+    deltas: impl IntoIterator<
+        Item = (
+            egui::TextureId,
+            impl IntoIterator<Item = egui::epaint::ImageDelta>,
+        ),
+    >,
 ) -> Result<HashMap<egui::TextureId, egui::ColorImage>, String> {
     let mut textures = HashMap::new();
-    for (id, delta) in deltas {
+    for (id, delta) in deltas
+        .into_iter()
+        .flat_map(|(id, deltas)| deltas.into_iter().map(move |delta| (id, delta)))
+    {
         let image = match delta.image {
             egui::ImageData::Color(image) => image.as_ref().clone(),
         };
@@ -348,15 +359,15 @@ mod tests {
             egui::ColorImage::filled([1, 1], Color32::from_rgb(15, 120, 220)),
             Default::default(),
         );
-        let output = ctx.run(
+        let output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::splat(16.0))),
                 ..Default::default()
             },
-            |ctx| {
+            |ui| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(ctx, |ui| {
+                    .show(ui, |ui| {
                         ui.image((texture.id(), Vec2::splat(4.0)));
                         ui.painter().text(
                             Pos2::new(4.0, 0.0),

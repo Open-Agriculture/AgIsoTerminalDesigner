@@ -557,8 +557,8 @@ mod tests {
 
     fn render(object: &Object, pool: &ObjectPool, version: VtVersion) -> egui::FullOutput {
         let ctx = egui::Context::default();
-        ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        crate::test_support::headless_pass(&ctx, egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 crate::object_rendering::render_object_with_version(
                     ui,
                     pool,

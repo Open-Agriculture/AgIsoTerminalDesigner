@@ -1050,6 +1050,12 @@ impl DesignerApp {
 }
 
 impl DesignerApp {
+    /// A file picker for opening a project or pool is up. The IOP import window keeps
+    /// `open_in_progress` set but needs input itself.
+    fn open_dialog_pending(&self) -> bool {
+        self.open_in_progress && self.pending_iop_import.is_none()
+    }
+
     /// Open a file dialog
     fn open_file_dialog(&mut self, reason: FileDialogReason, ctx: &egui::Context) {
         if matches!(
@@ -1621,10 +1627,11 @@ impl DesignerApp {
         });
     }
 
-    fn render_startup(&mut self, ctx: &egui::Context) {
+    fn render_startup(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(ctx.style().visuals.faint_bg_color))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE.fill(ctx.global_style().visuals.faint_bg_color))
+            .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
@@ -2008,7 +2015,7 @@ fn render_selectable_object(
         }
         if is_selected
             && ui.input(|input| input.key_pressed(egui::Key::F2))
-            && (!ui.ctx().wants_keyboard_input() || response.has_focus())
+            && (!ui.ctx().egui_wants_keyboard_input() || response.has_focus())
         {
             ui.ctx().input_mut(|input| {
                 input.consume_key(egui::Modifiers::NONE, egui::Key::F2);
@@ -2888,16 +2895,19 @@ fn render_selected_ancestry_panel(ui: &mut egui::Ui, project: &EditorProject) {
 }
 
 impl eframe::App for DesignerApp {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         self.canvas.set_grid_visible(self.preferences.show_grid);
         self.add_object_menu_seen = false;
         self.property_name_draft_seen = false;
         ctx.data_mut(|data| data.remove::<bool>(egui::Id::new("tree_row_had_focus")));
         self.mask_view.begin_frame();
         self.preferences.apply(ctx);
-        ctx.style_mut(|style| {
+        ctx.global_style_mut(|style| {
             style.interaction.selectable_labels = false;
         });
+        // The root Ui copied the style before this frame's changes; refresh it so they apply now
+        ui.set_style(ctx.global_style());
 
         // Handle file dialogs and deferred writes first.
         self.handle_file_loaded(ctx);
@@ -2950,7 +2960,7 @@ impl eframe::App for DesignerApp {
                 .show(ctx, |ui| {
                     // Long diagnostic lists scroll so the buttons stay on screen
                     egui::ScrollArea::vertical()
-                        .max_height(ctx.screen_rect().height() * 0.6)
+                        .max_height(ctx.content_rect().height() * 0.6)
                         .show(ui, |ui| ui_style::error_text(ui, &error));
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -3026,16 +3036,23 @@ impl eframe::App for DesignerApp {
                 });
         }
 
+        // Saves draw nothing: panes can change the project, e.g. by applying a finished
+        // graphics upload, after the save serialized it.
         if self.pending_action.is_some()
             || self.confirm_discard_recovery.is_some()
+            || self.pending_iop_import.is_some()
             || self.save_then_continue.is_some()
             || self.save_in_progress
-            || self.open_in_progress
         {
             #[cfg(target_arch = "wasm32")]
             self.browser_dirty
                 .set(self.project.as_ref().is_some_and(EditorProject::is_dirty));
             return;
+        }
+        if self.open_dialog_pending() {
+            // Keep the workspace visible behind the file picker; `raw_input_hook` withholds
+            // new input until it closes.
+            ui.disable();
         }
 
         if let Some(project) = &mut self.project {
@@ -3201,7 +3218,7 @@ impl eframe::App for DesignerApp {
             }
         }
 
-        egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
+        egui::Panel::top("topbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New Object Pool").clicked() {
@@ -3393,9 +3410,9 @@ impl eframe::App for DesignerApp {
         }
 
         if self.project.is_some() {
-            self.render_workspace(ctx);
+            self.render_workspace(ui);
         } else {
-            self.render_startup(ctx);
+            self.render_startup(ui);
         }
         self.preferences.show_grid = self.canvas.grid_visible();
         let tree_row_focused = ctx.data(|data| {
@@ -3403,7 +3420,7 @@ impl eframe::App for DesignerApp {
                 .unwrap_or(false)
         });
         if ctx.input(|input| input.key_pressed(egui::Key::Delete))
-            && (!ctx.wants_keyboard_input() || tree_row_focused)
+            && (!ctx.egui_wants_keyboard_input() || tree_row_focused)
             && self.new_object_dialog.is_none()
         {
             if let Some(project) = self.project.as_mut() {
@@ -3558,6 +3575,106 @@ impl eframe::App for DesignerApp {
     fn persist_egui_memory(&self) -> bool {
         // Dock windows keep their position and resize state in egui memory.
         true
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.open_dialog_pending() {
+            withhold_user_input(raw_input);
+        }
+    }
+}
+
+/// Drop new pointer, keyboard and file-drop input. Releases and window state changes pass,
+/// so keys and buttons pressed before the picker opened are not left held down.
+fn withhold_user_input(raw_input: &mut egui::RawInput) {
+    raw_input.events.retain(|event| {
+        matches!(
+            event,
+            egui::Event::WindowFocused(_)
+                | egui::Event::PointerGone
+                | egui::Event::ModifiersChanged(_)
+                | egui::Event::Screenshot { .. }
+                | egui::Event::Key { pressed: false, .. }
+                | egui::Event::PointerButton { pressed: false, .. }
+        )
+    });
+    raw_input.hovered_files.clear();
+    raw_input.dropped_files.clear();
+}
+
+#[cfg(test)]
+mod withhold_user_input_tests {
+    use super::*;
+
+    fn key(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn button(pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: egui::pos2(1.0, 2.0),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn only_releases_and_window_state_pass_while_a_picker_is_open() {
+        let mut raw_input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(1.0, 2.0)),
+                button(true),
+                key(egui::Key::Delete, true),
+                egui::Event::Text("x".into()),
+                egui::Event::Paste("pasted".into()),
+                key(egui::Key::Space, false),
+                button(false),
+                egui::Event::WindowFocused(false),
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                egui::Event::PointerGone,
+            ],
+            hovered_files: vec![egui::HoveredFile::default()],
+            ..Default::default()
+        };
+        withhold_user_input(&mut raw_input);
+        assert_eq!(
+            raw_input.events,
+            vec![
+                key(egui::Key::Space, false),
+                button(false),
+                egui::Event::WindowFocused(false),
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                egui::Event::PointerGone,
+            ]
+        );
+        assert!(raw_input.hovered_files.is_empty());
+    }
+
+    /// Space held for panning must not stay down when it is released while a picker is open.
+    #[test]
+    fn a_key_pressed_before_the_picker_is_released_during_it() {
+        let ctx = egui::Context::default();
+        let pass = |events: Vec<egui::Event>, withheld: bool| {
+            let mut raw_input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            if withheld {
+                withhold_user_input(&mut raw_input);
+            }
+            ctx.run_ui(raw_input, |_| {}).drop_without_applying_deltas();
+        };
+        pass(vec![key(egui::Key::Space, true)], false);
+        assert!(ctx.input(|input| input.key_down(egui::Key::Space)));
+        pass(vec![key(egui::Key::Space, false)], true);
+        assert!(!ctx.input(|input| input.key_down(egui::Key::Space)));
     }
 }
 
@@ -4037,7 +4154,7 @@ impl DesignerApp {
             let painter = ctx
                 .layer_painter(candidate.layer)
                 .with_clip_rect(candidate.clip_rect);
-            let stroke = egui::Stroke::new(2.0, ctx.style().visuals.selection.stroke.color);
+            let stroke = egui::Stroke::new(2.0, ctx.global_style().visuals.selection.stroke.color);
             if let Some(y) = candidate.edge_y {
                 painter.line_segment(
                     [
@@ -4169,14 +4286,15 @@ impl DesignerApp {
         }
     }
 
-    fn render_workspace(&mut self, ctx: &egui::Context) {
+    fn render_workspace(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         ctx.data_mut(|data| data.remove::<TreeDropCandidate>(egui::Id::new("tree_drop_candidate")));
         let mut dock =
             std::mem::replace(&mut self.workspace.dock, egui_dock::DockState::new(vec![]));
         self.canvas_visible = false;
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(ctx.style().visuals.faint_bg_color))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE.fill(ctx.global_style().visuals.faint_bg_color))
+            .show(ui, |ui| {
                 egui_dock::DockArea::new(&mut dock)
                     .id(egui::Id::new("designer_dock"))
                     .show_leaf_collapse_buttons(false)

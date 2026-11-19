@@ -198,7 +198,7 @@ pub(crate) fn text_width(
         FontSize::Proportional(height) => text
             .chars()
             .map(|c| {
-                let galley = ui.fonts(|f| {
+                let galley = ui.fonts_mut(|f| {
                     f.layout_no_wrap(
                         c.to_string(),
                         FontId::proportional(height as f32),
@@ -392,7 +392,7 @@ pub(crate) fn render(
             '\u{387}' => '\u{b7}',
             _ => c,
         };
-        let galley = ui.fonts(|f| {
+        let galley = ui.fonts_mut(|f| {
             f.layout_no_wrap(
                 display.to_string(),
                 FontId::new(height, family.clone()),
@@ -409,7 +409,7 @@ pub(crate) fn render(
             .unwrap_or(1.0)
             .clamp(1.0, 8.0);
         let galley = if scale > 1.0 {
-            ui.fonts(|f| {
+            ui.fonts_mut(|f| {
                 f.layout_no_wrap(
                     display.to_string(),
                     FontId::new(height * scale, family.clone()),

@@ -62,7 +62,9 @@ pub fn render_object_with_preview_session(
     });
     render_object_with_settings(ui, &pool, object, position, version, soft_key_size);
     ui.ctx().data_mut(|data| match previous {
-        Some(previous) => data.insert_temp(key, previous),
+        Some(previous) => {
+            data.insert_temp(key, previous);
+        }
         None => {
             data.remove::<Arc<Mutex<crate::preview_session::PreviewSession>>>(key);
         }
@@ -125,13 +127,17 @@ pub fn render_object_with_settings(
         }
     });
     ui.ctx().data_mut(|data| match previous {
-        Some(previous) => data.insert_temp(render_version_id(), previous),
+        Some(previous) => {
+            data.insert_temp(render_version_id(), previous);
+        }
         None => {
             data.remove_temp::<VtVersion>(render_version_id());
         }
     });
     ui.ctx().data_mut(|data| match previous_settings {
-        Some(previous) => data.insert_temp(settings_key, previous),
+        Some(previous) => {
+            data.insert_temp(settings_key, previous);
+        }
         None => {
             data.remove_temp::<(u16, u16)>(settings_key);
         }
@@ -754,7 +760,9 @@ fn render_designator(
         });
         render_object_refs(ui, pool, children);
         ui.ctx().data_mut(|data| match previous {
-            Some(origin) => data.insert_temp(key, origin),
+            Some(origin) => {
+                data.insert_temp(key, origin);
+            }
             None => {
                 data.remove_temp::<egui::Pos2>(key);
             }
@@ -1752,7 +1760,8 @@ mod rendering_tests {
         position: Point<i16>,
     ) -> egui::FullOutput {
         let ctx = egui::Context::default();
-        ctx.run(
+        crate::test_support::headless_pass(
+            &ctx,
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -1761,8 +1770,8 @@ mod rendering_tests {
                 time: Some(time),
                 ..Default::default()
             },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     if let Some(object) = object {
                         render_object_with_settings(
                             ui,

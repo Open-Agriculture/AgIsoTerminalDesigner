@@ -1272,12 +1272,13 @@ impl CanvasState {
                 self.pan = viewport.size() * 0.5 - fit_rect.center().to_vec2() * self.zoom;
             }
         }
+        let input_options = ui.ctx().options(|o| o.input_options);
         let input = ui.input(|i| {
             (
                 i.pointer.clone(),
                 i.modifiers,
                 i.key_down(Key::Space),
-                i.raw_scroll_delta,
+                raw_scroll_delta(i, &input_options),
                 i.focused,
             )
         });
@@ -1365,7 +1366,8 @@ impl CanvasState {
         let can_key = self.mask.is_some() && (response.has_focus() || self.gesture.is_some());
         if can_key {
             self.keys(ui, project, &scene, modifiers, &mut commands);
-        } else if self.mask.is_some() && response.hovered() && !ui.ctx().wants_keyboard_input() {
+        } else if self.mask.is_some() && response.hovered() && !ui.ctx().egui_wants_keyboard_input()
+        {
             // Arrow keys also move the selection while the pointer is over the canvas, so an
             // object selected in the hierarchy or Properties can be nudged without clicking it
             self.nudge(ui, project, &scene, modifiers, &mut commands);
@@ -3589,4 +3591,39 @@ mod tests {
         assert_eq!(origin, i16::MAX);
         assert_eq!(origin as i32 + size as i32 - 1, 40_000);
     }
+}
+
+/// This frame's wheel scroll in points, without egui's smoothing. egui 0.36 dropped
+/// `InputState::raw_scroll_delta`, so this mirrors how egui 0.32 computed it.
+fn raw_scroll_delta(input: &egui::InputState, options: &egui::InputOptions) -> Vec2 {
+    let mut total = Vec2::ZERO;
+    for event in &input.events {
+        let egui::Event::MouseWheel {
+            unit,
+            delta,
+            phase,
+            modifiers,
+        } = event
+        else {
+            continue;
+        };
+        if *phase != egui::TouchPhase::Move {
+            continue;
+        }
+        let mut delta = match unit {
+            egui::MouseWheelUnit::Point => *delta,
+            egui::MouseWheelUnit::Line => options.line_scroll_speed * *delta,
+            egui::MouseWheelUnit::Page => input.viewport_rect().height() * *delta,
+        };
+        let horizontal = modifiers.matches_any(options.horizontal_scroll_modifier);
+        let vertical = modifiers.matches_any(options.vertical_scroll_modifier);
+        if horizontal && !vertical {
+            delta = egui::vec2(delta.x + delta.y, 0.0);
+        }
+        if vertical && !horizontal {
+            delta = egui::vec2(0.0, delta.x + delta.y);
+        }
+        total += delta;
+    }
+    total
 }
