@@ -168,7 +168,9 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
                 keep_references,
             ) {
                 Ok(plan) => {
-                    ui.data_mut(|d| d.insert_temp(egui::Id::new("component_capture"), plan))
+                    ui.data_mut(|d| {
+                        d.insert_temp(egui::Id::new("component_capture"), plan);
+                    });
                 }
                 Err(e) => error = Some(e.to_string()),
             }

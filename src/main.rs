@@ -1621,10 +1621,11 @@ impl DesignerApp {
         });
     }
 
-    fn render_startup(&mut self, ctx: &egui::Context) {
+    fn render_startup(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(ctx.style().visuals.faint_bg_color))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE.fill(ctx.global_style().visuals.faint_bg_color))
+            .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(40.0);
@@ -2008,7 +2009,7 @@ fn render_selectable_object(
         }
         if is_selected
             && ui.input(|input| input.key_pressed(egui::Key::F2))
-            && (!ui.ctx().wants_keyboard_input() || response.has_focus())
+            && (!ui.ctx().egui_wants_keyboard_input() || response.has_focus())
         {
             ui.ctx().input_mut(|input| {
                 input.consume_key(egui::Modifiers::NONE, egui::Key::F2);
@@ -2888,16 +2889,19 @@ fn render_selected_ancestry_panel(ui: &mut egui::Ui, project: &EditorProject) {
 }
 
 impl eframe::App for DesignerApp {
-    fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
         self.canvas.set_grid_visible(self.preferences.show_grid);
         self.add_object_menu_seen = false;
         self.property_name_draft_seen = false;
         ctx.data_mut(|data| data.remove::<bool>(egui::Id::new("tree_row_had_focus")));
         self.mask_view.begin_frame();
         self.preferences.apply(ctx);
-        ctx.style_mut(|style| {
+        ctx.global_style_mut(|style| {
             style.interaction.selectable_labels = false;
         });
+        // The root Ui copied the style before this frame's changes; refresh it so they apply now
+        ui.set_style(ctx.global_style());
 
         // Handle file dialogs and deferred writes first.
         self.handle_file_loaded(ctx);
@@ -2950,7 +2954,7 @@ impl eframe::App for DesignerApp {
                 .show(ctx, |ui| {
                     // Long diagnostic lists scroll so the buttons stay on screen
                     egui::ScrollArea::vertical()
-                        .max_height(ctx.screen_rect().height() * 0.6)
+                        .max_height(ctx.content_rect().height() * 0.6)
                         .show(ui, |ui| ui_style::error_text(ui, &error));
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
@@ -3201,7 +3205,7 @@ impl eframe::App for DesignerApp {
             }
         }
 
-        egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
+        egui::Panel::top("topbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New Object Pool").clicked() {
@@ -3393,9 +3397,9 @@ impl eframe::App for DesignerApp {
         }
 
         if self.project.is_some() {
-            self.render_workspace(ctx);
+            self.render_workspace(ui);
         } else {
-            self.render_startup(ctx);
+            self.render_startup(ui);
         }
         self.preferences.show_grid = self.canvas.grid_visible();
         let tree_row_focused = ctx.data(|data| {
@@ -3403,7 +3407,7 @@ impl eframe::App for DesignerApp {
                 .unwrap_or(false)
         });
         if ctx.input(|input| input.key_pressed(egui::Key::Delete))
-            && (!ctx.wants_keyboard_input() || tree_row_focused)
+            && (!ctx.egui_wants_keyboard_input() || tree_row_focused)
             && self.new_object_dialog.is_none()
         {
             if let Some(project) = self.project.as_mut() {
@@ -4037,7 +4041,7 @@ impl DesignerApp {
             let painter = ctx
                 .layer_painter(candidate.layer)
                 .with_clip_rect(candidate.clip_rect);
-            let stroke = egui::Stroke::new(2.0, ctx.style().visuals.selection.stroke.color);
+            let stroke = egui::Stroke::new(2.0, ctx.global_style().visuals.selection.stroke.color);
             if let Some(y) = candidate.edge_y {
                 painter.line_segment(
                     [
@@ -4169,14 +4173,15 @@ impl DesignerApp {
         }
     }
 
-    fn render_workspace(&mut self, ctx: &egui::Context) {
+    fn render_workspace(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         ctx.data_mut(|data| data.remove::<TreeDropCandidate>(egui::Id::new("tree_drop_candidate")));
         let mut dock =
             std::mem::replace(&mut self.workspace.dock, egui_dock::DockState::new(vec![]));
         self.canvas_visible = false;
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(ctx.style().visuals.faint_bg_color))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE.fill(ctx.global_style().visuals.faint_bg_color))
+            .show(ui, |ui| {
                 egui_dock::DockArea::new(&mut dock)
                     .id(egui::Id::new("designer_dock"))
                     .show_leaf_collapse_buttons(false)

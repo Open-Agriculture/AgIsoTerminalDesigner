@@ -76,8 +76,9 @@ where
         dock.remove_tab(location);
     }
     if let Some(location) = focused.and_then(|pane| dock.find_tab(&pane)) {
-        dock.set_active_tab(location);
-        dock.set_focused_node_and_surface((location.0, location.1));
+        // `find_tab` just returned this path, so it is valid
+        let _ = dock.set_active_tab(location);
+        dock.set_focused_node_and_surface(location.node_path());
     }
     sanitize_nonfinite_dock_geometry(&mut dock);
     let mut value = serde_json::to_value(dock).map_err(serde::de::Error::custom)?;
@@ -153,9 +154,10 @@ impl Workspace {
         self.dock.find_tab(&pane).is_some()
     }
     pub fn open(&mut self, pane: Pane) {
-        if let Some((surface, node, tab)) = self.dock.find_tab(&pane) {
-            self.dock.set_active_tab((surface, node, tab));
-            self.dock.set_focused_node_and_surface((surface, node));
+        if let Some(location) = self.dock.find_tab(&pane) {
+            // `find_tab` just returned this path, so it is valid
+            let _ = self.dock.set_active_tab(location);
+            self.dock.set_focused_node_and_surface(location.node_path());
         } else {
             self.dock.push_to_focused_leaf(pane);
         }

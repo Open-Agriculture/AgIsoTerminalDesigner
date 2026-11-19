@@ -72,7 +72,7 @@ fn paint_chevron(ui: &Ui, center: egui::Pos2, radius: f32, angle: f32, stroke: S
 /// The caller supplies a stable ID for its editor and already formatted entries.
 pub fn vt_availability_note(
     ui: &mut Ui,
-    id: impl std::hash::Hash,
+    id: impl egui::AsIdSalt,
     version: ag_iso_stack::object_pool::vt_version::VtVersion,
     mut entries: Vec<String>,
 ) {

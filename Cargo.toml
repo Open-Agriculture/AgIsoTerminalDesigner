@@ -14,9 +14,9 @@ path = "src/cli/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-egui = "0.32"
-egui_dock = { version = "0.17", features = ["serde"] }
-eframe = { version = "0.32", features = ["persistence"] }
+egui = "0.36"
+egui_dock = { version = "0.21", features = ["serde"] }
+eframe = { version = "0.36", features = ["persistence"] }
 ag-iso-stack = { git = "https://github.com/Open-Agriculture/AgIsoStack-rs", rev = "c59744087cc3b0ae01c8fe476dcf444182cd5182" }
 rfd = "0.18"
 image = "0.25.1"

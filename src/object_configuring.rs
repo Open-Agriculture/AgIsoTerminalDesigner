@@ -947,7 +947,7 @@ fn candidate_is_valid(design: &EditorProject, parent: ObjectId, child: ObjectId)
 
 fn render_object_selector(
     ui: &mut egui::Ui,
-    salt: impl std::hash::Hash,
+    salt: impl egui::AsIdSalt,
     design: &EditorProject,
     parent: ObjectId,
     selected: ObjectId,
@@ -980,7 +980,7 @@ fn render_object_selector(
 
 fn child_picker(
     ui: &mut egui::Ui,
-    salt: impl std::hash::Hash,
+    salt: impl egui::AsIdSalt,
     label: &str,
     design: &EditorProject,
     parent: ObjectId,
@@ -1615,7 +1615,7 @@ fn render_object_labels(
 #[allow(clippy::too_many_arguments)]
 fn label_reference_picker(
     ui: &mut egui::Ui,
-    salt: impl std::hash::Hash,
+    salt: impl egui::AsIdSalt,
     design: &EditorProject,
     list_id: ObjectId,
     current: Option<ObjectId>,
@@ -2595,7 +2595,7 @@ fn max_string_length(max_bytes: usize, version: VtVersion) -> usize {
 /// names. Returns the code clicked; `offered` hides codes that cannot be picked.
 fn code_picker(
     ui: &mut egui::Ui,
-    salt: impl std::hash::Hash,
+    salt: impl egui::AsIdSalt,
     selected_text: &str,
     table: &'static [(&'static str, &'static str)],
     current: Option<&str>,
@@ -3072,8 +3072,12 @@ fn render_palette_colours(
             }
         });
     ui.data_mut(|data| match selected {
-        Some(index) => data.insert_temp(selected_id, index),
-        None => data.remove::<usize>(selected_id),
+        Some(index) => {
+            data.insert_temp(selected_id, index);
+        }
+        None => {
+            data.remove::<usize>(selected_id);
+        }
     });
     if let Some(index) = selected {
         let key = ui.make_persistent_id((id.value(), "palette_colour"));
@@ -4950,8 +4954,8 @@ mod polygon_draft_tests {
 
         let ctx = egui::Context::default();
         let frame = |project: &mut EditorProject, shown: bool, events: Vec<egui::Event>| {
-            let output = ctx.run(input(events), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let output = crate::test_support::headless_pass(&ctx, input(events), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     if shown {
                         let object = project
                             .get_pool()
@@ -4961,7 +4965,7 @@ mod polygon_draft_tests {
                         render_property_editor(ui, &object, project);
                     }
                 });
-                finish_property_edits(ctx, project);
+                finish_property_edits(ui, project);
             });
             project.commit_queued("Edit");
             output

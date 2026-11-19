@@ -1046,7 +1046,9 @@ mod tests {
         let before = project.get_pool().object_by_id(id).unwrap().clone();
         let ctx = egui::Context::default();
         open_for_picture(&ctx, &project, id, Some(PictureGraphicFormat::Monochrome));
-        let _ = ctx.run(egui::RawInput::default(), |ctx| show(ctx, &mut project));
+        crate::test_support::headless_pass(&ctx, egui::RawInput::default(), |ui| {
+            show(ui, &mut project)
+        });
         assert!(ctx
             .data(|data| data.get_temp::<Draft>(draft_key(&ctx)))
             .is_some());
@@ -1059,7 +1061,7 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::default(),
         });
-        let _ = ctx.run(input, |ctx| show(ctx, &mut project));
+        crate::test_support::headless_pass(&ctx, input, |ui| show(ui, &mut project));
         assert!(ctx
             .data(|data| data.get_temp::<Draft>(draft_key(&ctx)))
             .is_none());
@@ -1073,7 +1075,9 @@ mod tests {
         open_for_import(&ctx, &project, id, vec![1, 2, 3], None);
         let options = ConversionOptions::suggested(PictureGraphicFormat::FourBit);
         GraphicService::convert_picture(&mut project, id.value(), &options).unwrap();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| show(ctx, &mut project));
+        crate::test_support::headless_pass(&ctx, egui::RawInput::default(), |ui| {
+            show(ui, &mut project)
+        });
         assert!(ctx
             .data(|data| data.get_temp::<Draft>(draft_key(&ctx)))
             .is_none());

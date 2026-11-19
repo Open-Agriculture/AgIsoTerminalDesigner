@@ -99,12 +99,12 @@ pub fn window<T: Clone + Send + Sync + 'static>(
         let mut accept = false;
         let mut back = false;
         let modal = egui::Modal::new(id.with("confirm_selection")).show(ctx, |ui| {
-            ui.set_width((ctx.screen_rect().width() - 64.0).clamp(280.0, 740.0));
+            ui.set_width((ctx.content_rect().width() - 64.0).clamp(280.0, 740.0));
             ui.heading("Confirm selection");
             ui.label(title);
             ui.separator();
             let valid = egui::ScrollArea::vertical()
-                .max_height((ctx.screen_rect().height() - 200.0).max(160.0))
+                .max_height((ctx.content_rect().height() - 200.0).max(160.0))
                 .show(ui, |ui| review(ui, &pending))
                 .inner;
             ui.separator();
@@ -193,7 +193,7 @@ pub fn fit_rect(bounds: Rect, size: Vec2) -> Rect {
 
 pub fn checkerboard(painter: &egui::Painter, rect: Rect) {
     const TILE: f32 = 8.0;
-    let visuals = painter.ctx().style().visuals.clone();
+    let visuals = painter.ctx().global_style().visuals.clone();
     let base = visuals.extreme_bg_color;
     let alternate = visuals.faint_bg_color;
     for row in 0..(rect.height() / TILE).ceil() as usize {
@@ -418,7 +418,7 @@ pub fn object_window(
 
 pub fn button(
     ui: &mut egui::Ui,
-    salt: impl std::hash::Hash,
+    salt: impl egui::AsIdSalt,
     label: &str,
     action: &str,
     project: &EditorProject,
