@@ -1,7 +1,7 @@
 //! Small, platform-local persistence for crash recovery and desktop recents.
 
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 const RECOVERY_VERSION: u32 = 1;
 #[cfg(target_arch = "wasm32")]

@@ -86,15 +86,19 @@ impl GraphicService {
                     format!("Target {object_id} must be a PictureGraphic"),
                 ));
             };
+            // Check the width it is stored at, which a stored size changes
+            let mut converted = picture.clone();
+            super::conversion::apply_picture_conversion(&mut converted, options, &palette)
+                .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))?;
             super::validate_picture_format(
                 &pool_snapshot,
                 id,
-                picture.actual_width,
+                converted.actual_width,
                 options.target,
             )
             .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))?;
-            super::conversion::apply_picture_conversion(picture, options, &palette)
-                .map_err(|error| ComponentError::new("GRAPHIC_CONVERSION_FAILED", error))
+            *picture = converted;
+            Ok(())
         })
     }
 

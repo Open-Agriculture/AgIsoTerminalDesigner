@@ -1048,7 +1048,7 @@ fn decoded_picture_data_len(
     }
 }
 
-fn validate_graphic_data_png(bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn validate_graphic_data_png(bytes: &[u8]) -> Result<(), String> {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder
         .read_info()

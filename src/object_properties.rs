@@ -234,6 +234,22 @@ pub enum EditorKind {
     Justification,
     PolygonPoints,
     MacroReferences,
+    /// ISO 639-1 language codes, picked from a searchable list.
+    LanguageCodes,
+    /// ISO 639-1 language and ISO 3166-1 country code pairs.
+    LanguagePairs,
+    /// A 64-bit ISO 11783-5 NAME, edited by field.
+    Name,
+    /// The colours of a Colour Palette, as swatches.
+    PaletteColours,
+    /// The entries of a Colour Map, as palette colours.
+    ColourMap,
+    /// Code planes and character ranges of Extended Input Attributes.
+    CodePlanes,
+    /// The command stream of a Macro, as readable instructions.
+    MacroCommands,
+    /// The PNG of a Graphic Data object, previewed and loaded from a file.
+    GraphicData,
 }
 
 /// UI schemas for every writable property of an object type.
@@ -275,6 +291,21 @@ fn default_editor(semantic: &PropertySemantic) -> EditorKind {
 fn editor_override(object_type: ObjectType, property: PropertyKey) -> Option<EditorKind> {
     match (object_type, property) {
         (ObjectType::OutputPolygon, PropertyKey::Points) => Some(EditorKind::PolygonPoints),
+        (ObjectType::WorkingSet, PropertyKey::LanguageCodes) => Some(EditorKind::LanguageCodes),
+        (ObjectType::WorkingSetSpecialControls, PropertyKey::LanguagePairs) => {
+            Some(EditorKind::LanguagePairs)
+        }
+        (
+            ObjectType::ExternalObjectDefinition | ObjectType::ExternalReferenceName,
+            PropertyKey::Name,
+        ) => Some(EditorKind::Name),
+        (ObjectType::ColourPalette, PropertyKey::Colours) => Some(EditorKind::PaletteColours),
+        (ObjectType::ColourMap, PropertyKey::ColourMap) => Some(EditorKind::ColourMap),
+        (ObjectType::ExtendedInputAttributes, PropertyKey::CodePlanes) => {
+            Some(EditorKind::CodePlanes)
+        }
+        (ObjectType::Macro, PropertyKey::Commands) => Some(EditorKind::MacroCommands),
+        (ObjectType::GraphicData, PropertyKey::Data) => Some(EditorKind::GraphicData),
         (_, PropertyKey::Justification) => Some(EditorKind::Justification),
         _ => None,
     }

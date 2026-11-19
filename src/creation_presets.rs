@@ -264,4 +264,30 @@ mod placement_tests {
         };
         assert!(data_mask.object_refs.is_empty());
     }
+
+    #[test]
+    fn create_object_at_a_soft_key_mask_appends_a_key_in_one_undo_step() {
+        let mut project = EditorProject::default();
+        let mask_name = project.generate_smart_name_for_new_object(ObjectType::SoftKeyMask);
+        let mask = project
+            .create_object(ObjectType::SoftKeyMask, mask_name)
+            .unwrap();
+        let first_name = project.generate_smart_name_for_new_object(ObjectType::Key);
+        let first = project
+            .create_object_at(ObjectType::Key, first_name, mask, 5, 5)
+            .unwrap();
+        let second_name = project.generate_smart_name_for_new_object(ObjectType::Key);
+        let second = project
+            .create_object_at(ObjectType::Key, second_name, mask, 5, 5)
+            .unwrap();
+        let keys = |project: &EditorProject| match project.get_pool().object_by_id(mask) {
+            Some(Object::SoftKeyMask(mask)) => mask.objects.clone(),
+            _ => panic!("expected the Soft Key Mask"),
+        };
+        assert_eq!(keys(&project), vec![first, second]);
+
+        project.undo();
+        assert_eq!(keys(&project), vec![first]);
+        assert!(project.get_pool().object_by_id(second).is_none());
+    }
 }

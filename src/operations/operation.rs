@@ -1,6 +1,7 @@
 //! Single mutation operation on the object pool
 //! Each operation is reversible: apply() returns its inverse
 
+use crate::allowed_object_relationships::AllowedChildRefs;
 use crate::object_info::ObjectInfo;
 use crate::object_properties::PropertyKey;
 use crate::smart_naming::{names_equal, normalized_name};
@@ -227,6 +228,49 @@ fn object_label_references(label: &ObjectLabel) -> impl Iterator<Item = ObjectId
     ]
     .into_iter()
     .flatten()
+}
+
+/// Check each reference of a label against its own role: the labelled object
+/// against Table A.2, the text against String Variable, and the graphic
+/// against the object label graphics.
+fn validate_object_label(
+    pool: &ObjectPool,
+    list_id: u16,
+    label: &ObjectLabel,
+    version: VtVersion,
+) -> Result<(), OperationError> {
+    let list = ObjectId::new(list_id).map_err(|_| OperationError::ObjectNotFound(list_id))?;
+    crate::pool_validation::validate_parent_child_relationship_for_version(
+        pool, list, label.id, version,
+    )
+    .map_err(|diag| OperationError::InvalidReference {
+        parent_type: format!("{}: {}", list_id, diag.message),
+        child_type: label.id.value().to_string(),
+    })?;
+    let wrong_type = |reference: ObjectId, role: &str| OperationError::OperationContextError {
+        object_id: list_id,
+        context: "object_labels".to_owned(),
+        reason: format!(
+            "Object {} cannot be the {role} of the label for object {}.",
+            reference.value(),
+            label.id.value()
+        ),
+    };
+    if let Some(text) = label.string_variable_reference.0 {
+        if pool.object_by_id(text).map(Object::object_type) != Some(ObjectType::StringVariable) {
+            return Err(wrong_type(text, "text, which must be a String Variable,"));
+        }
+    }
+    if let Some(graphic) = label.graphic_representation.0 {
+        let allowed = <ObjectLabel as AllowedChildRefs>::get_allowed_child_refs(version);
+        if !pool
+            .object_by_id(graphic)
+            .is_some_and(|object| allowed.contains(&object.object_type()))
+        {
+            return Err(wrong_type(graphic, "graphic"));
+        }
+    }
+    Ok(())
 }
 
 /// Context passed to each operation during execution
@@ -1543,16 +1587,9 @@ impl Operation {
                             child: reference_id.value(),
                         }
                     })?;
-                    crate::pool_validation::validate_parent_child_relationship_for_version(
-                        pool,
-                        id,
-                        reference_id,
-                        context.vt_version,
-                    )
-                    .map_err(|diag| OperationError::InvalidReference {
-                        parent_type: format!("{}: {}", object_id, diag.message),
-                        child_type: reference_id.value().to_string(),
-                    })?;
+                }
+                for label in labels {
+                    validate_object_label(pool, *object_id, label, context.vt_version)?;
                 }
 
                 let object = pool

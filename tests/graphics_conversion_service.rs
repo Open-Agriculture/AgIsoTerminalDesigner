@@ -109,3 +109,41 @@ fn failed_configured_conversion_keeps_picture_and_available_asset() {
     assert_eq!(picture(&project), before);
     assert!(project.graphic_library().assets.contains_key(&asset));
 }
+
+#[test]
+fn a_stored_size_cannot_break_a_fill_pattern_width() {
+    let mut pool = ObjectPool::default();
+    let mut object = default_object(ObjectType::PictureGraphic);
+    object.mut_id().set_value(120).unwrap();
+    let Object::PictureGraphic(pattern) = &mut object else {
+        unreachable!();
+    };
+    pattern.width = 16;
+    pattern.actual_width = 16;
+    pattern.actual_height = 1;
+    pattern.format = PictureGraphicFormat::Monochrome;
+    pattern.data = vec![0b1010_1010, 0b0101_0101];
+    pool.add(object);
+    let mut fill = default_object(ObjectType::FillAttributes);
+    fill.mut_id().set_value(121).unwrap();
+    let Object::FillAttributes(attributes) = &mut fill else {
+        unreachable!();
+    };
+    attributes.fill_type = 3;
+    attributes.fill_pattern =
+        ag_iso_stack::object_pool::NullableObjectId(Some(ObjectId::new(120).unwrap()));
+    pool.add(fill);
+    let mut project = EditorProject::from(pool);
+    let before = picture(&project);
+
+    // 12 pixels is not a whole number of monochrome bytes
+    let mut options = ConversionOptions::suggested(PictureGraphicFormat::Monochrome);
+    options.stored_width = Some(12);
+    let error = GraphicService::convert_picture(&mut project, 120, &options).unwrap_err();
+    assert!(error.to_string().contains("fill pattern"), "{error}");
+    assert_eq!(picture(&project), before);
+
+    options.stored_width = Some(8);
+    GraphicService::convert_picture(&mut project, 120, &options).unwrap();
+    assert_eq!(picture(&project).actual_width, 8);
+}

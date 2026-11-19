@@ -12,6 +12,7 @@ mod graphics_context_raster;
 mod graphics_context_rendering;
 mod id_reassignment;
 mod interactive_rendering_simple;
+mod iso_codes;
 mod layout_containment;
 mod numeric_rendering;
 mod object_configuring;
