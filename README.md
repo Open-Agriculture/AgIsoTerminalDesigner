@@ -47,8 +47,8 @@ This project is under **active development**. While some features may not yet be
 - Preview multiple data/alarm masks with their linked soft keys on one canvas; edit the focused mask with undo/redo
 - Limit selecting macro's and object references to allowed types only.
 - Assign allowed references to object pointers and switch their active target with a dropdown in the properties panel. Empty lists keep unrestricted selection; lists are saved in `.aitp` projects, while IOP export contains only the active target.
-- Edit every object attribute in Properties, with editors for palette colours, colour maps, languages, Macro commands, NAME fields, object labels, input code planes, and Graphic Data images
-- New objects start with a usable size and the most used Font and Line Attributes; missing required references are marked
+- Edit object attributes in Properties, including editors for palette colours, colour maps, languages, Macro commands, NAME fields, object labels, input code planes, and Graphic Data images
+- Common new objects start with a usable size, and required Font or Line Attributes are filled in; missing required references are marked
 - Reuse groups of objects as components, manage shared Font, Line and Fill Attributes, replace every reference to an object, and reassign object IDs
 - Convert images to Picture Graphics: pick the format, colour mapping and transparency, store a smaller image, and compare the sizes
 - Import a pool split over several IOP files; export an IOP, a C header with object IDs, or a CLI ZIP
@@ -76,11 +76,13 @@ Check masks in the Objects pane to preview them side by side. Click a mask row o
 
 The canvas toolbar provides X/Y and supported W/H fields, alignment/distribution, snapping switches, an optional grid overlay, and a shortcut reference. Grid spacing follows zoom automatically, down to one pool pixel, independently of snapping. Alignment and distribution operate on selections sharing a parent; hold Shift while aligning to align the selection as a group to that parent.
 
-Right-click the canvas to add an object right there, group the selection, or align it. **Add object here** only lists objects that fit under the pointer, such as a Key in an empty soft key slot.
+Right-click the canvas to add an object right there, group the selection, or align it. **Add object here** only lists objects that fit under the pointer. Positioned objects go at the pointer; a new Key is added to the end of the soft key mask.
+
+To move polygon points or line ends on the canvas, tick **Edit points** in Properties.
 
 Moving a repeated reference updates its exact child-list occurrence. Resizing changes the shared object's dimensions at every reference; the toolbar identifies shared dimensions. Removing a placement retains its primitive object definition in the pool. Component instances move and duplicate as units; their internal geometry stays controlled by their component definitions.
 
-Switch the canvas to **Preview** to run local animations and visual macros against a temporary copy of the pool. Use **Reset** to restart from the current design, select a mask, press its keys and buttons, or run a macro directly. Playback values and Graphics Context drawings do not enter project history or saved files. Runtime errors appear above the preview. Selecting a VT2 Auxiliary Type 1 object also shows its designator in Properties.
+Switch the canvas to **Preview** to run local animations and visual macros against a temporary copy of the pool. Use **Reset** to restart from the current design, select a mask, press its keys and buttons, or run a macro directly. Playback values and Graphics Context drawings do not enter project history or saved files. Runtime errors appear above the preview. Selecting a VT2 Auxiliary Type 1 object also shows its designator in Properties. Meters, bar graphs and buttons (pressed, latched and disabled) are drawn like AgIsoVirtualTerminal draws them.
 
 Primitive copies receive fresh object IDs and metadata identities. PictureGraphic placements reuse the original image object, including pictures inside copied parents. Internal references within the copied positioned subtree are remapped; external styles and resources remain shared. Component copies retain their master and overrides. Completed gestures and numeric edits each create one undo action.
 
@@ -105,7 +107,7 @@ If you have any suggestions or would like to contribute, feel free to open an is
 
 ### Supported Objects
 
-All object types from VT2 to VT6 can be created and edited. The canvas draws every visible object, except Window Mask and Key Group, which show a placeholder. Open an issue if something is missing or looks wrong, or even better, submit a pull request!
+All object types from VT2 to VT6 can be created and edited. The canvas previews most visible objects. Window Mask and Key Group have no preview yet, and auxiliary designators that depend on runtime assignments show a placeholder. Open an issue if something is missing or looks wrong, or even better, submit a pull request!
 
 
 ## Installation
