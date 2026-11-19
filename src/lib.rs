@@ -37,7 +37,6 @@ pub mod canvas;
 pub mod cli;
 pub mod components;
 pub mod effective_colour;
-pub mod egui_memory;
 pub mod graphics;
 pub mod isobus_colour;
 pub mod macro_authoring;

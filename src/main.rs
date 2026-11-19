@@ -942,15 +942,6 @@ impl DesignerApp {
         //     .unwrap()
         //     .insert(0, "iso_greek".to_owned());
 
-        // eframe starts egui's memory from scratch when an egui upgrade changed its format.
-        // Restore it before installing the styles, which live in that memory too.
-        if let Some(memory) = _cc.storage.and_then(|storage| {
-            ag_iso_terminal_designer::egui_memory::migrate(
-                &storage.get_string(ag_iso_terminal_designer::egui_memory::STORAGE_KEY)?,
-            )
-        }) {
-            _cc.egui_ctx.memory_mut(|stored| *stored = memory);
-        }
         ag_iso_terminal_designer::ui_style::install(&_cc.egui_ctx);
         let preferences: AppPreferences = _cc
             .storage
@@ -1060,8 +1051,11 @@ impl DesignerApp {
 
 impl DesignerApp {
     /// An OS file dialog is open, or a save that continues into another action is pending.
+    /// The IOP import window keeps `open_in_progress` set but needs input itself.
     fn file_dialog_open(&self) -> bool {
-        self.open_in_progress || self.save_in_progress || self.save_then_continue.is_some()
+        (self.open_in_progress && self.pending_iop_import.is_none())
+            || self.save_in_progress
+            || self.save_then_continue.is_some()
     }
 
     /// Open a file dialog
@@ -3044,7 +3038,10 @@ impl eframe::App for DesignerApp {
                 });
         }
 
-        if self.pending_action.is_some() || self.confirm_discard_recovery.is_some() {
+        if self.pending_action.is_some()
+            || self.confirm_discard_recovery.is_some()
+            || self.pending_iop_import.is_some()
+        {
             #[cfg(target_arch = "wasm32")]
             self.browser_dirty
                 .set(self.project.as_ref().is_some_and(EditorProject::is_dirty));
