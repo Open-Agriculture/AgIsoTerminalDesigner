@@ -2030,12 +2030,31 @@ fn render_selectable_object(
                 project.set_renaming_object(this_ui_id, object.id(), object_info.get_name(object));
                 ui.close();
             }
+            let placements = project.placing_parents(object.id()).len();
             if ui
                 .add_enabled(count == 1, egui::Button::new("Delete"))
-                .on_hover_text("Delete object")
+                .on_hover_text(if placements > 0 {
+                    "Delete object. It is still placed, so use \"Remove from parents and delete\"."
+                } else {
+                    "Delete object"
+                })
                 .clicked()
             {
                 project.request_delete_object(object.id());
+                ui.close();
+            }
+            if placements > 0
+                && ui
+                    .add_enabled(
+                        count == 1,
+                        egui::Button::new("Remove from parents and delete"),
+                    )
+                    .on_hover_text(format!(
+                        "Remove its {placements} placement(s) and delete it in one undo step"
+                    ))
+                    .clicked()
+            {
+                project.request_delete_object_and_placements(object.id());
                 ui.close();
             }
         });
@@ -3484,8 +3503,13 @@ impl eframe::App for DesignerApp {
                     ctx.request_repaint();
                 }
             }
-            if let Some(object_id) = pool.take_delete_request() {
-                if pool.delete_object(object_id) {
+            if let Some((object_id, unplace)) = pool.take_delete_request() {
+                let deleted = if unplace {
+                    pool.delete_object_and_placements(object_id)
+                } else {
+                    pool.delete_object(object_id)
+                };
+                if deleted {
                     ctx.request_repaint();
                 }
             }

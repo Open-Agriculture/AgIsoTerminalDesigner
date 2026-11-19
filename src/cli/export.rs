@@ -51,6 +51,32 @@ pub fn header_for_project(project: &EditorProject) -> Result<Vec<u8>, String> {
         .ok_or_else(|| "Header export did not produce an artifact".to_owned())
 }
 
+/// The C identifier each object ID receives in the exported header, using the
+/// same names and mapping as [`header_for_project`]. Collisions are not
+/// rejected here; header export reports them.
+pub fn c_identifiers(project: &EditorProject) -> Result<HashMap<u16, String>, String> {
+    let materialized = project
+        .materialize_shared()
+        .map_err(|error| error.to_string())?;
+    let info = project.component_object_info();
+    Ok(materialized
+        .pool
+        .objects()
+        .iter()
+        .map(|object| {
+            (
+                object.id().value(),
+                c_identifier(&object_name(
+                    project,
+                    &info,
+                    &materialized.source_map,
+                    object,
+                )),
+            )
+        })
+        .collect())
+}
+
 fn object_name(
     project: &EditorProject,
     info: &HashMap<ag_iso_stack::object_pool::ObjectId, crate::ObjectInfo>,
@@ -78,6 +104,12 @@ fn object_name(
                 .get(&instance.component_id)
             {
                 if let Some(node) = definition.nodes.iter().find(|n| n.id == *node_id) {
+                    // `<instance>_<node>` tells instances of one component apart
+                    // and stays stable when IDs are reassigned. Instance names
+                    // are unique; any C identifier clash is reported on export.
+                    if !instance.name.trim().is_empty() {
+                        return format!("{}_{}", instance.name, node.name);
+                    }
                     return format!("{}_{}_{}", definition.name, node.name, id.value());
                 }
             }

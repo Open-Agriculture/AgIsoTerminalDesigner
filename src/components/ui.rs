@@ -146,9 +146,27 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
         open_editor(ui, &project.component_source().definitions[&id]);
     }
     let mut error = None;
+    let keep_key = egui::Id::new("component_capture_keep_references");
+    let mut keep_references = ui.data(|d| d.get_temp::<bool>(keep_key).unwrap_or(false));
+    if ui
+        .checkbox(&mut keep_references, "Keep shared objects as references")
+        .on_hover_text(
+            "Fonts, line/fill attributes, pictures, variables and macros the selection uses \
+             but does not place stay as the existing objects, shared by every instance, \
+             instead of being copied into the component.",
+        )
+        .changed()
+    {
+        ui.data_mut(|d| d.insert_temp(keep_key, keep_references));
+    }
     if ui.button("Create from selection…").clicked() {
         if let Some(id) = project.get_selected().0 {
-            match plan_component_capture(project, id.value(), "New component".into()) {
+            match plan_component_capture_with(
+                project,
+                id.value(),
+                "New component".into(),
+                keep_references,
+            ) {
                 Ok(plan) => {
                     ui.data_mut(|d| d.insert_temp(egui::Id::new("component_capture"), plan))
                 }
@@ -239,7 +257,7 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
     ui.separator();
     let instances = project.component_source().instances.clone();
     for instance in instances {
-        let definition = &project.component_source().definitions[&instance.component_id];
+        let definition = project.component_source().definitions[&instance.component_id].clone();
         let root = instance.compiled_ids[&definition.root_node];
         let label = format!(
             "{} · {} ({}, {})",
@@ -249,6 +267,9 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
             .id_salt(instance.id)
             .icon(crate::ui_style::collapsing_icon)
             .show(ui, |ui| {
+                if let Err(e) = instance_name_editor(ui, project, instance.id, &instance.name) {
+                    error = Some(e.to_string());
+                }
                 if ui
                     .selectable_label(
                         project
@@ -280,6 +301,39 @@ pub fn show(ui: &mut egui::Ui, project: &mut EditorProject) {
     capture_dialog(ui.ctx(), project);
     edit_dialog(ui.ctx(), project);
 }
+/// Edit an instance name; commits on Enter or when focus leaves, Escape
+/// restores it. Instance names become the prefix of their objects' C header
+/// names, so the hint says so.
+fn instance_name_editor(
+    ui: &mut egui::Ui,
+    project: &mut EditorProject,
+    id: ComponentInstanceId,
+    current: &str,
+) -> ComponentResult<()> {
+    let key = ui.id().with(("instance_name", id, project.revision()));
+    let mut draft = ui
+        .data(|d| d.get_temp::<String>(key))
+        .unwrap_or_else(|| current.to_owned());
+    let mut result = Ok(());
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        let response = ui
+            .text_edit_singleline(&mut draft)
+            .on_hover_text("Also the prefix of this instance's C header names");
+        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            draft = current.to_owned();
+            response.surrender_focus();
+        } else if response.lost_focus() && draft != current {
+            result = ComponentService::rename_instance(project, id, draft.clone());
+            if result.is_err() {
+                draft = current.to_owned();
+            }
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(key, draft));
+    result
+}
+
 type DefinitionPreview = Result<
     std::sync::Arc<(
         ag_iso_stack::object_pool::ObjectPool,
@@ -395,10 +449,21 @@ fn capture_dialog(ctx: &egui::Context, project: &mut EditorProject) {
             plan.definition.parameters.len()
         ));
         manual_parameter_form(ui, &mut plan.definition, project);
-        for (_, property, target) in &plan.external_references {
-            ui.label(format!(
-                "External reference: {property} → ordinary object {target}"
-            ));
+        for (node, property, target) in &plan.external_references {
+            let node = plan
+                .definition
+                .nodes
+                .iter()
+                .find(|candidate| candidate.id == *node)
+                .map_or("?", |candidate| candidate.name.as_str());
+            let target = ag_iso_stack::object_pool::ObjectId::new(*target)
+                .ok()
+                .and_then(|id| project.get_pool().object_by_id(id))
+                .map_or_else(
+                    || target.to_string(),
+                    |object| project.get_object_info(object).get_name(object),
+                );
+            ui.label(format!("Shared reference: {node} {property} → {target}"));
         }
         let title = if plan.external_references.is_empty() {
             "Create"
@@ -1059,6 +1124,7 @@ fn manual_parameter_form(
                         ComponentParameterKind::Colour,
                         ComponentParameterKind::Enum,
                         ComponentParameterKind::Graphic,
+                        ComponentParameterKind::Position,
                     ] {
                         ui.selectable_value(&mut draft.3, kind, format!("{kind:?}"));
                     }
@@ -1093,6 +1159,8 @@ fn manual_parameter_form(
             if ui.button("Add declared parameter").clicked() {
                 let target = if draft.3 == ComponentParameterKind::Graphic {
                     Some(ComponentParameterTarget::Graphic)
+                } else if draft.3 == ComponentParameterKind::Position {
+                    Some(ComponentParameterTarget::Position)
                 } else {
                     crate::object_properties::PropertyKey::parse(&draft.2)
                         .map(ComponentParameterTarget::Property)
@@ -1100,6 +1168,15 @@ fn manual_parameter_form(
                 if let Some(target) = target {
                     let value = if draft.3 == ComponentParameterKind::Graphic {
                         graphic
+                    } else if draft.3 == ComponentParameterKind::Position {
+                        // Default to where the parent node currently places it.
+                        definition
+                            .nodes
+                            .iter()
+                            .flat_map(|parent| &parent.children)
+                            .find(|child| child.child == draft.1)
+                            .map(|child| serde_json::json!({"x": child.x, "y": child.y}))
+                            .unwrap_or(serde_json::Value::Null)
                     } else if draft.3 == ComponentParameterKind::ObjectReference {
                         match target {
                             ComponentParameterTarget::Property(property) => {
@@ -1110,7 +1187,8 @@ fn manual_parameter_form(
                                     _ => serde_json::Value::Null,
                                 }
                             }
-                            ComponentParameterTarget::Graphic => unreachable!(),
+                            ComponentParameterTarget::Graphic
+                            | ComponentParameterTarget::Position => unreachable!(),
                         }
                     } else if let ComponentParameterTarget::Property(property) = target {
                         declared_parameter_default(node, property, draft.3)
@@ -1169,7 +1247,7 @@ pub fn inspector(
         overrides: Default::default(),
     };
     ui.heading(&definition.name);
-    ui.label(format!("Instance: {id}"));
+    let rename = instance_name_editor(ui, project, id, &instance.name);
     ui.label(format!(
         "Node: {}",
         definition
@@ -1205,7 +1283,7 @@ pub fn inspector(
             data.insert_temp(position_key, position);
         }
     });
-    let mut result = Ok(());
+    let mut result = rename;
     if finished && !cancelled && position != (instance.x, instance.y) {
         result = ComponentService::move_instance(project, id, position.0, position.1);
     } else if !finished && !cancelled && position != (instance.x, instance.y) {
@@ -1239,6 +1317,52 @@ pub fn inspector(
         });
         let mut apply = false;
         let mut response = None;
+        if parameter.kind == ComponentParameterKind::Position {
+            // Same interaction as the instance position: preview while
+            // dragging, commit one override when the drag or edit ends.
+            let committed: ComponentPosition =
+                serde_json::from_value(value.clone()).unwrap_or(ComponentPosition { x: 0, y: 0 });
+            let mut position =
+                serde_json::from_str::<ComponentPosition>(&draft).unwrap_or(committed);
+            let mut finished = false;
+            let mut cancelled = false;
+            ui.horizontal(|ui| {
+                ui.label("x");
+                let x = ui.add(egui::DragValue::new(&mut position.x));
+                ui.label("y");
+                let y = ui.add(egui::DragValue::new(&mut position.y));
+                cancelled = (x.has_focus() || y.has_focus() || x.lost_focus() || y.lost_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Escape));
+                finished = x.drag_stopped() || y.drag_stopped() || x.lost_focus() || y.lost_focus();
+            });
+            if cancelled {
+                ui.data_mut(|d| d.remove::<String>(key));
+            } else if finished {
+                ui.data_mut(|d| d.remove::<String>(key));
+                if position != committed {
+                    result = ComponentService::set_component_override(
+                        project,
+                        id,
+                        parameter.id,
+                        serde_json::json!(position),
+                    );
+                }
+            } else {
+                if position != committed {
+                    pending_edit
+                        .overrides
+                        .insert(parameter.id, serde_json::json!(position));
+                }
+                ui.data_mut(|d| d.insert_temp(key, serde_json::json!(position).to_string()));
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Reset").clicked() {
+                    result = ComponentService::reset_component_override(project, id, parameter.id);
+                    ui.data_mut(|d| d.remove::<String>(key));
+                }
+            });
+            continue;
+        }
         if parameter.kind == ComponentParameterKind::Graphic {
             let previous = draft.clone();
             let mut value = serde_json::from_str(&draft).unwrap_or_default();
@@ -1372,7 +1496,17 @@ pub fn inspector(
             }
         });
     }
-    ui.label("Size, styling and internal positions are inherited from the master.");
+    ui.label(
+        if definition
+            .parameters
+            .iter()
+            .any(|p| p.kind == ComponentParameterKind::Position)
+        {
+            "Other sizes, styling and internal positions are inherited from the master."
+        } else {
+            "Size, styling and internal positions are inherited from the master."
+        },
+    );
     if ui.button("Reset All Overrides").clicked() {
         result = ComponentService::reset_all_overrides(project, id);
     }

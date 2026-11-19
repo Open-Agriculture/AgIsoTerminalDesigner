@@ -15,10 +15,26 @@ pub struct CapturePlan {
     pub expected_objects: Vec<(ComponentNodeId, ag_iso_stack::object_pool::object::Object)>,
 }
 /// Prepare a reviewable capture; no source changes and no automatic parameters.
+/// Referenced fonts, line/fill attributes and PictureGraphics are copied into
+/// the component.
 pub fn plan_component_capture(
     project: &EditorProject,
     root: u16,
     name: String,
+) -> ComponentResult<CapturePlan> {
+    plan_component_capture_with(project, root, name, false)
+}
+
+/// Like [`plan_component_capture`]. With `keep_references`, objects the
+/// subtree refers to but does not place (fonts, attributes, pictures,
+/// variables, macros) stay in the pool and every instance refers to them,
+/// instead of each instance carrying its own copy. They are listed in
+/// `external_references`, which the caller must accept.
+pub fn plan_component_capture_with(
+    project: &EditorProject,
+    root: u16,
+    name: String,
+    keep_references: bool,
 ) -> ComponentResult<CapturePlan> {
     let pool = project.get_pool();
     let fail = |message: &str| ComponentError::new("COMPONENT_CAPTURE_INVALID", message);
@@ -53,7 +69,9 @@ pub fn plan_component_capture(
         );
     }
     let subtree = included.clone();
-    pending.extend(included.iter().copied());
+    if !keep_references {
+        pending.extend(included.iter().copied());
+    }
     while let Some(id) = pending.pop() {
         let object = pool.object_by_id(ObjectId::new(id).unwrap()).unwrap();
         for reference in object.referenced_objects() {

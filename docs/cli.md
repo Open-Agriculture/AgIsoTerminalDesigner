@@ -42,6 +42,8 @@ All inputs use commands, arguments, and text assignments. JSON is supported for 
 ```bash
 aitd status
 aitd object list --type Button
+aitd object list --unused
+aitd object list --columns name,type,id,c_ident
 aitd object get Start --parents --children --macros
 aitd schema Button --properties width,height,options
 aitd tree MainScreen
@@ -52,7 +54,9 @@ aitd capabilities
 aitd completions bash > aitd-completion.bash
 ```
 
-Entity targets use names and match case-insensitively. Spaces, hyphens, and underscores are equivalent, so `Start Button`, `start-button`, and `START_BUTTON` select the same entity. Names must be unique within their collection; ambiguous legacy names produce an error. Newly created entities can be addressed by name later in the same command or command file. Numeric-looking names are still names. Set an object's fixed protocol ID on creation with `--override-id ID`, or change it later with `object override-id NAME ID|automatic`. Inspections return bounded results and pagination information; request additional details only when needed. `object list --all` reads all pages, and `object get --style` adds factual descendant style examples.
+Entity targets use names and match case-insensitively. Spaces, hyphens, and underscores are equivalent, so `Start Button`, `start-button`, and `START_BUTTON` select the same entity. Names must be unique within their collection; ambiguous legacy names produce an error. Newly created entities can be addressed by name later in the same command or command file. Numeric-looking names are still names; `object get` falls back to the object ID when no object has that name, which also reaches component instance objects. Set an object's fixed protocol ID on creation with `--override-id ID`, or change it later with `object override-id NAME ID|automatic`. Inspections return bounded results and pagination information; request additional details only when needed. `object list --all` reads all pages, and `object get --style` adds factual descendant style examples.
+
+`object list --unused` keeps only objects that nothing points to: no parent, attribute, variable or pointer reference, event macro, or macro command target. Types the VT finds on its own (Working Set, Working Set Special Controls, Window Mask, Key Group, Object Label Reference List, External Object Definition and auxiliary function/input objects) are never listed. An object that only the ECU uses at runtime, such as a mask it activates or an object it writes into an Object Pointer, has no reference in the pool, so it is listed; review the list before deleting anything. If a macro's commands cannot be decoded, the result names it under `unresolved_macros`, since its targets are unknown. `object list --columns` selects and orders the columns from `id`, `name`, `type` and `c_ident`; `c_ident` is the identifier `export header` writes for the object.
 
 ## Properties, fields, and arrays
 
@@ -87,15 +91,17 @@ aitd reference clear Label variable_reference
 aitd placement add Mask Start 20 30
 aitd placement move Mask Start 40 30
 aitd placement remove Mask Start
+aitd placement shift Mask 0 -20 --all
+aitd placement shift Mask 5 0 Start "Panel 1"
 aitd list insert Choices 0 Counter
 aitd list remove Choices 0
 aitd event bind Start OnKeyPress=Pressed
 aitd event unbind Start OnKeyPress
 ```
 
-Incremental edits preserve other entries. Use `--occurrence INDEX` to disambiguate repeated placements of the same child (zero-based among matching children). Complete replacement uses `list set`, `pointer set`, or `event set` with positional targets or `EVENT=MACRO` bindings. `null` denotes an empty nullable reference/list slot; `name:null` targets an object literally named `null`. Prefix names beginning with `name:` with another `name:` when using an object target token. Reordering commands require every existing entry exactly once. Label commands accept `id=TARGET`, `string=TARGET`, `graphic=TARGET`, and `font=NUMBER`; use `label --help` for forms.
+`placement shift PARENT DX DY` moves children by a relative offset in one atomic edit: name the children (objects, where every placement moves, or component instances), or use `--all` for every placement and component instance under the parent. Put `--` before a child name that starts with a hyphen. Incremental edits preserve other entries. Use `--occurrence INDEX` to disambiguate repeated placements of the same child (zero-based among matching children). Complete replacement uses `list set`, `pointer set`, or `event set` with positional targets or `EVENT=MACRO` bindings. `null` denotes an empty nullable reference/list slot; `name:null` targets an object literally named `null`. Prefix names beginning with `name:` with another `name:` when using an object target token. Reordering commands require every existing entry exactly once. `object get` and `context` show an Object Pointer's allowed targets as `allowed_targets`, in authored order, and list the pointers that may show an object as `allowed_by` on that object. A pointer without allowed targets is unrestricted. Label commands accept `id=TARGET`, `string=TARGET`, `graphic=TARGET`, and `font=NUMBER`; use `label --help` for forms.
 
-Components, instances, nodes, parameters, and graphics are also addressed by names, using the same case-insensitive matching rule. Components and graphics use their own command groups. `component definition-create COMPONENT_NAME ROOT_NODE_NAME OBJECT_TYPE` creates a reusable definition; `component instance-create INSTANCE_NAME COMPONENT_NAME PARENT_OBJECT_NAME X Y` places a named instance. `component node-create COMPONENT_NAME NODE_NAME OBJECT_TYPE` creates a node. `component node-set`, `component override`, and parameter defaults use the same metadata-based value parsing as object properties. Import images with `graphic import FILE --name NAME`. Use `component --help`, `instance --help`, and `graphic --help` for the remaining commands.
+Components, instances, nodes, parameters, and graphics are also addressed by names, using the same case-insensitive matching rule. Components and graphics use their own command groups. `component definition-create COMPONENT_NAME ROOT_NODE_NAME OBJECT_TYPE` creates a reusable definition; `component instance-create INSTANCE_NAME COMPONENT_NAME PARENT_OBJECT_NAME X Y` places a named instance. `component node-create COMPONENT_NAME NODE_NAME OBJECT_TYPE` creates a node. `component node-set`, `component override`, and parameter defaults use the same metadata-based value parsing as object properties. Import images with `graphic import FILE --name NAME`. `component capture OBJECT_NAME COMPONENT_NAME` replaces the object with an instance of a new component; the captured objects then belong to that instance. Objects generated by a component instance are named `<instance>/<node>` (for example `Panel 1/Label`; spaces around `/` don't matter). Inspection commands (`object list`, `object get`, `tree`, `context`, readable output) show and accept these names. Commands that change an object, or point to one, refuse them, because the object is rebuilt from its component: change it per instance with `component override-set`, or for all instances in the master. By default, fonts, line and fill attributes and pictures the subtree refers to are copied into the component, and references to variables or macros are refused. `--keep-shared-references` instead keeps every object the subtree uses but does not place as a reference to the existing object, so instances share them. `component node-reference` takes `node:NAME` (a node of the component), `object:NAME` (a pool object), a bare name (a node if one matches, otherwise an object), or `null`. `component override-set` takes object and graphic parameter values as plain names, like `parameter-add`. A `Position` parameter makes a child node's offset in its parent node configurable per instance: `component parameter-add COMPONENT NAME NODE position Position X,Y`, then `component override-set INSTANCE NAME X,Y`. It cannot target the root node, whose position is the instance's own. The parameter's default and the child's offset in the master stay equal: moving the child (in the editor or with `node-children-set`) updates the default, and changing the default moves the child. Capture, `component instantiate` and `component duplicate` generate the instance name, and every edit that creates instances reports their names under `created_instances`. Use `component --help`, `instance --help`, and `graphic --help` for the remaining commands.
 
 ## Atomic command files and checks
 
@@ -115,7 +121,7 @@ aitd run --file - < resources/labels.aitcmd
 aitd --check object set Counter value=77
 ```
 
-A file contains up to 256 edit actions. Commands execute in order on an isolated working-copy candidate. Every command must be valid when reached: create referenced objects first, repair incompatibilities before changing VT, and resize/reposition before shrinking their available bounds. Any failure discards the entire batch. A successful batch updates the working copy atomically. `--check` runs the same checks without changing the working project.
+A file contains up to 256 edit actions. Commands execute in order on an isolated working-copy candidate. Every command must be valid when reached: create referenced objects first, repair incompatibilities before changing VT, and resize/reposition before shrinking their available bounds. Any failure discards the entire batch. A successful batch updates the working copy atomically. `--check` runs the same checks without changing the working project, and reports the same `changed_objects` and `allocated_objects` a real run would, named as they would be after the edit (`--json` adds them as a `names` map).
 
 Command files support single/double quotes (including literal newlines inside quotes), escaped characters, trailing backslash continuations, blank lines, and lines beginning with `#`. They perform no variable expansion, command substitution, or shell execution. Image and binary resource paths resolve relative to the command file; stdin command files resolve paths relative to the current directory. `--json` and `--check` belong on `run`, not inside the file. Inspection and output commands cannot be included in an edit batch. A Bash script can coordinate multiple `.aitcmd` files and individual CLI commands; the 256-action limit applies to each file independently.
 
@@ -129,7 +135,7 @@ aitd project id-range-set Button 6000 6999
 aitd validate
 ```
 
-Settings use shared project validation: VT2–VT6, positive dimensions, valid softkey counts and layout, and complete nonoverlapping ID ranges. Macro ID ranges for older VT targets must fit their supported limits. Dimension changes do not scale objects and cannot introduce or worsen overflow. Ordinary edits may repair invalid imported content while preserving unchanged existing errors. Changing VT additionally requires compatible materialized content and successful encoding for the target version. All fields in one settings command are checked together. Validation reports errors and nonblocking warnings, including `TEXT_CLIPPED` for fixed-width Output Strings whose current decoded text clips horizontally or vertically; valid wrapping is not flagged.
+Settings use shared project validation: VT2–VT6, positive dimensions, valid softkey counts and layout, and complete nonoverlapping ID ranges. Macro ID ranges for older VT targets must fit their supported limits. Dimension changes do not scale objects and cannot introduce or worsen overflow; a refused change lists every object that would stick out, with its size and position, so `placement shift` can make room in one pass. Ordinary edits may repair invalid imported content while preserving unchanged existing errors. Changing VT additionally requires compatible materialized content and successful encoding for the target version. All fields in one settings command are checked together. Validation reports errors and nonblocking warnings, including `TEXT_CLIPPED` for fixed-width Output Strings whose current decoded text clips horizontally or vertically; valid wrapping is not flagged.
 
 ## Output and exports
 
@@ -143,7 +149,7 @@ aitd export project --output-dir release
 aitd graphic export Logo --output build/image.png
 ```
 
-Previews are schematic geometry images, not screenshots of the full VT renderer. Binary export applies its own target compatibility checks, independently of save-time validation. Existing output files require `--force`; bundle artifacts are generated and staged before publishing. C header export rejects colliding or reserved identifiers.
+Previews are schematic geometry images, not screenshots of the full VT renderer. Binary export applies its own target compatibility checks, independently of save-time validation. Existing output files require `--force`; bundle artifacts are generated and staged before publishing. C header export rejects colliding or reserved identifiers. Objects generated by a component instance get `<instance>_<node>` identifiers (for example `PANEL_1_LABEL`), so instances of one component stay distinct and names do not change when IDs are reassigned. Rename an instance with `component instance-rename INSTANCE_NAME NEW_NAME`.
 
 `export project --output-dir DIR` validates the project and creates a new directory containing `project.aitp` and `project.iop`. Both artifacts are prepared before the directory is published. The destination must not exist, including an empty directory or symbolic link; there is no overwrite option. Failed generation leaves no final output directory.
 
@@ -191,6 +197,10 @@ colour transparent. If no conversion controls are supplied, assignment keeps
 its existing defaults. With conversion controls, an omitted format keeps the
 target PictureGraphic's format; newly created pictures default to eight-bit.
 Encoding is selected automatically from raw and run-length sizes.
+`object delete --unplace` first removes the object from every parent that places it; other references still block the delete. A refused delete names what still uses the object, such as `placed in Main (2×)`, `the font_attributes of Speed` or `an allowed target of pointer Selector`. `object delete` on a PictureGraphic also removes its image, which the editor
+would otherwise keep as an available graphic; the result names it under
+`removed_assets`. Add `--keep-image` to keep it as an available graphic,
+reported under `recovered_assets`.
 `graphic assign-file` remains available for lossless
 indexed PNG transport with an explicit format and encoding. ZIP export compares regenerated picture bytes
 and rejects non-reproducible encodings, unsupported binary content, and invalid

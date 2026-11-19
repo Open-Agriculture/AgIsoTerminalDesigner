@@ -731,3 +731,133 @@ fn reassignment_includes_compiled_nodes_and_round_trips_as_one_change() {
     assert!(project.redo_operation());
     assert_eq!(project.save_project().unwrap(), after);
 }
+
+fn text_node(p: &EditorProject, component: ComponentId) -> ComponentNodeId {
+    p.component_source().definitions[&component]
+        .nodes
+        .iter()
+        .find(|n| n.object_type == ObjectType::OutputString)
+        .unwrap()
+        .id
+}
+
+fn child_offset(p: &EditorProject, component: ComponentId, node: ComponentNodeId) -> (i32, i32) {
+    p.component_source().definitions[&component]
+        .nodes
+        .iter()
+        .flat_map(|parent| &parent.children)
+        .find(|child| child.child == node)
+        .map(|child| (child.x, child.y))
+        .unwrap()
+}
+
+#[test]
+fn position_parameter_and_master_child_offset_stay_in_sync() {
+    let (mut p, component, instance) = captured();
+    let node = text_node(&p, component);
+    let id = ComponentParameterId::default();
+    ComponentService::add_component_parameter(
+        &mut p,
+        component,
+        ComponentParameter {
+            id,
+            name: "Caption position".into(),
+            description: None,
+            target_node: node,
+            property: ComponentParameterTarget::Position,
+            kind: ComponentParameterKind::Position,
+            default_value: json!({"x": 0, "y": 10}),
+        },
+    )
+    .unwrap();
+    // A new parameter's default moves the master child.
+    assert_eq!(child_offset(&p, component, node), (0, 10));
+
+    // Moving the child in the master moves the default, and so instances.
+    let mut definition = p.component_source().definitions[&component].clone();
+    for child in definition.nodes.iter_mut().flat_map(|n| &mut n.children) {
+        if child.child == node {
+            child.y = 6;
+        }
+    }
+    ComponentService::edit_component_definition(&mut p, definition).unwrap();
+    let parameter = p.component_source().definitions[&component]
+        .parameters
+        .iter()
+        .find(|parameter| parameter.id == id)
+        .unwrap()
+        .clone();
+    assert_eq!(parameter.default_value, json!({"x": 0, "y": 6}));
+    let root = p.component_source().instances[0].compiled_ids
+        [&p.component_source().definitions[&component].root_node];
+    let pool = p.materialize().unwrap().pool;
+    let placed =
+        object_refs(pool.object_by_id(ObjectId::new(root).unwrap()).unwrap()).unwrap()[0].offset;
+    assert_eq!((placed.x, placed.y), (0, 6));
+
+    // Editing the default moves the master child.
+    ComponentService::edit_component_parameter(
+        &mut p,
+        component,
+        ComponentParameter {
+            default_value: json!({"x": 0, "y": 4}),
+            ..parameter
+        },
+    )
+    .unwrap();
+    assert_eq!(child_offset(&p, component, node), (0, 4));
+    let _ = instance;
+}
+
+#[test]
+fn instances_can_be_renamed_with_unique_names() {
+    let (mut p, component, first) = captured();
+    let second =
+        ComponentService::instantiate_component(&mut p, component, 2, 200, 20, Default::default())
+            .unwrap();
+    ComponentService::rename_instance(&mut p, first, "Panel one".into()).unwrap();
+    let name = |p: &EditorProject, id| {
+        p.component_source()
+            .instances
+            .iter()
+            .find(|instance| instance.id == id)
+            .unwrap()
+            .name
+            .clone()
+    };
+    assert_eq!(name(&p, first), "Panel one");
+    assert!(ComponentService::rename_instance(&mut p, second, "panel-one".into()).is_err());
+    assert!(ComponentService::rename_instance(&mut p, second, " ".into()).is_err());
+    ComponentService::rename_instance(&mut p, first, "Panel One".into()).unwrap();
+    assert_eq!(name(&p, first), "Panel One");
+    assert!(p.undo_operation());
+    assert_eq!(name(&p, first), "Panel one");
+}
+
+#[test]
+fn capture_can_keep_referenced_objects_shared() {
+    let p = fixture();
+    let copied = plan_component_capture(&p, 100, "Copy".into()).unwrap();
+    let kept = plan_component_capture_with(&p, 100, "Keep".into(), true).unwrap();
+    // The font is copied into the component by default, referenced when kept.
+    assert!(copied
+        .definition
+        .nodes
+        .iter()
+        .any(|n| n.object_type == ObjectType::FontAttributes));
+    assert!(!kept
+        .definition
+        .nodes
+        .iter()
+        .any(|n| n.object_type == ObjectType::FontAttributes));
+    assert!(kept
+        .external_references
+        .iter()
+        .any(|(_, property, target)| property == "font_attributes" && *target == 102));
+    let mut p = p;
+    ComponentService::create_component_from_selection(&mut p, kept, true).unwrap();
+    assert!(p
+        .get_pool()
+        .object_by_id(ObjectId::new(102).unwrap())
+        .is_some());
+}

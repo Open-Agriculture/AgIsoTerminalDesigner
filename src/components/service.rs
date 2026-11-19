@@ -192,6 +192,7 @@ impl ComponentService {
         mut definition: ComponentDefinition,
     ) -> ComponentResult<()> {
         project.edit_components("Edit component definition", |_, source| {
+            sync_position_parameters(source.definitions.get(&definition.id), &mut definition);
             validate_definition_names(source, &definition)?;
             validate_changed_iso_domain_properties(source, &definition)?;
             definition.revision = source
@@ -300,6 +301,16 @@ impl ComponentService {
         project.edit_components("Reset component overrides", |_, source| {
             instance_mut(source, id)?.overrides.clear();
             Ok(())
+        })
+    }
+    /// Rename an instance. Its generated objects' C header names follow.
+    pub fn rename_instance(
+        project: &mut EditorProject,
+        id: ComponentInstanceId,
+        name: String,
+    ) -> ComponentResult<()> {
+        project.edit_components("Rename component instance", |_, source| {
+            rename_instance_in(source, id, name)
         })
     }
     pub fn move_instance(
@@ -558,6 +569,96 @@ fn unique_component_name(source: &ComponentSource, name: &str) -> String {
 
 /// Validate new or changed labels while allowing unchanged legacy collisions to
 /// be repaired one at a time.
+/// Rename an instance in place. Names must be non-empty and unique among
+/// instances; changing only the case or separators of its own name is allowed.
+pub(crate) fn rename_instance_in(
+    source: &mut ComponentSource,
+    id: ComponentInstanceId,
+    name: String,
+) -> ComponentResult<()> {
+    if crate::smart_naming::normalized_name(&name).is_empty()
+        || source.instances.iter().any(|instance| {
+            instance.id != id && crate::smart_naming::names_equal(&instance.name, &name)
+        })
+    {
+        return Err(ComponentError::new(
+            "COMPONENT_INSTANCE_NAME_CONFLICT",
+            format!("Component instance name is empty or already exists: {name}"),
+        ));
+    }
+    let instance = source
+        .instances
+        .iter_mut()
+        .find(|instance| instance.id == id)
+        .ok_or_else(|| {
+            ComponentError::new(
+                "COMPONENT_INSTANCE_INVALID",
+                format!("Unknown component instance {id}"),
+            )
+        })?;
+    instance.name = name;
+    Ok(())
+}
+
+/// Keep each Position parameter's default equal to its child's authored
+/// offset, so moving the child in the master (or `node-children-set`) moves
+/// instances that don't override it. When the child moved, the parameter
+/// default follows; when the parameter is new or its default changed, the
+/// child follows. Instances use the parameter value, so the two must agree.
+pub(crate) fn sync_position_parameters(
+    previous: Option<&ComponentDefinition>,
+    definition: &mut ComponentDefinition,
+) {
+    let child_position = |definition: &ComponentDefinition, node: ComponentNodeId| {
+        definition
+            .nodes
+            .iter()
+            .flat_map(|parent| &parent.children)
+            .find(|child| child.child == node)
+            .map(|child| (child.x, child.y))
+    };
+    let parameters: Vec<_> = definition
+        .parameters
+        .iter()
+        .filter(|p| p.property == ComponentParameterTarget::Position)
+        .map(|p| (p.id, p.target_node, p.default_value.clone()))
+        .collect();
+    for (id, node, default) in parameters {
+        let Some(current) = child_position(definition, node) else {
+            continue;
+        };
+        let before_child = previous.and_then(|previous| child_position(previous, node));
+        // A parameter retargeted to another node counts as newly attached.
+        let before_default = previous.and_then(|previous| {
+            previous
+                .parameters
+                .iter()
+                .find(|p| p.id == id && p.target_node == node)
+                .map(|p| p.default_value.clone())
+        });
+        let child_moved = before_child.is_some_and(|before| before != current);
+        if child_moved {
+            if let Some(parameter) = definition.parameters.iter_mut().find(|p| p.id == id) {
+                parameter.default_value = serde_json::json!({"x": current.0, "y": current.1});
+            }
+        } else if before_default.as_ref() != Some(&default) {
+            // An invalid default is left for validation to reject.
+            let Ok(position) = serde_json::from_value::<ComponentPosition>(default) else {
+                continue;
+            };
+            if let Some(child) = definition
+                .nodes
+                .iter_mut()
+                .flat_map(|parent| &mut parent.children)
+                .find(|child| child.child == node)
+            {
+                child.x = position.x;
+                child.y = position.y;
+            }
+        }
+    }
+}
+
 pub(crate) fn validate_definition_names(
     source: &ComponentSource,
     definition: &ComponentDefinition,

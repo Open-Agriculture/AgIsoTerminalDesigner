@@ -164,6 +164,8 @@ pub fn get_design_context(
                     object_list: None,
                     macro_references: Vec::new(),
                     parents: Vec::new(),
+                    allowed_targets: Vec::new(),
+                    allowed_by: Vec::new(),
                 }
             };
             if !request.include_properties {
@@ -174,6 +176,8 @@ pub fn get_design_context(
             }
             if !request.include_references {
                 object.references.clear();
+                object.allowed_targets.clear();
+                object.allowed_by.clear();
             }
             // Relationships and full child lists are available through paginated get_objects.
             object.positioned_children.clear();
@@ -231,6 +235,8 @@ pub fn get_objects(
             }
             if !request.include_references {
                 object.references.clear();
+                object.allowed_targets.clear();
+                object.allowed_by.clear();
             }
             if !request.include_children {
                 object.positioned_children.clear();

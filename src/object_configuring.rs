@@ -233,6 +233,7 @@ fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &Ed
         design.vt_version,
         unavailable,
     );
+    render_allowed_by(ui, design, id);
     ui.separator();
     if let Object::PictureGraphic(picture) = object {
         let current_format = picture.format;
@@ -893,6 +894,40 @@ fn object_label(design: &EditorProject, object: &Object) -> String {
 
 fn object_selector_label(design: &EditorProject, object: &Object) -> String {
     design.object_display_name(object)
+}
+
+/// List the Object Pointers that may show this object at runtime, as links.
+/// Such an object is in use even without a parent, and cannot be deleted
+/// until it is removed from those pointers' allowed targets.
+fn render_allowed_by(ui: &mut egui::Ui, design: &EditorProject, id: ObjectId) {
+    let mut pointers: Vec<_> = design
+        .get_pool()
+        .objects_by_type(ObjectType::ObjectPointer)
+        .into_iter()
+        .filter(|pointer| {
+            pointer.id() != id
+                && design
+                    .get_object_info(pointer)
+                    .allowed_references
+                    .contains(&id)
+        })
+        .map(|pointer| (pointer.id(), design.object_display_name(pointer)))
+        .collect();
+    if pointers.is_empty() {
+        return;
+    }
+    pointers.sort_by_key(|(pointer, _)| pointer.value());
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Can be shown by:").on_hover_text(
+            "Object Pointers that list this object as an allowed target. It cannot be \
+             deleted while it is listed there.",
+        );
+        for (pointer, name) in pointers {
+            if ui.link(name).clicked() {
+                select_object(design, pointer);
+            }
+        }
+    });
 }
 
 fn select_object(design: &EditorProject, id: ObjectId) {

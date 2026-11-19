@@ -94,10 +94,22 @@ pub fn execute(
                     other => other,
                 });
             }
+            // A root inside a component instance shows its own contents;
+            // otherwise generated objects are summarised as instances.
+            let generated_root = args["root_id"].as_u64().is_some_and(|id| {
+                crate::components::source_map(&state.components)
+                    .by_object_id
+                    .contains_key(&(id as u16))
+            });
             let request = serde_json::from_value(args)
                 .map_err(|e| DomainError::new("INVALID_ARGUMENTS", e.to_string()))?;
             let context = cli::get_design_context(state, request).map_err(inspection_error)?;
-            Ok(json!({"context": cli::tools::component_design_context(state, context)}))
+            let context = if generated_root {
+                serde_json::to_value(context).expect("snapshot serializes")
+            } else {
+                cli::tools::component_design_context(state, context)
+            };
+            Ok(json!({ "context": context }))
         }
         AutomationAction::GetObjects => {
             if let Some(targets) = args.get("targets").and_then(Value::as_array) {
@@ -112,6 +124,25 @@ pub fn execute(
                             &state.object_info,
                         )
                         .map(|id| id.value())
+                        .or_else(|error| {
+                            // Names win; a number that names nothing is an object
+                            // ID. This also reaches component instance objects,
+                            // which have no names of their own.
+                            let (
+                                crate::ObjectTarget::Name { name },
+                                crate::operations::OperationError::ObjectNameNotFound(_),
+                            ) = (&target, &error)
+                            else {
+                                return Err(error);
+                            };
+                            name.parse::<u16>()
+                                .ok()
+                                .and_then(|id| ag_iso_stack::object_pool::ObjectId::new(id).ok())
+                                .filter(|id| state.pool.object_by_id(*id).is_some())
+                                .map(|id| id.value())
+                                .or_else(|| cli::names::readable_object_id(project, name).ok())
+                                .ok_or(error)
+                        })
                         .map_err(|e| DomainError::new("OBJECT_NOT_FOUND", e.to_string()))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -155,6 +186,17 @@ pub fn execute(
             }
             let offset = args["offset"].as_u64().unwrap_or(0) as usize;
             let limit = args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
+            let unused = args["unused"].as_bool().unwrap_or(false);
+            let columns = list_columns(&args["columns"])?;
+            let c_identifiers = if columns.contains(&"c_ident") {
+                Some(
+                    cli::export::c_identifiers(project)
+                        .map_err(|e| DomainError::new("EXPORT_FAILED", e))?,
+                )
+            } else {
+                None
+            };
+            let usage = unused.then(|| object_usage(state));
             let parent_children = parent.map(|parent_id| {
                 ag_iso_stack::object_pool::ObjectId::new(parent_id)
                     .ok()
@@ -201,19 +243,42 @@ pub fn execute(
                         continue;
                     }
                 }
-                matches.push(json!({"id":id,"name":name,"type":object_type}));
+                if let Some(usage) = &usage {
+                    if usage.referenced.contains(&id) || is_top_level(object.object_type()) {
+                        continue;
+                    }
+                }
+                let row = columns
+                    .iter()
+                    .map(|column| {
+                        let value = match *column {
+                            "id" => json!(id),
+                            "name" => json!(name),
+                            "type" => json!(object_type),
+                            "c_ident" => json!(c_identifiers.as_ref().and_then(|c| c.get(&id))),
+                            _ => unreachable!("columns are validated"),
+                        };
+                        ((*column).to_owned(), value)
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                matches.push((id, Value::Object(row)));
             }
-            matches.sort_by_key(|item| item["id"].as_u64().unwrap_or(u64::MAX));
+            matches.sort_by_key(|(id, _)| *id);
             let total = matches.len();
             let objects = matches
                 .into_iter()
                 .skip(offset)
                 .take(limit)
+                .map(|(_, row)| row)
                 .collect::<Vec<_>>();
             let has_more = offset.saturating_add(objects.len()) < total;
-            Ok(
-                json!({"objects":objects,"total":total,"offset":offset,"limit":limit,"has_more":has_more}),
-            )
+            let mut result = json!({"objects":objects,"columns":columns,"total":total,"offset":offset,"limit":limit,"has_more":has_more});
+            if let Some(usage) = usage.filter(|usage| !usage.unresolved_macros.is_empty()) {
+                // Macros whose commands could not be decoded may reference
+                // objects listed here, so name them instead of guessing.
+                result["unresolved_macros"] = json!(usage.unresolved_macros);
+            }
+            Ok(result)
         }
         AutomationAction::GetObjectSchema => {
             let names: Vec<&str> = match args.get("object_types").and_then(Value::as_array) {
@@ -464,5 +529,117 @@ pub fn execute(
                 .map_err(|e| DomainError::new("INSPECTION_FAILED", format!("{e:?}")))?;
             Ok(json!({"region":region}))
         }
+    }
+}
+
+/// Columns `list_objects` can return, in their default order.
+const LIST_COLUMNS: [&str; 4] = ["id", "name", "type", "c_ident"];
+
+fn list_columns(value: &Value) -> Result<Vec<&'static str>, DomainError> {
+    let Some(requested) = value.as_array() else {
+        if value.is_null() {
+            return Ok(LIST_COLUMNS[..3].to_vec());
+        }
+        return Err(DomainError::new(
+            "INVALID_ARGUMENTS",
+            "columns must be a list of column names",
+        ));
+    };
+    let mut columns = Vec::new();
+    for column in requested {
+        let column = column.as_str().map(str::trim).unwrap_or_default();
+        let known = LIST_COLUMNS
+            .iter()
+            .find(|known| **known == column)
+            .ok_or_else(|| {
+                DomainError::new(
+                    "INVALID_ARGUMENTS",
+                    format!(
+                        "Unknown column '{column}'. Choose from {}",
+                        LIST_COLUMNS.join(", ")
+                    ),
+                )
+            })?;
+        if !columns.contains(known) {
+            columns.push(*known);
+        }
+    }
+    if columns.is_empty() {
+        return Err(DomainError::new(
+            "INVALID_ARGUMENTS",
+            "Provide at least one column",
+        ));
+    }
+    Ok(columns)
+}
+
+/// Types the VT finds by type rather than through a parent or reference
+/// (ISO 11783-6), so having no inbound reference does not make them unused.
+fn is_top_level(object_type: ObjectType) -> bool {
+    matches!(
+        object_type,
+        ObjectType::WorkingSet
+            | ObjectType::WorkingSetSpecialControls
+            | ObjectType::WindowMask
+            | ObjectType::KeyGroup
+            | ObjectType::ObjectLabelReferenceList
+            | ObjectType::ExternalObjectDefinition
+            | ObjectType::AuxiliaryFunctionType1
+            | ObjectType::AuxiliaryInputType1
+            | ObjectType::AuxiliaryFunctionType2
+            | ObjectType::AuxiliaryInputType2
+    )
+}
+
+struct ObjectUsage {
+    /// IDs that another object points to: children, attribute and variable
+    /// references, pointer values and allowed pointer targets, event macros,
+    /// and macro command targets.
+    referenced: std::collections::HashSet<u16>,
+    unresolved_macros: Vec<u16>,
+}
+
+fn object_usage(state: &cli::AiDesignState) -> ObjectUsage {
+    use ag_iso_stack::object_pool::object::Object;
+    let types = state
+        .pool
+        .objects()
+        .iter()
+        .map(|object| (object.id().value(), object.object_type()))
+        .collect();
+    let mut referenced = std::collections::HashSet::new();
+    let mut unresolved_macros = Vec::new();
+    for object in state.pool.objects() {
+        let own = object.id().value();
+        // Same references the delete operation checks, so an object listed
+        // here can be deleted.
+        let mut targets: Vec<u16> = object
+            .referenced_objects()
+            .into_iter()
+            .map(|id| id.value())
+            .collect();
+        if let Some(macros) = crate::operations::operation::macro_refs(object) {
+            targets.extend(macros.iter().map(|r| r.macro_id));
+        }
+        if let Object::Macro(mac) = object {
+            match crate::macro_id_remap::macro_object_references(
+                &mac.commands,
+                state.vt_version,
+                &types,
+            ) {
+                Ok(ids) => targets.extend(ids),
+                Err(_) => unresolved_macros.push(own),
+            }
+        }
+        // A pointer may show any of its allowed targets at runtime.
+        if let Some(info) = state.object_info.get(&object.id()) {
+            targets.extend(info.allowed_references.iter().map(|id| id.value()));
+        }
+        referenced.extend(targets.into_iter().filter(|id| *id != own));
+    }
+    unresolved_macros.sort_unstable();
+    ObjectUsage {
+        referenced,
+        unresolved_macros,
     }
 }

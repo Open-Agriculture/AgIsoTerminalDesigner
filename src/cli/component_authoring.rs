@@ -135,6 +135,10 @@ pub enum ComponentAuthoringAction {
         #[serde(default)]
         compiled_ids: BTreeMap<ComponentNodeId, u16>,
     },
+    InstanceRename {
+        instance_id: ComponentInstanceId,
+        name: String,
+    },
     OverrideSet {
         instance_id: ComponentInstanceId,
         parameter_id: ComponentParameterId,
@@ -201,6 +205,20 @@ pub fn export_actions(
                 }
             }
         }
+        // Child placements first (a Position parameter needs its node placed),
+        // then parameters in authored order, then references, which may
+        // target parameters.
+        for node in definition
+            .nodes
+            .iter()
+            .filter(|node| !node.children.is_empty())
+        {
+            actions.push(ComponentAuthoringAction::NodeChildrenSet {
+                component_id: definition.id,
+                node_id: node.id,
+                children: node.children.clone(),
+            });
+        }
         for parameter in &definition.parameters {
             actions.push(ComponentAuthoringAction::ParameterAdd {
                 component_id: definition.id,
@@ -217,13 +235,6 @@ pub fn export_actions(
                         target: target.clone(),
                     });
                 }
-            }
-            if !node.children.is_empty() {
-                actions.push(ComponentAuthoringAction::NodeChildrenSet {
-                    component_id: definition.id,
-                    node_id: node.id,
-                    children: node.children.clone(),
-                });
             }
             if !node.macro_references.is_empty() {
                 actions.push(ComponentAuthoringAction::NodeMacroReferencesSet {
@@ -747,6 +758,19 @@ pub fn export_command_tokens(
             }
             let _ = compiled_ids;
         }
+        A::InstanceRename { instance_id, name } => {
+            let instance = project
+                .component_source()
+                .instances
+                .iter()
+                .find(|instance| instance.id == *instance_id)
+                .ok_or_else(|| format!("Unknown component instance {instance_id}"))?;
+            tokens.extend([
+                "instance-rename".into(),
+                instance.name.clone(),
+                name.clone(),
+            ]);
+        }
         A::OverrideSet {
             instance_id,
             parameter_id,
@@ -1166,6 +1190,9 @@ pub fn apply(project: &mut EditorProject, action: ComponentAuthoringAction) -> R
                         instance.compiled_ids = compiled_ids;
                     }
                 }
+                ComponentAuthoringAction::InstanceRename { instance_id, name } => {
+                    crate::components::rename_instance_in(source, instance_id, name)?;
+                }
                 ComponentAuthoringAction::OverrideSet {
                     instance_id,
                     parameter_id,
@@ -1183,6 +1210,12 @@ pub fn apply(project: &mut EditorProject, action: ComponentAuthoringAction) -> R
                         })?;
                     instance.overrides.insert(parameter_id, value);
                 }
+            }
+            for definition in source.definitions.values_mut() {
+                crate::components::sync_position_parameters(
+                    original_source.definitions.get(&definition.id),
+                    definition,
+                );
             }
             for definition in source.definitions.values() {
                 crate::components::validate_definition_names(&original_source, definition)?;
