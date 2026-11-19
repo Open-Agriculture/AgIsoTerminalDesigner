@@ -47,6 +47,11 @@ This project is under **active development**. While some features may not yet be
 - Preview multiple data/alarm masks with their linked soft keys on one canvas; edit the focused mask with undo/redo
 - Limit selecting macro's and object references to allowed types only.
 - Assign allowed references to object pointers and switch their active target with a dropdown in the properties panel. Empty lists keep unrestricted selection; lists are saved in `.aitp` projects, while IOP export contains only the active target.
+- Edit object attributes in Properties, including editors for palette colours, colour maps, languages, Macro commands, NAME fields, object labels, input code planes, and Graphic Data images
+- Common new objects start with a usable size, and required Font or Line Attributes are filled in; missing required references are marked
+- Reuse groups of objects as components, manage shared Font, Line and Fill Attributes, replace every reference to an object, and reassign object IDs
+- Convert images to Picture Graphics: pick the format, colour mapping and transparency, store a smaller image, and compare the sizes
+- Import a pool split over several IOP files; export an IOP, a C header with object IDs, or a CLI ZIP
 
 ### Interactive layout editor
 
@@ -64,15 +69,20 @@ Check masks in the Objects pane to preview them side by side. Click a mask row o
 | Arrow / Shift+Arrow | Move by 1 / 10 pool pixels |
 | Resize handle + Shift / Alt | Preserve aspect ratio / resize from center |
 | Delete / Escape | Remove selected placements / cancel a gesture or clear selection |
+| Ctrl+N / Ctrl+G | Add an object / group the selection into a Container |
 | Space-drag, middle mouse, or right mouse drag | Pan (stationary right-click opens the context menu) |
 | Ctrl-wheel | Zoom around the pointer |
 | Shift+1 / Shift+2 | Fit mask / fit selection |
 
 The canvas toolbar provides X/Y and supported W/H fields, alignment/distribution, snapping switches, an optional grid overlay, and a shortcut reference. Grid spacing follows zoom automatically, down to one pool pixel, independently of snapping. Alignment and distribution operate on selections sharing a parent; hold Shift while aligning to align the selection as a group to that parent.
 
+Right-click the canvas to add an object right there, group the selection, or align it. **Add object here** only lists objects that fit under the pointer. Positioned objects go at the pointer; a new Key is added to the end of the soft key mask.
+
+To move polygon points or line ends on the canvas, tick **Edit points** in Properties.
+
 Moving a repeated reference updates its exact child-list occurrence. Resizing changes the shared object's dimensions at every reference; the toolbar identifies shared dimensions. Removing a placement retains its primitive object definition in the pool. Component instances move and duplicate as units; their internal geometry stays controlled by their component definitions.
 
-Switch the canvas to **Preview** to run local animations and visual macros against a temporary copy of the pool. Use **Reset** to restart from the current design, select a mask, press its keys and buttons, or run a macro directly. Playback values and Graphics Context drawings do not enter project history or saved files. Runtime errors appear above the preview. Selecting a VT2 Auxiliary Type 1 object also shows its designator in Properties.
+Switch the canvas to **Preview** to run local animations and visual macros against a temporary copy of the pool. Use **Reset** to restart from the current design, select a mask, press its keys and buttons, or run a macro directly. Playback values and Graphics Context drawings do not enter project history or saved files. Runtime errors appear above the preview. Selecting a VT2 Auxiliary Type 1 object also shows its designator in Properties. Meters, bar graphs and buttons (pressed, latched and disabled) are drawn like AgIsoVirtualTerminal draws them.
 
 Primitive copies receive fresh object IDs and metadata identities. PictureGraphic placements reuse the original image object, including pictures inside copied parents. Internal references within the copied positioned subtree are remapped; external styles and resources remain shared. Component copies retain their master and overrides. Completed gestures and numeric edits each create one undo action.
 
@@ -84,87 +94,20 @@ Output Strings use the selected VT version's presentation rules from ISO 11783-6
 
 Imported strings retain their original bytes and decode using their ISO-8859 font character set or UTF-16LE BOM. Editing text converts it to Unicode, exported as a UTF-16LE WideString (VT version 4 and later). Unsupported proprietary encodings display a diagnostic. Export rejects strings exceeding their encoded byte-length limit. A shared String Variable is decoded separately for each rendered field; its text editor uses the first referencing field's character set.
 
-Project Settings supports VT2–VT6 with compatibility checks, undo/redo, and version-aware authoring and preview. VT2/VT3 export uses the consumers' 8-bit font encodings and rejects unrepresentable text. Raw IOP import asks for its target version and rejects malformed records. Existing incompatible projects remain editable for repair; binary export waits until they are compatible. New `.aitp` saves use lossless authoring format v2, while v1 files remain readable. See [Designer settings](docs/project-settings.md).
+Project Settings supports VT2–VT6 with compatibility checks, undo/redo, and version-aware authoring and preview. VT2/VT3 export uses the consumers' 8-bit font encodings and rejects unrepresentable text. Raw IOP import asks for its target version and rejects malformed records. Existing incompatible projects remain editable for repair; binary export waits until they are compatible. New `.aitp` saves use lossless authoring format v2, while v1 files remain readable.
 
 ### What's Next
 
 The list below outlines some of the features and improvements that are planned to be implemented in the future. The order is a good indication of the priority.
 
-- Add the remaining objects for configuration and rendering.
-- Display a preview of the active soft key mask.
-- Add a colour picker for colour attributes.
+- Preview Window Mask and Key Group objects.
 - Show a pop-up when creating a new object for initial configuration.
 
 If you have any suggestions or would like to contribute, feel free to open an issue or submit a pull request!
 
 ### Supported Objects
 
-The lists below only apply to version 3 of the VT specification. There are 3 stages of development for each object: **Not Started** [ :white_circle: ], **In Progress** [ :yellow_circle: ], and **Completed** [ :green_circle: ]. Open an issue if you would like to prioritize a specific object, or even better, submit a pull request to help implement it!
-
-#### Configurable Types
-
-- :yellow_circle: WorkingSet (missing language codes)
-- :green_circle: DataMask
-- :green_circle: AlarmMask
-- :green_circle: Container
-- :green_circle: SoftKeyMask
-- :green_circle: Key
-- :yellow_circle: Button (missing options, keycode, border colour)
-- :green_circle: InputBoolean
-- :green_circle: InputString
-- :green_circle: InputNumber
-- :green_circle: InputList
-- :green_circle: OutputString
-- :green_circle: OutputNumber
-- :yellow_circle: OutputList
-- :yellow_circle: OutputLine
-- :yellow_circle: OutputRectangle
-- :yellow_circle: OutputEllipse
-- :yellow_circle: OutputPolygon
-- :yellow_circle: OutputMeter
-- :yellow_circle: OutputLinearBarGraph
-- :yellow_circle: OutputArchedBarGraph
-- :yellow_circle: PictureGraphic (missing loading images from file)
-- :yellow_circle: NumberVariable
-- :yellow_circle: StringVariable
-- :yellow_circle: FontAttributes
-- :yellow_circle: LineAttributes
-- :yellow_circle: FillAttributes
-- :yellow_circle: InputAttributes
-- :green_circle: ObjectPointer
-- :yellow_circle: Macro
-- :yellow_circle: Auxiliary Function Type 2
-- :yellow_circle: Auxiliary Input Type 2
-- :yellow_circle: Auxiliary Control Designator Type 2 Object Pointer
-
-#### Renderable Types
-
-- :green_circle: WorkingSet
-- :yellow_circle: DataMask (missing soft key mask)
-- :yellow_circle: AlarmMask (missing soft key mask)
-- :green_circle: Container
-- :white_circle: SoftKeyMask
-- :yellow_circle: Key
-- :green_circle: Button
-- :yellow_circle: InputBoolean
-- :green_circle: InputString
-- :yellow_circle: InputNumber
-- :green_circle: InputList
-- :yellow_circle: OutputString
-- :yellow_circle: OutputNumber
-- :white_circle: OutputList
-- :yellow_circle: OutputLine
-- :yellow_circle: OutputRectangle
-- :green_circle: OutputEllipse
-- :white_circle: OutputPolygon
-- :green_circle: OutputMeter
-- :green_circle: OutputLinearBarGraph
-- :green_circle: OutputArchedBarGraph
-- :green_circle: PictureGraphic
-- :green_circle: ObjectPointer
-- :yellow_circle: Auxiliary Function Type 2
-- :yellow_circle: Auxiliary Input Type 2
-- :yellow_circle: Auxiliary Control Designator Type 2 Object Pointer
+All object types from VT2 to VT6 can be created and edited. The canvas previews most visible objects. Window Mask and Key Group have no preview yet, and auxiliary designators that depend on runtime assignments show a placeholder. Open an issue if something is missing or looks wrong, or even better, submit a pull request!
 
 
 ## Installation
