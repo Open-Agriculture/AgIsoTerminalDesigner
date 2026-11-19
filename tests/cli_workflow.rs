@@ -577,3 +577,34 @@ fn project_export_publishes_validated_artifacts_and_refuses_existing_outputs() {
     success(cli(&cwd, &["project", "close", "--discard"]));
     std::fs::remove_dir_all(cwd).unwrap();
 }
+
+#[test]
+fn region_reports_each_placement_of_a_reused_container_at_its_own_position() {
+    let _session = CLI_SESSION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let cwd = temp_dir("aitd-region-reuse");
+    new_session(&cwd);
+    for command in [
+        "object create DataMask Screen",
+        "object create Container Box",
+        "object set Box width=50 height=50",
+        "object create Container Dot",
+        "object set Dot width=5 height=5",
+        "placement add Box Dot 10 0",
+        "placement add Screen Box 0 0",
+        "placement add Screen Box 100 0",
+    ] {
+        success(cli(&cwd, &command.split_whitespace().collect::<Vec<_>>()));
+    }
+    let region = success(cli(&cwd, &["region", "Screen", "--region", "all"]));
+    let mut dots: Vec<_> = region["result"]["region"]["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|object| object["name"] == "Dot")
+        .map(|object| object["absolute"]["x"].as_i64().unwrap())
+        .collect();
+    dots.sort();
+    assert_eq!(dots, [10, 110]);
+}

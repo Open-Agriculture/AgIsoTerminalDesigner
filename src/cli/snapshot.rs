@@ -371,16 +371,27 @@ pub(crate) fn context_layout<'a>(
     root: Option<ObjectId>,
     max_depth: usize,
 ) -> impl Iterator<Item = LayoutInstance> + 'a {
+    positioned_context_layout(pool, info, root, max_depth).map(|(instance, _)| instance)
+}
+
+/// Breadth-first layout with each occurrence's position relative to `root`.
+/// An object placed more than once gets one origin per placement.
+pub(crate) fn positioned_context_layout<'a>(
+    pool: &'a ObjectPool,
+    info: &'a HashMap<ObjectId, ObjectInfo>,
+    root: Option<ObjectId>,
+    max_depth: usize,
+) -> impl Iterator<Item = (LayoutInstance, (i32, i32))> + 'a {
     let mut queue = std::collections::VecDeque::new();
     if let Some(root) = root {
-        queue.push_back((root, vec![root.value()], 0));
+        queue.push_back((root, vec![root.value()], 0, (0i32, 0i32)));
     }
     let mut pending = std::collections::VecDeque::new();
     std::iter::from_fn(move || loop {
         if let Some(item) = pending.pop_front() {
             return Some(item);
         }
-        let (id, path, depth) = queue.pop_front()?;
+        let (id, path, depth, (ox, oy)) = queue.pop_front()?;
         if depth >= max_depth {
             continue;
         }
@@ -403,17 +414,21 @@ pub(crate) fn context_layout<'a>(
             };
             let mut child_path = path.clone();
             child_path.push(child_id.value());
-            pending.push_back(LayoutInstance {
-                object: child,
-                parent: summary(pool, info, id).unwrap(),
-                x,
-                y,
-                width: dimension(PropertyKey::Width),
-                height: dimension(PropertyKey::Height),
-                depth: depth + 1,
-                path: child_path.clone(),
-            });
-            queue.push_back((child_id, child_path, depth + 1));
+            let origin = (ox + x, oy + y);
+            pending.push_back((
+                LayoutInstance {
+                    object: child,
+                    parent: summary(pool, info, id).unwrap(),
+                    x,
+                    y,
+                    width: dimension(PropertyKey::Width),
+                    height: dimension(PropertyKey::Height),
+                    depth: depth + 1,
+                    path: child_path.clone(),
+                },
+                origin,
+            ));
+            queue.push_back((child_id, child_path, depth + 1, origin));
         }
     })
 }

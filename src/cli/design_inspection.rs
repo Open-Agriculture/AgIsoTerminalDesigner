@@ -4,7 +4,6 @@ use crate::object_properties::{get_object_property, PropertyKey};
 use ag_iso_stack::object_pool::ObjectId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 pub const DEFAULT_REGION_RESULTS: usize = 12;
 pub const MAX_REGION_RESULTS: usize = 30;
 pub const MAX_REGION_DEPTH: usize = 6;
@@ -74,11 +73,10 @@ pub fn inspect_design_region(
         Region::BottomRight => (width / 2., height / 2., width, height),
         Region::All => (0., 0., width, height),
     };
-    let mut origins = BTreeMap::from([(vec![request.root_id], (0i32, 0i32))]);
     let mut candidates = Vec::new();
     let mut visited = 0;
     let mut depth_limited = false;
-    for p in super::snapshot::context_layout(
+    for (p, (ax, ay)) in super::snapshot::positioned_context_layout(
         &state.pool,
         &state.object_info,
         Some(root),
@@ -90,10 +88,6 @@ pub fn inspect_design_region(
         if visited > MAX_VISITED {
             break;
         }
-        let parent_path = &p.path[..p.path.len() - 1];
-        let (px, py) = origins.get(parent_path).copied().unwrap_or_default();
-        let (ax, ay) = (px + p.x, py + p.y);
-        origins.insert(p.path.clone(), (ax, ay));
         let object = state
             .pool
             .object_by_id(ObjectId::new(p.object.id).unwrap())
