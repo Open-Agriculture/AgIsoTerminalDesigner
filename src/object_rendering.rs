@@ -2,32 +2,187 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::Hash;
-use std::hash::Hasher;
-use std::ops::Sub;
+use std::{
+    cell::RefCell,
+    collections::HashSet,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use ag_iso_stack::object_pool::object::*;
 use ag_iso_stack::object_pool::object_attributes::ButtonState;
-use ag_iso_stack::object_pool::object_attributes::FontSize;
 use ag_iso_stack::object_pool::object_attributes::FormatType;
-use ag_iso_stack::object_pool::object_attributes::HorizontalAlignment;
 use ag_iso_stack::object_pool::object_attributes::LineDirection;
-use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
 use ag_iso_stack::object_pool::object_attributes::Point;
-use ag_iso_stack::object_pool::object_attributes::VerticalAlignment;
 use ag_iso_stack::object_pool::vt_version::VtVersion;
 use ag_iso_stack::object_pool::Colour;
 use ag_iso_stack::object_pool::ObjectPool;
 use ag_iso_stack::object_pool::ObjectRef;
 use eframe::egui;
 use eframe::egui::Color32;
-use eframe::egui::ColorImage;
-use eframe::egui::FontId;
 use eframe::egui::TextWrapMode;
-use eframe::egui::TextureHandle;
-use eframe::egui::TextureId;
 use eframe::egui::UiBuilder;
+
+/// Border inset used by the preview's button rendering.
+pub(crate) const BUTTON_BORDER_INSET: f32 = 4.0;
+fn render_version_id() -> egui::Id {
+    egui::Id::new("vt_render_version")
+}
+
+pub(crate) fn preview_session(
+    ui: &egui::Ui,
+) -> Option<Arc<Mutex<crate::preview_session::PreviewSession>>> {
+    ui.ctx()
+        .data(|data| data.get_temp(egui::Id::new("vt_preview_session")))
+}
+
+/// Render from an isolated local playback session. The caller brackets each
+/// displayed frame with `PreviewSession::begin_frame` and `finish_frame`.
+/// No session lock is held while painting or recursively rendering children.
+pub fn render_object_with_preview_session(
+    ui: &mut egui::Ui,
+    session: &Arc<Mutex<crate::preview_session::PreviewSession>>,
+    object_id: ag_iso_stack::object_pool::ObjectId,
+    position: Point<i16>,
+    version: VtVersion,
+    soft_key_size: (u16, u16),
+) {
+    let pool = match session.lock() {
+        Ok(session) => session.pool().clone(),
+        Err(_) => return,
+    };
+    let Some(object) = pool.object_by_id(object_id) else {
+        return;
+    };
+    let key = egui::Id::new("vt_preview_session");
+    let previous = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<Arc<Mutex<crate::preview_session::PreviewSession>>>(key);
+        data.insert_temp(key, session.clone());
+        previous
+    });
+    render_object_with_settings(ui, &pool, object, position, version, soft_key_size);
+    ui.ctx().data_mut(|data| match previous {
+        Some(previous) => data.insert_temp(key, previous),
+        None => {
+            data.remove::<Arc<Mutex<crate::preview_session::PreviewSession>>>(key);
+        }
+    });
+}
+
+/// Render a pool object using the requested target VT version and the legacy
+/// 60 × 60 pixel Soft Key size. The settings apply to nested object rendering
+/// and restore any enclosing render settings when this call returns.
+pub fn render_object_with_version(
+    ui: &mut egui::Ui,
+    pool: &ObjectPool,
+    object: &Object,
+    position: Point<i16>,
+    version: VtVersion,
+) {
+    render_object_with_settings(ui, pool, object, position, version, (60, 60));
+}
+
+/// Render an object with project VT and Soft Key settings. Soft Key dimensions
+/// are in terminal pixels and bound auxiliary designator previews. Settings
+/// are scoped to this call, inherited by nested rendering, then restored to
+/// the previous values.
+pub fn render_object_with_settings(
+    ui: &mut egui::Ui,
+    pool: &ObjectPool,
+    object: &Object,
+    position: Point<i16>,
+    version: VtVersion,
+    soft_key_size: (u16, u16),
+) {
+    // Offscreen Graphics Context draws can start during an interactive object
+    // render. Each root needs its own ancestry so those snapshots do not look
+    // like recursive references into the surrounding canvas.
+    let _root =
+        RenderRootGuard(RENDER_ANCESTRY.with(|active| std::mem::take(&mut *active.borrow_mut())));
+    let previous = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<VtVersion>(render_version_id());
+        data.insert_temp(render_version_id(), version);
+        previous
+    });
+    let settings_key = egui::Id::new("vt_render_soft_key_size");
+    let previous_settings = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<(u16, u16)>(settings_key);
+        data.insert_temp(settings_key, soft_key_size);
+        previous
+    });
+    let origin_key = egui::Id::new("vt_pattern_origin");
+    let previous_origin = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<egui::Pos2>(origin_key);
+        data.insert_temp(origin_key, ui.max_rect().min);
+        previous
+    });
+    object.render(ui, pool, position);
+    ui.ctx().data_mut(|data| {
+        if let Some(previous) = previous_origin {
+            data.insert_temp(origin_key, previous);
+        } else {
+            data.remove_temp::<egui::Pos2>(origin_key);
+        }
+    });
+    ui.ctx().data_mut(|data| match previous {
+        Some(previous) => data.insert_temp(render_version_id(), previous),
+        None => {
+            data.remove_temp::<VtVersion>(render_version_id());
+        }
+    });
+    ui.ctx().data_mut(|data| match previous_settings {
+        Some(previous) => data.insert_temp(settings_key, previous),
+        None => {
+            data.remove_temp::<(u16, u16)>(settings_key);
+        }
+    });
+}
+
+fn soft_key_size(ui: &egui::Ui) -> (u16, u16) {
+    ui.ctx()
+        .data(|data| data.get_temp::<(u16, u16)>(egui::Id::new("vt_render_soft_key_size")))
+        .unwrap_or((60, 60))
+}
+
+fn render_version(ui: &egui::Ui) -> VtVersion {
+    ui.ctx()
+        .data(|data| data.get_temp::<VtVersion>(render_version_id()))
+        .unwrap_or(VtVersion::Version6)
+}
+
+thread_local! {
+    /// Prevent malformed cyclic object references from recursing forever.
+    static RENDER_ANCESTRY: RefCell<HashSet<u16>> = RefCell::new(HashSet::new());
+}
+
+struct RenderAncestryGuard(u16);
+
+struct RenderRootGuard(HashSet<u16>);
+
+impl Drop for RenderRootGuard {
+    fn drop(&mut self) {
+        RENDER_ANCESTRY.with(|active| *active.borrow_mut() = std::mem::take(&mut self.0));
+    }
+}
+
+impl RenderAncestryGuard {
+    fn enter(object_id: u16) -> Option<Self> {
+        RENDER_ANCESTRY.with(|active| {
+            active
+                .borrow_mut()
+                .insert(object_id)
+                .then_some(Self(object_id))
+        })
+    }
+}
+
+impl Drop for RenderAncestryGuard {
+    fn drop(&mut self) {
+        RENDER_ANCESTRY.with(|active| {
+            active.borrow_mut().remove(&self.0);
+        });
+    }
+}
 
 pub trait RenderableObject {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>);
@@ -35,8 +190,35 @@ pub trait RenderableObject {
 
 impl RenderableObject for Object {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        if preview_session(ui).is_some_and(|session| {
+            session
+                .lock()
+                .is_ok_and(|session| session.is_hidden(self.id().value()))
+        }) {
+            return;
+        }
+        let Some(_ancestry_guard) = RenderAncestryGuard::enter(self.id().value()) else {
+            return;
+        };
+
         // Make sure text is truncated if it doesn't fit for all object renderings (useful for error labels)
         ui.style_mut().wrap_mode = Some(TextWrapMode::Truncate);
+
+        let version = render_version(ui);
+        if !crate::vt_compatibility::supported_object_type(self.object_type(), version) {
+            ui.painter().text(
+                ui.min_rect().min + egui::vec2(position.x as f32, position.y as f32),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "{:?} is unavailable in VT{}",
+                    self.object_type(),
+                    u8::from(version)
+                ),
+                egui::FontId::proportional(12.0),
+                ui.visuals().warn_fg_color,
+            );
+            return;
+        }
 
         match self {
             Object::WorkingSet(o) => o.render(ui, pool, position),
@@ -69,62 +251,97 @@ impl RenderableObject for Object {
             Object::InputAttributes(o) => (),
             Object::ObjectPointer(o) => o.render(ui, pool, position),
             Object::Macro(o) => (),
-            Object::AuxiliaryFunctionType1(o) => (),
-            Object::AuxiliaryInputType1(o) => (),
             Object::AuxiliaryFunctionType2(o) => o.render(ui, pool, position),
             Object::AuxiliaryInputType2(o) => o.render(ui, pool, position),
             Object::AuxiliaryControlDesignatorType2(o) => o.render(ui, pool, position),
-            Object::WindowMask(o) => (),
-            Object::KeyGroup(o) => (),
-            Object::GraphicsContext(o) => (),
+            Object::AuxiliaryFunctionType1(o) => o.render(ui, pool, position),
+            Object::AuxiliaryInputType1(o) => o.render(ui, pool, position),
+            Object::ExternalObjectPointer(o) => o.render(ui, pool, position),
+            Object::ScaledGraphic(o) => {
+                crate::graphic_rendering::render_scaled(o, ui, pool, position)
+            }
+            Object::Animation(o) => o.render(ui, pool, position),
+            Object::GraphicsContext(o) => o.render(ui, pool, position),
             Object::ExtendedInputAttributes(o) => (),
             Object::ColourMap(o) => (),
             Object::ObjectLabelReferenceList(o) => (),
             Object::ExternalObjectDefinition(o) => (),
             Object::ExternalReferenceName(o) => (),
-            Object::ExternalObjectPointer(o) => (),
-            Object::Animation(o) => (),
             Object::ColourPalette(o) => (),
             Object::GraphicData(o) => (),
             Object::WorkingSetSpecialControls(o) => (),
-            Object::ScaledGraphic(o) => (),
+            Object::WindowMask(_) | Object::KeyGroup(_) => {
+                ui.painter().text(
+                    ui.min_rect().min + egui::vec2(position.x as f32, position.y as f32),
+                    egui::Align2::LEFT_TOP,
+                    format!("Preview unavailable: {:?}", self.object_type()),
+                    egui::FontId::proportional(12.0),
+                    ui.visuals().warn_fg_color,
+                );
+            }
         }
+        preview_activation(ui, self, position);
     }
 }
 
-trait Colorable {
+fn preview_activation(ui: &mut egui::Ui, object: &Object, position: Point<i16>) {
+    use ag_iso_stack::object_pool::object_attributes::Event;
+    let Some(session) = preview_session(ui) else {
+        return;
+    };
+    let size = match object {
+        Object::Button(button) if !button.options.disabled => {
+            egui::vec2(button.width as f32, button.height as f32)
+        }
+        Object::Key(_) => {
+            let (w, h) = soft_key_size(ui);
+            egui::vec2(w as f32, h as f32)
+        }
+        _ => return,
+    };
+    let rect = create_relative_rect(ui, position, size).intersect(ui.clip_rect());
+    let id = ui.id().with((
+        "preview_activation",
+        object.id().value(),
+        position.x,
+        position.y,
+    ));
+    let response = ui.interact(rect, id, egui::Sense::click_and_drag());
+    let pressed = response.is_pointer_button_down_on();
+    let previous = ui.ctx().data_mut(|data| {
+        let previous = data.get_temp::<bool>(id).unwrap_or(false);
+        data.insert_temp(id, pressed);
+        previous
+    });
+    let event = if pressed && !previous {
+        Some(Event::OnKeyPress)
+    } else if !pressed && previous {
+        Some(Event::OnKeyRelease)
+    } else {
+        None
+    };
+    if let Some(event) = event {
+        if let Ok(mut session) = session.lock() {
+            let _ = session.trigger_key_event(object.id().value(), event == Event::OnKeyPress);
+        }
+        ui.ctx().request_repaint();
+    }
+}
+
+pub(crate) trait Colorable {
     fn convert(&self) -> egui::Color32;
 }
 
 impl Colorable for Colour {
     fn convert(&self) -> egui::Color32 {
-        egui::Color32::from_rgb(self.r, self.g, self.b)
+        egui::Color32::from_rgba_unmultiplied(self.r, self.g, self.b, self.a)
     }
 }
 
-// Helper function to lighten a color by a certain amount
-fn lighten_color(color: egui::Color32, amount: f32) -> egui::Color32 {
-    let r = (color.r() as f32 + 255.0 * amount).min(255.0) as u8;
-    let g = (color.g() as f32 + 255.0 * amount).min(255.0) as u8;
-    let b = (color.b() as f32 + 255.0 * amount).min(255.0) as u8;
-    egui::Color32::from_rgb(r, g, b)
-}
-
-// Helper function to darken a color by a certain amount
-fn darken_color(color: egui::Color32, amount: f32) -> egui::Color32 {
-    let r = (color.r() as f32 * (1.0 - amount)).max(0.0) as u8;
-    let g = (color.g() as f32 * (1.0 - amount)).max(0.0) as u8;
-    let b = (color.b() as f32 * (1.0 - amount)).max(0.0) as u8;
-    egui::Color32::from_rgb(r, g, b)
-}
-
 fn create_relative_rect(ui: &mut egui::Ui, position: Point<i16>, size: egui::Vec2) -> egui::Rect {
-    let width = ui.max_rect().width().sub(position.x as f32).min(size.x);
-    let height = ui.max_rect().height().sub(position.y as f32).min(size.y);
-
     egui::Rect::from_min_size(
         ui.max_rect().min + egui::vec2(position.x as f32, position.y as f32),
-        egui::vec2(width, height),
+        size,
     )
 }
 
@@ -141,78 +358,15 @@ fn render_object_refs(ui: &mut egui::Ui, pool: &ObjectPool, object_refs: &Vec<Ob
     }
 }
 
-fn fill_polygon_even_odd(
-    painter: &egui::Painter,
-    polygon_points: &[egui::Pos2],
-    fill_color: Color32,
-    clip_rect: egui::Rect,
-) {
-    if polygon_points.len() < 3 || fill_color == Color32::TRANSPARENT {
-        return;
-    }
-
-    let mut min_y = f32::INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    for p in polygon_points {
-        min_y = min_y.min(p.y);
-        max_y = max_y.max(p.y);
-    }
-
-    min_y = min_y.max(clip_rect.top());
-    max_y = max_y.min(clip_rect.bottom());
-    if max_y <= min_y {
-        return;
-    }
-
-    let y_start = min_y.floor() as i32;
-    let y_end = max_y.ceil() as i32;
-
-    for y in y_start..y_end {
-        let y_sample = y as f32 + 0.5;
-        let mut x_intersections: Vec<f32> = Vec::new();
-
-        for idx in 0..polygon_points.len() {
-            let p0 = polygon_points[idx];
-            let p1 = polygon_points[(idx + 1) % polygon_points.len()];
-
-            let y0 = p0.y;
-            let y1 = p1.y;
-
-            if (y0 <= y_sample && y_sample < y1) || (y1 <= y_sample && y_sample < y0) {
-                let t = (y_sample - y0) / (y1 - y0);
-                let x = p0.x + t * (p1.x - p0.x);
-                x_intersections.push(x);
-            }
-        }
-
-        if x_intersections.len() < 2 {
-            continue;
-        }
-
-        x_intersections.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        for pair in x_intersections.chunks_exact(2) {
-            let x0 = pair[0].max(clip_rect.left());
-            let x1 = pair[1].min(clip_rect.right());
-            if x1 > x0 {
-                painter.line_segment(
-                    [egui::pos2(x0, y_sample), egui::pos2(x1, y_sample)],
-                    egui::Stroke::new(1.0, fill_color),
-                );
-            }
-        }
-    }
-}
-
 impl RenderableObject for WorkingSet {
-    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, _: Point<i16>) {
-        ui.painter().rect_filled(
-            ui.available_rect_before_wrap(),
-            0.0,
-            pool.color_by_index(self.background_colour).convert(),
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        render_designator(
+            ui,
+            pool,
+            position,
+            self.background_colour,
+            &self.object_refs,
         );
-
-        render_object_refs(ui, pool, &self.object_refs);
     }
 }
 
@@ -221,7 +375,7 @@ impl RenderableObject for DataMask {
         ui.painter().rect_filled(
             ui.available_rect_before_wrap(),
             0.0,
-            pool.color_by_index(self.background_colour).convert(),
+            crate::effective_colour::colour(pool, self.background_colour).convert(),
         );
 
         render_object_refs(ui, pool, &self.object_refs);
@@ -233,7 +387,7 @@ impl RenderableObject for AlarmMask {
         ui.painter().rect_filled(
             ui.available_rect_before_wrap(),
             0.0,
-            pool.color_by_index(self.background_colour).convert(),
+            crate::effective_colour::colour(pool, self.background_colour).convert(),
         );
 
         render_object_refs(ui, pool, &self.object_refs);
@@ -253,6 +407,7 @@ impl RenderableObject for Container {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.shrink_clip_rect(rect);
             render_object_refs(ui, pool, &self.object_refs);
         });
     }
@@ -260,7 +415,7 @@ impl RenderableObject for Container {
 
 impl RenderableObject for Button {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let vt_version = VtVersion::Version3;
+        let vt_version = render_version(ui);
 
         let rect = create_relative_rect(
             ui,
@@ -296,14 +451,8 @@ impl RenderableObject for Button {
         //
         // The border is a VT proprietary 8-pixel area, but we must reduce face size accordingly.
         // Let's assume a uniform distribution of that 8-pixel shrinkage (4 pixels on each side).
-        const BORDER_WIDTH: f32 = 4.0;
-        let face_rect = if no_border {
-            rect
-        } else {
-            // Face is area minus 8 pixels in width and height.
-            // We'll just evenly shrink by 4 pixels on each side.
-            rect.shrink(BORDER_WIDTH)
-        };
+        let face_inset = crate::button_geometry::face_inset(self, vt_version);
+        let face_rect = rect.shrink(face_inset);
 
         let response = ui.interact(
             face_rect,
@@ -311,88 +460,105 @@ impl RenderableObject for Button {
             egui::Sense::click(),
         );
 
-        // Determine the current visual state
-        // Priority: latched > pressed > hovered > normal
-        let is_pressed_state = latched || (response.is_pointer_button_down_on() && !latchable);
-        let is_hovered_state = response.hovered();
-        // TODO: better visuals for latched states
+        let is_pressed_state = latched
+            || (response.is_pointer_button_down_on() && !latchable)
+            || preview_session(ui).is_some_and(|session| {
+                session
+                    .lock()
+                    .is_ok_and(|session| session.button_is_pressed(self.id.value()))
+            });
 
-        let background_color = if transparent_background {
-            egui::Color32::TRANSPARENT
-        } else {
-            let color = pool.color_by_index(self.background_colour).convert();
-            if is_pressed_state {
-                darken_color(color, 0.2)
-            } else if is_hovered_state {
-                lighten_color(color, 0.1)
-            } else {
-                color
-            }
-        };
+        // A disabled Button is drawn at half opacity, children included
+        let opacity = if disabled { 0.5 } else { 1.0 };
+        let mut painter = ui.painter().clone();
+        painter.multiply_opacity(opacity);
 
-        let border_color = if suppress_border {
-            egui::Color32::TRANSPARENT
-        } else {
-            let color = pool.color_by_index(self.border_colour).convert();
-            if is_pressed_state {
-                lighten_color(color, 0.1)
-            } else if is_hovered_state {
-                darken_color(color, 0.05)
-            } else {
-                color
-            }
-        };
-
-        if !no_border {
-            ui.painter().rect_stroke(
+        // The background fills the whole Button Area, so a suppressed border shows it
+        if !transparent_background {
+            painter.rect_filled(
                 rect,
                 0.0,
-                egui::Stroke::new(BORDER_WIDTH, border_color),
-                egui::StrokeKind::Inside,
+                crate::effective_colour::colour(pool, self.background_colour).convert(),
             );
         }
 
-        ui.painter().rect_filled(face_rect, 0.0, background_color);
-
         // Child objects are clipped to the face area
         ui.scope_builder(UiBuilder::new().max_rect(face_rect), |ui| {
+            ui.multiply_opacity(opacity);
+            ui.shrink_clip_rect(face_rect);
             render_object_refs(ui, pool, &self.object_refs);
         });
 
-        // If disabled, we overlay a semi-transparent gray:
-        if disabled {
-            ui.painter().rect_filled(
-                face_rect,
+        // Only the border shows the pressed or latched state, so a Button without one shows neither
+        if !no_border && !suppress_border {
+            let border_colour = crate::effective_colour::colour(pool, self.border_colour).convert();
+            painter.rect_stroke(
+                rect,
                 0.0,
-                egui::Color32::from_rgba_premultiplied(128, 128, 128, 100),
+                egui::Stroke::new(
+                    BUTTON_BORDER_INSET,
+                    if is_pressed_state {
+                        contrasting_colour(border_colour)
+                    } else {
+                        border_colour
+                    },
+                ),
+                egui::StrokeKind::Inside,
             );
         }
     }
 }
 
+/// Black on bright colours and white on dark ones, by perceived brightness.
+fn contrasting_colour(colour: egui::Color32) -> egui::Color32 {
+    let [r, g, b, _] = colour.to_srgba_unmultiplied();
+    let channel = |value: u8| (value as f32 / 255.0).powi(2);
+    let brightness = (0.241 * channel(r) + 0.691 * channel(g) + 0.068 * channel(b)).sqrt();
+    if brightness >= 0.5 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
 impl RenderableObject for InputBoolean {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let vt_version = render_version(ui);
         let is_true = if let Some(var_id) = self.variable_reference.0 {
             match pool.object_by_id(var_id) {
-                Some(Object::NumberVariable(num_var)) => num_var.value > 0,
-                _ => self.value,
+                Some(Object::NumberVariable(num_var)) if vt_version >= VtVersion::Version4 => {
+                    num_var.value > 0
+                }
+                Some(Object::NumberVariable(num_var)) => num_var.value == 1,
+                _ => {
+                    if vt_version >= VtVersion::Version4 {
+                        self.value > 0
+                    } else {
+                        self.value == 1
+                    }
+                }
             }
         } else {
-            self.value
+            if vt_version >= VtVersion::Version4 {
+                self.value > 0
+            } else {
+                self.value == 1
+            }
         };
 
         let side = self.width as f32;
         let rect = create_relative_rect(ui, position, egui::Vec2::new(side, side));
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let background_color = pool.color_by_index(self.background_colour).convert();
+            let background_color =
+                crate::effective_colour::colour(pool, self.background_colour).convert();
             ui.painter().rect_filled(rect, 0.0, background_color);
 
             // If the boolean is true, we display a checkmark in the center
             if is_true {
-                let fg_color = match pool.object_by_id(self.foreground_colour) {
+                let fg_color = match pool.object_by_nullable_id(self.foreground_colour) {
                     Some(Object::FontAttributes(font_attr)) => {
-                        pool.color_by_index(font_attr.font_colour).convert()
+                        crate::effective_colour::colour(pool, font_attr.font_colour).convert()
                     }
                     // Fall back if missing or the ID is invalid.
                     _ => egui::Color32::BLACK,
@@ -409,7 +575,7 @@ impl RenderableObject for InputBoolean {
             }
 
             // If disabled, overlay a semi-transparent layer
-            if !self.enabled {
+            if vt_version >= VtVersion::Version4 && !self.enabled {
                 ui.painter().rect_filled(
                     rect,
                     0.0,
@@ -422,190 +588,75 @@ impl RenderableObject for InputBoolean {
 
 impl RenderableObject for InputString {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
-            ui,
-            position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
-        );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "InputString not implemented");
-        });
+        // B.8.3 shares Output String formatting, including variable contents,
+        // character sets, control characters, wrapping and justification.
+        let output = OutputString {
+            id: self.id,
+            width: self.width,
+            height: self.height,
+            background_colour: self.background_colour,
+            font_attributes: self.font_attributes,
+            options: ag_iso_stack::object_pool::object_attributes::OutputStringOptions {
+                transparent: self.options.transparent,
+                auto_wrap: self.options.auto_wrap,
+                wrap_on_hyphen: self.options.wrap_on_hyphen,
+            },
+            variable_reference: self.variable_reference,
+            justification: self.justification,
+            value: self.value.clone(),
+            macro_refs: Vec::new(),
+        };
+        output.render(ui, pool, position);
+        if !self.enabled {
+            let rect = create_relative_rect(
+                ui,
+                position,
+                egui::vec2(self.width as f32, self.height as f32),
+            );
+            ui.painter()
+                .with_clip_rect(rect.intersect(ui.clip_rect()))
+                .rect_filled(
+                    rect,
+                    0.0,
+                    Color32::from_rgba_premultiplied(128, 128, 128, 100),
+                );
+        }
     }
 }
 
 impl RenderableObject for InputNumber {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
-            ui,
-            position,
-            egui::Vec2::new(self.width as f32, self.height as f32),
-        );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            // Look up the font attributes. If missing, show an error.
-            let font_attributes = match pool.object_by_id(self.font_attributes) {
-                Some(Object::FontAttributes(fa)) => fa,
-                _ => {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        format!(
-                            "Missing FontAttributes for InputNumber ID {:?}",
-                            self.id.value()
-                        ),
-                    );
-                    return;
-                }
-            };
-
-            // Get the background colour from the pool.
-            let background_colour = pool.color_by_index(self.background_colour).convert();
-            // Fill the background if the NumberOptions do not specify transparency.
-            if !self.options.transparent {
-                ui.painter().rect_filled(rect, 0.0, background_colour);
-            }
-
-            // Determine the “raw” number value to use: if a variable_reference exists, use the referenced
-            // NumberVariable’s value; otherwise use our own value.
-            let raw_value: u32 = if let Some(var_id) = self.variable_reference.0 {
-                match pool.object_by_id(var_id) {
-                    Some(Object::NumberVariable(num_var)) => num_var.value,
-                    _ => self.value,
-                }
-            } else {
-                self.value
-            };
-
-            // Compute the displayed value using double precision:
-            //   displayed_value = (raw_value + offset) * scale
-            let mut displayed_value = {
-                let float_raw = raw_value as f64;
-                let float_offset = self.offset as f64;
-                let float_scale = self.scale as f64;
-                (float_raw + float_offset) * float_scale
-            };
-
-            // Use the number of decimals (up to 7) and the "truncate" flag from NumberOptions
-            let decimals = self.nr_of_decimals.min(7);
-            let power_of_ten = 10f64.powi(decimals as i32);
-            if self.options.truncate {
-                displayed_value = (displayed_value * power_of_ten).trunc() / power_of_ten;
-            } else {
-                displayed_value = (displayed_value * power_of_ten).round() / power_of_ten;
-            }
-
-            // If the "display_zero_as_blank" option is set and the computed value is exactly zero, show nothing.
-            if self.options.display_zero_as_blank && displayed_value == 0.0 {
-                return;
-            }
-
-            // Format the number to a string. Use exponential formatting if requested.
-            let mut number_string = if self.format == FormatType::Exponential {
-                format!("{:.*e}", decimals as usize, displayed_value)
-            } else {
-                format!("{:.*}", decimals as usize, displayed_value)
-            };
-
-            // If the "display_leading_zeros" option is set, try to pad the text on the left with zeros
-            // so that it fills (or exceeds) the available field width.
-            if self.options.display_leading_zeros {
-                let fonts = ui.fonts(|f| f.clone());
-                let font_height = match font_attributes.font_size {
-                    FontSize::NonProportional(size) => size.height() as f32,
-                    FontSize::Proportional(h) => h as f32,
-                };
-                let font_id = egui::FontId::new(font_height, egui::FontFamily::Proportional);
-                let mut zero_padded = number_string.clone();
-                let max_loop = 1000; // safety to avoid an infinite loop
-                for _ in 0..max_loop {
-                    let galley = fonts.layout_no_wrap(
-                        zero_padded.clone(),
-                        font_id.clone(),
-                        pool.color_by_index(font_attributes.font_colour).convert(),
-                    );
-                    if galley.size().x >= rect.width() {
-                        number_string = zero_padded;
-                        break;
-                    } else {
-                        zero_padded.insert(0, '0');
-                    }
-                }
-            }
-
-            // Get the font colour.
-            let font_colour = pool.color_by_index(font_attributes.font_colour).convert();
-
-            // Choose the font family and height according to the font size:
-            let (font_family, font_height) = match font_attributes.font_size {
-                FontSize::NonProportional(npsize) => {
-                    (egui::FontFamily::Monospace, npsize.height() as f32)
-                }
-                FontSize::Proportional(h) => (egui::FontFamily::Proportional, h as f32),
-            };
-            let font_id = egui::FontId::new(font_height, font_family);
-
-            // Lay out the text.
-            let fonts = ui.fonts(|f| f.clone());
-            let galley = fonts.layout(
-                number_string.clone(),
-                font_id.clone(),
-                font_colour,
-                f32::INFINITY,
+        let output = OutputNumber {
+            id: self.id,
+            width: self.width,
+            height: self.height,
+            background_colour: self.background_colour,
+            font_attributes: self.font_attributes,
+            options: self.options,
+            variable_reference: self.variable_reference,
+            value: self.value,
+            offset: self.offset,
+            scale: self.scale,
+            nr_of_decimals: self.nr_of_decimals,
+            format: self.format,
+            justification: self.justification,
+            macro_refs: Vec::new(),
+        };
+        output.render(ui, pool, position);
+        if !self.options2.enabled {
+            let rect = create_relative_rect(
+                ui,
+                position,
+                egui::vec2(self.width as f32, self.height as f32),
             );
-            let text_size = galley.size();
-
-            // Compute the text’s paint position according to the horizontal and vertical justification.
-            let mut paint_pos = rect.min;
-            match self.justification.horizontal {
-                HorizontalAlignment::Left => {
-                    paint_pos.x = rect.min.x;
-                }
-                HorizontalAlignment::Middle => {
-                    paint_pos.x = rect.center().x - text_size.x * 0.5;
-                }
-                HorizontalAlignment::Right => {
-                    paint_pos.x = rect.max.x - text_size.x;
-                }
-                HorizontalAlignment::Reserved => {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        "Invalid horizontal alignment for InputNumber",
-                    );
-                    return;
-                }
-            }
-            match self.justification.vertical {
-                VerticalAlignment::Top => {
-                    paint_pos.y = rect.min.y;
-                }
-                VerticalAlignment::Middle => {
-                    paint_pos.y = rect.center().y - text_size.y * 0.5;
-                }
-                VerticalAlignment::Bottom => {
-                    paint_pos.y = rect.max.y - text_size.y;
-                }
-                VerticalAlignment::Reserved => {
-                    ui.colored_label(
-                        egui::Color32::RED,
-                        "Invalid vertical alignment for InputNumber",
-                    );
-                    return;
-                }
-            }
-
-            // Draw the number string.
-            ui.painter().galley(paint_pos, galley, font_colour);
-
-            // If the InputNumber object is not enabled (according to its InputNumberOptions),
-            // overlay a semi‐transparent gray rectangle.
-            if !self.options2.enabled {
-                ui.painter().rect_filled(
+            ui.painter()
+                .with_clip_rect(ui.clip_rect().intersect(rect))
+                .rect_filled(
                     rect,
                     0.0,
-                    egui::Color32::from_rgba_premultiplied(128, 128, 128, 100),
+                    Color32::from_rgba_premultiplied(128, 128, 128, 100),
                 );
-            }
-        });
+        }
     }
 }
 
@@ -614,22 +665,250 @@ impl RenderableObject for InputList {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::vec2(self.width as f32, self.height as f32),
         );
-
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "InputList not implemented");
+            ui.shrink_clip_rect(rect);
+            render_list_item(
+                ui,
+                pool,
+                self.variable_reference,
+                self.value,
+                &self.list_items,
+            );
+            if !self.options.enabled {
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    Color32::from_rgba_premultiplied(128, 128, 128, 100),
+                );
+            }
         });
+    }
+}
+
+fn render_list_item(
+    ui: &mut egui::Ui,
+    pool: &ObjectPool,
+    variable: ag_iso_stack::object_pool::NullableObjectId,
+    value: u8,
+    items: &[ag_iso_stack::object_pool::NullableObjectId],
+) {
+    let index = variable
+        .0
+        .and_then(|id| match pool.object_by_id(id) {
+            Some(Object::NumberVariable(variable)) => Some(variable.value),
+            _ => None,
+        })
+        .unwrap_or(u32::from(value));
+    // ISO 11783-6 B.8.5: 255 explicitly means no selection.
+    if index == 255 {
+        return;
+    }
+    if let Some(id) = items.get(index as usize).and_then(|item| item.0) {
+        if let Some(object) = pool.object_by_id(id) {
+            object.render(ui, pool, Point::default());
+        }
     }
 }
 
 impl RenderableObject for Key {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
-
+        let available = ui.available_rect_before_wrap();
+        let rect = create_relative_rect(ui, position, available.size());
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.shrink_clip_rect(rect);
+            ui.painter().rect_filled(
+                rect,
+                0.0,
+                crate::effective_colour::colour(pool, self.background_colour).convert(),
+            );
             render_object_refs(ui, pool, &self.object_refs);
         });
+    }
+}
+
+/// Working Set and auxiliary identifiers each occupy one Soft Key designator.
+/// Their own origin also anchors pattern fills, independently of the mask.
+fn render_designator(
+    ui: &mut egui::Ui,
+    pool: &ObjectPool,
+    position: Point<i16>,
+    background: u8,
+    children: &Vec<ObjectRef>,
+) {
+    let (width, height) = soft_key_size(ui);
+    let rect = create_relative_rect(ui, position, egui::vec2(width as f32, height as f32));
+    ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+        ui.shrink_clip_rect(rect);
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            crate::effective_colour::colour(pool, background).convert(),
+        );
+        let key = egui::Id::new("vt_pattern_origin");
+        let previous = ui.ctx().data_mut(|data| {
+            let previous = data.get_temp::<egui::Pos2>(key);
+            data.insert_temp(key, rect.min);
+            previous
+        });
+        render_object_refs(ui, pool, children);
+        ui.ctx().data_mut(|data| match previous {
+            Some(origin) => data.insert_temp(key, origin),
+            None => {
+                data.remove_temp::<egui::Pos2>(key);
+            }
+        });
+    });
+}
+
+impl RenderableObject for AuxiliaryFunctionType1 {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        render_designator(
+            ui,
+            pool,
+            position,
+            self.background_colour,
+            &self.object_refs,
+        );
+    }
+}
+
+impl RenderableObject for AuxiliaryInputType1 {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        render_designator(
+            ui,
+            pool,
+            position,
+            self.background_colour,
+            &self.object_refs,
+        );
+    }
+}
+
+impl RenderableObject for ExternalObjectPointer {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        // A standalone project has no validated external Working Set connection.
+        // B.24 requires the local default in this case, including NULL = no drawing.
+        if let Some(object) = pool.object_by_nullable_id(self.default_object_id) {
+            object.render(ui, pool, position);
+        }
+    }
+}
+
+impl RenderableObject for Animation {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::vec2(self.width as f32, self.height as f32),
+        );
+        if !rect.intersect(ui.clip_rect()).is_positive() {
+            return;
+        }
+        let child = if let Some(session) = preview_session(ui) {
+            if self.enabled && self.refresh_interval != 0 {
+                ui.ctx()
+                    .request_repaint_after(Duration::from_millis(u64::from(self.refresh_interval)));
+            }
+            session
+                .lock()
+                .ok()
+                .and_then(|mut session| session.animation_child(self.id.value()))
+        } else {
+            crate::preview_session::animation_static_child(self)
+        };
+        let Some(child) = child else {
+            return;
+        };
+        if let Some(object) = pool.object_by_id(child.id) {
+            ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+                ui.shrink_clip_rect(rect);
+                object.render(ui, pool, child.offset);
+            });
+        }
+    }
+}
+
+impl RenderableObject for GraphicsContext {
+    fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
+        use std::hash::{Hash, Hasher};
+        let error = |ui: &egui::Ui, message: &str| {
+            ui.painter().text(
+                ui.max_rect().min + egui::vec2(position.x as f32, position.y as f32),
+                egui::Align2::LEFT_TOP,
+                message,
+                egui::FontId::monospace(10.0),
+                Color32::RED,
+            );
+        };
+        let (canvas, limit) = if let Some(session) = preview_session(ui) {
+            let Ok(mut session) = session.lock() else {
+                return;
+            };
+            let limit = session.pixel_limit();
+            let Some(canvas) = session.graphics_context(self.id.value()) else {
+                return;
+            };
+            (canvas, limit)
+        } else {
+            let limit = crate::graphics_context_rendering::default_pixel_limit();
+            match crate::graphics_context_rendering::GraphicsContextCanvas::try_from_object(
+                self, limit,
+            ) {
+                Ok(canvas) => (canvas, limit),
+                Err(message) => {
+                    error(ui, &message);
+                    return;
+                }
+            }
+        };
+        if canvas.viewport.2 == 0 || canvas.viewport.3 == 0 {
+            return;
+        }
+        let rect = create_relative_rect(
+            ui,
+            position,
+            egui::vec2(canvas.viewport.2 as f32, canvas.viewport.3 as f32),
+        );
+        if !rect.intersect(ui.clip_rect()).is_positive() {
+            return;
+        }
+        let image = match canvas.try_viewport_image(pool, limit) {
+            Ok(image) => image,
+            Err(message) => {
+                error(ui, &message);
+                return;
+            }
+        };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        image.size.hash(&mut hasher);
+        image.pixels.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let key = ui.id().with(("graphics_context_texture", self.id.value()));
+        let cached = ui
+            .ctx()
+            .data(|data| data.get_temp::<(u64, egui::TextureHandle)>(key));
+        let texture = if let Some((_, texture)) = cached.filter(|(hash, _)| *hash == fingerprint) {
+            texture
+        } else {
+            let texture = ui.ctx().load_texture(
+                format!("graphics_context_{}", self.id.value()),
+                image,
+                egui::TextureOptions::NEAREST,
+            );
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(key, (fingerprint, texture.clone())));
+            texture
+        };
+        ui.painter()
+            .with_clip_rect(rect.intersect(ui.clip_rect()))
+            .image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
     }
 }
 
@@ -653,351 +932,113 @@ impl RenderableObject for ObjectPointer {
 
 impl RenderableObject for OutputString {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
-            ui,
-            position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
-        );
+        crate::output_string_rendering::render(self, ui, pool, position, render_version(ui));
+    }
+}
 
-        let font_attributes = match pool.object_by_id(self.font_attributes) {
-            Some(Object::FontAttributes(f)) => f,
-            _ => {
-                ui.colored_label(
-                    Color32::RED,
-                    format!("Missing font attributes: {:?}", self.font_attributes),
-                );
-                return;
-            }
-        };
-        let background_colour = pool.color_by_index(self.background_colour).convert();
-
-        let transparent = self.options.transparent;
-        let auto_wrap = self.options.auto_wrap;
-
-        // TODO: check if VT version is 4 or later, if so implement wrap_on_hyphen
-        // let wrap_on_hyphen = self.options.wrap_on_hyphen;
-        // Note: wrap_on_hyphen behavior is complex. For simplicity here, we rely on normal word-wrapping
-        // from egui and do not implement special hyphenation logic. A more thorough implementation
-        // would detect hyphens and possibly treat them as break opportunities.
-
-        // According to the specification, we need to handle control characters (CR, LF) as line breaks.
-        // We'll normalize all line endings to '\n'.
-        let mut text_value = if let Some(variable_reference_id) = self.variable_reference.into() {
-            match pool.object_by_id(variable_reference_id) {
-                Some(Object::StringVariable(s)) => s.value.clone(),
-                _ => self.value.clone(),
-            }
+/// ISO 11783-6 B.8.4/B.9.3: apply the signed offset before scaling.
+fn format_number(
+    raw: u32,
+    offset: i32,
+    scale: f32,
+    decimals: u8,
+    format: FormatType,
+    options: ag_iso_stack::object_pool::object_attributes::NumberOptions,
+) -> String {
+    // Tables B.18/B.23 test the effective raw value before offset/scaling.
+    if options.display_zero_as_blank && raw == 0 {
+        return String::new();
+    }
+    let value = (f64::from(raw) + f64::from(offset)) * f64::from(scale);
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let decimals = decimals.min(7) as usize;
+    if format == FormatType::Exponential {
+        // Decimal places apply to the mantissa, not the unnormalized value.
+        let exponent = if value == 0.0 {
+            0
         } else {
-            self.value.clone()
+            value.abs().log10().floor() as i32
         };
-        text_value = text_value
-            .replace("\r\n", "\n")
-            .replace("\n\r", "\n")
-            .replace('\r', "\n")
-            .replace('\x0a', "\n");
-
-        // Apply space trimming rules based on horizontal justification:
-        // - Left justification: no trimming of leading spaces (for the first line), trailing spaces remain as is.
-        // - Middle justification: remove leading and trailing spaces on each line.
-        // - Right justification: remove trailing spaces on each line.
-        let mut lines: Vec<&str> = text_value.split('\n').collect();
-        for (line_number, line) in lines.iter_mut().enumerate() {
-            match self.justification.horizontal {
-                HorizontalAlignment::Left => {
-                    // Per ISO rules, if auto-wrapping is enabled, leading spaces on wrapped lines might be removed.
-                    if auto_wrap && line_number > 0 {
-                        // Remove leading spaces
-                        *line = line.trim_start();
-                    }
-                }
-                HorizontalAlignment::Middle => {
-                    // Remove both leading and trailing spaces
-                    *line = line.trim();
-                }
-                HorizontalAlignment::Right => {
-                    // Remove trailing spaces only
-                    *line = line.trim_end();
-                }
-                HorizontalAlignment::Reserved => {
-                    ui.colored_label(
-                        Color32::RED,
-                        "Configuration incorrect: horizontal alignment is set to Reserved",
-                    );
-                    return;
-                }
-            }
-        }
-
-        let processed_text = lines.join("\n");
-
-        let font_colour = pool.color_by_index(font_attributes.font_colour).convert();
-        let fonts = ui.fonts(|fonts| fonts.clone());
-        let font_height;
-        let font_family;
-        match font_attributes.font_size {
-            FontSize::NonProportional(size) => {
-                font_family = egui::FontFamily::Monospace;
-
-                // We need to calculate the font height based on the width of a letter in the monospace font.
-                let font_size = fonts
-                    .layout_no_wrap(
-                        "a".into(),
-                        FontId::new(size.height() as f32, egui::FontFamily::Monospace),
-                        font_colour,
-                    )
-                    .size();
-
-                font_height = size.height() as f32 * (font_size.x / size.width() as f32);
-            }
-            FontSize::Proportional(height) => {
-                font_height = height as f32;
-                font_family = egui::FontFamily::Proportional;
-            }
-        }
-
-        let wrap_width = if auto_wrap {
-            self.width() as f32
+        let power = 10f64.powi(exponent);
+        let mut mantissa = value / power;
+        let precision = 10f64.powi(decimals as i32);
+        mantissa = if options.truncate {
+            (mantissa * precision).trunc() / precision
         } else {
-            f32::INFINITY
+            (mantissa * precision).round() / precision
         };
-
-        let galley = fonts.layout(
-            processed_text,
-            FontId::new(font_height, font_family.clone()),
-            font_colour,
-            wrap_width,
-        );
-
-        let text_size = galley.size();
-
-        let mut paint_pos = rect.min;
-
-        match self.justification.horizontal {
-            HorizontalAlignment::Left => {
-                paint_pos.x = rect.min.x;
-            }
-            HorizontalAlignment::Middle => {
-                paint_pos.x = rect.center().x - (text_size.x * 0.5);
-            }
-            HorizontalAlignment::Right => {
-                paint_pos.x = rect.max.x - text_size.x;
-            }
-            HorizontalAlignment::Reserved => {
-                ui.colored_label(
-                    Color32::RED,
-                    "Configuration incorrect: horizontal alignment is set to Reserved",
-                );
-                return;
-            }
-        };
-
-        match self.justification.vertical {
-            VerticalAlignment::Top => {
-                paint_pos.y = rect.min.y;
-            }
-            VerticalAlignment::Middle => {
-                paint_pos.y = rect.center().y - (text_size.y * 0.5);
-            }
-            VerticalAlignment::Bottom => {
-                paint_pos.y = rect.max.y - text_size.y;
-            }
-            VerticalAlignment::Reserved => {
-                ui.colored_label(
-                    Color32::RED,
-                    "Configuration incorrect: vertical alignment is set to Reserved",
-                );
-                return;
-            }
-        };
-
-        if !transparent {
-            let painter = ui.painter();
-            painter.rect_filled(rect, 0.0, background_colour);
+        let mut exponent = exponent;
+        if mantissa.abs() >= 10.0 {
+            mantissa /= 10.0;
+            exponent += 1;
         }
-
-        ui.painter().galley(paint_pos, galley, font_colour);
+        format!("{mantissa:.decimals$}E{exponent:+03}")
+    } else {
+        let precision = 10f64.powi(decimals as i32);
+        let value = if options.truncate {
+            (value * precision).trunc() / precision
+        } else {
+            (value * precision).round() / precision
+        };
+        let value = if value == 0.0 { 0.0 } else { value };
+        format!("{value:.decimals$}")
     }
 }
 
 impl RenderableObject for OutputNumber {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
-            ui,
-            position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+        let raw = self
+            .variable_reference
+            .0
+            .and_then(|id| match pool.object_by_id(id) {
+                Some(Object::NumberVariable(variable)) => Some(variable.value),
+                _ => None,
+            })
+            .unwrap_or(self.value);
+        let mut value = format_number(
+            raw,
+            self.offset,
+            self.scale,
+            self.nr_of_decimals,
+            self.format,
+            self.options,
         );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            // 1. Get the font attributes
-            let font_attributes = match pool.object_by_id(self.font_attributes) {
-                Some(Object::FontAttributes(fa)) => fa,
-                _ => {
-                    ui.colored_label(
-                        Color32::RED,
-                        format!(
-                            "Missing FontAttributes for OutputNumber ID {:?}",
-                            self.id.value()
-                        ),
-                    );
-                    return;
-                }
-            };
-
-            // 2. Convert the pool color indices to `egui::Color32`
-            let background_colour = pool.color_by_index(self.background_colour).convert();
-            let font_colour = pool.color_by_index(font_attributes.font_colour).convert();
-
-            // 3. Determine if we need to fill the background or remain transparent
-            if !self.options.transparent {
-                ui.painter().rect_filled(rect, 0.0, background_colour);
-            }
-
-            // 4. Retrieve the raw value (either from variable_reference or this object’s own `value`)
-            let raw_value = if let Some(var_id) = self.variable_reference.into() {
-                // If we have a referenced NumberVariable, use it
-                match pool.object_by_id(var_id) {
-                    Some(Object::NumberVariable(num_var)) => num_var.value,
-                    _ => self.value,
-                }
-            } else {
-                self.value
-            };
-
-            // 5. Compute the displayed value using double precision to reduce rounding errors
-            let mut displayed_value = {
-                let float_raw = raw_value as f64;
-                let float_offset = self.offset as f64;
-                let float_scale = self.scale as f64;
-                (float_raw + float_offset) * float_scale
-            };
-
-            // 6. Apply truncation or rounding to the number of decimals
-            let decimals = self.nr_of_decimals.min(7); // standard says 0–7 decimals
-            let power_of_ten = 10f64.powi(decimals as i32);
-
-            if self.options.truncate {
-                // Truncate
-                displayed_value = (displayed_value * power_of_ten).trunc() / power_of_ten;
-            } else {
-                // Round
-                displayed_value = (displayed_value * power_of_ten).round() / power_of_ten;
-            }
-
-            // 7. If "display_zero_as_blank" and the final number is exactly zero, display blank
-            //    We interpret "exactly zero" after the rounding/truncation step
-            if self.options.display_zero_as_blank && displayed_value == 0.0 {
-                return;
-            }
-
-            // 8. Convert the (possibly truncated/rounded) displayed_value to string
-            //    Depending on the "format" attribute, use decimal or exponential
-            let mut number_string = if self.format == FormatType::Exponential {
-                format!("{:.*e}", decimals as usize, displayed_value)
-            } else {
-                format!("{:.*}", decimals as usize, displayed_value)
-            };
-
-            // 9. The standard states that we must always display at least one digit
-            //    before the decimal point (i.e., "0.xxxx" if the absolute value < 1)
-            //    Normal Rust formatting already ensures e.g. "0.12" for 0.12,
-            //    so we usually don't need a special patch here. But we keep the note.
-            //
-            // 10. If display_leading_zeros is set, we *attempt* to fill the entire width
-            //     with zeros to the left before applying alignment. (ISO 11783 says
-            //     "fill left to width of field with zeros, then apply justification.")
-            //     Below is a best-effort approach: we measure the text in a loop,
-            //     and keep prepending '0' until it meets or exceeds the available width.
-            //     We also place a reasonable safety limit to avoid infinite loops.
-            //
-            if self.options.display_leading_zeros {
-                let fonts = ui.fonts(|f| f.clone());
-                let font_height = match font_attributes.font_size {
-                    FontSize::NonProportional(s) => s.height() as f32,
-                    FontSize::Proportional(h) => h as f32,
-                };
-                let font_id = egui::FontId::new(font_height, egui::FontFamily::Proportional);
-                let mut zero_padded = number_string.clone();
-                let max_loop = 1000; // safety net to avoid infinite loops
-                for _ in 0..max_loop {
-                    // Measure the current galley
-                    let galley = fonts.layout(
-                        zero_padded.as_str().to_owned(),
-                        font_id.clone(),
-                        font_colour,
-                        f32::INFINITY, // no wrap
-                    );
-                    if galley.size().x >= rect.width() {
-                        // Enough zeros to fill or exceed the field width
-                        number_string = zero_padded;
-                        break;
-                    } else {
-                        zero_padded.insert(0, '0');
-                    }
+        if self.options.display_leading_zeros && !value.is_empty() {
+            if let Some(Object::FontAttributes(font)) =
+                pool.object_by_nullable_id(self.font_attributes)
+            {
+                // Use the same cell advances as the text renderer; only complete
+                // leading characters that fit in the field are added.
+                let measure =
+                    |text: &str| crate::output_string_rendering::text_width(ui, font, text);
+                let zero_width = measure("0");
+                if zero_width > 0.0 {
+                    let count = ((self.width as f32 - measure(&value)) / zero_width)
+                        .floor()
+                        .max(0.0) as usize;
+                    value.insert_str(usize::from(value.starts_with('-')), &"0".repeat(count));
                 }
             }
-
-            // 11. We have the final text we want to display in `number_string`.
-            //     Next, figure out the font size and alignment. This is similar
-            //     to the `OutputString` example.
-            let fonts = ui.fonts(|fonts| fonts.clone());
-            let (font_family, font_height) = match font_attributes.font_size {
-                FontSize::NonProportional(npsize) => {
-                    // For simplicity, treat it as monospace
-                    (egui::FontFamily::Monospace, npsize.height() as f32)
-                }
-                FontSize::Proportional(h) => (egui::FontFamily::Proportional, h as f32),
-            };
-            let font_id = egui::FontId::new(font_height, font_family);
-            let galley = fonts.layout(
-                number_string.clone(),
-                font_id.clone(),
-                font_colour,
-                f32::INFINITY, // no wrapping
-            );
-            let text_size = galley.size();
-
-            // 12. Determine text anchor point based on the justification bits
-            let mut paint_pos = rect.min;
-            match self.justification.horizontal {
-                HorizontalAlignment::Left => {
-                    paint_pos.x = rect.min.x;
-                }
-                HorizontalAlignment::Middle => {
-                    paint_pos.x = rect.center().x - (text_size.x * 0.5);
-                }
-                HorizontalAlignment::Right => {
-                    paint_pos.x = rect.max.x - text_size.x;
-                }
-                HorizontalAlignment::Reserved => {
-                    ui.colored_label(
-                        Color32::RED,
-                        "Configuration incorrect: horizontal alignment is set to Reserved",
-                    );
-                    return;
-                }
-            }
-            match self.justification.vertical {
-                VerticalAlignment::Top => {
-                    paint_pos.y = rect.min.y;
-                }
-                VerticalAlignment::Middle => {
-                    paint_pos.y = rect.center().y - (text_size.y * 0.5);
-                }
-                VerticalAlignment::Bottom => {
-                    paint_pos.y = rect.max.y - text_size.y;
-                }
-                VerticalAlignment::Reserved => {
-                    ui.colored_label(
-                        Color32::RED,
-                        "Configuration incorrect: vertical alignment is set to Reserved",
-                    );
-                    return;
-                }
-            }
-
-            // 13. Finally, paint the text
-            ui.painter().galley(paint_pos, galley, font_colour);
-        });
+        }
+        let output = OutputString {
+            id: self.id,
+            width: self.width,
+            height: self.height,
+            background_colour: self.background_colour,
+            font_attributes: self.font_attributes,
+            options: ag_iso_stack::object_pool::object_attributes::OutputStringOptions {
+                transparent: self.options.transparent,
+                auto_wrap: false,
+                wrap_on_hyphen: false,
+            },
+            variable_reference: ag_iso_stack::object_pool::NullableObjectId(None),
+            justification: self.justification,
+            value: value.into(),
+            macro_refs: Vec::new(),
+        };
+        output.render(ui, pool, position);
     }
 }
 
@@ -1010,7 +1051,18 @@ impl RenderableObject for OutputList {
         );
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "OutputList not implemented");
+            ui.shrink_clip_rect(rect);
+            if render_version(ui) < VtVersion::Version4 {
+                ui.colored_label(Color32::RED, "OutputList requires VT4 or later");
+                return;
+            }
+            render_list_item(
+                ui,
+                pool,
+                self.variable_reference,
+                self.value,
+                &self.list_items,
+            );
         });
     }
 }
@@ -1020,67 +1072,33 @@ impl RenderableObject for OutputLine {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::vec2(self.width as f32, self.height as f32),
         );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let line_attributes = match pool.object_by_id(self.line_attributes) {
-                Some(Object::LineAttributes(attr)) => attr,
-                _ => {
-                    // If we don't have valid line attributes, just show an error and return
-                    ui.colored_label(
-                        Color32::RED,
-                        format!(
-                            "Missing or invalid LineAttributes ID: {:?}",
-                            self.line_attributes
-                        ),
-                    );
-                    return;
-                }
-            };
-
-            if line_attributes.line_width == 0 {
-                return;
-            }
-
-            let colour = pool.color_by_index(line_attributes.line_colour).convert();
-            let stroke_width = line_attributes.line_width as f32;
-            let stroke = egui::Stroke::new(stroke_width, colour);
-            // TODO: implement line art
-
-            let (start, end) = match self.line_direction {
-                LineDirection::TopLeftToBottomRight => {
-                    let start = rect.min;
-                    let mut end = rect.max - egui::vec2(stroke_width, stroke_width);
-
-                    // Clamp end to start
-                    if end.x < start.x {
-                        end.x = start.x;
-                    }
-                    if end.y < start.y {
-                        end.y = start.y;
-                    }
-
-                    (start, end)
-                }
-                LineDirection::BottomLeftToTopRight => {
-                    let mut start = egui::pos2(rect.left(), rect.bottom() + stroke_width);
-                    let mut end = egui::pos2(rect.right() - stroke_width, rect.top());
-
-                    // Clamping start and end
-                    if end.x < start.x {
-                        end.x = start.x;
-                    }
-                    if start.y < end.y {
-                        start.y = end.y;
-                    }
-
-                    (start, end)
-                }
-            };
-
-            ui.painter().line_segment([start, end], stroke);
-        });
+        let Some(Object::LineAttributes(line)) = pool.object_by_nullable_id(self.line_attributes)
+        else {
+            return;
+        };
+        let width = f32::from(line.line_width);
+        // Table B.27 coordinates locate the top-left corner of the square brush.
+        let right = (rect.right() - width).max(rect.left());
+        let bottom = (rect.bottom() - width).max(rect.top());
+        let (start, end) = match self.line_direction {
+            LineDirection::TopLeftToBottomRight => (rect.min, egui::pos2(right, bottom)),
+            LineDirection::BottomLeftToTopRight => (
+                egui::pos2(rect.left(), bottom),
+                egui::pos2(right, rect.top()),
+            ),
+        };
+        let offset = egui::vec2(width * 0.5, width * 0.5);
+        paint_shape(
+            ui,
+            pool,
+            rect.intersect(ui.clip_rect()),
+            &[start + offset, end + offset],
+            line,
+            None,
+            0,
+        );
     }
 }
 
@@ -1089,49 +1107,295 @@ impl RenderableObject for OutputRectangle {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::vec2(self.width as f32, self.height as f32),
         );
-
-        // Paint the border of the rectangle
-        let line_attributes = match pool.object_by_id(self.line_attributes) {
-            Some(Object::LineAttributes(l)) => l,
-            _ => {
-                ui.colored_label(
-                    Color32::RED,
-                    format!("Missing line attributes: {:?}", self.line_attributes),
-                );
-                return;
-            }
+        let Some(Object::LineAttributes(line)) = pool.object_by_nullable_id(self.line_attributes)
+        else {
+            return;
         };
-        // Paint the fill of the rectangle
-        if let Some(fill) = self.fill_attributes.into() {
-            let fill_attributes = match pool.object_by_id(fill) {
-                Some(Object::FillAttributes(f)) => f,
-                _ => {
-                    ui.colored_label(Color32::RED, format!("Missing fill attributes: {:?}", fill));
-                    return;
+        let width = f32::from(line.line_width);
+        let offset = egui::vec2(width * 0.5, width * 0.5);
+        let start = rect.min + offset;
+        let end = egui::pos2(
+            (rect.right() - width).max(rect.left()),
+            (rect.bottom() - width).max(rect.top()),
+        ) + offset;
+        let points = [
+            start,
+            egui::pos2(end.x, start.y),
+            end,
+            egui::pos2(start.x, end.y),
+            start,
+        ];
+        paint_shape(
+            ui,
+            pool,
+            rect.intersect(ui.clip_rect()),
+            &points,
+            line,
+            pool.object_by_nullable_id(self.fill_attributes),
+            self.line_suppression,
+        );
+    }
+}
+
+/// Paint square-brush borders and even-odd interiors. All border footprints,
+/// including skipped and suppressed strokes, are excluded from the fill.
+pub(crate) fn paint_shape(
+    ui: &egui::Ui,
+    pool: &ObjectPool,
+    clip: egui::Rect,
+    points: &[egui::Pos2],
+    line: &LineAttributes,
+    fill: Option<&Object>,
+    suppressed_edges: u8,
+) {
+    if !clip.is_positive() {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(clip);
+    let line_colour = crate::effective_colour::colour(pool, line.line_colour).convert();
+    // Mesh quads avoid antialiased seams between scanlines after fractional
+    // canvas scaling.
+    let mut fill_mesh = egui::Mesh::default();
+    let mut border_mesh = egui::Mesh::default();
+    let y_start = clip.top().floor() as i32;
+    let y_end = clip.bottom().ceil() as i32;
+    // Keep all brush footprints, including skipped line-art bits, so fill
+    // never leaks into the border (4.6.21). Restrict work to visible rows.
+    let mut borders = vec![Vec::<(f32, f32, bool)>::new(); (y_end - y_start) as usize];
+    let width = f32::from(line.line_width);
+    let mut distance = 0.0;
+    if width > 0.0 {
+        for (edge_index, pair) in points.windows(2).enumerate() {
+            let delta = pair[1] - pair[0];
+            let length = delta.length();
+            if !egui::Rect::from_two_pos(pair[0], pair[1])
+                .expand(width)
+                .intersects(clip)
+            {
+                distance += length;
+                continue;
+            }
+            let edge_visible = suppressed_edges & (1 << (edge_index % 4)) == 0;
+            let mut stamp = |point: egui::Pos2, visible: bool| {
+                let brush = egui::Rect::from_center_size(point, egui::vec2(width, width));
+                for y in (brush.top().floor() as i32).max(y_start)
+                    ..(brush.bottom().ceil() as i32).min(y_end)
+                {
+                    if y as f32 + 0.5 >= brush.top() && (y as f32 + 0.5) < brush.bottom() {
+                        borders[(y - y_start) as usize].push((
+                            brush.left(),
+                            brush.right(),
+                            visible,
+                        ));
+                    }
                 }
             };
-            ui.painter().rect_filled(
-                rect,
-                0.0,
-                pool.color_by_index(fill_attributes.fill_colour).convert(),
-            );
-            // TODO: implement fill type for infill
-            // TODO: implement fill pattern for infill
+            // The hypothetical solid border bounds the fill even for skipped
+            // line-art spots. Dense sampling also keeps solid curves smooth.
+            let count = (length / 0.75).ceil().max(1.0) as usize;
+            for i in 0..=count {
+                stamp(
+                    pair[0] + delta * (i as f32 / count as f32),
+                    edge_visible && line.line_art == 0xffff,
+                );
+            }
+            if edge_visible && line.line_art != 0xffff {
+                // Each bit is one square brush spot, not a swept segment.
+                // Carry the pattern phase across edges (4.6.21).
+                let first = (distance / width).ceil() as usize;
+                let last = ((distance + length) / width).floor() as usize;
+                for spot in first..=last {
+                    if line.line_art & (0x8000 >> (spot % 16)) != 0 {
+                        let t = if length > 0.0 {
+                            (spot as f32 * width - distance) / length
+                        } else {
+                            0.0
+                        };
+                        stamp(pair[0] + delta * t, true);
+                    }
+                }
+            }
+            distance += length;
         }
-
-        ui.painter().rect_stroke(
-            rect,
-            0.0,
-            egui::Stroke::new(
-                line_attributes.line_width,
-                pool.color_by_index(line_attributes.line_colour).convert(),
-            ),
-            egui::StrokeKind::Inside,
-        );
-        // TODO: implement line art for border
     }
+
+    let pattern = match fill {
+        Some(Object::FillAttributes(fill)) if fill.fill_type == 3 => {
+            if let Some(Object::PictureGraphic(picture)) =
+                pool.object_by_nullable_id(fill.fill_pattern)
+            {
+                if picture.actual_width > 0 && picture.actual_height > 0 {
+                    let mut picture = picture.clone();
+                    picture.options.transparent = false;
+                    Some(crate::graphics::preview::decode_picture(&picture, pool))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let solid = match fill {
+        Some(Object::FillAttributes(fill)) if fill.fill_type == 1 => Some(line_colour),
+        Some(Object::FillAttributes(fill)) if fill.fill_type == 2 => {
+            Some(crate::effective_colour::colour(pool, fill.fill_colour).convert())
+        }
+        _ => None,
+    };
+    let anchor = ui
+        .ctx()
+        .data(|data| data.get_temp::<egui::Pos2>(egui::Id::new("vt_pattern_origin")))
+        .unwrap_or(egui::Pos2::ZERO);
+    for y in y_start..y_end {
+        let row = &borders[(y - y_start) as usize];
+        if solid.is_some() || pattern.is_some() {
+            let sample_y = y as f32 + 0.5;
+            let mut crossings = Vec::new();
+            for edge in points.windows(2) {
+                let (a, b) = (edge[0], edge[1]);
+                if (a.y <= sample_y && sample_y < b.y) || (b.y <= sample_y && sample_y < a.y) {
+                    crossings.push(a.x + (sample_y - a.y) * (b.x - a.x) / (b.y - a.y));
+                }
+            }
+            crossings.sort_by(f32::total_cmp);
+            for interval in crossings.chunks_exact(2) {
+                let mut cuts: Vec<_> = row.iter().map(|(a, b, _)| (*a, *b)).collect();
+                cuts.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let mut left = interval[0].max(clip.left());
+                let right = interval[1].min(clip.right());
+                cuts.push((right, right));
+                for (a, b) in cuts {
+                    let end = a.min(right);
+                    if end > left {
+                        if let Some(colour) = solid {
+                            fill_mesh.add_colored_rect(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(left, y as f32),
+                                    egui::pos2(end, y as f32 + 1.0),
+                                ),
+                                colour,
+                            );
+                        } else if let Some(pattern) = &pattern {
+                            let py = ((y as f32 - anchor.y).floor() as i64)
+                                .rem_euclid(pattern.size[1] as i64)
+                                as usize;
+                            let mut x = left.ceil() as i32;
+                            let stop = end.ceil() as i32;
+                            while x < stop {
+                                let px = ((x as f32 - anchor.x).floor() as i64)
+                                    .rem_euclid(pattern.size[0] as i64)
+                                    as usize;
+                                let colour = pattern.pixels[py * pattern.size[0] + px];
+                                let start = x;
+                                x += 1;
+                                while x < stop {
+                                    let px = ((x as f32 - anchor.x).floor() as i64)
+                                        .rem_euclid(pattern.size[0] as i64)
+                                        as usize;
+                                    if pattern.pixels[py * pattern.size[0] + px] != colour {
+                                        break;
+                                    }
+                                    x += 1;
+                                }
+                                fill_mesh.add_colored_rect(
+                                    egui::Rect::from_min_size(
+                                        egui::pos2(start as f32, y as f32),
+                                        egui::vec2((x - start) as f32, 1.0),
+                                    ),
+                                    colour,
+                                );
+                            }
+                        }
+                    }
+                    left = left.max(b);
+                    if left >= right {
+                        break;
+                    }
+                }
+            }
+        }
+        // Coalesce brush footprints into runs to keep the shape count small.
+        let mut visible: Vec<_> = row
+            .iter()
+            .filter(|(_, _, visible)| *visible)
+            .map(|(a, b, _)| (*a, *b))
+            .collect();
+        visible.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut run: Option<(f32, f32)> = None;
+        for (a, b) in visible
+            .into_iter()
+            .chain(std::iter::once((f32::INFINITY, f32::INFINITY)))
+        {
+            match run {
+                Some((left, right)) if a <= right => run = Some((left, right.max(b))),
+                Some((left, right)) => {
+                    border_mesh.add_colored_rect(
+                        egui::Rect::from_min_max(
+                            egui::pos2(left, y as f32),
+                            egui::pos2(right, y as f32 + 1.0),
+                        ),
+                        line_colour,
+                    );
+                    run = Some((a, b));
+                }
+                None => run = Some((a, b)),
+            }
+        }
+    }
+    if !fill_mesh.is_empty() {
+        painter.add(egui::Shape::mesh(fill_mesh));
+    }
+    if !border_mesh.is_empty() {
+        painter.add(egui::Shape::mesh(border_mesh));
+    }
+}
+
+/// Ray/ellipse intersection: ISO angles are geometric angles, not the
+/// parameter angle of a stretched circle (Figure B.8).
+fn ellipse_point(rect: egui::Rect, angle: f32) -> egui::Pos2 {
+    let radius = rect.size() * 0.5;
+    let direction = egui::vec2(angle.cos(), -angle.sin());
+    let distance =
+        1.0 / ((direction.x / radius.x).powi(2) + (direction.y / radius.y).powi(2)).sqrt();
+    rect.center() + direction * distance
+}
+
+pub(crate) fn ellipse_path(rect: egui::Rect, kind: u8, start: u8, end: u8) -> Vec<egui::Pos2> {
+    let full = kind == 0 || start == end;
+    let start_angle = if kind == 0 {
+        0.0
+    } else {
+        (f32::from(start) * 2.0).to_radians()
+    };
+    let sweep = if full {
+        std::f32::consts::TAU
+    } else {
+        ((f32::from(end) - f32::from(start)) * 2.0)
+            .to_radians()
+            .rem_euclid(std::f32::consts::TAU)
+    };
+    let steps = ((rect.width() + rect.height()) * sweep)
+        .ceil()
+        .clamp(8.0, 8192.0) as usize;
+    let mut points: Vec<_> = (0..=steps)
+        .map(|i| ellipse_point(rect, start_angle + sweep * i as f32 / steps as f32))
+        .collect();
+    if kind == 2 && !full {
+        points.push(rect.center());
+    }
+    if kind != 1 || full {
+        points.push(points[0]);
+    }
+    // Table B.31 note 2 additionally draws the radius for an equal-angle segment.
+    if kind == 2 && start == end {
+        points.push(rect.center());
+        points.push(points[0]);
+    }
+    points
 }
 
 impl RenderableObject for OutputEllipse {
@@ -1139,12 +1403,46 @@ impl RenderableObject for OutputEllipse {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::vec2(self.width as f32, self.height as f32),
         );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "OutputEllipse not implemented");
-        });
+        let clip = rect.intersect(ui.clip_rect());
+        if !clip.is_positive() || self.ellipse_type > 3 {
+            return;
+        }
+        let Some(Object::LineAttributes(line)) = pool.object_by_nullable_id(self.line_attributes)
+        else {
+            ui.painter().text(
+                rect.min,
+                egui::Align2::LEFT_TOP,
+                format!("OutputEllipse #{}: missing LineAttributes", self.id.value()),
+                egui::FontId::monospace(10.0),
+                Color32::RED,
+            );
+            return;
+        };
+        // Output shape dimensions include the complete square brush footprint.
+        let inset = (f32::from(line.line_width) * 0.5)
+            .min((rect.width().min(rect.height()) * 0.5 - 0.001).max(0.0));
+        let points = ellipse_path(
+            rect.shrink(inset),
+            self.ellipse_type,
+            self.start_angle,
+            self.end_angle,
+        );
+        let closed = self.ellipse_type != 1 || self.start_angle == self.end_angle;
+        paint_shape(
+            ui,
+            pool,
+            clip,
+            &points,
+            line,
+            if closed {
+                pool.object_by_nullable_id(self.fill_attributes)
+            } else {
+                None
+            },
+            0,
+        );
     }
 }
 
@@ -1153,118 +1451,73 @@ impl RenderableObject for OutputPolygon {
         let rect = create_relative_rect(
             ui,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            egui::vec2(self.width as f32, self.height as f32),
         );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            let line_attributes = match pool.object_by_id(self.line_attributes) {
-                Some(Object::LineAttributes(attr)) => attr,
-                _ => {
-                    ui.colored_label(
-                        Color32::RED,
-                        format!(
-                            "Missing or invalid LineAttributes ID: {:?}",
-                            self.line_attributes
-                        ),
-                    );
-                    return;
-                }
-            };
-
-            if self.points.len() < 2 {
-                return;
-            }
-
-            let points: Vec<egui::Pos2> = self
-                .points
-                .iter()
-                .map(|point| rect.min + egui::vec2(point.x as f32, point.y as f32))
-                .collect();
-
-            let is_open_polygon = self.polygon_type == 3;
-
-            if !is_open_polygon && self.points.len() >= 3 {
-                if let Some(fill_id) = self.fill_attributes.into() {
-                    let fill_attributes = match pool.object_by_id(fill_id) {
-                        Some(Object::FillAttributes(f)) => f,
-                        _ => {
-                            ui.colored_label(
-                                Color32::RED,
-                                format!("Missing fill attributes: {:?}", fill_id),
-                            );
-                            return;
-                        }
-                    };
-
-                    fill_polygon_even_odd(
-                        ui.painter(),
-                        &points,
-                        pool.color_by_index(fill_attributes.fill_colour).convert(),
-                        rect,
-                    );
-                    // TODO: implement fill type for infill
-                    // TODO: implement fill pattern for infill
-                }
-            }
-
-            if line_attributes.line_width == 0 {
-                return;
-            }
-
-            let stroke = egui::Stroke::new(
-                line_attributes.line_width,
-                pool.color_by_index(line_attributes.line_colour).convert(),
-            );
-
-            if is_open_polygon {
-                ui.painter().add(egui::Shape::line(points, stroke));
+        let Some(Object::LineAttributes(line)) = pool.object_by_nullable_id(self.line_attributes)
+        else {
+            return;
+        };
+        if self.points.len() < 2 {
+            return;
+        }
+        let mut points: Vec<_> = self
+            .points
+            .iter()
+            .map(|point| {
+                // B.10.1 locates a point at the square brush's upper-left corner.
+                // Preserve B.33 coordinates; the enclosing rectangle clips
+                // any portion of the brush beyond its right/bottom edge.
+                let width = f32::from(line.line_width);
+                rect.min + egui::vec2(point.x as f32 + width * 0.5, point.y as f32 + width * 0.5)
+            })
+            .collect();
+        let closed = self.polygon_type != 3;
+        if closed {
+            points.push(points[0]);
+        }
+        paint_shape(
+            ui,
+            pool,
+            rect.intersect(ui.clip_rect()),
+            &points,
+            line,
+            if closed {
+                pool.object_by_nullable_id(self.fill_attributes)
             } else {
-                ui.painter().add(egui::Shape::closed_line(points, stroke));
-            }
-            // TODO: implement line art for border
-        });
+                None
+            },
+            0,
+        );
     }
 }
 
 impl RenderableObject for OutputMeter {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
-            ui,
-            position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
-        );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "OutputMeter not implemented");
-        });
+        crate::numeric_rendering::render_meter(self, ui, pool, position, render_version(ui));
     }
 }
 
 impl RenderableObject for OutputLinearBarGraph {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
+        crate::numeric_rendering::render_linear_bar_graph(
+            self,
             ui,
+            pool,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            render_version(ui),
         );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "OutputLinearBarGraph not implemented");
-        });
     }
 }
 
 impl RenderableObject for OutputArchedBarGraph {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(
+        crate::numeric_rendering::render_arched_bar_graph(
+            self,
             ui,
+            pool,
             position,
-            egui::Vec2::new(self.width() as f32, self.height() as f32),
+            render_version(ui),
         );
-
-        ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ui.colored_label(Color32::RED, "OutputArchedBarGraph not implemented");
-        });
     }
 }
 
@@ -1276,103 +1529,25 @@ impl RenderableObject for PictureGraphic {
             egui::Vec2::new(self.width() as f32, self.height() as f32),
         );
 
-        let mut hasher = DefaultHasher::new();
-        Object::PictureGraphic(self.clone())
-            .write()
-            .hash(&mut hasher);
-        let hash = hasher.finish();
-
-        let changed: bool = ui.data_mut(|data| {
-            let old_hash: Option<u64> =
-                data.get_temp(format!("picturegraphic_{}_image", self.id.value()).into());
-            if old_hash.is_none() || old_hash.unwrap() != hash {
-                data.insert_temp(
-                    format!("picturegraphic_{}_image", self.id.value()).into(),
-                    hash,
-                );
-                true
-            } else {
-                false
+        let texture = crate::graphics::preview::picture_texture(ui.ctx(), self, pool);
+        let phase = ui.input(|input| input.time).rem_euclid(1.0);
+        if self.options.flashing {
+            ui.ctx()
+                .request_repaint_after(Duration::from_secs_f64(if phase < 0.5 {
+                    0.5 - phase
+                } else {
+                    1.0 - phase
+                }));
+            if phase >= 0.5 {
+                return;
             }
-        });
-
-        let texture_id: Option<TextureId>;
-        if changed {
-            let mut x = 0;
-            let mut y = 0;
-
-            let mut image = ColorImage::filled(
-                [self.actual_width.into(), self.actual_height.into()],
-                Color32::TRANSPARENT,
-            );
-
-            for raw in self.data_as_raw_encoded() {
-                let mut colors: Vec<Color32> = vec![];
-                match self.format {
-                    PictureGraphicFormat::Monochrome => {
-                        for bit in 0..8 {
-                            colors.push(pool.color_by_index((raw >> (7 - bit)) & 0x01).convert());
-                        }
-                    }
-                    PictureGraphicFormat::FourBit => {
-                        for segment in 0..2 {
-                            let shift = 4 - (segment * 4);
-                            colors.push(pool.color_by_index((raw >> shift) & 0x0F).convert());
-                        }
-                    }
-                    PictureGraphicFormat::EightBit => {
-                        colors.push(pool.color_by_index(raw).convert());
-                    }
-                }
-
-                for color in colors {
-                    let idx = y as usize * self.actual_width as usize + x as usize;
-                    if idx >= image.pixels.len() {
-                        break;
-                    }
-                    if !(self.options.transparent
-                        && color == pool.color_by_index(self.transparency_colour).convert())
-                    {
-                        image.pixels[idx] = color;
-                    }
-
-                    x += 1;
-                    if x >= self.actual_width {
-                        x = 0;
-                        y += 1;
-                        // If we go onto the next row, then we discard the rest of the bits
-                        break;
-                    }
-                }
-            }
-
-            let new_texture = ui.ctx().load_texture(
-                format!("picturegraphic_{}_texture", self.id.value()).as_str(),
-                image,
-                Default::default(),
-            );
-            texture_id = Some(new_texture.id());
-            ui.data_mut(|data| {
-                println!("Saving texture - {:?}", self.id.value());
-                data.insert_temp(
-                    format!("picturegraphic_{}_texture", self.id.value()).into(),
-                    new_texture,
-                );
-            });
-        } else {
-            texture_id = ui.data(|data| {
-                data.get_temp::<TextureHandle>(
-                    format!("picturegraphic_{}_texture", self.id.value()).into(),
-                )
-                .map(|t| t.id())
-            });
         }
 
         // Use image dimensions, but clip to the available rect
         let image_size = egui::Vec2::new(self.width as f32, self.height() as f32);
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            if let Some(texture_id) = texture_id {
-                ui.image((texture_id, image_size));
+            if let Some(texture) = texture {
+                ui.image((texture.id(), image_size));
             } else {
                 ui.colored_label(Color32::RED, "Failed to load image");
             }
@@ -1382,11 +1557,14 @@ impl RenderableObject for PictureGraphic {
 
 impl RenderableObject for AuxiliaryFunctionType2 {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
+        let (width, height) = soft_key_size(ui);
+        let rect = create_relative_rect(ui, position, egui::vec2(width as f32, height as f32));
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(rect));
             // Draw background colour
-            let background_colour = pool.color_by_index(self.background_colour).convert();
+            let background_colour =
+                crate::effective_colour::colour(pool, self.background_colour).convert();
             ui.painter().rect_filled(rect, 0.0, background_colour);
 
             // Render child objects (the function designator content)
@@ -1397,11 +1575,14 @@ impl RenderableObject for AuxiliaryFunctionType2 {
 
 impl RenderableObject for AuxiliaryInputType2 {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
+        let (width, height) = soft_key_size(ui);
+        let rect = create_relative_rect(ui, position, egui::vec2(width as f32, height as f32));
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(rect));
             // Draw background colour
-            let background_colour = pool.color_by_index(self.background_colour).convert();
+            let background_colour =
+                crate::effective_colour::colour(pool, self.background_colour).convert();
             ui.painter().rect_filled(rect, 0.0, background_colour);
 
             // Render child objects (the input designator content)
@@ -1412,9 +1593,14 @@ impl RenderableObject for AuxiliaryInputType2 {
 
 impl RenderableObject for AuxiliaryControlDesignatorType2 {
     fn render(&self, ui: &mut egui::Ui, pool: &ObjectPool, position: Point<i16>) {
-        let rect = create_relative_rect(ui, position, egui::Vec2::INFINITY); // TODO: set size to softkey area
+        let (width, height) = soft_key_size(ui);
+        let rect = create_relative_rect(ui, position, egui::vec2(width as f32, height as f32));
 
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(rect));
+            if self.pointer_type != 2 && self.auxiliary_object_id.0.is_none() {
+                return;
+            }
             // Determine what to display based on pointer_type
             match self.pointer_type {
                 0 => {
@@ -1422,13 +1608,9 @@ impl RenderableObject for AuxiliaryControlDesignatorType2 {
                     // Display the auxiliary object designator
                     if let Some(aux_obj_id) = self.auxiliary_object_id.0 {
                         match pool.object_by_id(aux_obj_id) {
-                            Some(Object::AuxiliaryFunctionType2(aux_func)) => {
-                                // Render the auxiliary function designator
-                                render_object_refs(ui, pool, &aux_func.object_refs);
-                            }
-                            Some(Object::AuxiliaryInputType2(aux_input)) => {
-                                // Render the auxiliary input designator
-                                render_object_refs(ui, pool, &aux_input.object_refs);
+                            Some(aux @ Object::AuxiliaryFunctionType2(_))
+                            | Some(aux @ Object::AuxiliaryInputType2(_)) => {
+                                aux.render(ui, pool, Point { x: 0, y: 0 });
                             }
                             Some(_) => {
                                 ui.colored_label(
@@ -1485,5 +1667,380 @@ impl RenderableObject for AuxiliaryControlDesignatorType2 {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod rendering_tests {
+    use super::*;
+    use ag_iso_stack::object_pool::{NullableObjectId, ObjectType};
+
+    #[test]
+    fn numeric_zero_blank_uses_raw_local_or_variable_value_before_scaling() {
+        use ag_iso_stack::object_pool::{object_attributes::NumberOptions, ObjectId};
+        let options = NumberOptions {
+            transparent: false,
+            display_leading_zeros: false,
+            display_zero_as_blank: true,
+            truncate: false,
+        };
+        for format in [FormatType::Decimal, FormatType::Exponential] {
+            assert_eq!(format_number(0, 5, 2.0, 0, format, options), "");
+            assert!(!format_number(1, -1, 1.0, 0, format, options).is_empty());
+            assert!(!format_number(1, 0, 0.0, 0, format, options).is_empty());
+        }
+        let mut pool = ObjectPool::new();
+        let mut font = crate::default_object(ObjectType::FontAttributes);
+        *font.mut_id() = ObjectId::new(2).unwrap();
+        pool.add(font);
+        pool.add(Object::NumberVariable(NumberVariable {
+            id: ObjectId::new(3).unwrap(),
+            value: 0,
+        }));
+        for kind in [ObjectType::InputNumber, ObjectType::OutputNumber] {
+            let mut object = crate::default_object(kind);
+            match &mut object {
+                Object::InputNumber(o) => {
+                    o.width = 80;
+                    o.height = 30;
+                    o.options = options;
+                    o.font_attributes = NullableObjectId::new(2);
+                    o.variable_reference = NullableObjectId::new(3);
+                    o.value = 1;
+                    o.offset = -1;
+                    o.scale = 1.0;
+                }
+                Object::OutputNumber(o) => {
+                    o.width = 80;
+                    o.height = 30;
+                    o.options = options;
+                    o.font_attributes = NullableObjectId::new(2);
+                    o.variable_reference = NullableObjectId::new(3);
+                    o.value = 1;
+                    o.offset = -1;
+                    o.scale = 1.0;
+                }
+                _ => unreachable!(),
+            }
+            for raw in [0, 1] {
+                if let Some(Object::NumberVariable(variable)) =
+                    pool.object_mut_by_id(ObjectId::new(3).unwrap())
+                {
+                    variable.value = raw;
+                }
+                let text: String = frame(&pool, Some(&object), 0.0)
+                    .shapes
+                    .into_iter()
+                    .filter_map(|shape| match shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(text, if raw == 0 { "" } else { "0" }, "{kind:?}");
+            }
+        }
+    }
+
+    fn frame(pool: &ObjectPool, object: Option<&Object>, time: f64) -> egui::FullOutput {
+        frame_at(pool, object, time, Point::default())
+    }
+
+    fn frame_at(
+        pool: &ObjectPool,
+        object: Option<&Object>,
+        time: f64,
+        position: Point<i16>,
+    ) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(100.0, 100.0),
+                )),
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(object) = object {
+                        render_object_with_settings(
+                            ui,
+                            pool,
+                            object,
+                            position,
+                            VtVersion::Version6,
+                            (20, 15),
+                        );
+                    }
+                });
+            },
+        )
+    }
+
+    #[test]
+    fn working_set_designator_has_its_own_origin_bounds_and_palette_alpha() {
+        let mut working_set = crate::default_object(ObjectType::WorkingSet);
+        if let Object::WorkingSet(ws) = &mut working_set {
+            ws.background_colour = 12;
+        }
+        let pool = ObjectPool::default();
+        let origin = frame_at(&pool, Some(&working_set), 0.0, Point { x: 9, y: 11 });
+        let rectangles: Vec<_> = origin
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Rect(rectangle) = &shape.shape {
+                    (rectangle.fill == Color32::RED).then_some((rectangle.rect, shape.clip_rect))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(rectangles.len(), 1);
+        assert_eq!(rectangles[0].0.min, egui::pos2(17.0, 19.0));
+        assert_eq!(rectangles[0].0.size(), egui::vec2(20.0, 15.0));
+        assert_eq!(rectangles[0].1, rectangles[0].0);
+
+        let mut colour = Colour::BLACK;
+        colour.a = 128;
+        assert_eq!(
+            colour.convert(),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 128)
+        );
+    }
+
+    #[test]
+    fn external_pointer_draws_local_default_and_null_draws_nothing() {
+        let mut working_set = crate::default_object(ObjectType::WorkingSet);
+        *working_set.mut_id() = ag_iso_stack::object_pool::ObjectId::new(2).unwrap();
+        let mut pointer = crate::default_object(ObjectType::ExternalObjectPointer);
+        *pointer.mut_id() = ag_iso_stack::object_pool::ObjectId::new(1).unwrap();
+        if let Object::ExternalObjectPointer(pointer) = &mut pointer {
+            pointer.default_object_id = NullableObjectId::new(2);
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(working_set.clone());
+        let rectangles = |out: egui::FullOutput| {
+            out.shapes
+                .into_iter()
+                .filter_map(|s| {
+                    if let egui::Shape::Rect(r) = s.shape {
+                        Some((s.clip_rect, r.rect, r.fill))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            rectangles(frame(&pool, Some(&working_set), 0.0)),
+            rectangles(frame(&pool, Some(&pointer), 0.0))
+        );
+        if let Object::ExternalObjectPointer(pointer) = &mut pointer {
+            pointer.default_object_id = NullableObjectId::NULL;
+        }
+        assert_eq!(
+            rectangles(frame(&pool, None, 0.0)),
+            rectangles(frame(&pool, Some(&pointer), 0.0))
+        );
+    }
+
+    #[test]
+    fn polygon_boundary_keeps_the_complete_square_brush() {
+        let mut polygon = crate::default_object(ObjectType::OutputPolygon);
+        if let Object::OutputPolygon(polygon) = &mut polygon {
+            polygon.width = 10;
+            polygon.height = 10;
+            polygon.line_attributes = NullableObjectId::new(2);
+            polygon.fill_attributes = NullableObjectId::NULL;
+            polygon.points = vec![
+                Point { x: 0, y: 0 },
+                Point { x: 8, y: 0 },
+                Point { x: 8, y: 8 },
+                Point { x: 0, y: 8 },
+            ];
+        }
+        let mut line = crate::default_object(ObjectType::LineAttributes);
+        *line.mut_id() = ag_iso_stack::object_pool::ObjectId::new(2).unwrap();
+        if let Object::LineAttributes(line) = &mut line {
+            line.line_width = 2;
+            line.line_art = 65535;
+            line.line_colour = 12;
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(line);
+        let rendered = frame(&pool, Some(&polygon), 0.0);
+        let red_meshes: Vec<_> = rendered
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh)
+                    if mesh
+                        .vertices
+                        .iter()
+                        .any(|vertex| vertex.color == Color32::RED) =>
+                {
+                    Some(mesh)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(red_meshes.len(), 1);
+        let red_positions: Vec<_> = red_meshes[0]
+            .vertices
+            .iter()
+            .filter(|vertex| vertex.color == Color32::RED)
+            .map(|vertex| vertex.pos)
+            .collect();
+        let mut bounds = egui::Rect::NOTHING;
+        for point in red_positions {
+            bounds.extend_with(point);
+        }
+        // The path endpoints are inset by half the 2px brush, whose complete
+        // footprint restores the polygon's full 10px enclosing extent.
+        assert_eq!(bounds.size(), egui::vec2(10.0, 10.0));
+    }
+
+    #[test]
+    fn polygon_fill_mesh_has_no_scanline_gaps_at_fractional_zoom() {
+        let mut line_object = crate::default_object(ObjectType::LineAttributes);
+        *line_object.mut_id() = ag_iso_stack::object_pool::ObjectId::new(2).unwrap();
+        if let Object::LineAttributes(line) = &mut line_object {
+            line.line_width = 0;
+        }
+        let mut fill_object = crate::default_object(ObjectType::FillAttributes);
+        *fill_object.mut_id() = ag_iso_stack::object_pool::ObjectId::new(3).unwrap();
+        if let Object::FillAttributes(fill) = &mut fill_object {
+            fill.fill_type = 2;
+            fill.fill_colour = 10;
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(line_object);
+        pool.add(fill_object.clone());
+        let Object::FillAttributes(fill) = &fill_object else {
+            unreachable!()
+        };
+        let polygon_points = [
+            egui::pos2(10.0, 10.0),
+            egui::pos2(50.0, 10.0),
+            egui::pos2(50.0, 50.0),
+            egui::pos2(10.0, 50.0),
+            egui::pos2(10.0, 10.0),
+        ];
+        let line = match pool.object_by_id(ag_iso_stack::object_pool::ObjectId::new(2).unwrap()) {
+            Some(Object::LineAttributes(line)) => line,
+            _ => unreachable!(),
+        };
+        let expected = crate::effective_colour::colour(&pool, 10).convert();
+
+        for zoom in [0.5, 0.9, 0.95, 1.0, 1.25] {
+            let offset = egui::vec2(0.37, 0.61);
+            let transform = egui::emath::TSTransform::new(offset, zoom);
+            let image = crate::graphics_context_raster::rasterize_paint(80, 80, 6400, |ui| {
+                ui.with_visual_transform(transform, |ui| {
+                    paint_shape(
+                        ui,
+                        &pool,
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80.0, 80.0)),
+                        &polygon_points,
+                        line,
+                        Some(&fill_object),
+                        0,
+                    );
+                });
+            })
+            .unwrap();
+            // Stay well inside the outline and sample every rendered row;
+            // independently antialiased scanline rectangles used to leave
+            // background pixels here for fractional zooms.
+            let top = (transform * egui::pos2(16.0, 16.0)).y.ceil() as usize;
+            let bottom = (transform * egui::pos2(44.0, 44.0)).y.floor() as usize;
+            let left = (transform * egui::pos2(16.0, 16.0)).x.ceil() as usize;
+            let right = (transform * egui::pos2(44.0, 44.0)).x.floor() as usize;
+            for y in top..=bottom {
+                for x in left..=right {
+                    assert_eq!(
+                        image[(x, y)],
+                        expected,
+                        "gap at zoom={zoom}, pixel=({x},{y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn picture_flashing_and_auxiliary_designators_respect_render_settings() {
+        let mut picture = crate::default_object(ObjectType::PictureGraphic);
+        if let Object::PictureGraphic(picture) = &mut picture {
+            picture.id = ag_iso_stack::object_pool::ObjectId::new(1).unwrap();
+            picture.width = 1;
+            picture.actual_width = 1;
+            picture.actual_height = 1;
+            picture.data = vec![0];
+            picture.options.flashing = true;
+        }
+        let mut pool = ObjectPool::default();
+        pool.add(picture.clone());
+        let visible = frame(&pool, Some(&picture), 0.25);
+        let hidden = frame(&pool, Some(&picture), 0.75);
+        assert!(visible.shapes.len() > hidden.shapes.len());
+
+        let mut auxiliary = crate::default_object(ObjectType::AuxiliaryFunctionType2);
+        if let Object::AuxiliaryFunctionType2(auxiliary) = &mut auxiliary {
+            auxiliary.id = ag_iso_stack::object_pool::ObjectId::new(2).unwrap();
+            auxiliary.object_refs = vec![ObjectRef {
+                id: ag_iso_stack::object_pool::ObjectId::new(4).unwrap(),
+                offset: Point { x: 0, y: 0 },
+            }];
+        }
+        let mut button = crate::default_object(ObjectType::Button);
+        if let Object::Button(button) = &mut button {
+            button.id = ag_iso_stack::object_pool::ObjectId::new(4).unwrap();
+            button.width = 50;
+            button.height = 40;
+        }
+        let mut direct_pool = ObjectPool::default();
+        direct_pool.add(button.clone());
+        let direct = frame(&direct_pool, Some(&auxiliary), 0.25);
+        let mut pointer = crate::default_object(ObjectType::AuxiliaryControlDesignatorType2);
+        if let Object::AuxiliaryControlDesignatorType2(pointer) = &mut pointer {
+            pointer.id = ag_iso_stack::object_pool::ObjectId::new(3).unwrap();
+            pointer.auxiliary_object_id = NullableObjectId::new(2);
+        }
+        let mut aux_pool = ObjectPool::default();
+        aux_pool.add(button);
+        aux_pool.add(auxiliary.clone());
+        aux_pool.add(pointer.clone());
+        let referenced = frame(&aux_pool, Some(&pointer), 0.25);
+        let rect_shapes = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(rect) => Some((shape.clip_rect, rect.rect, rect.fill)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rect_shapes(&direct), rect_shapes(&referenced));
+        assert!(referenced.shapes.iter().any(|shape| match &shape.shape {
+            egui::Shape::Rect(rect) => {
+                rect.rect.size() == egui::vec2(50.0, 40.0)
+                    && shape.clip_rect.size() == egui::vec2(20.0, 15.0)
+            }
+            _ => false,
+        }));
+
+        let empty = frame(&aux_pool, None, 0.25);
+        for pointer_type in [0, 1, 3] {
+            if let Object::AuxiliaryControlDesignatorType2(pointer) = &mut pointer {
+                pointer.pointer_type = pointer_type;
+                pointer.auxiliary_object_id = NullableObjectId::NULL;
+            }
+            let null_pointer = frame(&aux_pool, Some(&pointer), 0.25);
+            assert_eq!(null_pointer.shapes.len(), empty.shapes.len());
+        }
     }
 }

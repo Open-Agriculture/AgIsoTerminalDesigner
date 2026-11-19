@@ -1,0 +1,376 @@
+//! Preview and planning for project-wide object ID reassignment.
+
+use crate::{components::*, ObjectIdRanges, ObjectInfo, ObjectTarget};
+use ag_iso_stack::object_pool::{vt_version::VtVersion, ObjectId, ObjectPool, ObjectType};
+use std::collections::{HashMap, HashSet};
+
+/// One object affected by a reassignment preview.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReassignmentRow {
+    pub name: String,
+    pub object_type: ObjectType,
+    pub old_id: u16,
+    pub new_id: u16,
+    pub overridden: bool,
+    /// Present for IDs assigned to compiled component nodes.
+    pub component_node: Option<(
+        crate::components::ComponentInstanceId,
+        crate::components::ComponentNodeId,
+    )>,
+}
+
+/// A validated, deterministic ID mapping ready to apply as one operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdReassignmentPlan {
+    pub rows: Vec<ReassignmentRow>,
+    /// Changed IDs only, in preview order.
+    pub mappings: Vec<(u16, u16)>,
+    /// Original object types used to interpret macro references to compiled
+    /// component nodes during packet rewriting.
+    pub target_types: Vec<(u16, ObjectType)>,
+    pub includes_overrides: bool,
+}
+
+pub(crate) fn remap_component_source(
+    source: &mut ComponentSource,
+    mappings: &[(u16, u16)],
+    pool: &ObjectPool,
+    version: VtVersion,
+) -> Result<(), String> {
+    let map: HashMap<_, _> = mappings.iter().copied().collect();
+    let mut target_types: HashMap<u16, ObjectType> = pool
+        .objects()
+        .iter()
+        .map(|object| (object.id().value(), object.object_type()))
+        .collect();
+    for instance in &source.instances {
+        if let Some(definition) = source.definitions.get(&instance.component_id) {
+            for node in &definition.nodes {
+                if let Some(id) = instance.compiled_ids.get(&node.id) {
+                    target_types.insert(*id, node.object_type);
+                }
+            }
+        }
+    }
+    // Object reference values are stored either as a bare ID or as an
+    // `ObjectTarget` (`{"id": n}`), as the component override picker writes.
+    let map_value = |value: &mut serde_json::Value| {
+        if let Some(id) = value.as_u64().and_then(|id| u16::try_from(id).ok()) {
+            if let Some(new_id) = map.get(&id) {
+                *value = serde_json::Value::from(*new_id);
+            }
+        } else if let Ok(ObjectTarget::Id { id }) =
+            serde_json::from_value::<ObjectTarget>(value.clone())
+        {
+            if let Some(new_id) = map.get(&id) {
+                *value = serde_json::json!(ObjectTarget::id(*new_id));
+            }
+        }
+    };
+    let map_target = |target: &mut ObjectTarget| {
+        if let ObjectTarget::Id { id } = target {
+            if let Some(new_id) = map.get(id) {
+                *id = *new_id;
+            }
+        }
+    };
+    for definition in source.definitions.values_mut() {
+        for node in &mut definition.nodes {
+            if node.object_type == ObjectType::Macro {
+                if let Some(value) = node
+                    .properties
+                    .get_mut(&crate::object_properties::PropertyKey::Commands)
+                {
+                    let bytes: Vec<u8> =
+                        serde_json::from_value(value.clone()).map_err(|error| {
+                            format!("Invalid component Macro command stream: {error}")
+                        })?;
+                    let remapped = crate::macro_id_remap::remap_macro_object_ids_checked(
+                        &bytes,
+                        &map,
+                        version,
+                        &target_types,
+                    )?;
+                    *value = serde_json::to_value(remapped)
+                        .map_err(|error| format!("Cannot encode component Macro: {error}"))?;
+                }
+            }
+            for (property, reference) in &mut node.references {
+                if node.object_type == ObjectType::ExternalObjectPointer
+                    && *property == crate::object_properties::PropertyKey::ExternalObjectId
+                {
+                    continue;
+                }
+                if let ComponentReference::ExternalObject(target) = reference {
+                    map_target(target);
+                }
+            }
+            for reference in &mut node.macro_references {
+                map_target(&mut reference.target);
+            }
+            match &mut node.object_list {
+                Some(ComponentObjectList::Required(targets)) => {
+                    for target in targets {
+                        map_target(target);
+                    }
+                }
+                Some(ComponentObjectList::Nullable(targets)) => {
+                    for target in targets.iter_mut().flatten() {
+                        map_target(target);
+                    }
+                }
+                None => {}
+            }
+        }
+        for parameter in &mut definition.parameters {
+            if parameter.kind == ComponentParameterKind::ObjectReference {
+                map_value(&mut parameter.default_value);
+            }
+        }
+    }
+    for instance in &mut source.instances {
+        let EditorParentRef::Primitive(id) = &mut instance.parent;
+        if let Some(new_id) = map.get(id) {
+            *id = *new_id;
+        }
+        for id in instance.compiled_ids.values_mut() {
+            if let Some(new_id) = map.get(id) {
+                *id = *new_id;
+            }
+        }
+        if let Some(definition) = source.definitions.get(&instance.component_id) {
+            for parameter in &definition.parameters {
+                if parameter.kind == ComponentParameterKind::ObjectReference {
+                    if let Some(value) = instance.overrides.get_mut(&parameter.id) {
+                        map_value(value);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compose sequential identity operations into one map from the original IDs
+/// to their final IDs. A RemapObjectIds entry remains simultaneous within its
+/// own operation.
+pub(crate) fn compose_id_mappings(operations: &[crate::Operation]) -> Vec<(u16, u16)> {
+    let mut composed = HashMap::<u16, u16>::new();
+    for operation in operations {
+        let step: Vec<(u16, u16)> = match operation {
+            crate::Operation::ChangeObjectId { old_id, new_id }
+            | crate::Operation::SetObjectIdAssignment {
+                object_id: old_id,
+                new_id,
+                ..
+            } => vec![(*old_id, *new_id)],
+            crate::Operation::RemapObjectIds { mappings, .. } => mappings.clone(),
+            _ => Vec::new(),
+        };
+        if step.is_empty() {
+            continue;
+        }
+        let previous_targets: HashSet<_> = composed.values().copied().collect();
+        let step_map: HashMap<_, _> = step.iter().copied().collect();
+        for final_id in composed.values_mut() {
+            if let Some(next) = step_map.get(final_id) {
+                *final_id = *next;
+            }
+        }
+        for (old_id, new_id) in step {
+            if !previous_targets.contains(&old_id) && !composed.contains_key(&old_id) {
+                composed.insert(old_id, new_id);
+            }
+        }
+    }
+    let mut mappings: Vec<_> = composed
+        .into_iter()
+        .filter(|(old, new)| old != new)
+        .collect();
+    mappings.sort_unstable_by_key(|(old, _)| *old);
+    mappings
+}
+
+impl IdReassignmentPlan {
+    /// Build a lowest-free per-type mapping. Manual IDs are held fixed unless
+    /// `include_overrides` is true. All source and compiled IDs participate.
+    pub fn build(
+        pool: &ObjectPool,
+        components: &ComponentSource,
+        object_info: &HashMap<ObjectId, ObjectInfo>,
+        ranges: &ObjectIdRanges,
+        version: VtVersion,
+        include_overrides: bool,
+    ) -> Result<Self, String> {
+        ranges.validate(version)?;
+
+        #[derive(Clone)]
+        struct Item {
+            id: u16,
+            object_type: ObjectType,
+            name: String,
+            overridden: bool,
+            component_node: Option<(
+                crate::components::ComponentInstanceId,
+                crate::components::ComponentNodeId,
+            )>,
+        }
+
+        let mut items = Vec::new();
+        let mut occupied = HashSet::new();
+        for object in pool.objects() {
+            let id = object.id().value();
+            if !occupied.insert(id) {
+                return Err(format!("Object ID {id} is duplicated"));
+            }
+            let info = object_info.get(&object.id());
+            items.push(Item {
+                id,
+                object_type: object.object_type(),
+                name: info.map(|info| info.get_name(object)).unwrap_or_else(|| {
+                    crate::smart_naming::get_object_type_name(object.object_type()).to_owned()
+                }),
+                overridden: info.is_some_and(|info| info.id_overridden),
+                component_node: None,
+            });
+        }
+        for instance in &components.instances {
+            let definition = components
+                .definitions
+                .get(&instance.component_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Component definition for instance {} is missing",
+                        instance.id
+                    )
+                })?;
+            for node in &definition.nodes {
+                let id = *instance.compiled_ids.get(&node.id).ok_or_else(|| {
+                    format!("Compiled ID for component node {:?} is missing", node.id)
+                })?;
+                ObjectId::new(id).map_err(|_| format!("Compiled ID {id} is invalid"))?;
+                if !occupied.insert(id) {
+                    return Err(format!("Object ID {id} is used more than once"));
+                }
+                items.push(Item {
+                    id,
+                    object_type: node.object_type,
+                    name: node.name.clone(),
+                    overridden: false,
+                    component_node: Some((instance.id, node.id)),
+                });
+            }
+        }
+        items.sort_by_key(|item| item.id);
+
+        // Only IDs held fixed by preserved manual assignments consume space
+        // before automatic rows are allocated.
+        let mut reserved = HashSet::new();
+        for item in &items {
+            if item.overridden && !include_overrides {
+                reserved.insert(item.id);
+            }
+        }
+
+        let mut rows = Vec::with_capacity(items.len());
+        for item in items {
+            let new_id = if item.overridden && !include_overrides {
+                item.id
+            } else {
+                let range = ranges.range_for(item.object_type);
+                (range.start..=range.end)
+                    .find(|candidate| !reserved.contains(candidate))
+                    .ok_or_else(|| {
+                        format!(
+                            "No IDs remain in the {:?} range {}–{} for {}",
+                            item.object_type, range.start, range.end, item.name
+                        )
+                    })?
+            };
+            reserved.insert(new_id);
+            rows.push(ReassignmentRow {
+                name: item.name,
+                object_type: item.object_type,
+                old_id: item.id,
+                new_id,
+                overridden: item.overridden,
+                component_node: item.component_node,
+            });
+        }
+        let mappings = rows
+            .iter()
+            .filter_map(|row| (row.old_id != row.new_id).then_some((row.old_id, row.new_id)))
+            .collect();
+        let target_types = rows
+            .iter()
+            .map(|row| (row.old_id, row.object_type))
+            .collect();
+        Ok(Self {
+            rows,
+            mappings,
+            target_types,
+            includes_overrides: include_overrides,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn remaps_object_target_overrides_and_defaults() {
+        let parameter_id = ComponentParameterId::default();
+        let node_id = ComponentNodeId::default();
+        let definition = ComponentDefinition {
+            schema_version: 1,
+            id: ComponentId::default(),
+            name: "Label".into(),
+            description: String::new(),
+            category_path: Vec::new(),
+            tags: Vec::new(),
+            revision: 1,
+            root_node: node_id,
+            nodes: Vec::new(),
+            parameters: vec![ComponentParameter {
+                id: parameter_id,
+                name: "Font".into(),
+                description: None,
+                target_node: node_id,
+                property: ComponentParameterTarget::Graphic,
+                kind: ComponentParameterKind::ObjectReference,
+                default_value: json!({ "id": 102 }),
+            }],
+        };
+        let mut source = ComponentSource::default();
+        source.instances.push(ComponentInstance {
+            id: ComponentInstanceId::default(),
+            component_id: definition.id,
+            name: "Label".into(),
+            parent: EditorParentRef::Primitive(2),
+            child_index: None,
+            x: 0,
+            y: 0,
+            overrides: [(parameter_id, json!({ "id": 102 }))].into(),
+            compiled_ids: BTreeMap::new(),
+        });
+        source.definitions.insert(definition.id, definition);
+
+        remap_component_source(
+            &mut source,
+            &[(102, 103), (103, 102)],
+            &ObjectPool::default(),
+            VtVersion::default(),
+        )
+        .unwrap();
+
+        let definition = source.definitions.values().next().unwrap();
+        assert_eq!(definition.parameters[0].default_value, json!({ "id": 103 }));
+        assert_eq!(
+            source.instances[0].overrides[&parameter_id],
+            json!({ "id": 103 })
+        );
+    }
+}

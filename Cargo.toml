@@ -2,33 +2,50 @@
 name = "ag-iso-terminal-designer"
 version = "0.1.0"
 edition = "2021"
+default-run = "ag-iso-terminal-designer"
 authors = ["Daan Steenbergen <d.steenbergen@student.tue.nl>"]
+
+[[bin]]
+name = "aitd"
+path = "src/cli/main.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 egui = "0.32"
-eframe = "0.32"
-# ag-iso-stack = { path = "../AgIsoStack-rs" }
-ag-iso-stack = { git = "https://github.com/Open-Agriculture/AgIsoStack-rs", branch = "daan/terminal-designer-changes" }
+egui_dock = { version = "0.17", features = ["serde"] }
+eframe = { version = "0.32", features = ["persistence"] }
+ag-iso-stack = { git = "https://github.com/Open-Agriculture/AgIsoStack-rs", rev = "c59744087cc3b0ae01c8fe476dcf444182cd5182" }
 rfd = "0.13"
 image = "0.25.1"
+png = "0.18"
 log = "0.4.27"
 uuid = { version = "1.17.0", features = ["v4", "v7", "js", "serde"] }
 getrandom = { version = "0.2", features = ["js"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+base64 = "0.22"
+zip = { version = "2", default-features = false }
+# std::time panics in the browser; this is std::time on native
+web-time = "1.1"
 
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tracing-subscriber = "0.3"
 futures = "0.3.28"
 env_logger = "0.11.8"
+libc = "0.2"
 
 # web:
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0.4.50"
-web-sys = "0.3.70"              # to access the DOM (to hide the loading text)
+web-sys = { version = "0.3.70", features = [
+    "BeforeUnloadEvent",
+    "Performance",
+    "Storage",
+    "Window",
+] }
 
 [profile.release]
 opt-level = 2 # fast and small wasm

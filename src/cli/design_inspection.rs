@@ -1,0 +1,161 @@
+//! Focused display-tree inspection using the existing path-aware layout iterator.
+use super::{AiDesignState, AiToolError};
+use crate::object_properties::{get_object_property, PropertyKey};
+use ag_iso_stack::object_pool::ObjectId;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+pub const DEFAULT_REGION_RESULTS: usize = 12;
+pub const MAX_REGION_RESULTS: usize = 30;
+pub const MAX_REGION_DEPTH: usize = 6;
+const MAX_VISITED: usize = 4096;
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Region {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Center,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    #[default]
+    All,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InspectDesignRegionRequest {
+    pub root_id: u16,
+    pub region: Region,
+    pub types: Vec<String>,
+    pub max_results: usize,
+}
+impl Default for InspectDesignRegionRequest {
+    fn default() -> Self {
+        Self {
+            root_id: 0,
+            region: Region::All,
+            types: vec![],
+            max_results: DEFAULT_REGION_RESULTS,
+        }
+    }
+}
+pub fn inspect_design_region(
+    state: &AiDesignState,
+    request: InspectDesignRegionRequest,
+) -> Result<Value, AiToolError> {
+    let root =
+        ObjectId::new(request.root_id).map_err(|_| AiToolError::ObjectNotFound(request.root_id))?;
+    let object = state
+        .pool
+        .object_by_id(root)
+        .ok_or(AiToolError::ObjectNotFound(request.root_id))?;
+    let dimension = |name: PropertyKey| {
+        get_object_property(object, name)
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(state.mask_size as f64)
+    };
+    let (width, height) = (
+        dimension(PropertyKey::Width),
+        dimension(PropertyKey::Height),
+    );
+    let (x0, y0, x1, y1) = match request.region {
+        Region::Top => (0., 0., width, height / 2.),
+        Region::Bottom => (0., height / 2., width, height),
+        Region::Left => (0., 0., width / 2., height),
+        Region::Right => (width / 2., 0., width, height),
+        Region::Center => (width / 4., height / 4., width * 0.75, height * 0.75),
+        Region::TopLeft => (0., 0., width / 2., height / 2.),
+        Region::TopRight => (width / 2., 0., width, height / 2.),
+        Region::BottomLeft => (0., height / 2., width / 2., height),
+        Region::BottomRight => (width / 2., height / 2., width, height),
+        Region::All => (0., 0., width, height),
+    };
+    let mut candidates = Vec::new();
+    let mut visited = 0;
+    let mut depth_limited = false;
+    for (p, (ax, ay)) in super::snapshot::positioned_context_layout(
+        &state.pool,
+        &state.object_info,
+        Some(root),
+        MAX_REGION_DEPTH,
+    )
+    .take(MAX_VISITED + 1)
+    {
+        visited += 1;
+        if visited > MAX_VISITED {
+            break;
+        }
+        let object = state
+            .pool
+            .object_by_id(ObjectId::new(p.object.id).unwrap())
+            .unwrap();
+        depth_limited |=
+            p.depth == MAX_REGION_DEPTH && !super::snapshot::display_children(object).is_empty();
+        if !request.types.is_empty() && !request.types.contains(&p.object.object_type) {
+            continue;
+        }
+        let (cx, cy) = (
+            ax as f64 + p.width.unwrap_or(0) as f64 / 2.,
+            ay as f64 + p.height.unwrap_or(0) as f64 / 2.,
+        );
+        if !matches!(request.region, Region::All) && !(cx >= x0 && cx < x1 && cy >= y0 && cy < y1) {
+            continue;
+        }
+        let mut style = json!({});
+        for property in [
+            PropertyKey::BackgroundColour,
+            PropertyKey::BorderColour,
+            PropertyKey::TransparencyColour,
+            PropertyKey::Justification,
+            PropertyKey::Options,
+        ] {
+            let name = property.as_str();
+            if let Ok(v) = get_object_property(object, property) {
+                style[name] =
+                    super::visual_intent::enrich(&state.pool, object.object_type(), property, v);
+            }
+        }
+        let mut refs = json!({});
+        for property in [
+            PropertyKey::FontAttributes,
+            PropertyKey::FillAttributes,
+            PropertyKey::LineAttributes,
+            PropertyKey::VariableReference,
+        ] {
+            let name = property.as_str();
+            let Ok(v) = get_object_property(object, property) else {
+                continue;
+            };
+            if let Ok(id) = serde_json::from_value::<ag_iso_stack::object_pool::NullableObjectId>(v)
+            {
+                refs[name] = json!(id.0.map(|id| id.value()));
+                if property != PropertyKey::VariableReference {
+                    if let Some(attribute) = id.0.and_then(|id| state.pool.object_by_id(id)) {
+                        style[name] =
+                            super::visual_intent::property_style(&state.pool, attribute, Some(256));
+                    }
+                }
+            }
+        }
+        let distance = (cx - (x0 + x1) / 2.).powi(2) + (cy - (y0 + y1) / 2.).powi(2);
+        candidates.push((distance,p.path.clone(),json!({"id":p.object.id,"name":p.object.name.chars().take(128).collect::<String>(),"type":p.object.object_type,"path":p.path,"parent":p.parent.id,
+            "local":{"x":p.x,"y":p.y,"width":p.width,"height":p.height},
+            "absolute":{"x":ax,"y":ay,"width":p.width,"height":p.height},"style":style,"refs":refs})));
+    }
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let count = candidates.len();
+    let limit = request.max_results.clamp(1, MAX_REGION_RESULTS);
+    let objects: Vec<_> = candidates
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, v)| v)
+        .collect();
+    Ok(
+        json!({"root_id":request.root_id,"coordinate_origin":"requested_root","region":request.region,"objects":objects,
+        "ranking":"distance_to_region_center_then_path","matched":count,"truncated":count>limit || depth_limited || visited>MAX_VISITED,
+        "depth_limited":depth_limited,"scan_limited":visited>MAX_VISITED,"max_depth":MAX_REGION_DEPTH}),
+    )
+}

@@ -1,3560 +1,4984 @@
-//! Copyright 2024 - The Open-Agriculture Developers
-//! SPDX-License-Identifier: GPL-3.0-or-later
-//! Authors: Daan Steenbergen
+//! Descriptor-driven object configuration.
+//!
+//! This module is deliberately generic: object types expose properties through
+//! `PropertyAccess`, and this renderer is the sole configuration UI.
 
-use crate::allowed_object_relationships::get_allowed_child_refs;
-use crate::allowed_object_relationships::AllowedChildRefs;
-use crate::possible_events::PossibleEvents;
-use crate::EditorProject;
-
-use ag_iso_stack::object_pool::object::*;
-use ag_iso_stack::object_pool::object_attributes::*;
+use crate::object_properties::{
+    get_object_property, get_property_descriptors, property_editor_descriptors, EditorKind,
+    EditorTarget, PropertyKey, PropertySemantic,
+};
+use crate::operations::{
+    ChildPlacement, MacroReferenceTarget, ObjectReferenceList, ObjectTarget, ObjectTargetList,
+    OperationTransaction,
+};
+use crate::{EditorProject, Operation};
+use ag_iso_stack::object_pool::object::Object;
+use ag_iso_stack::object_pool::object_attributes::{Event, MacroRef};
 use ag_iso_stack::object_pool::vt_version::VtVersion;
-use ag_iso_stack::object_pool::NullableObjectId;
-use ag_iso_stack::object_pool::ObjectId;
-use ag_iso_stack::object_pool::ObjectPool;
-use ag_iso_stack::object_pool::ObjectRef;
-use ag_iso_stack::object_pool::ObjectType;
+use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectRef, ObjectType};
 use eframe::egui;
-use eframe::egui::TextWrapMode;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-/// Check if adding a reference from `parent_id` to `child_id` would create a circular reference
-/// Returns true if it would create a cycle (and should be blocked)
-fn would_create_circular_reference(
-    pool: &ObjectPool,
-    parent_id: ObjectId,
-    child_id: ObjectId,
-) -> bool {
-    // If parent and child are the same, it's definitely circular
-    if parent_id == child_id {
-        return true;
+#[derive(Clone)]
+enum PendingValue {
+    Number(f64),
+    Text(String),
+}
+
+#[derive(Clone)]
+struct PendingPosition {
+    x: i16,
+    y: i16,
+    revision: u64,
+}
+
+#[derive(Clone)]
+struct PendingOperation {
+    session: uuid::Uuid,
+    revision: u64,
+    operation: Option<Operation>,
+    discard_on_disappear: bool,
+}
+
+#[derive(Clone, Default)]
+struct PropertyDraftRegistry {
+    entries: HashMap<egui::Id, PendingOperation>,
+    seen: HashSet<egui::Id>,
+}
+
+fn registry_id() -> egui::Id {
+    egui::Id::new("property_editor_pending_drafts")
+}
+
+fn touch_draft(ctx: &egui::Context, key: egui::Id) {
+    ctx.data_mut(|data| {
+        let registry_id = registry_id();
+        let mut registry = data
+            .get_temp::<PropertyDraftRegistry>(registry_id)
+            .unwrap_or_default();
+        if registry.entries.contains_key(&key) {
+            registry.seen.insert(key);
+            data.insert_temp(registry_id, registry);
+        }
+    });
+}
+
+fn update_draft(
+    ctx: &egui::Context,
+    key: egui::Id,
+    design: &EditorProject,
+    operation: Option<Operation>,
+) {
+    ctx.data_mut(|data| {
+        let registry_id = registry_id();
+        let mut registry = data
+            .get_temp::<PropertyDraftRegistry>(registry_id)
+            .unwrap_or_default();
+        registry.entries.insert(
+            key,
+            PendingOperation {
+                session: design.ui_session_id(),
+                revision: design.revision(),
+                discard_on_disappear: matches!(
+                    operation.as_ref(),
+                    Some(Operation::SetProperty {
+                        property: PropertyKey::Points,
+                        ..
+                    })
+                ),
+                operation,
+            },
+        );
+        registry.seen.insert(key);
+        data.insert_temp(registry_id, registry);
+    });
+}
+
+fn clear_draft(ctx: &egui::Context, key: egui::Id) {
+    ctx.data_mut(|data| {
+        let registry_id = registry_id();
+        if let Some(mut registry) = data.get_temp::<PropertyDraftRegistry>(registry_id) {
+            registry.entries.remove(&key);
+            registry.seen.remove(&key);
+            data.insert_temp(registry_id, registry);
+        }
+    });
+}
+
+/// Finish property drafts whose widgets disappeared since the previous frame.
+/// Polygon coordinate drafts are discarded when their editor disappears.
+/// Call after rendering the editor panels and before committing queued edits.
+pub fn finish_property_edits(ctx: &egui::Context, design: &EditorProject) {
+    let operations = ctx.data_mut(|data| {
+        let registry_id = registry_id();
+        let mut registry = data
+            .get_temp::<PropertyDraftRegistry>(registry_id)
+            .unwrap_or_default();
+        let mut operations = Vec::new();
+        let mut expired_keys = Vec::new();
+        let seen = registry.seen.clone();
+        registry.entries.retain(|key, pending| {
+            if seen.contains(key) {
+                if pending.session == design.ui_session_id()
+                    && pending.revision == design.revision()
+                {
+                    return true;
+                }
+                expired_keys.push(*key);
+                return false;
+            }
+            if !pending.discard_on_disappear
+                && pending.session == design.ui_session_id()
+                && pending.revision == design.revision()
+            {
+                if let Some(operation) = pending.operation.take() {
+                    operations.push(operation);
+                }
+            }
+            expired_keys.push(*key);
+            false
+        });
+        registry.seen.clear();
+        data.insert_temp(registry_id, registry);
+        for key in expired_keys {
+            data.remove::<PendingValue>(key);
+            data.remove::<PendingPosition>(key);
+            data.remove::<PolygonPointDraft>(key);
+            data.remove::<u16>(key);
+        }
+        operations
+    });
+    for operation in operations {
+        design.queue_operation(operation);
     }
+}
 
-    // Check if child already references parent (directly or indirectly)
-    // Use depth-first search to check all descendants of child_id
-    let mut visited = HashSet::new();
-    let mut stack = vec![child_id];
+/// A drag value changes on every pointer-move frame. Keep displaying those
+/// intermediate values, but only turn the edit into an operation when the
+/// pointer is released (or a keyboard edit loses focus).
+fn drag_value_finished(response: &egui::Response) -> bool {
+    response.drag_stopped() || response.lost_focus()
+}
 
-    while let Some(current_id) = stack.pop() {
-        // If we've already visited this object, skip it (prevents infinite loops)
-        if !visited.insert(current_id) {
+/// Render every writable property declared for `object`.
+pub fn render_property_editor(ui: &mut egui::Ui, object: &Object, design: &EditorProject) {
+    ui.push_id((design.ui_session_id(), design.revision()), |ui| {
+        render_property_editor_scoped(ui, object, design);
+    });
+}
+
+fn render_property_editor_scoped(ui: &mut egui::Ui, object: &Object, design: &EditorProject) {
+    ui.style_mut().spacing.combo_width = 0.0;
+    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+    ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+    ui.spacing_mut().interact_size.y = 26.0;
+    let id = object.id();
+    let object_type = object.object_type();
+    let properties = get_property_descriptors(object_type);
+
+    render_identity(ui, id, object_type, design);
+    if matches!(object, Object::OutputPolygon(_) | Object::OutputLine(_)) {
+        render_shape_edit_toggle(ui, id, design);
+    }
+    if matches!(
+        object,
+        Object::AuxiliaryFunctionType1(_) | Object::AuxiliaryInputType1(_)
+    ) {
+        ui.label("Designator preview");
+        let (width, height) = design.soft_key_size();
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(width as f32, height as f32),
+            egui::Sense::hover(),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.shrink_clip_rect(rect);
+            crate::render_object_with_settings(
+                ui,
+                design.get_pool(),
+                object,
+                ag_iso_stack::object_pool::object_attributes::Point::default(),
+                design.vt_version(),
+                design.soft_key_size(),
+            );
+        });
+    }
+    let mut unavailable = unavailable_features(object, design.vt_version);
+    if object_type == ObjectType::ObjectPointer {
+        for target in design.get_object_info(object).allowed_references {
+            if let Some(target) = design.get_pool().object_by_id(target) {
+                if !crate::vt_compatibility::supported_object_type(
+                    target.object_type(),
+                    design.vt_version,
+                ) {
+                    if let Some(availability) =
+                        crate::vt_compatibility::availability_description(|version| {
+                            crate::vt_compatibility::supported_object_type(
+                                target.object_type(),
+                                version,
+                            )
+                        })
+                    {
+                        unavailable.push(format!(
+                            "Allowed references: {:?} — {availability}",
+                            target.object_type()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    crate::ui_style::vt_availability_note(
+        ui,
+        ("object_vt_availability", id.value()),
+        design.vt_version,
+        unavailable,
+    );
+    ui.separator();
+    if let Object::PictureGraphic(picture) = object {
+        let current_format = picture.format;
+        ui.horizontal(|ui| {
+            ui.label("Format:");
+            use ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat;
+            for (format, label) in [
+                (PictureGraphicFormat::Monochrome, "Monochrome"),
+                (PictureGraphicFormat::FourBit, "4-bit colour"),
+                (PictureGraphicFormat::EightBit, "8-bit colour"),
+            ] {
+                if ui.radio(current_format == format, label).clicked() && current_format != format {
+                    crate::graphics::conversion_ui::open_for_picture(
+                        ui.ctx(),
+                        design,
+                        id,
+                        Some(format),
+                    );
+                }
+            }
+            if ui.button("Convert…").clicked() {
+                crate::graphics::conversion_ui::open_for_picture(ui.ctx(), design, id, None);
+            }
+        });
+        let palette =
+            crate::effective_colour::colours(design.get_pool()).map(|colour| colour.as_rgb());
+        let raw = crate::graphics::picture_data_sizes(picture).1;
+        let rle =
+            crate::graphics::conversion::candidate_rle_size(picture).unwrap_or(picture.data.len());
+        let stored = picture.data.len();
+        let rle_stored = picture.options.data_code_type
+            == ag_iso_stack::object_pool::object_attributes::DataCodeType::RunLength;
+        let summary = if rle_stored && stored < raw {
+            format!("Data size: {raw} bytes (raw) optimized to {stored} bytes (RLE)")
+        } else if rle_stored && stored >= raw {
+            format!("Data size: {stored} bytes (stored as RLE; RLE provides no size reduction)")
+        } else if rle >= raw {
+            format!("Data size: {raw} bytes (raw; RLE provides no size reduction)")
+        } else {
+            format!("Data size: {raw} bytes (raw; candidate RLE is smaller)")
+        };
+        let benefit = if rle < raw {
+            format!("saves {} bytes", raw - rle)
+        } else if rle == raw {
+            "ties raw size".into()
+        } else {
+            format!("increases size by {} bytes", rle - raw)
+        };
+        let tooltip = if rle < raw {
+            format!("Packed raw bytes (including row padding, before RLE): {raw}; candidate RLE: {rle} bytes; {benefit}.")
+        } else if rle == raw {
+            format!("Packed raw bytes (including row padding, before RLE): {raw}; candidate RLE: {rle} bytes; ties raw size.")
+        } else {
+            format!(
+                "Packed raw bytes (including row padding, before RLE): {raw}; candidate RLE: {rle} bytes; increases size by {} bytes.",
+                rle - raw
+            )
+        };
+        let tooltip = if rle_stored && stored >= raw {
+            format!(
+                "{tooltip} Existing payload is stored as RLE, which provides no size reduction."
+            )
+        } else {
+            tooltip
+        };
+        ui.label(egui::RichText::new(summary).weak())
+            .on_hover_text(tooltip);
+        let mut transparent = picture.options.transparent;
+        let mut colour = picture.transparency_colour;
+        let mut flashing = picture.options.flashing;
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(&mut transparent, "Transparent Pixels")
+                .changed();
+            if transparent {
+                ui.label("Transparent colour:");
+                let maximum = match picture.format {
+                    ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::Monochrome => 1,
+                    ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::FourBit => 15,
+                    ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat::EightBit => 255,
+                };
+                if let Some(selected) = colour_index_picker(ui, colour, &palette, 0..=maximum) {
+                    changed |= colour != selected;
+                    colour = selected;
+                }
+            }
+        });
+        changed |= ui.checkbox(&mut flashing, "Flashing").changed();
+        if changed {
+            let mut options = picture.options.clone();
+            options.transparent = transparent;
+            options.flashing = flashing;
+            queue(
+                design,
+                id,
+                PropertyKey::Options,
+                serde_json::to_value(options).unwrap(),
+            );
+            queue(
+                design,
+                id,
+                PropertyKey::TransparencyColour,
+                serde_json::json!(colour),
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("Load Image")
+                .on_hover_text("Load an image file (PNG, JPG, BMP, etc.)")
+                .clicked()
+            {
+                design.request_image_load(id);
+            }
+            if let Some(asset) = crate::graphics::ui::available_button(
+                ui,
+                ("choose_available", id.value()),
+                design,
+                id,
+            ) {
+                design.request_graphic_assignment(asset, id);
+            }
+        });
+    }
+    for editor in property_editor_descriptors(object_type) {
+        let EditorTarget::Property(property_key) = editor.property else {
+            continue;
+        };
+        let property_name = property_key.as_str();
+        if object_type == ObjectType::PictureGraphic
+            && matches!(
+                property_key,
+                PropertyKey::Format | PropertyKey::Options | PropertyKey::TransparencyColour
+            )
+        {
             continue;
         }
 
-        // If we find the parent in the descendants of child, it's circular
-        if current_id == parent_id {
-            return true;
+        if object_type == ObjectType::PictureGraphic
+            && matches!(
+                property_key,
+                PropertyKey::Data | PropertyKey::ActualWidth | PropertyKey::ActualHeight
+            )
+        {
+            continue;
         }
-
-        // Add all children of current object to the stack
-        if let Some(obj) = pool.object_by_id(current_id) {
-            for ref_id in obj.referenced_objects() {
-                stack.push(ref_id);
+        let Some(property) = properties.iter().find(|item| item.name == property_key) else {
+            continue;
+        };
+        let Ok(value) = get_object_property(object, property_key) else {
+            continue;
+        };
+        let label = human_readable_property_name(property_name);
+        if object_type == ObjectType::ExternalObjectPointer
+            && property_key == PropertyKey::ExternalObjectId
+        {
+            let key = ui.make_persistent_id((id.value(), property_name));
+            touch_draft(ui.ctx(), key);
+            let original_foreign_id = value.as_u64().map_or(u16::MAX, |value| value as u16);
+            let mut foreign_id = ui
+                .data(|data| data.get_temp::<u16>(key))
+                .unwrap_or(original_foreign_id);
+            ui.horizontal(|ui| {
+                ui.label(&label);
+                let format = design.object_id_format();
+                let response = ui.add(
+                    egui::DragValue::new(&mut foreign_id)
+                        .range(0..=u16::MAX)
+                        .custom_formatter(move |value, _| format.format(value as u16))
+                        .custom_parser(move |text| format.parse(text).ok().map(f64::from)),
+                );
+                if response.changed() {
+                    ui.data_mut(|data| data.insert_temp(key, foreign_id));
+                    let operation = if foreign_id == u16::MAX {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::json!(foreign_id)
+                    };
+                    update_draft(
+                        ui.ctx(),
+                        key,
+                        design,
+                        Some(property_operation(design, id, property_key, operation)),
+                    );
+                }
+                let cancelled =
+                    response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+                if cancelled {
+                    ui.data_mut(|data| data.remove::<u16>(key));
+                    clear_draft(ui.ctx(), key);
+                } else if drag_value_finished(&response)
+                    || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
+                    let value = if foreign_id == u16::MAX {
+                        serde_json::Value::Null
+                    } else {
+                        foreign_id.into()
+                    };
+                    if foreign_id != original_foreign_id {
+                        queue(design, id, property_key, value);
+                    }
+                    ui.data_mut(|data| data.remove::<u16>(key));
+                    clear_draft(ui.ctx(), key);
+                }
+            });
+            ui.small("Object ID in the external ECU's pool; 65535 means no reference.");
+            continue;
+        }
+        if !crate::vt_compatibility::supported_property(
+            object_type,
+            property_name,
+            design.vt_version,
+        ) {
+            let default = crate::default_object(object_type);
+            if get_object_property(&default, property_key).ok().as_ref() == Some(&value) {
+                continue;
+            }
+            repair_warning(ui, &label, design.vt_version, |version| {
+                crate::vt_compatibility::supported_property(object_type, property_name, version)
+            });
+        }
+        if property_key == PropertyKey::Value {
+            if let Some(decoded) = decoded_string_value(object, design.get_pool()) {
+                match decoded {
+                    Ok(text) => {
+                        ui.push_id(property_name, |ui| {
+                            render_text(ui, &label, &text, id, property_key, design)
+                        });
+                        render_string_length(ui, object, &text, design);
+                    }
+                    Err(message) => {
+                        crate::ui_style::error_text(ui, &message);
+                    }
+                }
+                continue;
             }
         }
+        if object_type == ObjectType::InputBoolean && property_key == PropertyKey::Value {
+            if value.as_u64().is_some_and(|value| value > 1)
+                && design.vt_version < VtVersion::Version4
+            {
+                repair_warning(ui, &label, design.vt_version, |version| {
+                    crate::vt_compatibility::supported_input_boolean_value(2, version)
+                });
+            }
+            let maximum = if design.vt_version < VtVersion::Version4 {
+                1.0
+            } else {
+                u8::MAX as f64
+            };
+            render_number(ui, &label, &value, 0.0..=maximum, id, property_key, design);
+            continue;
+        }
+        if matches!(editor.editor, EditorKind::ObjectReference) {
+            if let Some(target) = value
+                .as_u64()
+                .and_then(|value| ObjectId::new(value as u16).ok())
+                .and_then(|target| design.get_pool().object_by_id(target))
+            {
+                if !crate::vt_compatibility::supported_object_type(
+                    target.object_type(),
+                    design.vt_version,
+                ) {
+                    repair_warning(ui, &label, design.vt_version, |version| {
+                        crate::vt_compatibility::supported_object_type(
+                            target.object_type(),
+                            version,
+                        )
+                    });
+                }
+            }
+        }
+        ui.push_id(property_name, |ui| match editor.editor {
+            EditorKind::Colour => render_colour(ui, &label, &value, id, property_key, design),
+            EditorKind::ObjectReference => {
+                if object_type == ObjectType::ObjectPointer && property_key == PropertyKey::Value {
+                    render_pointer_reference(
+                        ui,
+                        &label,
+                        &value,
+                        property,
+                        id,
+                        property_key,
+                        design,
+                    );
+                } else {
+                    render_reference(ui, &label, &value, property, id, property_key, design)
+                }
+            }
+            EditorKind::Enum => {
+                if !crate::vt_compatibility::supported_enum_value(
+                    object_type,
+                    property_key,
+                    &value,
+                    design.vt_version,
+                ) {
+                    repair_warning(ui, &label, design.vt_version, |version| {
+                        crate::vt_compatibility::supported_enum_value(
+                            object_type,
+                            property_key,
+                            &value,
+                            version,
+                        )
+                    });
+                }
+                ui.horizontal(|ui| {
+                    let label_response = ui.label(&label);
+                    egui::ComboBox::from_id_salt(property_name)
+                        .icon(crate::ui_style::combo_box_icon)
+                        .selected_text(crate::enum_labels::enum_choice_label(
+                            object_type,
+                            property_key,
+                            &value,
+                        ))
+                        .show_ui(ui, |ui| {
+                            for choice in &property.enum_choices {
+                                let supported = crate::vt_compatibility::supported_enum_value(
+                                    object_type,
+                                    property_key,
+                                    choice,
+                                    design.vt_version,
+                                );
+                                let valid = supported
+                                    && (choice == &value
+                                        || property_choice_is_valid(
+                                            design,
+                                            id,
+                                            property_key,
+                                            choice.clone(),
+                                        ));
+                                let response = ui.add_enabled(
+                                    valid,
+                                    egui::Button::selectable(
+                                        choice == &value,
+                                        crate::enum_labels::enum_choice_label(
+                                            object_type,
+                                            property_key,
+                                            choice,
+                                        ),
+                                    ),
+                                );
+                                if !supported && response.contains_pointer() {
+                                    if let Some(availability) =
+                                        crate::vt_compatibility::availability_description(
+                                            |version| {
+                                                crate::vt_compatibility::supported_enum_value(
+                                                    object_type,
+                                                    property_key,
+                                                    choice,
+                                                    version,
+                                                )
+                                            },
+                                        )
+                                    {
+                                        response.show_tooltip_text(availability);
+                                    }
+                                }
+                                if response.clicked() && choice != &value {
+                                    queue(design, id, property_key, choice.clone());
+                                }
+                            }
+                        })
+                        .response
+                        .labelled_by(label_response.id);
+                });
+            }
+            EditorKind::FlagSet => {
+                render_flag_set(ui, &label, &value, id, object_type, property_key, design)
+            }
+            EditorKind::Justification => {
+                render_justification(ui, &label, &value, id, property_key, design)
+            }
+            EditorKind::PolygonPoints => {
+                if let Object::OutputPolygon(polygon) = object {
+                    render_polygon_points(ui, polygon, design);
+                }
+            }
+            EditorKind::LanguageCodes => {
+                if let Object::WorkingSet(working_set) = object {
+                    render_language_codes(ui, &label, id, &working_set.language_codes, design);
+                }
+            }
+            EditorKind::LanguagePairs => {
+                if let Object::WorkingSetSpecialControls(controls) = object {
+                    render_language_pairs(ui, &label, id, &controls.language_pairs, design);
+                }
+            }
+            EditorKind::Name => match object {
+                Object::ExternalObjectDefinition(definition) => {
+                    render_name(ui, &label, id, definition.name, design)
+                }
+                Object::ExternalReferenceName(reference) => {
+                    render_name(ui, &label, id, reference.name, design)
+                }
+                _ => {}
+            },
+            EditorKind::PaletteColours => {
+                if let Object::ColourPalette(palette) = object {
+                    render_palette_colours(ui, &label, id, &palette.colours, design);
+                }
+            }
+            EditorKind::ColourMap => {
+                if let Object::ColourMap(map) = object {
+                    render_colour_map(ui, &label, id, &map.colour_map, design);
+                }
+            }
+            EditorKind::CodePlanes => {
+                if let Object::ExtendedInputAttributes(attributes) = object {
+                    render_code_planes(ui, &label, id, &attributes.code_planes, design);
+                }
+            }
+            EditorKind::MacroCommands => {
+                if let Object::Macro(macro_object) = object {
+                    render_macro_commands(ui, &label, id, &macro_object.commands, design);
+                }
+            }
+            EditorKind::GraphicData => {
+                if let Object::GraphicData(graphic) = object {
+                    render_graphic_data(ui, &label, graphic, design);
+                }
+            }
+            EditorKind::Auto => render_auto(ui, &label, &value, id, property_key, design),
+            EditorKind::MacroReferences => unreachable!("macro references are rendered separately"),
+        });
     }
 
-    false
+    if let Object::PictureGraphic(picture) = object {
+        render_picture_dimensions(ui, picture, id, design);
+    }
+
+    if let Some(children) = crate::operations::operation::object_refs(object) {
+        ui.separator();
+        ui.label("Objects");
+        render_positioned_children(ui, object, children, design);
+    }
+    if let Some(objects) = crate::operations::operation::object_list(object) {
+        ui.separator();
+        ui.label("Objects");
+        render_object_list(ui, object, objects, design);
+    }
+    if let Object::ObjectLabelReferenceList(list) = object {
+        ui.separator();
+        render_object_labels(ui, list, design);
+    }
+    if crate::operations::operation::macro_refs(object).is_some() {
+        ui.separator();
+        render_macro_references(ui, object, id, design);
+    }
 }
 
-pub trait ConfigurableObject {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject);
+/// Encoded values retain their bytes until the operator actually edits text.
+/// A shared variable has no font of its own; use the first referencing string
+/// field in pool order to choose its editor character set.
+fn decoded_string_value(
+    object: &Object,
+    pool: &ag_iso_stack::object_pool::ObjectPool,
+) -> Option<Result<String, String>> {
+    use ag_iso_stack::object_pool::object_attributes::FontType;
+    let (value, font_id) = match object {
+        Object::OutputString(o) => (&o.value, Some(o.font_attributes)),
+        Object::InputString(o) => (&o.value, Some(o.font_attributes)),
+        Object::StringVariable(o) => {
+            let font = pool.objects().iter().find_map(|candidate| match candidate {
+                Object::OutputString(s) if s.variable_reference.0 == Some(o.id) => {
+                    Some(s.font_attributes)
+                }
+                Object::InputString(s) if s.variable_reference.0 == Some(o.id) => {
+                    Some(s.font_attributes)
+                }
+                _ => None,
+            });
+            (&o.value, font)
+        }
+        _ => return None,
+    };
+    let font_type = font_id
+        .and_then(|id| match pool.object_by_nullable_id(id) {
+            Some(Object::FontAttributes(font)) => Some(font.font_type),
+            _ => None,
+        })
+        .unwrap_or(FontType::Latin1);
+    Some(
+        value
+            .decode(font_type)
+            .map_err(|_| "Unsupported string encoding".to_owned()),
+    )
 }
 
-impl ConfigurableObject for Object {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        // Specific UI settings that are applied to all configuration screens
-
-        // The combination below makes the comboboxes used throughout the configuration UI have minimal width, yet still be able to show the full text
-        ui.style_mut().wrap_mode = Some(TextWrapMode::Extend);
-        ui.style_mut().spacing.combo_width = 0.0;
-
-        match self {
-            Object::WorkingSet(o) => o.render_parameters(ui, design),
-            Object::DataMask(o) => o.render_parameters(ui, design),
-            Object::AlarmMask(o) => o.render_parameters(ui, design),
-            Object::Container(o) => o.render_parameters(ui, design),
-            Object::SoftKeyMask(o) => o.render_parameters(ui, design),
-            Object::Key(o) => o.render_parameters(ui, design),
-            Object::Button(o) => o.render_parameters(ui, design),
-            Object::InputBoolean(o) => o.render_parameters(ui, design),
-            Object::InputString(o) => o.render_parameters(ui, design),
-            Object::InputNumber(o) => o.render_parameters(ui, design),
-            Object::InputList(o) => o.render_parameters(ui, design),
-            Object::OutputString(o) => o.render_parameters(ui, design),
-            Object::OutputNumber(o) => o.render_parameters(ui, design),
-            Object::OutputList(o) => o.render_parameters(ui, design),
-            Object::OutputLine(o) => o.render_parameters(ui, design),
-            Object::OutputRectangle(o) => o.render_parameters(ui, design),
-            Object::OutputEllipse(o) => o.render_parameters(ui, design),
-            Object::OutputPolygon(o) => o.render_parameters(ui, design),
-            Object::OutputMeter(o) => o.render_parameters(ui, design),
-            Object::OutputLinearBarGraph(o) => o.render_parameters(ui, design),
-            Object::OutputArchedBarGraph(o) => o.render_parameters(ui, design),
-            Object::PictureGraphic(o) => o.render_parameters(ui, design),
-            Object::NumberVariable(o) => o.render_parameters(ui, design),
-            Object::StringVariable(o) => o.render_parameters(ui, design),
-            Object::FontAttributes(o) => o.render_parameters(ui, design),
-            Object::LineAttributes(o) => o.render_parameters(ui, design),
-            Object::FillAttributes(o) => o.render_parameters(ui, design),
-            Object::InputAttributes(o) => o.render_parameters(ui, design),
-            Object::ObjectPointer(o) => o.render_parameters(ui, design),
-            Object::Macro(o) => o.render_parameters(ui, design),
-            Object::AuxiliaryFunctionType1(o) => (),
-            Object::AuxiliaryInputType1(o) => (),
-            Object::AuxiliaryFunctionType2(o) => o.render_parameters(ui, design),
-            Object::AuxiliaryInputType2(o) => o.render_parameters(ui, design),
-            Object::AuxiliaryControlDesignatorType2(o) => o.render_parameters(ui, design),
-            Object::WindowMask(o) => (),
-            Object::KeyGroup(o) => (),
-            Object::GraphicsContext(o) => (),
-            Object::ExtendedInputAttributes(o) => (),
-            Object::ColourMap(o) => (),
-            Object::ObjectLabelReferenceList(o) => (),
-            Object::ExternalObjectDefinition(o) => (),
-            Object::ExternalReferenceName(o) => (),
-            Object::ExternalObjectPointer(o) => (),
-            Object::Animation(o) => (),
-            Object::ColourPalette(o) => (),
-            Object::GraphicData(o) => (),
-            Object::WorkingSetSpecialControls(o) => (),
-            Object::ScaledGraphic(o) => (),
+/// Commit a palette selection through the same undoable operation as other properties.
+fn render_colour(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    id: ObjectId,
+    property: PropertyKey,
+    design: &EditorProject,
+) {
+    let Some(current) = value.as_u64().and_then(|v| u8::try_from(v).ok()) else {
+        return;
+    };
+    ui.label(label);
+    let palette = crate::effective_colour::colours(design.get_pool()).map(|colour| colour.as_rgb());
+    if let Some(index) = colour_index_picker(ui, current, &palette, 0..=u8::MAX) {
+        if index != current {
+            queue(design, id, property, serde_json::json!(index));
         }
     }
 }
 
-fn render_object_id(ui: &mut egui::Ui, id: &mut ObjectId, design: &EditorProject) {
-    let mut current_id = u16::from(*id);
-
+/// Choose a resolved project-palette index, optionally restricting valid indices.
+/// Returns an explicitly selected index, including reselection of the current one.
+pub fn colour_index_picker(
+    ui: &mut egui::Ui,
+    current: u8,
+    palette: &[[u8; 3]; 256],
+    permitted: std::ops::RangeInclusive<u8>,
+) -> Option<u8> {
+    let colour = palette[usize::from(current)];
+    let mut selected = None;
     ui.horizontal(|ui| {
-        ui.label("Object ID:");
-
-        let widget = egui::DragValue::new(&mut current_id)
-            .speed(1.0)
-            .range(0..=65534);
-        let resp = ui.add(widget);
-
-        let new_id = ObjectId::new(current_id).unwrap();
-
-        // Check if the new ID is already used by another object (excluding the current object)
-        let conflict = design.get_pool().object_by_id(new_id).is_some() && new_id != *id;
-
-        let conflict_storage = ui.id().with("conflict");
-        let was_conflict = ui.data(|data| data.get_temp::<u16>(conflict_storage));
-
-        if conflict || was_conflict.is_some_and(|id| id == current_id) {
-            ui.colored_label(egui::Color32::RED, "ID already in use!");
-
-            // Save the conflict in storage so it is still displayed next frame
-            ui.data_mut(|data| {
-                data.insert_temp(conflict_storage, u16::from(*id));
-            });
-        } else if resp.changed() || was_conflict.is_some_and(|id| id != current_id) {
-            // Remove the conflict from storage if we are actively changing the ID,
-            // or if the ID has changed (most likely another object is selected)
-            ui.data_mut(|data| {
-                data.remove_temp::<u16>(conflict_storage);
-            });
-        }
-
-        if !conflict && resp.changed() {
-            design.update_object_id_for_info(*id, new_id);
-            *id = new_id;
-            design.get_mut_selected().borrow_mut().0 = Some(*id);
-        }
-
-        // Add the object type display
-        if let Some(obj) = design.get_pool().object_by_id(*id) {
-            ui.separator();
-            ui.label("Type:");
-            ui.label(format!("{:?}", obj.object_type()));
-        }
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+        ui.painter().rect_filled(
+            rect,
+            2.0,
+            egui::Color32::from_rgb(colour[0], colour[1], colour[2]),
+        );
+        ui.menu_button(
+            format!("{} · {current}", crate::isobus_colour::label(current)),
+            |ui| {
+                ui.label("Resolved project palette (8-bit index)");
+                selected = colour_index_menu(ui, current, palette, permitted);
+            },
+        );
     });
+    selected
 }
 
-fn render_object_id_selector(
+/// The palette grid of a colour index menu; closes the menu on a pick.
+fn colour_index_menu(
     ui: &mut egui::Ui,
-    idx: usize,
-    design: &EditorProject,
-    object_id: &mut ObjectId,
-    allowed_child_objects: &[ObjectType],
-    current_object_id: Option<ObjectId>,
-) {
-    let pool = design.get_pool();
-    egui::ComboBox::from_id_salt(format!("object_id_selector_{}", idx))
-        .selected_text(format!("{:?}", object_id.value()))
-        .show_ui(ui, |ui| {
-            for potential_child in pool.objects_by_types(allowed_child_objects) {
-                let child_id = potential_child.id();
-
-                // Check if this would create a circular reference
-                let would_be_circular = if let Some(parent_id) = current_object_id {
-                    would_create_circular_reference(pool, parent_id, child_id)
-                } else {
-                    false
-                };
-
-                let object_info = design.get_object_info(potential_child);
-                let name = object_info.get_name(potential_child);
-                let label = format!(
-                    "{:?}: {:?} - {}{}",
-                    u16::from(child_id),
-                    potential_child.object_type(),
-                    name,
-                    if would_be_circular {
-                        " ⚠ (circular)"
-                    } else {
-                        ""
+    current: u8,
+    palette: &[[u8; 3]; 256],
+    permitted: std::ops::RangeInclusive<u8>,
+) -> Option<u8> {
+    let mut selected = None;
+    egui::ScrollArea::vertical()
+        .max_height(420.0)
+        .show(ui, |ui| {
+            egui::Grid::new(ui.next_auto_id())
+                .spacing(egui::vec2(3.0, 3.0))
+                .show(ui, |ui| {
+                    for (position, index) in permitted.enumerate() {
+                        let [r, g, b] = palette[usize::from(index)];
+                        let mut button = egui::Button::new(
+                            egui::RichText::new(index.to_string()).color(text_on([r, g, b])),
+                        )
+                        .fill(egui::Color32::from_rgb(r, g, b))
+                        .min_size(egui::vec2(32.0, 24.0));
+                        if index == current {
+                            button = button.stroke(egui::Stroke::new(
+                                2.0,
+                                ui.visuals().selection.stroke.color,
+                            ));
+                        }
+                        if ui
+                            .add(button)
+                            .on_hover_text(format!(
+                                "{} · #{r:02X}{g:02X}{b:02X}",
+                                crate::isobus_colour::label(index)
+                            ))
+                            .clicked()
+                        {
+                            selected = Some(index);
+                            ui.close();
+                        }
+                        if (position + 1) % 8 == 0 {
+                            ui.end_row();
+                        }
                     }
-                );
-
-                // Disable selection if it would create a circular reference
-                ui.add_enabled_ui(!would_be_circular, |ui| {
-                    ui.selectable_value(object_id, child_id, label);
                 });
-            }
         });
+    selected
 }
 
-fn render_nullable_object_id_selector(
+/// Black or white, whichever reads on a `background` of this colour.
+fn text_on([r, g, b]: [u8; 3]) -> egui::Color32 {
+    if 299 * r as u32 + 587 * g as u32 + 114 * b as u32 > 128_000 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
+/// Convert a snake_case property identifier to a title-cased editor label.
+pub(crate) fn human_readable_property_name(property: &str) -> String {
+    let mut label = String::with_capacity(property.len());
+    let mut capitalise_next = true;
+    for character in property.chars() {
+        if character == '_' {
+            label.push(' ');
+            capitalise_next = true;
+        } else if capitalise_next {
+            label.extend(character.to_uppercase());
+            capitalise_next = false;
+        } else {
+            label.push(character);
+        }
+    }
+    label
+}
+
+#[derive(Clone)]
+enum ListAction {
+    MoveUp(usize),
+    MoveDown(usize),
+    Remove(usize),
+    ReplaceMacro(usize, MacroRef),
+}
+
+fn row_actions(ui: &mut egui::Ui, index: usize, len: usize, action: &mut Option<ListAction>) {
+    row_actions_keeping(ui, index, len, 0, action);
+}
+
+/// [`row_actions`] for a list that must keep at least `minimum` entries.
+fn row_actions_keeping(
     ui: &mut egui::Ui,
-    idx: usize,
-    design: &EditorProject,
-    object_id: &mut NullableObjectId,
-    allowed_child_objects: &[ObjectType],
-    current_object_id: Option<ObjectId>,
+    index: usize,
+    len: usize,
+    minimum: usize,
+    action: &mut Option<ListAction>,
 ) {
-    let pool = design.get_pool();
-    egui::ComboBox::from_id_salt(format!("nullable_object_id_selector_{}", idx))
-        .selected_text(
-            object_id
-                .0
-                .map_or("None".to_string(), |id| format!("{:?}", id.value())),
-        )
-        .show_ui(ui, |ui| {
-            ui.selectable_value(object_id, NullableObjectId::NULL, "None");
-            for potential_child in pool.objects_by_types(allowed_child_objects) {
-                let child_id = potential_child.id();
-
-                // Check if this would create a circular reference
-                let would_be_circular = if let Some(parent_id) = current_object_id {
-                    would_create_circular_reference(pool, parent_id, child_id)
-                } else {
-                    false
-                };
-
-                let object_info = design.get_object_info(potential_child);
-                let name = object_info.get_name(potential_child);
-                let label = format!(
-                    "{:?}: {:?} - {}{}",
-                    u16::from(child_id),
-                    potential_child.object_type(),
-                    name,
-                    if would_be_circular {
-                        " ⚠ (circular)"
-                    } else {
-                        ""
-                    }
-                );
-
-                // Disable selection if it would create a circular reference
-                ui.add_enabled_ui(!would_be_circular, |ui| {
-                    ui.selectable_value(object_id, child_id.into(), label);
-                });
-            }
-        });
-}
-
-fn render_index_modifiers<T>(ui: &mut egui::Ui, idx: usize, list: &mut Vec<T>) {
     if ui
-        .add_enabled(idx > 0, egui::Button::new("\u{23F6}"))
+        .add_enabled(index > 0, egui::Button::new("\u{23F6}"))
         .on_hover_text("Move up")
         .clicked()
     {
-        list.swap(idx, idx - 1);
+        *action = Some(ListAction::MoveUp(index));
     }
     if ui
-        .add_enabled(idx < list.len() - 1, egui::Button::new("\u{23F7}"))
+        .add_enabled(index + 1 < len, egui::Button::new("\u{23F7}"))
         .on_hover_text("Move down")
         .clicked()
     {
-        list.swap(idx, idx + 1);
+        *action = Some(ListAction::MoveDown(index));
     }
-    if ui.button("\u{1F5D9}").on_hover_text("Remove").clicked() {
-        list.remove(idx);
+    if ui
+        .add_enabled(len > minimum, egui::Button::new("\u{1F5D9}"))
+        .on_hover_text("Remove")
+        .clicked()
+    {
+        *action = Some(ListAction::Remove(index));
     }
 }
 
-fn render_object_references_list(
+fn object_label(design: &EditorProject, object: &Object) -> String {
+    design.object_display_name(object)
+}
+
+fn object_selector_label(design: &EditorProject, object: &Object) -> String {
+    design.object_display_name(object)
+}
+
+fn select_object(design: &EditorProject, id: ObjectId) {
+    design.get_mut_selected().set(NullableObjectId(Some(id)));
+}
+
+fn candidate_is_valid(design: &EditorProject, parent: ObjectId, child: ObjectId) -> bool {
+    crate::pool_validation::would_create_circular_reference(design.get_pool(), parent, child)
+        .is_ok()
+        && crate::pool_validation::validate_parent_child_relationship(
+            design.get_pool(),
+            parent,
+            child,
+        )
+        .is_ok()
+}
+
+fn render_object_selector(
     ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
     design: &EditorProject,
-    width: u16,
-    height: u16,
-    object_refs: &mut Vec<ObjectRef>,
-    allowed_child_objects: &[ObjectType],
-    current_object_id: ObjectId,
-) {
-    egui::Grid::new("object_ref_grid")
-        .striped(true)
-        .min_col_width(0.0)
-        .show(ui, |ui| {
-            let mut idx = 0;
-            while idx < object_refs.len() {
-                let obj_ref = &mut object_refs[idx];
-                let obj = design.get_pool().object_by_id(obj_ref.id);
-
-                ui.label(" - ");
-                render_object_id_selector(
-                    ui,
-                    idx,
-                    design,
-                    &mut obj_ref.id,
-                    allowed_child_objects,
-                    Some(current_object_id),
-                );
-
-                if let Some(obj) = obj {
-                    let mut max_x = width as i16;
-                    let mut max_y = height as i16;
-                    if let Some(sized_obj) = obj.as_sized_object() {
-                        max_x -= sized_obj.width() as i16;
-                        max_y -= sized_obj.height() as i16;
-                    }
-                    if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                        *design.get_mut_selected().borrow_mut() = obj.id().into();
-                    }
-
-                    // Add name column
-                    let object_info = design.get_object_info(obj);
-                    ui.label(object_info.get_name(obj));
-
-                    ui.add(
-                        egui::Slider::new(&mut obj_ref.offset.x, 0..=max_x)
-                            .text("X")
-                            .drag_value_speed(1.0),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut obj_ref.offset.y, 0..=max_y)
-                            .text("Y")
-                            .drag_value_speed(1.0),
-                    );
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object");
-                }
-
-                render_index_modifiers(ui, idx, object_refs);
-                idx += 1;
-                ui.end_row();
-            }
-        });
-
-    let (new_object_id, _) = render_add_object_id(
+    parent: ObjectId,
+    selected: ObjectId,
+    index: usize,
+    allowed_types: &[ObjectType],
+) -> Option<ObjectId> {
+    let selected_text = design.get_pool().object_by_id(selected).map_or_else(
+        || {
+            format!(
+                "{}: Missing object",
+                design.format_object_id(selected.value())
+            )
+        },
+        |object| object_selector_label(design, object),
+    );
+    child_picker(
         ui,
+        salt,
+        &selected_text,
         design,
-        allowed_child_objects,
+        parent,
+        Some(selected),
+        Some(index),
+        allowed_types,
         false,
-        Some(current_object_id),
-    );
-    if let Some(id) = new_object_id {
-        object_refs.push(ObjectRef {
-            id,
-            offset: Point::default(),
-        });
-    }
+    )
+    .and_then(|id| id.0)
+    .filter(|id| *id != selected)
 }
 
-fn render_object_id_list(
+fn child_picker(
     ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    label: &str,
     design: &EditorProject,
-    object_ids: &mut Vec<ObjectId>,
-    allowed_child_objects: &[ObjectType],
-    current_object_id: ObjectId,
-) {
-    egui::Grid::new("object_id_grid")
-        .striped(true)
-        .min_col_width(0.0)
-        .show(ui, |ui| {
-            let mut idx = 0;
-            while idx < object_ids.len() {
-                let obj: Option<&Object> = design.get_pool().object_by_id(object_ids[idx]);
-
-                ui.label(" - ");
-                render_object_id_selector(
-                    ui,
-                    idx,
-                    design,
-                    &mut object_ids[idx],
-                    allowed_child_objects,
-                    Some(current_object_id),
-                );
-
-                if let Some(obj) = obj {
-                    if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                        *design.get_mut_selected().borrow_mut() = obj.id().into();
-                    }
-
-                    // Add name column
-                    let object_info = design.get_object_info(obj);
-                    ui.label(object_info.get_name(obj));
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object");
-                    ui.label(""); // Empty cell for name column
-                }
-
-                render_index_modifiers(ui, idx, object_ids);
-                idx += 1;
-                ui.end_row();
-            }
-        });
-    let (new_object_id, _) = render_add_object_id(
-        ui,
-        design,
-        allowed_child_objects,
-        false,
-        Some(current_object_id),
-    );
-    if let Some(id) = new_object_id {
-        object_ids.push(id);
-    }
-}
-
-fn render_nullable_object_id_list(
-    ui: &mut egui::Ui,
-    design: &EditorProject,
-    nullable_object_ids: &mut Vec<NullableObjectId>,
-    allowed_child_objects: &[ObjectType],
-    current_object_id: ObjectId,
-) {
-    egui::Grid::new("object_id_grid")
-        .striped(true)
-        .min_col_width(0.0)
-        .show(ui, |ui| {
-            let mut idx = 0;
-            while idx < nullable_object_ids.len() {
-                ui.label(" - ");
-                render_nullable_object_id_selector(
-                    ui,
-                    idx,
-                    design,
-                    &mut nullable_object_ids[idx],
-                    allowed_child_objects,
-                    Some(current_object_id),
-                );
-                if let Some(object_id) = &mut nullable_object_ids[idx].0 {
-                    let obj: Option<&Object> = design.get_pool().object_by_id(*object_id);
-
-                    if let Some(obj) = obj {
-                        if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                            *design.get_mut_selected().borrow_mut() = obj.id().into();
-                        }
-
-                        // Add name column
-                        let object_info = design.get_object_info(obj);
-                        ui.label(object_info.get_name(obj));
-                    } else {
-                        ui.colored_label(egui::Color32::RED, "Missing object");
-                        ui.label(""); // Empty cell for name column
-                    }
-                } else {
-                    ui.label(""); // Empty cell for type
-                    ui.label(""); // Empty cell for name
-                }
-                render_index_modifiers(ui, idx, nullable_object_ids);
-                idx += 1;
-                ui.end_row();
-            }
-        });
-
-    let (new_object_id, success) = render_add_object_id(
-        ui,
-        design,
-        allowed_child_objects,
-        true,
-        Some(current_object_id),
-    );
-    if success {
-        nullable_object_ids.push(NullableObjectId(new_object_id));
-    }
-}
-
-fn render_add_object_id(
-    ui: &mut egui::Ui,
-    design: &EditorProject,
-    allowed_child_objects: &[ObjectType],
+    parent: ObjectId,
+    selected: Option<ObjectId>,
+    index: Option<usize>,
+    allowed: &[ObjectType],
     allow_none: bool,
-    current_object_id: Option<ObjectId>,
-) -> (Option<ObjectId>, bool) {
-    let pool = design.get_pool();
-    let mut result = (None, false);
+) -> Option<NullableObjectId> {
+    let action = format!(
+        "{} {}",
+        if index.is_some() {
+            "Replace child of"
+        } else {
+            "Add child to"
+        },
+        crate::object_picker::object_label(design, Some(parent))
+    );
+    crate::object_picker::button(
+        ui,
+        salt,
+        label,
+        &action,
+        design,
+        selected,
+        allow_none,
+        |candidate| {
+            allowed.contains(&candidate.object_type())
+                && crate::vt_compatibility::supported_object_type(
+                    candidate.object_type(),
+                    design.vt_version,
+                )
+                && candidate_is_valid(design, parent, candidate.id())
+        },
+        |ui, choice| {
+            crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                queue_child_selection(candidate, parent, index, choice);
+            })
+        },
+    )
+}
+
+fn queue_child_selection(
+    design: &EditorProject,
+    parent: ObjectId,
+    index: Option<usize>,
+    choice: NullableObjectId,
+) {
+    let Some(object) = design.get_pool().object_by_id(parent) else {
+        return;
+    };
+    if let Some(children) = crate::operations::operation::object_refs(object) {
+        let Some(child) = choice.0 else {
+            return;
+        };
+        if let Some(index) = index {
+            let mut updated = children.to_vec();
+            if let Some(entry) = updated.get_mut(index) {
+                entry.id = child;
+            } else {
+                return;
+            }
+            design.queue_operation(Operation::SetChildren {
+                parent: ObjectTarget::id(parent.value()),
+                children: updated
+                    .into_iter()
+                    .map(|child| ChildPlacement {
+                        child: ObjectTarget::id(child.id.value()),
+                        x: child.offset.x,
+                        y: child.offset.y,
+                    })
+                    .collect(),
+            });
+        } else {
+            design.queue_operation(Operation::AddChild {
+                parent: ObjectTarget::id(parent.value()),
+                child: ObjectTarget::id(child.value()),
+                x: 0,
+                y: 0,
+            });
+        }
+    } else if let Some(mut objects) = crate::operations::operation::object_list(object) {
+        match &mut objects {
+            ObjectReferenceList::Required(ids) => {
+                let Some(child) = choice.0 else {
+                    return;
+                };
+                if let Some(index) = index {
+                    ids[index] = child;
+                } else {
+                    ids.push(child);
+                }
+            }
+            ObjectReferenceList::Nullable(ids) => {
+                if let Some(index) = index {
+                    ids[index] = choice;
+                } else {
+                    ids.push(choice);
+                }
+            }
+        }
+        queue_object_list(design, parent, objects);
+    }
+}
+
+fn render_positioned_children(
+    ui: &mut egui::Ui,
+    parent: &Object,
+    children: &[ObjectRef],
+    design: &EditorProject,
+) {
+    let parent_id = parent.id();
+    let allowed = crate::allowed_object_relationships::get_allowed_child_refs(
+        parent.object_type(),
+        design.vt_version,
+    );
+    let mut replacement = None;
+    let mut position = None;
+    let mut action = None;
+    egui::Grid::new(("positioned_children", parent_id.value()))
+        .striped(true)
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            ui.label("Object");
+            ui.label("Type");
+            ui.label("X");
+            ui.label("Y");
+            ui.label("");
+            ui.label("");
+            ui.label("");
+            ui.end_row();
+            for (index, child_ref) in children.iter().enumerate() {
+                if let Some(new_id) = render_object_selector(
+                    ui,
+                    ("positioned_child", index),
+                    design,
+                    parent_id,
+                    child_ref.id,
+                    index,
+                    &allowed,
+                ) {
+                    replacement = Some((index, new_id));
+                }
+                let child = design.get_pool().object_by_id(child_ref.id);
+                if let Some(child) = child {
+                    if ui.link(format!("{:?}", child.object_type())).clicked() {
+                        select_object(design, child.id());
+                    }
+                } else {
+                    crate::ui_style::error_text(ui, "Missing object");
+                }
+                let position_key =
+                    ui.make_persistent_id(("positioned_child_position", parent_id.value(), index));
+                touch_draft(ui.ctx(), position_key);
+                let revision = design.revision();
+                let mut edited = ui
+                    .data(|data| data.get_temp::<PendingPosition>(position_key))
+                    .filter(|pending| pending.revision == revision)
+                    .unwrap_or(PendingPosition {
+                        x: child_ref.offset.x,
+                        y: child_ref.offset.y,
+                        revision,
+                    });
+                let x_response = ui.add(
+                    egui::DragValue::new(&mut edited.x)
+                        .range(i16::MIN..=i16::MAX)
+                        .speed(1.0),
+                );
+                let y_response = ui.add(
+                    egui::DragValue::new(&mut edited.y)
+                        .range(i16::MIN..=i16::MAX)
+                        .speed(1.0),
+                );
+                if x_response.changed() || y_response.changed() {
+                    ui.data_mut(|data| data.insert_temp(position_key, edited.clone()));
+                    let updated =
+                        positioned_children_with_position(children, index, edited.x, edited.y);
+                    update_draft(
+                        ui.ctx(),
+                        position_key,
+                        design,
+                        Some(Operation::SetChildren {
+                            parent: ObjectTarget::id(parent_id.value()),
+                            children: updated,
+                        }),
+                    );
+                }
+                let cancelled = (x_response.has_focus() || y_response.has_focus())
+                    && ui.input(|input| input.key_pressed(egui::Key::Escape));
+                if cancelled {
+                    ui.data_mut(|data| data.remove::<PendingPosition>(position_key));
+                    clear_draft(ui.ctx(), position_key);
+                    edited.x = child_ref.offset.x;
+                    edited.y = child_ref.offset.y;
+                } else if drag_value_finished(&x_response)
+                    || drag_value_finished(&y_response)
+                    || (x_response.has_focus() || y_response.has_focus())
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
+                    if edited.x != child_ref.offset.x || edited.y != child_ref.offset.y {
+                        position = Some((index, edited.x, edited.y));
+                    }
+                    ui.data_mut(|data| data.remove::<PendingPosition>(position_key));
+                    clear_draft(ui.ctx(), position_key);
+                }
+                row_actions(ui, index, children.len(), &mut action);
+                ui.end_row();
+            }
+        });
+
+    if let Some((index, child_id)) = replacement {
+        queue_child_selection(
+            design,
+            parent_id,
+            Some(index),
+            NullableObjectId(Some(child_id)),
+        );
+    } else if let Some((index, x, y)) = position {
+        let updated = positioned_children_with_position(children, index, x, y);
+        design.queue_operation(Operation::SetChildren {
+            parent: ObjectTarget::id(parent_id.value()),
+            children: updated,
+        });
+    } else if let Some(action) = action {
+        let mut updated = children.to_vec();
+        apply_list_action(&mut updated, action);
+        design.queue_operation(Operation::SetChildren {
+            parent: ObjectTarget::id(parent_id.value()),
+            children: updated
+                .into_iter()
+                .map(|child| ChildPlacement {
+                    child: ObjectTarget::id(child.id.value()),
+                    x: child.offset.x,
+                    y: child.offset.y,
+                })
+                .collect(),
+        });
+    }
+
     ui.horizontal(|ui| {
         ui.label("Add object:");
-        egui::ComboBox::from_id_salt("New Object Type")
-            .selected_text("Select existing object")
-            .show_ui(ui, |ui| {
-                if allow_none {
-                    if ui.selectable_label(false, "None").clicked() {
-                        result = (None, true);
-                    }
-                }
-                for potential_child in pool.objects_by_types(allowed_child_objects) {
-                    let child_id = potential_child.id();
-
-                    // Check if this would create a circular reference
-                    let would_be_circular = if let Some(parent_id) = current_object_id {
-                        would_create_circular_reference(pool, parent_id, child_id)
-                    } else {
-                        false
-                    };
-
-                    let object_info = design.get_object_info(potential_child);
-                    let name = object_info.get_name(potential_child);
-                    let label = format!(
-                        "{:?}: {:?} - {}{}",
-                        u16::from(child_id),
-                        potential_child.object_type(),
-                        name,
-                        if would_be_circular {
-                            " ⚠ (circular)"
-                        } else {
-                            ""
-                        }
-                    );
-
-                    // Only allow clicking if it wouldn't create a circular reference
-                    ui.add_enabled_ui(!would_be_circular, |ui| {
-                        if ui.selectable_label(false, label).clicked() {
-                            result = (Some(child_id), true);
-                        }
-                    });
-                }
-            });
+        if let Some(Some(child)) = child_picker(
+            ui,
+            ("add_positioned_child", parent_id.value()),
+            "Select existing object…",
+            design,
+            parent_id,
+            None,
+            None,
+            &allowed,
+            false,
+        )
+        .map(|id| id.0)
+        {
+            queue_child_selection(design, parent_id, None, NullableObjectId(Some(child)));
+        }
     });
-    result
 }
 
-fn render_macro_references(
+fn positioned_children_with_position(
+    children: &[ObjectRef],
+    index: usize,
+    x: i16,
+    y: i16,
+) -> Vec<ChildPlacement> {
+    children
+        .iter()
+        .enumerate()
+        .map(|(child_index, child)| ChildPlacement {
+            child: ObjectTarget::id(child.id.value()),
+            x: if child_index == index {
+                x
+            } else {
+                child.offset.x
+            },
+            y: if child_index == index {
+                y
+            } else {
+                child.offset.y
+            },
+        })
+        .collect()
+}
+
+fn apply_list_action<T>(list: &mut Vec<T>, action: ListAction) {
+    match action {
+        ListAction::MoveUp(index) => list.swap(index, index - 1),
+        ListAction::MoveDown(index) => list.swap(index, index + 1),
+        ListAction::Remove(index) => {
+            list.remove(index);
+        }
+        ListAction::ReplaceMacro(_, _) => unreachable!(),
+    }
+}
+
+fn render_object_list(
+    ui: &mut egui::Ui,
+    parent: &Object,
+    objects: ObjectReferenceList,
+    design: &EditorProject,
+) {
+    let parent_id = parent.id();
+    let allowed = crate::allowed_object_relationships::get_allowed_child_refs(
+        parent.object_type(),
+        design.vt_version,
+    );
+    match objects {
+        ObjectReferenceList::Required(objects) => {
+            let mut replacement = None;
+            let mut action = None;
+            egui::Grid::new(("required_object_list", parent_id.value()))
+                .striped(true)
+                .show(ui, |ui| {
+                    for (index, object_id) in objects.iter().copied().enumerate() {
+                        ui.label((index + 1).to_string());
+                        if let Some(new_id) = render_object_selector(
+                            ui,
+                            ("required_object", index),
+                            design,
+                            parent_id,
+                            object_id,
+                            index,
+                            &allowed,
+                        ) {
+                            replacement = Some((index, new_id));
+                        }
+                        render_reference_links(ui, design, object_id);
+                        row_actions(ui, index, objects.len(), &mut action);
+                        ui.end_row();
+                    }
+                });
+            if let Some((index, object_id)) = replacement {
+                queue_child_selection(
+                    design,
+                    parent_id,
+                    Some(index),
+                    NullableObjectId(Some(object_id)),
+                );
+            } else if let Some(action) = action {
+                let mut updated = objects.clone();
+                apply_list_action(&mut updated, action);
+                queue_object_list(design, parent_id, ObjectReferenceList::Required(updated));
+            }
+            render_add_object(ui, design, parent_id, &allowed, false, |object_id| {
+                let mut updated = objects.clone();
+                if let Some(object_id) = object_id {
+                    updated.push(object_id);
+                    queue_object_list(design, parent_id, ObjectReferenceList::Required(updated));
+                }
+            });
+        }
+        ObjectReferenceList::Nullable(objects) => {
+            let mut replacement = None;
+            let mut action = None;
+            egui::Grid::new(("nullable_object_list", parent_id.value()))
+                .striped(true)
+                .show(ui, |ui| {
+                    for (index, object_id) in objects.iter().copied().enumerate() {
+                        ui.label((index + 1).to_string());
+                        let mut selected = object_id;
+                        let label = object_id.0.map_or_else(
+                            || "None".to_owned(),
+                            |id| {
+                                design.get_pool().object_by_id(id).map_or_else(
+                                    || {
+                                        format!(
+                                            "#{}: Missing object",
+                                            design.format_object_id(id.value())
+                                        )
+                                    },
+                                    |object| object_label(design, object),
+                                )
+                            },
+                        );
+                        if let Some(value) = child_picker(
+                            ui,
+                            ("nullable_object", index),
+                            &label,
+                            design,
+                            parent_id,
+                            object_id.0,
+                            Some(index),
+                            &allowed,
+                            true,
+                        ) {
+                            selected = value;
+                        }
+                        if selected != object_id {
+                            replacement = Some((index, selected));
+                        }
+                        if let Some(id) = object_id.0 {
+                            render_reference_links(ui, design, id);
+                        } else {
+                            ui.label("");
+                            ui.label("");
+                        }
+                        row_actions(ui, index, objects.len(), &mut action);
+                        ui.end_row();
+                    }
+                });
+            if let Some((index, object_id)) = replacement {
+                queue_child_selection(design, parent_id, Some(index), object_id);
+            } else if let Some(action) = action {
+                let mut updated = objects.clone();
+                apply_list_action(&mut updated, action);
+                queue_object_list(design, parent_id, ObjectReferenceList::Nullable(updated));
+            }
+            render_add_object(ui, design, parent_id, &allowed, true, |object_id| {
+                let mut updated = objects.clone();
+                updated.push(NullableObjectId(object_id));
+                queue_object_list(design, parent_id, ObjectReferenceList::Nullable(updated));
+            });
+        }
+    }
+}
+
+fn render_reference_links(ui: &mut egui::Ui, design: &EditorProject, object_id: ObjectId) {
+    if let Some(object) = design.get_pool().object_by_id(object_id) {
+        if ui.link(format!("{:?}", object.object_type())).clicked() {
+            select_object(design, object_id);
+        }
+        if ui.link(design.object_display_name(object)).clicked() {
+            select_object(design, object_id);
+        }
+    } else {
+        crate::ui_style::error_text(ui, "Missing object");
+        ui.label("");
+    }
+}
+
+fn render_add_object(
     ui: &mut egui::Ui,
     design: &EditorProject,
-    macro_refs: &mut Vec<MacroRef>,
-    possible_events: &[Event],
+    parent_id: ObjectId,
+    allowed: &[ObjectType],
+    allow_none: bool,
+    mut add: impl FnMut(Option<ObjectId>),
 ) {
-    egui::Grid::new("macro_grid")
+    ui.horizontal(|ui| {
+        ui.label("Add object:");
+        if let Some(id) = child_picker(
+            ui,
+            ("add_object_list_item", parent_id.value()),
+            "Select existing object…",
+            design,
+            parent_id,
+            None,
+            None,
+            allowed,
+            allow_none,
+        ) {
+            add(id.0);
+        }
+    });
+}
+
+fn queue_object_list(design: &EditorProject, id: ObjectId, objects: ObjectReferenceList) {
+    design.queue_operation(Operation::SetObjectList {
+        object: ObjectTarget::id(id.value()),
+        objects: match objects {
+            ObjectReferenceList::Required(ids) => ObjectTargetList::Required(
+                ids.into_iter()
+                    .map(|id| ObjectTarget::id(id.value()))
+                    .collect(),
+            ),
+            ObjectReferenceList::Nullable(ids) => ObjectTargetList::Nullable(
+                ids.into_iter()
+                    .map(|id| id.0.map(|id| ObjectTarget::id(id.value())))
+                    .collect(),
+            ),
+        },
+    });
+}
+
+/// Each label names an object and gives it text from a String Variable, the
+/// font type of that text, and a graphic. Text and graphic are optional.
+fn render_object_labels(
+    ui: &mut egui::Ui,
+    list: &ag_iso_stack::object_pool::object::ObjectLabelReferenceList,
+    design: &EditorProject,
+) {
+    use crate::allowed_object_relationships::AllowedChildRefs;
+    use ag_iso_stack::object_pool::object_attributes::{FontType, ObjectLabel};
+
+    let list_id = list.id;
+    let labels = &list.object_labels;
+    let version = design.vt_version;
+    let labelled = crate::allowed_object_relationships::get_allowed_child_refs(
+        ObjectType::ObjectLabelReferenceList,
+        version,
+    );
+    let graphics = <ObjectLabel as AllowedChildRefs>::get_allowed_child_refs(version);
+    let font_type_label = |font_type: u8| {
+        crate::enum_labels::enum_choice_label(
+            ObjectType::FontAttributes,
+            PropertyKey::FontType,
+            &serde_json::to_value(FontType::from(font_type)).unwrap(),
+        )
+    };
+    let with_label = |index: usize, change: &dyn Fn(&mut ObjectLabel)| {
+        let mut labels = labels.clone();
+        change(&mut labels[index]);
+        labels
+    };
+    let mut updated = None;
+    let mut action = None;
+    ui.label("Object labels");
+    egui::Grid::new(("object_labels", list_id.value()))
         .striped(true)
         .min_col_width(0.0)
         .show(ui, |ui| {
-            let mut idx = 0;
-            while idx < macro_refs.len() {
-                let macro_ref = &mut macro_refs[idx];
-
-                if let Some(macro_obj) = design
-                    .get_pool()
-                    .objects_by_type(ObjectType::Macro)
+            for heading in ["Object", "Text", "Font type", "Graphic", "", "", ""] {
+                ui.label(heading);
+            }
+            ui.end_row();
+            for (index, label) in labels.iter().enumerate() {
+                let others: Vec<ObjectId> = labels
                     .iter()
-                    .find(|o| u16::from(o.id()) == macro_ref.macro_id as u16)
-                {
-                    ui.label(" - ");
-                    ui.push_id(idx, |ui| {
-                        egui::ComboBox::from_id_salt("event_id")
-                            .selected_text(format!("{:?}", macro_ref.event_id))
-                            .show_ui(ui, |ui| {
-                                for event in possible_events {
-                                    ui.selectable_value(
-                                        &mut macro_ref.event_id,
-                                        *event,
-                                        format!("{:?}", event),
-                                    );
-                                }
-                            });
-
-                        if ui.link(" Macro ").clicked() {
-                            *design.get_mut_selected().borrow_mut() = macro_obj.id().into();
-                        }
-
-                        egui::ComboBox::from_id_salt("macro_id")
-                            .selected_text(format!("{:?}", macro_ref.macro_id))
-                            .show_ui(ui, |ui| {
-                                for potential_macro in
-                                    design.get_pool().objects_by_type(ObjectType::Macro)
-                                {
-                                    ui.selectable_value(
-                                        &mut macro_ref.macro_id,
-                                        u16::from(potential_macro.id()) as u8,
-                                        format!("{:?}", u16::from(potential_macro.id())),
-                                    );
-                                }
-                            });
-                    });
-                } else {
-                    ui.label(format!(
-                        "- {:?}: Missing macro object {:?}",
-                        macro_ref.event_id, macro_ref.macro_id
-                    ));
+                    .enumerate()
+                    .filter(|(other, _)| *other != index)
+                    .map(|(_, label)| label.id)
+                    .collect();
+                if let Some(changed) = label_reference_picker(
+                    ui,
+                    ("label_object", index),
+                    design,
+                    list_id,
+                    Some(label.id),
+                    &labelled,
+                    false,
+                    |candidate| !others.contains(&candidate),
+                    |choice| {
+                        with_label(index, &|label| {
+                            if let Some(id) = choice.0 {
+                                label.id = id;
+                            }
+                        })
+                    },
+                ) {
+                    updated = Some(changed);
                 }
-
-                render_index_modifiers(ui, idx, macro_refs);
-                idx += 1;
+                if let Some(changed) = label_reference_picker(
+                    ui,
+                    ("label_text", index),
+                    design,
+                    list_id,
+                    label.string_variable_reference.0,
+                    &[ObjectType::StringVariable],
+                    true,
+                    |_| true,
+                    |choice| with_label(index, &|label| label.string_variable_reference = choice),
+                ) {
+                    updated = Some(changed);
+                }
+                egui::ComboBox::from_id_salt(("label_font_type", index))
+                    .icon(crate::ui_style::combo_box_icon)
+                    .selected_text(font_type_label(label.font_type))
+                    .show_ui(ui, |ui| {
+                        for font_type in 0..=u8::MAX {
+                            let supported = crate::vt_compatibility::supported_font_type(
+                                FontType::from(font_type),
+                                version,
+                            );
+                            let current = font_type == label.font_type;
+                            // An unsupported font type is listed only when it is set
+                            if !supported && !current {
+                                continue;
+                            }
+                            let clicked = ui
+                                .selectable_label(current, font_type_label(font_type))
+                                .clicked();
+                            if clicked && !current {
+                                updated =
+                                    Some(with_label(index, &|label| label.font_type = font_type));
+                            }
+                        }
+                    });
+                if let Some(changed) = label_reference_picker(
+                    ui,
+                    ("label_graphic", index),
+                    design,
+                    list_id,
+                    label.graphic_representation.0,
+                    &graphics,
+                    true,
+                    |_| true,
+                    |choice| with_label(index, &|label| label.graphic_representation = choice),
+                ) {
+                    updated = Some(changed);
+                }
+                row_actions(ui, index, labels.len(), &mut action);
                 ui.end_row();
             }
         });
+    if let Some(action) = action {
+        let mut changed = labels.clone();
+        apply_list_action(&mut changed, action);
+        updated = Some(changed);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Add label:");
+        let labelled_ids: Vec<ObjectId> = labels.iter().map(|label| label.id).collect();
+        if let Some(changed) = label_reference_picker(
+            ui,
+            ("add_label", list_id.value()),
+            design,
+            list_id,
+            None,
+            &labelled,
+            false,
+            |candidate| !labelled_ids.contains(&candidate),
+            |choice| {
+                let mut labels = labels.clone();
+                labels.extend(choice.0.map(|id| ObjectLabel {
+                    id,
+                    string_variable_reference: NullableObjectId(None),
+                    font_type: u8::from(FontType::Latin1),
+                    graphic_representation: NullableObjectId(None),
+                }));
+                labels
+            },
+        ) {
+            updated = Some(changed);
+        }
+    });
+    if let Some(labels) = updated {
+        queue_object_labels(design, list_id, labels);
+    }
+}
 
-    render_add_macro_reference(ui, design.get_pool(), macro_refs, possible_events);
+/// Pick one reference of a label; `labels_with` builds the whole new list
+/// for both the impact preview and the edit.
+#[allow(clippy::too_many_arguments)]
+fn label_reference_picker(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    design: &EditorProject,
+    list_id: ObjectId,
+    current: Option<ObjectId>,
+    allowed: &[ObjectType],
+    allow_none: bool,
+    eligible: impl Fn(ObjectId) -> bool,
+    labels_with: impl Fn(
+        NullableObjectId,
+    ) -> Vec<ag_iso_stack::object_pool::object_attributes::ObjectLabel>,
+) -> Option<Vec<ag_iso_stack::object_pool::object_attributes::ObjectLabel>> {
+    let text = current.map_or_else(
+        || {
+            if allow_none {
+                "None".to_owned()
+            } else {
+                "Select object…".to_owned()
+            }
+        },
+        |id| {
+            design.get_pool().object_by_id(id).map_or_else(
+                || format!("Missing object #{}", design.format_object_id(id.value())),
+                |object| object_selector_label(design, object),
+            )
+        },
+    );
+    crate::object_picker::button(
+        ui,
+        salt,
+        &text,
+        &format!(
+            "Change object label on {}",
+            crate::object_picker::object_label(design, Some(list_id))
+        ),
+        design,
+        current,
+        allow_none,
+        |candidate| {
+            allowed.contains(&candidate.object_type())
+                && crate::vt_compatibility::supported_object_type(
+                    candidate.object_type(),
+                    design.vt_version,
+                )
+                && candidate.id() != list_id
+                && eligible(candidate.id())
+        },
+        |ui, choice| {
+            crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                queue_object_labels(candidate, list_id, labels_with(choice));
+            })
+        },
+    )
+    .filter(|choice| choice.0 != current)
+    .map(&labels_with)
+}
+
+fn queue_object_labels(
+    design: &EditorProject,
+    id: ObjectId,
+    labels: Vec<ag_iso_stack::object_pool::object_attributes::ObjectLabel>,
+) {
+    design.queue_operation(Operation::SetObjectLabels {
+        object_id: id.value(),
+        labels,
+    });
+}
+
+fn macro_object(design: &EditorProject, macro_id: u16) -> Option<&Object> {
+    ObjectId::new(macro_id)
+        .ok()
+        .and_then(|id| design.get_pool().object_by_id(id))
+        .filter(|object| object.object_type() == ObjectType::Macro)
+}
+
+fn apply_macro_action(references: &mut Vec<MacroRef>, action: ListAction) {
+    match action {
+        ListAction::ReplaceMacro(index, reference) => references[index] = reference,
+        action => apply_list_action(references, action),
+    }
+}
+
+fn queue_macro_references(design: &EditorProject, id: ObjectId, macro_refs: Vec<MacroRef>) {
+    design.queue_operation(Operation::SetMacroReferences {
+        object: ObjectTarget::id(id.value()),
+        macro_refs: macro_refs
+            .into_iter()
+            .map(|reference| MacroReferenceTarget {
+                event_id: reference.event_id,
+                macro_object: ObjectTarget::id(reference.macro_id),
+            })
+            .collect(),
+    });
 }
 
 fn render_add_macro_reference(
     ui: &mut egui::Ui,
-    pool: &ObjectPool,
-    macro_refs: &mut Vec<MacroRef>,
-    possible_events: &[Event],
+    design: &EditorProject,
+    id: ObjectId,
+    references: &[MacroRef],
+    events: &[Event],
 ) {
+    if events.is_empty() {
+        return;
+    }
+    let event_key = ui.make_persistent_id((id.value(), "new_macro_event"));
+    let mut selected_event = ui.data(|data| data.get_temp::<Event>(event_key));
     ui.horizontal(|ui| {
         ui.label("Add macro:");
-        ui.horizontal(|ui| {
-            let mut selected_event = ui.data_mut(|data| {
-                data.get_temp(egui::Id::new("selected_event"))
-                    .unwrap_or(Event::Reserved)
-            });
-            egui::ComboBox::from_id_salt("New Event Type")
-                .selected_text(if selected_event == Event::Reserved {
-                    "Select event".to_string()
-                } else {
-                    format!("{:?}", selected_event)
-                })
-                .show_ui(ui, |ui| {
-                    for event in possible_events {
-                        if ui
-                            .selectable_value(&mut selected_event, *event, format!("{:?}", event))
-                            .changed()
-                        {
-                            ui.data_mut(|data| {
-                                data.insert_temp(egui::Id::new("selected_event"), selected_event);
-                            });
-                        }
+        egui::ComboBox::from_id_salt(("new_macro_event", id.value()))
+            .icon(crate::ui_style::combo_box_icon)
+            .selected_text(
+                selected_event
+                    .map_or_else(|| "Select event".to_owned(), |event| format!("{event:?}")),
+            )
+            .show_ui(ui, |ui| {
+                for event in events {
+                    if ui
+                        .selectable_value(&mut selected_event, Some(*event), format!("{event:?}"))
+                        .changed()
+                    {
+                        ui.data_mut(|data| data.insert_temp(event_key, *event));
                     }
-                });
-
-            if selected_event != Event::Reserved {
-                egui::ComboBox::from_id_salt("New Macro")
-                    .selected_text("Select macro")
-                    .show_ui(ui, |ui| {
-                        for potential_macro in pool.objects_by_type(ObjectType::Macro) {
-                            if ui
-                                .selectable_label(
-                                    false,
-                                    format!("{:?}", u16::from(potential_macro.id())),
-                                )
-                                .clicked()
-                            {
-                                macro_refs.push(MacroRef {
-                                    event_id: selected_event,
-                                    macro_id: u16::from(potential_macro.id()) as u8,
-                                });
-                            }
+                }
+            });
+        if let Some(event_id) = selected_event.filter(|event| events.contains(event)) {
+            if let Some(Some(candidate)) = crate::object_picker::button(
+                ui,
+                ("new_macro_object", id.value()),
+                "Select macro…",
+                &format!(
+                    "Attach macro for {event_id:?} to {}",
+                    crate::object_picker::object_label(design, Some(id))
+                ),
+                design,
+                None,
+                false,
+                |candidate| {
+                    candidate.object_type() == ObjectType::Macro
+                        && crate::vt_compatibility::supported_event(
+                            design
+                                .get_pool()
+                                .object_by_id(id)
+                                .expect("macro owner is rendered from the pool"),
+                            event_id,
+                            design.vt_version,
+                        )
+                        && (candidate.id().value() <= u8::MAX.into()
+                            || design.vt_version
+                                >= ag_iso_stack::object_pool::vt_version::VtVersion::Version5)
+                },
+                |ui, choice| {
+                    crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                        if let Some(choice) = choice.0 {
+                            let mut updated = references.to_vec();
+                            updated.push(MacroRef {
+                                event_id,
+                                macro_id: choice.value(),
+                            });
+                            queue_macro_references(candidate, id, updated);
                         }
-                    });
+                    })
+                },
+            )
+            .map(|id| id.0)
+            {
+                let mut updated = references.to_vec();
+                updated.push(MacroRef {
+                    event_id,
+                    macro_id: candidate.value(),
+                });
+                queue_macro_references(design, id, updated);
+                ui.data_mut(|data| data.remove::<Event>(event_key));
             }
-        });
+        }
     });
 }
 
-impl ConfigurableObject for WorkingSet {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.checkbox(&mut self.selectable, "Selectable");
-        ui.horizontal(|ui| {
-            let masks = design
-                .get_pool()
-                .objects_by_types(&[ObjectType::DataMask, ObjectType::AlarmMask]);
-            egui::ComboBox::from_label("Active Mask")
-                .selected_text(format!("{:?}", u16::from(self.active_mask)))
-                .show_ui(ui, |ui| {
-                    for object in masks {
-                        ui.selectable_value(
-                            &mut self.active_mask,
-                            object.id(),
-                            format!("{:?}", u16::from(object.id())),
-                        );
-                    }
-                });
-            if ui.link("(view)").clicked() {
-                *design.get_mut_selected().borrow_mut() = self.active_mask.into();
-            }
-        });
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for DataMask {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_label("Soft Key Mask")
-                .selected_text(
-                    self.soft_key_mask
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.soft_key_mask,
-                        NullableObjectId(None),
-                        "None".to_string(),
-                    );
-                    for object in design.get_pool().objects_by_type(ObjectType::SoftKeyMask) {
-                        ui.selectable_value(
-                            &mut self.soft_key_mask,
-                            NullableObjectId(Some(object.id())),
-                            format!("{:?}", u16::from(object.id())),
-                        );
-                    }
-                });
-            if let Some(mask) = self.soft_key_mask.0 {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = mask.into();
-                }
-            }
-        });
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for AlarmMask {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_label("Soft Key Mask")
-                .selected_text(
-                    self.soft_key_mask
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.soft_key_mask,
-                        NullableObjectId(None),
-                        "None".to_string(),
-                    );
-                    for object in design.get_pool().objects_by_type(ObjectType::SoftKeyMask) {
-                        ui.selectable_value(
-                            &mut self.soft_key_mask,
-                            NullableObjectId(Some(object.id())),
-                            format!("{:?}", u16::from(object.id())),
-                        );
-                    }
-                });
-            if let Some(mask) = self.soft_key_mask.0 {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = mask.into();
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Priority:");
-            ui.radio_value(&mut self.priority, 2, "Low");
-            ui.radio_value(&mut self.priority, 1, "Medium");
-            ui.radio_value(&mut self.priority, 0, "High");
-        });
-        ui.horizontal(|ui| {
-            ui.label("Acoustic signal:");
-            ui.radio_value(&mut self.acoustic_signal, 3, "None");
-            ui.radio_value(&mut self.acoustic_signal, 2, "Lowest");
-            ui.radio_value(&mut self.acoustic_signal, 1, "Medium");
-            ui.radio_value(&mut self.acoustic_signal, 0, "Highest");
-        });
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for Container {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.checkbox(&mut self.hidden, "Hidden");
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            self.width,
-            self.height,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for SoftKeyMask {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.separator();
-        ui.label("Objects:");
-        render_object_id_list(
-            ui,
-            design,
-            &mut self.objects,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for Key {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Key code:");
-            ui.radio_value(&mut self.key_code, 0, "ACK");
-            ui.add(egui::DragValue::new(&mut self.key_code).speed(1));
-        });
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for Button {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.border_colour, 0..=255)
-                .text("Border Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Key code:");
-            ui.add(egui::DragValue::new(&mut self.key_code).speed(1.0));
-        });
-
-        ui.separator();
-        ui.checkbox(&mut self.options.latchable, "Latchable");
-        if self.options.latchable {
-            ui.horizontal(|ui| {
-                ui.label("Initial State:");
-                ui.radio_value(&mut self.options.state, ButtonState::Released, "Released");
-                ui.radio_value(&mut self.options.state, ButtonState::Latched, "Latched");
-            });
+fn render_macro_references(
+    ui: &mut egui::Ui,
+    object: &Object,
+    id: ObjectId,
+    design: &EditorProject,
+) {
+    let Some(references) = crate::operations::operation::macro_refs(object) else {
+        return;
+    };
+    ui.label("Macros");
+    let events = crate::possible_events::get_possible_events_for_version(object, design.vt_version);
+    for (index, reference) in references.iter().enumerate() {
+        if !crate::vt_compatibility::supported_event(object, reference.event_id, design.vt_version)
+        {
+            repair_warning(
+                ui,
+                &format!("Macro {}: {:?}", index + 1, reference.event_id),
+                design.vt_version,
+                |version| {
+                    crate::vt_compatibility::supported_event(object, reference.event_id, version)
+                },
+            );
         }
-
-        // TODO: check if we have VT version 4 or later
-        // ui.checkbox(&mut self.options.suppress_border, "Suppress Border");
-        // ui.checkbox(
-        //     &mut self.options.transparent_background,
-        //     "Transparent Background",
-        // );
-        // ui.checkbox(&mut self.options.disabled, "Disabled");
-        // ui.checkbox(&mut self.options.no_border, "No Border");
-
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            self.width,
-            self.height,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
+        if reference.macro_id > u8::MAX.into() && design.vt_version < VtVersion::Version5 {
+            repair_warning(
+                ui,
+                &format!("Macro {}: extended reference", index + 1),
+                design.vt_version,
+                |version| {
+                    crate::vt_compatibility::supported_property(
+                        object.object_type(),
+                        "extended_macro_reference",
+                        version,
+                    )
+                },
+            );
+        }
     }
-}
+    let mut action = None;
+    egui::Grid::new(("macro_grid", id.value()))
+        .striped(true)
+        .min_col_width(0.0)
+        .show(ui, |ui| {
+            for (index, reference) in references.iter().enumerate() {
+                let mut edited = reference.clone();
+                egui::ComboBox::from_id_salt(("macro_event", index))
+                    .icon(crate::ui_style::combo_box_icon)
+                    .selected_text(format!("{:?}", reference.event_id))
+                    .show_ui(ui, |ui| {
+                        for event in &events {
+                            ui.selectable_value(&mut edited.event_id, *event, format!("{event:?}"));
+                        }
+                    });
 
-impl ConfigurableObject for InputBoolean {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        egui::ComboBox::from_id_salt("foreground_colour")
-            .selected_text(format!("{:?}", u16::from(self.foreground_colour)))
-            .show_ui(ui, |ui| {
-                for potential_child in design
-                    .get_pool()
-                    .objects_by_type(ObjectType::FontAttributes)
-                {
-                    ui.selectable_value(
-                        &mut self.foreground_colour,
-                        potential_child.id(),
+                let macro_object = macro_object(design, reference.macro_id);
+                let selected_text = macro_object.map_or_else(
+                    || {
                         format!(
-                            "{:?}: {:?}",
-                            u16::from(potential_child.id()),
-                            potential_child.object_type()
-                        ),
-                    );
+                            "{} - Missing macro",
+                            design.format_object_id(reference.macro_id)
+                        )
+                    },
+                    |object| object_label(design, object),
+                );
+                if let Some(Some(candidate)) = crate::object_picker::button(
+                    ui,
+                    ("macro_object", index),
+                    &selected_text,
+                    &format!(
+                        "Replace {:?} macro on {}",
+                        reference.event_id,
+                        crate::object_picker::object_label(design, Some(id))
+                    ),
+                    design,
+                    macro_object.map(|object| object.id()),
+                    false,
+                    |candidate| {
+                        candidate.object_type() == ObjectType::Macro
+                            && (candidate.id().value() <= u8::MAX.into()
+                                || design.vt_version
+                                    >= ag_iso_stack::object_pool::vt_version::VtVersion::Version5)
+                    },
+                    |ui, choice| {
+                        crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                            if let Some(choice) = choice.0 {
+                                let mut updated = references.to_vec();
+                                updated[index] = edited.clone();
+                                updated[index].macro_id = choice.value();
+                                queue_macro_references(candidate, id, updated);
+                            }
+                        })
+                    },
+                )
+                .map(|id| id.0)
+                {
+                    edited.macro_id = candidate.value();
                 }
+                if let Some(macro_object) = macro_object {
+                    if ui.link("View").clicked() {
+                        select_object(design, macro_object.id());
+                    }
+                } else {
+                    ui.label("");
+                }
+                row_actions(ui, index, references.len(), &mut action);
+                if &edited != reference && action.is_none() {
+                    action = Some(ListAction::ReplaceMacro(index, edited));
+                }
+                ui.end_row();
+            }
+        });
+
+    if let Some(action) = action {
+        let mut updated = references.to_vec();
+        apply_macro_action(&mut updated, action);
+        queue_macro_references(design, id, updated);
+    }
+    render_add_macro_reference(ui, design, id, references, &events);
+}
+
+fn render_identity(
+    ui: &mut egui::Ui,
+    id: ObjectId,
+    object_type: ObjectType,
+    design: &EditorProject,
+) {
+    let key = ui.make_persistent_id(("object_id", id.value()));
+    touch_draft(ui.ctx(), key);
+    let mut overridden = design
+        .get_pool()
+        .object_by_id(id)
+        .is_some_and(|object| design.get_object_info(object).id_overridden);
+    let mut value = ui
+        .data(|data| match data.get_temp::<PendingValue>(key) {
+            Some(PendingValue::Number(value)) if overridden => Some(value as u16),
+            _ => None,
+        })
+        .unwrap_or_else(|| id.value());
+    ui.horizontal(|ui| {
+        ui.label("Assigned ID");
+        ui.monospace(design.format_object_id(id.value()));
+        ui.label(if overridden {
+            "Manual override"
+        } else {
+            "Automatic"
+        });
+        ui.label(format!("Type: {object_type:?}"));
+        ui.label(format!(
+            "Referenced {} times",
+            direct_reference_count(design.get_pool(), id)
+        ));
+    });
+    ui.horizontal(|ui| {
+        let toggled = ui.checkbox(&mut overridden, "Override ID").changed();
+        if toggled {
+            let assignment = if overridden {
+                Ok(id)
+            } else {
+                design.allocate_object_id(object_type)
+            };
+            match assignment {
+                Ok(new_id) => {
+                    design.queue_object_id_assignment(id, new_id, overridden);
+                    clear_draft(ui.ctx(), key);
+                    value = new_id.value();
+                    ui.data_mut(|data| {
+                        data.remove::<PendingValue>(key);
+                        data.remove::<String>(key.with("error"));
+                    });
+                }
+                Err(error) => {
+                    overridden = true;
+                    ui.data_mut(|data| data.insert_temp(key.with("error"), error.to_string()));
+                }
+            }
+        }
+        let format = design.object_id_format();
+        let response = ui.add_enabled(
+            overridden,
+            egui::DragValue::new(&mut value)
+                .range(0..=65534)
+                .custom_formatter(|value, _| design.format_object_id(value as u16))
+                .custom_parser(move |text| format.parse(text).ok().map(f64::from)),
+        );
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Number(value.into())));
+        }
+        let conflict = value != id.value()
+            && design.materialize_shared().map_or(true, |pool| {
+                ObjectId::new(value)
+                    .ok()
+                    .is_some_and(|candidate| pool.pool.object_by_id(candidate).is_some())
             });
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
+        let invalid_macro = object_type == ObjectType::Macro
+            && design.vt_version() < ag_iso_stack::object_pool::vt_version::VtVersion::Version5
+            && value > 255;
+        if response.changed() {
+            let operation =
+                (!conflict && !invalid_macro).then_some(Operation::SetObjectIdAssignment {
+                    object_id: id.value(),
+                    new_id: value,
+                    overridden: true,
                 });
-        });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            egui::ComboBox::from_id_salt("initial_value")
-                .selected_text(format!("{:?}", self.value))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.value, false, "False");
-                    ui.selectable_value(&mut self.value, true, "True");
-                });
+            update_draft(ui.ctx(), key, design, operation);
         }
-        ui.checkbox(&mut self.enabled, "Enabled");
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for InputString {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Font attributes:");
-            egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FontAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.font_attributes,
-                            potential_child.id(),
-                            format!("{:?}", u16::from(potential_child.id())),
-                        );
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Input attributes:");
-            egui::ComboBox::from_id_salt("input_attributes")
-                .selected_text(format!("{:?}", u16::from(self.input_attributes)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.input_attributes, NullableObjectId::NULL, "None");
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::InputAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.input_attributes,
-                            potential_child.id().into(),
-                            format!("{:?}", u16::from(potential_child.id())),
-                        );
-                    }
-                });
-        });
-        ui.checkbox(&mut self.options.transparent, "Transparent Background");
-        ui.checkbox(&mut self.options.auto_wrap, "Auto Wrap");
-        // TODO: check if we have VT version 4 or later
-        // if self.options.auto_wrap {
-        //     ui.checkbox(&mut self.options.wrap_on_hyphen, "Wrap on Hyphen");
-        // }
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::StringVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Horizontal Justification:");
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Left,
-                "Left",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Middle,
-                "Middle",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Right,
-                "Right",
-            );
-        });
-        // TODO: check if we have VT version 4 or later
-        // ui.horizontal(|ui| {
-        //     ui.label("Vertical Justification:");
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Top,
-        //         "Top",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Middle,
-        //         "Middle",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Bottom,
-        //         "Bottom",
-        //     );
-        // });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.text_edit_singleline(&mut self.value);
+        if overridden
+            && !toggled
+            && value != id.value()
+            && !conflict
+            && !invalid_macro
+            && (drag_value_finished(&response)
+                || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+        {
+            design.queue_operation(Operation::SetObjectIdAssignment {
+                object_id: id.value(),
+                new_id: value,
+                overridden: true,
+            });
+            ui.data_mut(|data| {
+                data.remove::<PendingValue>(key);
+                data.remove::<String>(key.with("error"));
+            });
+            clear_draft(ui.ctx(), key);
         }
-        ui.checkbox(&mut self.enabled, "Enabled");
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for InputNumber {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Font attributes:");
-            egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FontAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.font_attributes,
-                            potential_child.id(),
-                            format!("{:?}", u16::from(potential_child.id())),
-                        );
-                    }
-                });
-        });
-        ui.checkbox(&mut self.options.transparent, "Transparent Background");
-        ui.checkbox(
-            &mut self.options.display_leading_zeros,
-            "Display Leading Zeros",
-        );
-        ui.checkbox(
-            &mut self.options.display_zero_as_blank,
-            "Display Zero as Blank",
-        );
-        // TODO: check if we have VT version 4 or later
-        // ui.checkbox(&mut self.options.truncate, "Truncate");
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
+        if conflict {
+            crate::ui_style::error_text(ui, "ID already in use");
         }
-        ui.add(
-            egui::DragValue::new(&mut self.min_value)
-                .speed(1.0)
-                .prefix("Min: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.max_value)
-                .speed(1.0)
-                .prefix("Max: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.offset)
-                .speed(1.0)
-                .prefix("Offset: "),
-        );
-        ui.add(egui::DragValue::new(&mut self.scale).prefix("Scale: "));
-        ui.add(
-            egui::DragValue::new(&mut self.nr_of_decimals)
-                .speed(1.0)
-                .prefix("Number of Decimals: "),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Format:");
-            ui.radio_value(&mut self.format, FormatType::Decimal, "Decimal");
-            ui.radio_value(&mut self.format, FormatType::Exponential, "Exponential");
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Horizontal Justification:");
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Left,
-                "Left",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Middle,
-                "Middle",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Right,
-                "Right",
-            );
-        });
-        // TODO: check if we have VT version 4 or later
-        // ui.horizontal(|ui| {
-        //     ui.label("Vertical Justification:");
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Top,
-        //         "Top",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Middle,
-        //         "Middle",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Bottom,
-        //         "Bottom",
-        //     );
-        // });
-
-        ui.checkbox(&mut self.options2.enabled, "Enabled");
-        // TODO: check if we have VT version 4 or later
-        // ui.checkbox(&mut self.options2.real_time_editing, "Real Time Editing");
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for InputList {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
+        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            value = id.value();
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
         }
-
-        ui.checkbox(&mut self.options.enabled, "Enabled");
-        // TODO: check if we have VT version 4 or later
-        // ui.checkbox(&mut self.options.real_time_editing, "Real Time Editing");
-
-        ui.separator();
-        ui.label("List items:");
-        render_nullable_object_id_list(
-            ui,
-            design,
-            &mut self.list_items,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputString {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Font attributes:");
-            egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FontAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.font_attributes,
-                            potential_child.id(),
-                            format!("{:?}", u16::from(potential_child.id())),
-                        );
-                    }
-                });
-        });
-        ui.checkbox(&mut self.options.transparent, "Transparent Background");
-        ui.checkbox(&mut self.options.auto_wrap, "Auto Wrap");
-        // TODO: check if we have VT version 4 or later
-        // if self.options.auto_wrap {
-        //     ui.checkbox(&mut self.options.wrap_on_hyphen, "Wrap on Hyphen");
-        // }
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::StringVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.label("Horizontal Justification:");
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Left,
-                "Left",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Middle,
-                "Middle",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Right,
-                "Right",
-            );
-        });
-        // TODO: check if we have VT version 4 or later
-        // ui.horizontal(|ui| {
-        //     ui.label("Vertical Justification:");
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Top,
-        //         "Top",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Middle,
-        //         "Middle",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Bottom,
-        //         "Bottom",
-        //     );
-        // });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.text_edit_singleline(&mut self.value);
+        if invalid_macro {
+            crate::ui_style::error_text(ui, "VT2–4 macro IDs must be 0–255");
         }
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
+    });
+    if let Some(error) = ui.data(|data| data.get_temp::<String>(key.with("error"))) {
+        crate::ui_style::error_text(ui, &error);
     }
 }
 
-impl ConfigurableObject for OutputNumber {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-        ui.horizontal(|ui| {
-            ui.label("Font attributes:");
-            egui::ComboBox::from_id_salt("font_attributes")
-                .selected_text(format!("{:?}", u16::from(self.font_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FontAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.font_attributes,
-                            potential_child.id(),
-                            format!("{:?}", u16::from(potential_child.id())),
-                        );
-                    }
-                });
-        });
+fn direct_reference_count(pool: &ag_iso_stack::object_pool::ObjectPool, id: ObjectId) -> usize {
+    pool.objects()
+        .iter()
+        .flat_map(Object::referenced_objects)
+        .filter(|reference| *reference == id)
+        .count()
+}
 
-        ui.checkbox(&mut self.options.transparent, "Transparent Background");
-        ui.checkbox(
-            &mut self.options.display_leading_zeros,
-            "Display Leading Zeros",
-        );
-        ui.checkbox(
-            &mut self.options.display_zero_as_blank,
-            "Display Zero as Blank",
-        );
-        // TODO: check if we have VT version 4 or later
-        // ui.checkbox(&mut self.options.truncate, "Truncate");
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
+fn queue(design: &EditorProject, id: ObjectId, property: PropertyKey, value: serde_json::Value) {
+    design.queue_operation(property_operation(design, id, property, value));
+}
+
+fn property_operation(
+    design: &EditorProject,
+    id: ObjectId,
+    property: PropertyKey,
+    value: serde_json::Value,
+) -> Operation {
+    let is_reference = design.get_pool().object_by_id(id).is_some_and(|object| {
+        get_property_descriptors(object.object_type())
+            .into_iter()
+            .any(|descriptor| {
+                descriptor.name == property
+                    && matches!(
+                        descriptor.semantic,
+                        PropertySemantic::ObjectReference { .. }
+                    )
+            })
+    });
+    if is_reference {
+        let reference = if value.is_null() {
+            None
+        } else {
+            serde_json::from_value::<ObjectId>(value)
+                .ok()
+                .map(|id| ObjectTarget::id(id.value()))
+        };
+        Operation::SetObjectReference {
+            object: ObjectTarget::id(id.value()),
+            property,
+            reference,
         }
-        ui.horizontal(|ui| {
-            ui.label("Offset:");
-            ui.add(egui::DragValue::new(&mut self.offset).speed(1.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Scale:");
-            ui.add(egui::DragValue::new(&mut self.scale).speed(1.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Number of Decimals:");
-            ui.add(egui::DragValue::new(&mut self.nr_of_decimals).speed(1.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Format:");
-            ui.radio_value(&mut self.format, FormatType::Decimal, "Decimal");
-            ui.radio_value(&mut self.format, FormatType::Exponential, "Exponential");
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Horizontal Justification:");
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Left,
-                "Left",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Middle,
-                "Middle",
-            );
-            ui.radio_value(
-                &mut self.justification.horizontal,
-                HorizontalAlignment::Right,
-                "Right",
-            );
-        });
-        // TODO: check if we have VT version 4 or later
-        // ui.horizontal(|ui| {
-        //     ui.label("Vertical Justification:");
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Top,
-        //         "Top",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Middle,
-        //         "Middle",
-        //     );
-        //     ui.radio_value(
-        //         &mut self.justification.vertical,
-        //         VerticalAlignment::Bottom,
-        //         "Bottom",
-        //     );
-        // });
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputList {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(format!("{:?}", u16::from(self.variable_reference)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
+    } else {
+        Operation::SetProperty {
+            object: ObjectTarget::id(id.value()),
+            property,
+            value,
         }
-
-        ui.separator();
-        ui.label("List items:");
-        render_nullable_object_id_list(
-            ui,
-            design,
-            &mut self.list_items,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
     }
 }
 
-impl ConfigurableObject for OutputLine {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Line Attributes:");
-            egui::ComboBox::from_id_salt("line_attributes")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::LineAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.line_attributes,
-                            potential_child.id(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // If a valid line_attributes object is selected, provide a link to navigate there
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
-                }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
-            }
-        });
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Line Direction:");
-            ui.radio_value(
-                &mut self.line_direction,
-                LineDirection::TopLeftToBottomRight,
-                "Top-left to bottom-right",
-            );
-            ui.radio_value(
-                &mut self.line_direction,
-                LineDirection::BottomLeftToTopRight,
-                "Bottom-left to top-right",
-            );
-        });
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
+fn repair_warning(
+    ui: &mut egui::Ui,
+    label: &str,
+    version: VtVersion,
+    supports: impl FnMut(VtVersion) -> bool,
+) {
+    let availability = crate::vt_compatibility::availability_description(supports)
+        .unwrap_or_else(|| "Unavailable in supported VT versions".to_owned());
+    ui.colored_label(
+        ui.visuals().warn_fg_color,
+        format!(
+            "{label}: incompatible with VT{}. {availability}. Change the value to repair it.",
+            u8::from(version)
+        ),
+    );
 }
 
-impl ConfigurableObject for OutputRectangle {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Line Attributes:");
-            egui::ComboBox::from_id_salt("line_attributes_selector")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::LineAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.line_attributes,
-                            potential_child.id(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to view the selected line attributes object
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
-                }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
+fn unavailable_features(object: &Object, version: VtVersion) -> Vec<String> {
+    use crate::vt_compatibility as compatibility;
+    let object_type = object.object_type();
+    let mut entries = Vec::new();
+    let mut add = |label: String, supports: &dyn Fn(VtVersion) -> bool| {
+        if !supports(version) {
+            if let Some(availability) = compatibility::availability_description(supports) {
+                entries.push(format!("{label} — {availability}"));
             }
+        }
+    };
+    add(format!("{object_type:?} objects"), &|v| {
+        compatibility::supported_object_type(object_type, v)
+    });
+    let descriptors = get_property_descriptors(object_type);
+    for editor in property_editor_descriptors(object_type) {
+        let EditorTarget::Property(property_key) = editor.property else {
+            continue;
+        };
+        let property_name = property_key.as_str();
+        let label = human_readable_property_name(property_name);
+        add(label.clone(), &|v| {
+            compatibility::supported_property(object_type, property_name, v)
         });
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Line Suppression:");
-            ui.add(egui::DragValue::new(&mut self.line_suppression).speed(1.0));
-        });
-
-        // Fill Attributes Selection
-        ui.horizontal(|ui| {
-            ui.label("Fill Attributes:");
-            egui::ComboBox::from_id_salt("fill_attributes_selector")
-                .selected_text(
-                    self.fill_attributes
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FillAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.fill_attributes,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to view the selected fill attributes object if present
-            if let Some(id) = self.fill_attributes.into() {
-                if let Some(obj) = design.get_pool().object_by_id(id) {
-                    if ui.link("(view)").clicked() {
-                        *design.get_mut_selected().borrow_mut() = id.into();
-                    }
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object");
-                }
-            }
-        });
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputEllipse {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Line Attributes:");
-            egui::ComboBox::from_id_salt("line_attributes_selector")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::LineAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.line_attributes,
-                            potential_child.id(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to navigate to the chosen line attributes object
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
-                }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
-            }
-        });
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.label("Ellipse Type:");
-        ui.radio_value(&mut self.ellipse_type, 0, "Closed Ellipse");
-        ui.radio_value(&mut self.ellipse_type, 1, "Open Ellipse");
-        ui.radio_value(&mut self.ellipse_type, 2, "Closed Ellipse Segment");
-        ui.radio_value(&mut self.ellipse_type, 3, "Closed Ellipse Section");
-
-        ui.horizontal(|ui| {
-            ui.label("Start Angle:");
-            ui.add(
-                egui::DragValue::new(&mut self.start_angle)
-                    .speed(1.0)
-                    .range(0..=180),
-            );
-            ui.label("End Angle:");
-            ui.add(
-                egui::DragValue::new(&mut self.end_angle)
-                    .speed(1.0)
-                    .range(0..=180),
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Fill Attributes:");
-            egui::ComboBox::from_id_salt("fill_attributes_selector")
-                .selected_text(
-                    self.fill_attributes
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FillAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.fill_attributes,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to view the chosen fill attributes object, if any
-            if let Some(id) = self.fill_attributes.into() {
-                if let Some(obj) = design.get_pool().object_by_id(id) {
-                    if ui.link("(view)").clicked() {
-                        *design.get_mut_selected().borrow_mut() = id.into();
-                    }
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object");
-                }
-            }
-        });
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputPolygon {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Line Attributes:");
-            egui::ComboBox::from_id_salt("line_attributes_selector")
-                .selected_text(format!("{:?}", u16::from(self.line_attributes)))
-                .show_ui(ui, |ui| {
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::LineAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.line_attributes,
-                            potential_child.id(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to navigate to the chosen line attributes object
-            if let Some(obj) = design.get_pool().object_by_id(self.line_attributes) {
-                if ui.link("(view)").clicked() {
-                    *design.get_mut_selected().borrow_mut() = self.line_attributes.into();
-                }
-            } else {
-                ui.colored_label(egui::Color32::RED, "Missing object");
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Fill Attributes:");
-            egui::ComboBox::from_id_salt("fill_attributes_selector")
-                .selected_text(
-                    self.fill_attributes
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.fill_attributes, NullableObjectId::NULL, "None");
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::FillAttributes)
-                    {
-                        ui.selectable_value(
-                            &mut self.fill_attributes,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-
-            // Link to view the chosen fill attributes object
-            if let Some(id) = self.fill_attributes.into() {
-                if let Some(obj) = design.get_pool().object_by_id(id) {
-                    if ui.link("(view)").clicked() {
-                        *design.get_mut_selected().borrow_mut() = id.into();
-                    }
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object");
-                }
-            }
-        });
-
-        ui.label("Polygon Type:");
-        ui.radio_value(&mut self.polygon_type, 0, "Convex");
-        ui.radio_value(&mut self.polygon_type, 1, "Non-Convex");
-        ui.radio_value(&mut self.polygon_type, 2, "Complex");
-        ui.radio_value(&mut self.polygon_type, 3, "Open");
-
-        ui.separator();
-        ui.label("Points:");
-        egui::Grid::new("points_grid")
-            .striped(true)
-            .min_col_width(0.0)
-            .show(ui, |ui| {
-                let mut idx = 0;
-                while idx < self.points.len() {
-                    ui.label(format!("Point {}", idx));
-                    ui.add(egui::DragValue::new(&mut self.points[idx].x).speed(1.0));
-                    ui.add(egui::DragValue::new(&mut self.points[idx].y).speed(1.0));
-
-                    if ui
-                        .add_enabled(idx > 0, egui::Button::new("\u{23F6}"))
-                        .on_hover_text("Move Up")
-                        .clicked()
-                    {
-                        self.points.swap(idx, idx - 1);
-                    }
-
-                    if ui
-                        .add_enabled(idx < self.points.len() - 1, egui::Button::new("\u{23F7}"))
-                        .on_hover_text("Move Down")
-                        .clicked()
-                    {
-                        self.points.swap(idx, idx + 1);
-                    }
-                    if self.points.len() > 3 {
-                        if ui
-                            .add(egui::Button::new("\u{1F5D9}"))
-                            .on_hover_text("Remove")
-                            .clicked()
+        let Ok(value) = get_object_property(object, property_key) else {
+            continue;
+        };
+        match editor.editor {
+            EditorKind::Enum => {
+                if let Some(descriptor) = descriptors.iter().find(|item| item.name == property_key)
+                {
+                    for choice in &descriptor.enum_choices {
+                        let choice_label = if property_key == PropertyKey::FontSize
+                            && choice.get("Proportional").is_some()
                         {
-                            self.points.remove(idx);
-                            continue; // Skip incrementing idx since we removed this item
+                            "Proportional font sizes".to_owned()
+                        } else {
+                            format!(
+                                "{label}: {}",
+                                crate::enum_labels::enum_choice_label(
+                                    object_type,
+                                    property_key,
+                                    choice,
+                                )
+                            )
+                        };
+                        add(choice_label, &|v| {
+                            compatibility::supported_enum_value(
+                                object_type,
+                                property_key,
+                                choice,
+                                v,
+                            )
+                        });
+                    }
+                }
+            }
+            EditorKind::FlagSet => {
+                if let Some(fields) = value.as_object() {
+                    for (field, value) in fields {
+                        if value.is_boolean()
+                            && !(property_key == PropertyKey::FontStyle && field == "proportional")
+                        {
+                            add(
+                                format!("{label}: {}", human_readable_property_name(field)),
+                                &|v| {
+                                    compatibility::supported_property_flag(
+                                        object_type,
+                                        property_key,
+                                        field,
+                                        v,
+                                    )
+                                },
+                            );
                         }
                     }
+                }
+            }
+            EditorKind::Justification => {
+                add("Vertical alignment".to_owned(), &|v| {
+                    compatibility::supported_vertical_alignment(
+                        ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Middle,
+                        v,
+                    )
+                });
+            }
+            _ => {}
+        }
+        if let Some(descriptor) = descriptors.iter().find(|item| item.name == property_key) {
+            if let PropertySemantic::ObjectReference { allowed_types } = &descriptor.semantic {
+                for target_type in allowed_types {
+                    add(format!("{label}: {target_type:?} references"), &|v| {
+                        compatibility::supported_object_type(*target_type, v)
+                    });
+                }
+            }
+        }
+    }
+    if crate::operations::operation::macro_refs(object).is_some() {
+        for event in crate::possible_events::get_possible_events(object) {
+            add(format!("Macro event: {event:?}"), &|v| {
+                compatibility::supported_event(object, event, v)
+            });
+        }
+        add("Macro references with IDs above 255".to_owned(), &|v| {
+            compatibility::supported_property(object_type, "extended_macro_reference", v)
+        });
+    }
+    if object_type == ObjectType::InputBoolean {
+        add("Boolean values above 1".to_owned(), &|v| {
+            compatibility::supported_input_boolean_value(2, v)
+        });
+    }
+    entries.sort();
+    entries.dedup();
+    entries
+}
 
-                    idx += 1;
-                    ui.end_row();
+/// Only offer a new value when the normal transaction validator accepts it for
+/// the current target VT. This keeps legacy values visible while allowing a
+/// repair edit to move them back into the supported range.
+fn property_choice_is_valid(
+    design: &EditorProject,
+    id: ObjectId,
+    property: PropertyKey,
+    value: serde_json::Value,
+) -> bool {
+    design.property_choice_is_valid(id, property, value)
+}
+
+/// Preserve the JSON number kind exposed by the property's Rust type. In
+/// particular, integer properties must be committed as `42`, not `42.0`:
+/// serde_json deliberately does not expose the latter through `as_u64()`.
+fn number_after_edit(
+    original: &serde_json::Value,
+    edited: f64,
+    property: PropertyKey,
+) -> Option<serde_json::Number> {
+    let serde_json::Value::Number(original) = original else {
+        return None;
+    };
+
+    match property {
+        PropertyKey::Offset => {
+            if edited.is_finite()
+                && edited.fract() == 0.0
+                && (i32::MIN as f64..=i32::MAX as f64).contains(&edited)
+            {
+                return Some(serde_json::Number::from(edited as i32));
+            }
+            return None;
+        }
+        PropertyKey::ViewportX
+        | PropertyKey::ViewportY
+        | PropertyKey::GraphicsCursorX
+        | PropertyKey::GraphicsCursorY => {
+            if edited.is_finite()
+                && edited.fract() == 0.0
+                && (i16::MIN as f64..=i16::MAX as f64).contains(&edited)
+            {
+                return Some(serde_json::Number::from(edited as i16));
+            }
+            return None;
+        }
+        _ => {}
+    }
+
+    if original.is_u64() {
+        if edited.is_finite() && edited.fract() == 0.0 && (0.0..=u64::MAX as f64).contains(&edited)
+        {
+            return Some(serde_json::Number::from(edited as u64));
+        }
+        return None;
+    }
+
+    if original.is_i64() {
+        if edited.is_finite()
+            && edited.fract() == 0.0
+            && (i64::MIN as f64..=i64::MAX as f64).contains(&edited)
+        {
+            return Some(serde_json::Number::from(edited as i64));
+        }
+        return None;
+    }
+
+    serde_json::Number::from_f64(edited)
+}
+
+#[derive(Clone)]
+struct PolygonPointDraft {
+    points: Vec<ag_iso_stack::object_pool::object_attributes::Point<u16>>,
+}
+
+fn render_shape_edit_toggle(ui: &mut egui::Ui, id: ObjectId, design: &EditorProject) {
+    let mut editing = crate::shape_editing::editing(ui.ctx(), design, id.value());
+    if ui.checkbox(&mut editing, "Edit points").changed() {
+        crate::shape_editing::set_editing(ui.ctx(), design, id.value(), editing);
+    }
+    if editing {
+        ui.weak("Drag handles on the canvas. Changes affect the shared shape.");
+    }
+}
+
+fn render_polygon_points(
+    ui: &mut egui::Ui,
+    polygon: &ag_iso_stack::object_pool::object::OutputPolygon,
+    design: &EditorProject,
+) {
+    let id = polygon.id;
+    let key = ui.make_persistent_id((id.value(), "polygon_point_draft"));
+    touch_draft(ui.ctx(), key);
+    let mut points = ui
+        .data(|data| data.get_temp::<PolygonPointDraft>(key))
+        .map_or_else(|| polygon.points.clone(), |draft| draft.points);
+    let mut changed = false;
+    let mut finished = false;
+    let mut cancelled = false;
+    let mut structural = None;
+    ui.label(format!("Points ({}/255)", points.len()));
+    if points.len() < 3 {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "A polygon needs at least three points.",
+        );
+    }
+    let count = points.len();
+    // Reserve each insertion slot even while hidden, so hovering never moves rows.
+    for slot in 0..=count {
+        if slot > 0 || polygon.polygon_type == 3 || count == 0 {
+            let (rect, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+            let reveal = ui.rect_contains_pointer(rect.expand(8.0));
+            if reveal {
+                let button = egui::Rect::from_center_size(rect.center(), egui::vec2(30.0, 18.0));
+                let response = ui
+                    .add_enabled_ui(count < 255, |ui| {
+                        ui.put(button, egui::Button::new("+").sense(egui::Sense::click()))
+                    })
+                    .inner;
+                if response.on_hover_text("Insert point here").clicked() {
+                    structural = Some((slot, 0));
+                }
+            }
+        }
+        if slot == count {
+            break;
+        }
+        ui.push_id(slot, |ui| {
+            ui.horizontal(|ui| {
+                let selected = crate::shape_editing::selected_point(ui.ctx(), design, id.value())
+                    == Some(slot);
+                if ui
+                    .selectable_label(selected, format!("{}", slot + 1))
+                    .clicked()
+                {
+                    crate::shape_editing::select_point(ui.ctx(), design, id.value(), slot);
+                }
+                let point = &mut points[slot];
+                for (label, coordinate) in [("X", &mut point.x), ("Y", &mut point.y)] {
+                    ui.label(label);
+                    let response = ui.add(
+                        egui::DragValue::new(coordinate)
+                            .range(0..=u16::MAX)
+                            .speed(1),
+                    );
+                    if response.has_focus() || response.clicked() || response.dragged() {
+                        crate::shape_editing::select_point(ui.ctx(), design, id.value(), slot);
+                    }
+                    changed |= response.changed();
+                    finished |= drag_value_finished(&response)
+                        || response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    cancelled |=
+                        response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape));
+                }
+                if ui
+                    .add_enabled(slot > 0, egui::Button::new("↑"))
+                    .on_hover_text("Move point up")
+                    .clicked()
+                {
+                    structural = Some((slot, 1));
+                }
+                if ui
+                    .add_enabled(slot + 1 < count, egui::Button::new("↓"))
+                    .on_hover_text("Move point down")
+                    .clicked()
+                {
+                    structural = Some((slot, 2));
+                }
+                if ui
+                    .add_enabled(count > 3, egui::Button::new("×"))
+                    .on_hover_text("Remove point")
+                    .clicked()
+                {
+                    structural = Some((slot, 3));
                 }
             });
-
-        if ui.button("Add Point").clicked() {
-            self.points.push(Point { x: 0, y: 0 });
-        }
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
+        });
     }
-}
-
-impl ConfigurableObject for OutputMeter {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.needle_colour, 0..=255)
-                .text("Needle Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.border_colour, 0..=255)
-                .text("Border Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.arc_and_tick_colour, 0..=255)
-                .text("Arc & Tick Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.checkbox(&mut self.options.draw_arc, "Draw Arc");
-        ui.checkbox(&mut self.options.draw_border, "Draw Border");
-        ui.checkbox(&mut self.options.draw_ticks, "Draw Ticks");
-
-        ui.horizontal(|ui| {
-            ui.label("Deflection Direction:");
-            ui.radio_value(
-                &mut self.options.deflection_direction,
-                DeflectionDirection::AntiClockwise,
-                "Anti-clockwise",
-            );
-            ui.radio_value(
-                &mut self.options.deflection_direction,
-                DeflectionDirection::Clockwise,
-                "Clockwise",
-            );
-        });
-
-        ui.add(
-            egui::DragValue::new(&mut self.nr_of_ticks)
-                .speed(1.0)
-                .prefix("Number of Ticks: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.start_angle)
-                .speed(1.0)
-                .prefix("Start Angle: ")
-                .range(0..=180),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.end_angle)
-                .speed(1.0)
-                .prefix("End Angle: ")
-                .range(0..=180),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.min_value)
-                .speed(1.0)
-                .prefix("Min Value: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.max_value)
-                .speed(1.0)
-                .prefix("Max Value: "),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Variable reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(
-                    self.variable_reference
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        // If there's no variable reference, allow editing the initial value
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        }
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputLinearBarGraph {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.colour, 0..=255)
-                .text("Bar Colour")
-                .drag_value_speed(1.0),
-        );
-        if self.options.draw_target_line {
-            ui.add(
-                egui::Slider::new(&mut self.target_line_colour, 0..=255)
-                    .text("Target Line Colour")
-                    .drag_value_speed(1.0),
-            );
-        }
-
-        ui.checkbox(&mut self.options.draw_border, "Draw Border");
-        ui.checkbox(&mut self.options.draw_target_line, "Draw Target Line");
-        ui.checkbox(&mut self.options.draw_ticks, "Draw Ticks");
-        ui.horizontal(|ui| {
-            ui.label("Bar Graph Type:");
-            ui.radio_value(
-                &mut self.options.bar_graph_type,
-                BarGraphType::Filled,
-                "Filled",
-            );
-            ui.radio_value(
-                &mut self.options.bar_graph_type,
-                BarGraphType::NotFilled,
-                "Not Filled",
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Axis Orientation:");
-            ui.radio_value(
-                &mut self.options.axis_orientation,
-                AxisOrientation::Vertical,
-                "Vertical",
-            );
-            ui.radio_value(
-                &mut self.options.axis_orientation,
-                AxisOrientation::Horizontal,
-                "Horizontal",
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Grow Direction:");
-            ui.radio_value(
-                &mut self.options.grow_direction,
-                GrowDirection::GrowLeftDown,
-                "Left/Down",
-            );
-            ui.radio_value(
-                &mut self.options.grow_direction,
-                GrowDirection::GrowRightUp,
-                "Right/Up",
-            );
-        });
-
-        if self.options.draw_ticks {
-            ui.add(
-                egui::DragValue::new(&mut self.nr_of_ticks)
-                    .speed(1.0)
-                    .prefix("Number of Ticks: "),
-            );
-        }
-        ui.add(
-            egui::DragValue::new(&mut self.min_value)
-                .speed(1.0)
-                .prefix("Min Value: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.max_value)
-                .speed(1.0)
-                .prefix("Max Value: "),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Variable Reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(
-                    self.variable_reference
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        // If no variable reference, allow setting initial value manually
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial Value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("Target Value Variable Reference:");
-            egui::ComboBox::from_id_salt("target_value_variable_reference")
-                .selected_text(
-                    self.target_value_variable_reference
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.target_value_variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.target_value_variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        // If no target value variable reference, allow setting target value manually
-        if self.target_value_variable_reference.0.is_none() {
-            ui.label("Target Value:");
-            ui.add(egui::DragValue::new(&mut self.target_value).speed(1.0));
-        }
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for OutputArchedBarGraph {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.add(
-            egui::Slider::new(&mut self.height, 0..=design.mask_size)
-                .text("Height")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.colour, 0..=255)
-                .text("Bar Colour")
-                .drag_value_speed(1.0),
-        );
-        if self.options.draw_target_line {
-            ui.add(
-                egui::Slider::new(&mut self.target_line_colour, 0..=255)
-                    .text("Target Line Colour")
-                    .drag_value_speed(1.0),
-            );
-        }
-
-        ui.checkbox(&mut self.options.draw_border, "Draw Border");
-        ui.checkbox(&mut self.options.draw_target_line, "Draw Target Line");
-
-        ui.horizontal(|ui| {
-            ui.label("Bar Graph Type:");
-            ui.radio_value(
-                &mut self.options.bar_graph_type,
-                BarGraphType::Filled,
-                "Filled",
-            );
-            ui.radio_value(
-                &mut self.options.bar_graph_type,
-                BarGraphType::NotFilled,
-                "Not Filled",
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Axis Orientation:");
-            ui.radio_value(
-                &mut self.options.axis_orientation,
-                AxisOrientation::Vertical,
-                "Vertical",
-            );
-            ui.radio_value(
-                &mut self.options.axis_orientation,
-                AxisOrientation::Horizontal,
-                "Horizontal",
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Grow Direction:");
-            ui.radio_value(
-                &mut self.options.grow_direction,
-                GrowDirection::GrowLeftDown,
-                "Left/Down",
-            );
-            ui.radio_value(
-                &mut self.options.grow_direction,
-                GrowDirection::GrowRightUp,
-                "Right/Up",
-            );
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Deflection Direction:");
-            ui.radio_value(
-                &mut self.options.deflection_direction,
-                DeflectionDirection::AntiClockwise,
-                "Anti-clockwise",
-            );
-            ui.radio_value(
-                &mut self.options.deflection_direction,
-                DeflectionDirection::Clockwise,
-                "Clockwise",
-            );
-        });
-
-        ui.add(
-            egui::DragValue::new(&mut self.start_angle)
-                .speed(1.0)
-                .prefix("Start Angle: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.end_angle)
-                .speed(1.0)
-                .prefix("End Angle: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.bar_graph_width)
-                .speed(1.0)
-                .prefix("Bar Graph Width: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.min_value)
-                .speed(1.0)
-                .prefix("Min Value: "),
-        );
-        ui.add(
-            egui::DragValue::new(&mut self.max_value)
-                .speed(1.0)
-                .prefix("Max Value: "),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Variable Reference:");
-            egui::ComboBox::from_id_salt("variable_reference")
-                .selected_text(
-                    self.variable_reference
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        // If no variable reference, set initial value
-        if self.variable_reference.0.is_none() {
-            ui.label("Initial Value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        }
-
-        ui.horizontal(|ui| {
-            ui.label("Target Value Variable Reference:");
-            egui::ComboBox::from_id_salt("target_value_variable_reference")
-                .selected_text(
-                    self.target_value_variable_reference
-                        .0
-                        .map_or("None".to_string(), |id| format!("{:?}", u16::from(id))),
-                )
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.target_value_variable_reference,
-                        NullableObjectId::NULL,
-                        "None",
-                    );
-                    for potential_child in design
-                        .get_pool()
-                        .objects_by_type(ObjectType::NumberVariable)
-                    {
-                        ui.selectable_value(
-                            &mut self.target_value_variable_reference,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-        });
-
-        // If no target value variable reference, set target value
-        if self.target_value_variable_reference.0.is_none() {
-            ui.label("Target Value:");
-            ui.add(egui::DragValue::new(&mut self.target_value).speed(1.0));
-        }
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for PictureGraphic {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.add(
-            egui::Slider::new(&mut self.width, 0..=design.mask_size)
-                .text("Width")
-                .drag_value_speed(1.0),
-        );
-        ui.label(format!("Actual Image Width: {}", self.actual_width));
-        ui.label(format!("Actual Image Height: {}", self.actual_height));
-        ui.label(format!("Data Size (bytes): {}", self.data.len()));
-        ui.horizontal(|ui| {
-            ui.label("Format:");
-            if ui
-                .radio(
-                    self.format == PictureGraphicFormat::Monochrome,
-                    "Monochrome",
-                )
-                .clicked()
-            {
-                match self.format {
-                    PictureGraphicFormat::FourBit => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .windows(4)
-                            .step_by(4)
-                            .flat_map(|chunk| {
-                                let mut byte = 0;
-                                for (i, bit) in chunk.iter().enumerate() {
-                                    for j in 0..2 {
-                                        if *bit & (1 << j) != 0 {
-                                            byte |= 1 << (i * 2 + j);
-                                        }
-                                    }
-                                }
-                                vec![byte]
-                            })
-                            .collect();
-                    }
-                    PictureGraphicFormat::EightBit => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .windows(8)
-                            .step_by(8)
-                            .flat_map(|chunk| {
-                                let mut byte = 0;
-                                for (i, bit) in chunk.iter().enumerate() {
-                                    if *bit != 0 {
-                                        byte |= 1 << i;
-                                    }
-                                }
-                                vec![byte]
-                            })
-                            .collect();
-                    }
-                    _ => {}
-                }
-                self.format = PictureGraphicFormat::Monochrome;
-                self.options.data_code_type = DataCodeType::Raw;
+    if let Some((slot, action)) = structural {
+        let selected = match action {
+            0 => {
+                let point = crate::shape_editing::insertion_point(
+                    &points,
+                    slot,
+                    polygon.polygon_type == 3,
+                    polygon.width,
+                    polygon.height,
+                );
+                points.insert(slot, point);
+                slot
             }
-            if ui
-                .radio(self.format == PictureGraphicFormat::FourBit, "4-bit colour")
-                .clicked()
-            {
-                match self.format {
-                    PictureGraphicFormat::Monochrome => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .iter()
-                            .flat_map(|value| {
-                                let mut result = vec![];
-                                for idx in 0..8 {
-                                    let bit_color = value << idx & 0x01;
-                                    if idx % 2 == 0 {
-                                        result.push(bit_color);
-                                    } else if let Some(last) = result.last_mut() {
-                                        *last |= bit_color >> 4;
-                                    }
-                                }
-                                result
-                            })
-                            .collect();
-                    }
-                    PictureGraphicFormat::EightBit => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .windows(2)
-                            .step_by(2)
-                            .flat_map(|values| {
-                                let high = (values[0] & 0x0F) << 4;
-                                let low = values[1] & 0x0F;
-                                vec![high | low]
-                            })
-                            .collect();
-                    }
-                    _ => {}
-                }
-                self.format = PictureGraphicFormat::FourBit;
-                self.options.data_code_type = DataCodeType::Raw;
+            1 => {
+                points.swap(slot, slot - 1);
+                slot - 1
             }
-            if ui
-                .radio(
-                    self.format == PictureGraphicFormat::EightBit,
-                    "8-bit colour",
-                )
-                .clicked()
-            {
-                match self.format {
-                    PictureGraphicFormat::Monochrome => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .iter()
-                            .flat_map(|value| {
-                                let mut result = vec![];
-                                for bit in 0..8 {
-                                    result.push(value >> bit & 0x01);
-                                }
-                                result
-                            })
-                            .collect();
-                    }
-                    PictureGraphicFormat::FourBit => {
-                        self.data = self
-                            .data_as_raw_encoded()
-                            .iter()
-                            .flat_map(|value| {
-                                let high = (value >> 4) & 0x0F;
-                                let low = value & 0x0F;
-                                vec![high, low]
-                            })
-                            .collect();
-                    }
-                    _ => {}
-                }
-                self.format = PictureGraphicFormat::EightBit;
-                self.options.data_code_type = DataCodeType::Raw;
+            2 => {
+                points.swap(slot, slot + 1);
+                slot + 1
             }
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.options.transparent, "Transparent Pixels");
-            if self.options.transparent {
-                ui.add(
-                    egui::Slider::new(&mut self.transparency_colour, 0..=255)
-                        .text("Transparent Colour")
-                        .drag_value_speed(1.0),
+            _ => {
+                points.remove(slot);
+                slot.min(points.len().saturating_sub(1))
+            }
+        };
+        crate::shape_editing::select_point(ui.ctx(), design, id.value(), selected);
+        changed = true;
+        finished = true;
+    }
+    if cancelled {
+        ui.data_mut(|data| data.remove::<PolygonPointDraft>(key));
+        clear_draft(ui.ctx(), key);
+    } else if finished {
+        if points != polygon.points {
+            queue(
+                design,
+                id,
+                PropertyKey::Points,
+                serde_json::to_value(&points).unwrap(),
+            );
+        }
+        ui.data_mut(|data| data.remove::<PolygonPointDraft>(key));
+        clear_draft(ui.ctx(), key);
+    } else if changed {
+        update_draft(
+            ui.ctx(),
+            key,
+            design,
+            Some(property_operation(
+                design,
+                id,
+                PropertyKey::Points,
+                serde_json::to_value(&points).unwrap(),
+            )),
+        );
+        ui.data_mut(|data| data.insert_temp(key, PolygonPointDraft { points }));
+    }
+}
+
+fn render_auto(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    id: ObjectId,
+    property: PropertyKey,
+    design: &EditorProject,
+) {
+    match value {
+        serde_json::Value::Bool(current) => {
+            let mut edited = *current;
+            if ui.checkbox(&mut edited, label).changed() {
+                queue(design, id, property, edited.into());
+            }
+        }
+        serde_json::Value::Number(_) => render_number(
+            ui,
+            label,
+            value,
+            numeric_range(property),
+            id,
+            property,
+            design,
+        ),
+        serde_json::Value::String(current) => render_text(ui, label, current, id, property, design),
+        _ => render_json(ui, label, value, id, property, design),
+    }
+}
+
+/// The Length attribute of a string is the length of its value. Text set at
+/// runtime may be shorter, and the VT pads it with spaces, but not longer, so
+/// Length reserves room by padding the value with spaces.
+fn render_string_length(ui: &mut egui::Ui, object: &Object, text: &str, design: &EditorProject) {
+    let Some(max_bytes) = string_value_max_bytes(object, design.get_pool()) else {
+        return;
+    };
+    let id = object.id();
+    let length = text.chars().count();
+    let minimum = text.trim_end_matches(' ').chars().count();
+    let maximum = max_string_length(max_bytes, design.vt_version).max(length);
+    let key = ui.make_persistent_id((id.value(), "string_length"));
+    touch_draft(ui.ctx(), key);
+    let mut edited = ui
+        .data(|data| data.get_temp::<usize>(key))
+        .unwrap_or(length);
+    ui.horizontal(|ui| {
+        ui.label("Length").on_hover_text(
+            "Characters this string holds. Text set at runtime may be shorter, \
+             and the VT pads it with spaces, but not longer.",
+        );
+        let response = ui.add(egui::DragValue::new(&mut edited).range(minimum..=maximum));
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, edited));
+            update_draft(
+                ui.ctx(),
+                key,
+                design,
+                Some(property_operation(
+                    design,
+                    id,
+                    PropertyKey::Value,
+                    string_with_length(text, edited).into(),
+                )),
+            );
+        }
+        let cancelled =
+            response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if cancelled {
+            ui.data_mut(|data| data.remove::<usize>(key));
+            clear_draft(ui.ctx(), key);
+        } else if drag_value_finished(&response)
+            || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        {
+            if edited != length {
+                queue(
+                    design,
+                    id,
+                    PropertyKey::Value,
+                    string_with_length(text, edited).into(),
                 );
             }
-        });
-        ui.checkbox(&mut self.options.flashing, "Flashing");
+            ui.data_mut(|data| data.remove::<usize>(key));
+            clear_draft(ui.ctx(), key);
+        }
+    });
+}
 
-        ui.separator();
-        ui.label("Image:");
+/// The most bytes the value of a string object takes on the wire, or `None`
+/// when it has no value of its own: a String Variable holds it instead.
+fn string_value_max_bytes(
+    object: &Object,
+    pool: &ag_iso_stack::object_pool::ObjectPool,
+) -> Option<usize> {
+    match object {
+        Object::InputString(o) if o.variable_reference.0.is_none() => Some(u8::MAX.into()),
+        Object::OutputString(o) if o.variable_reference.0.is_none() => Some(u16::MAX.into()),
+        Object::StringVariable(variable) => {
+            // An Input String's value is at most 255 bytes, also when a
+            // String Variable holds it
+            let input = pool.objects().iter().any(|candidate| {
+                matches!(candidate, Object::InputString(input)
+                    if input.variable_reference.0 == Some(variable.id))
+            });
+            Some(if input {
+                u8::MAX.into()
+            } else {
+                u16::MAX.into()
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Pad `text` with spaces, or drop its trailing spaces, to `length` characters.
+fn string_with_length(text: &str, length: usize) -> String {
+    let minimum = text.trim_end_matches(' ').chars().count();
+    text.chars()
+        .chain(std::iter::repeat(' '))
+        .take(length.max(minimum))
+        .collect()
+}
+
+/// Edited text is exported in 8-bit characters before VT4 and as a UTF-16
+/// WideString, two bytes per character after a two-byte mark, from VT4.
+fn max_string_length(max_bytes: usize, version: VtVersion) -> usize {
+    if version >= VtVersion::Version4 {
+        max_bytes.saturating_sub(2) / 2
+    } else {
+        max_bytes
+    }
+}
+
+/// A dropdown of `table`'s codes with a search field that matches codes and
+/// names. Returns the code clicked; `offered` hides codes that cannot be picked.
+fn code_picker(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    selected_text: &str,
+    table: &'static [(&'static str, &'static str)],
+    current: Option<&str>,
+    offered: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
+    let id = ui.make_persistent_id(salt);
+    let query_id = id.with("query");
+    let mut chosen = None;
+    let popup = egui::ComboBox::from_id_salt(id)
+        .icon(crate::ui_style::combo_box_icon)
+        .selected_text(selected_text)
+        .height(320.0)
+        .show_ui(ui, |ui| {
+            let opened = ui.data(|data| data.get_temp::<String>(query_id)).is_none();
+            let mut query = ui
+                .data(|data| data.get_temp::<String>(query_id))
+                .unwrap_or_default();
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut query)
+                    .hint_text("Search…")
+                    .desired_width(220.0),
+            );
+            if opened {
+                search.request_focus();
+            }
+            let needle = query.to_lowercase();
+            let mut first = None;
+            let mut exact = None;
+            for (code, name) in table {
+                if !offered(code)
+                    || !code.to_lowercase().contains(&needle)
+                        && !name.to_lowercase().contains(&needle)
+                {
+                    continue;
+                }
+                first.get_or_insert(*code);
+                if code.eq_ignore_ascii_case(&needle) {
+                    exact = Some(*code);
+                }
+                let selected = current.is_some_and(|current| current.eq_ignore_ascii_case(code));
+                let response = ui.selectable_label(selected, format!("{code} — {name}"));
+                if selected && opened {
+                    response.scroll_to_me(Some(egui::Align::Center));
+                }
+                if response.clicked() {
+                    chosen = Some(*code);
+                }
+            }
+            // Enter picks the code typed, else the first match, so typing a
+            // code is enough. Without a search, or with the current code
+            // typed, Enter picks nothing.
+            let typed_current =
+                current.is_some_and(|current| current.eq_ignore_ascii_case(&needle));
+            if search.lost_focus()
+                && !needle.is_empty()
+                && !typed_current
+                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            {
+                chosen = chosen.or(exact).or(first);
+            }
+            ui.data_mut(|data| data.insert_temp(query_id, query));
+        });
+    if popup.inner.is_none() || chosen.is_some() {
+        ui.data_mut(|data| data.remove::<String>(query_id));
+    }
+    if chosen.is_some() {
+        // ComboBox keeps its popup state under its button id with "popup"
+        egui::Popup::close_id(ui.ctx(), ui.make_persistent_id(id).with("popup"));
+    }
+    chosen
+}
+
+/// The languages a Working Set supports, as ISO 639-1 codes.
+fn render_language_codes(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    codes: &[String],
+    design: &EditorProject,
+) {
+    use crate::iso_codes::{label as code_label, LANGUAGES};
+
+    let mut updated = None;
+    let mut action = None;
+    ui.label(label);
+    egui::Grid::new(("language_codes", id.value()))
+        .striped(true)
+        .show(ui, |ui| {
+            for (index, code) in codes.iter().enumerate() {
+                ui.label((index + 1).to_string());
+                if let Some(chosen) = code_picker(
+                    ui,
+                    ("language_code", index),
+                    &code_label(LANGUAGES, code),
+                    LANGUAGES,
+                    Some(code),
+                    |candidate| {
+                        !codes
+                            .iter()
+                            .any(|code| code.eq_ignore_ascii_case(candidate))
+                    },
+                ) {
+                    let mut changed = codes.to_vec();
+                    changed[index] = chosen.to_owned();
+                    updated = Some(changed);
+                }
+                row_actions(ui, index, codes.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = codes.to_vec();
+        apply_list_action(&mut changed, action);
+        updated = Some(changed);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Add language:");
+        if let Some(chosen) = code_picker(
+            ui,
+            ("add_language_code", id.value()),
+            "Select language…",
+            LANGUAGES,
+            None,
+            |candidate| {
+                !codes
+                    .iter()
+                    .any(|code| code.eq_ignore_ascii_case(candidate))
+            },
+        ) {
+            let mut changed = codes.to_vec();
+            changed.push(chosen.to_owned());
+            updated = Some(changed);
+        }
+    });
+    if let Some(codes) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::LanguageCodes,
+            serde_json::json!(codes),
+        );
+    }
+}
+
+/// Language and country pairs of Working Set Special Controls. Both codes
+/// are two characters on the wire, so a pair is added once both are picked.
+fn render_language_pairs(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    pairs: &[(String, String)],
+    design: &EditorProject,
+) {
+    use crate::iso_codes::{label as code_label, COUNTRIES, LANGUAGES};
+
+    let mut updated = None;
+    let mut action = None;
+    ui.label(label);
+    egui::Grid::new(("language_pairs", id.value()))
+        .striped(true)
+        .show(ui, |ui| {
+            for (index, (language, country)) in pairs.iter().enumerate() {
+                ui.label((index + 1).to_string());
+                let mut changed = None;
+                if let Some(chosen) = code_picker(
+                    ui,
+                    ("pair_language", index),
+                    &code_label(LANGUAGES, language),
+                    LANGUAGES,
+                    Some(language),
+                    |_| true,
+                ) {
+                    changed = Some((chosen.to_owned(), country.clone()));
+                }
+                if let Some(chosen) = code_picker(
+                    ui,
+                    ("pair_country", index),
+                    &code_label(COUNTRIES, country),
+                    COUNTRIES,
+                    Some(country),
+                    |_| true,
+                ) {
+                    changed = Some((language.clone(), chosen.to_owned()));
+                }
+                if let Some(pair) = changed {
+                    let mut changed = pairs.to_vec();
+                    changed[index] = pair;
+                    updated = Some(changed);
+                }
+                row_actions(ui, index, pairs.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = pairs.to_vec();
+        apply_list_action(&mut changed, action);
+        updated = Some(changed);
+    }
+    // Outside the revision scope, so another edit keeps a half-picked pair
+    let pending_id = egui::Id::new(("pending_language_pair", design.ui_session_id(), id.value()));
+    let (mut language, mut country) = ui
+        .data(|data| data.get_temp::<(Option<String>, Option<String>)>(pending_id))
+        .unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("Add pair:");
+        if let Some(chosen) = code_picker(
+            ui,
+            ("add_pair_language", id.value()),
+            &language.as_deref().map_or_else(
+                || "Language…".to_owned(),
+                |code| code_label(LANGUAGES, code),
+            ),
+            LANGUAGES,
+            language.as_deref(),
+            |_| true,
+        ) {
+            language = Some(chosen.to_owned());
+        }
+        if let Some(chosen) = code_picker(
+            ui,
+            ("add_pair_country", id.value()),
+            &country
+                .as_deref()
+                .map_or_else(|| "Country…".to_owned(), |code| code_label(COUNTRIES, code)),
+            COUNTRIES,
+            country.as_deref(),
+            |_| true,
+        ) {
+            country = Some(chosen.to_owned());
+        }
+    });
+    if let (Some(language), Some(country)) = (&language, &country) {
+        let mut changed = pairs.to_vec();
+        changed.push((language.clone(), country.clone()));
+        updated = Some(changed);
+        ui.data_mut(|data| data.remove::<(Option<String>, Option<String>)>(pending_id));
+    } else {
+        ui.data_mut(|data| data.insert_temp(pending_id, (language, country)));
+    }
+    if let Some(pairs) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::LanguagePairs,
+            serde_json::json!(pairs),
+        );
+    }
+}
+
+/// A NAME, ISO 11783-5, edited field by field or as its 64-bit value in hex.
+/// The value is kept as an integer: a number field would round it through f64.
+fn render_name(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    name: ag_iso_stack::network_management::name::NAME,
+    design: &EditorProject,
+) {
+    use ag_iso_stack::network_management::name::NAME;
+
+    type Field = (&'static str, u32, fn(&NAME) -> u32, fn(&mut NAME, u32));
+    let fields: [Field; 8] = [
+        (
+            "Identity number",
+            0x1F_FFFF,
+            |n| n.get_identity_number(),
+            |n, v| n.set_identity_number(v),
+        ),
+        (
+            "Manufacturer code",
+            0x7FF,
+            |n| n.get_manufacturer_code().into(),
+            |n, v| n.set_manufacturer_code(v as u16),
+        ),
+        (
+            "ECU instance",
+            0x7,
+            |n| n.get_ecu_instance().into(),
+            |n, v| n.set_ecu_instance(v as u8),
+        ),
+        (
+            "Function instance",
+            0x1F,
+            |n| n.get_function_instance().into(),
+            |n, v| n.set_function_instance(v as u8),
+        ),
+        (
+            "Function",
+            0xFF,
+            |n| n.get_function().into(),
+            |n, v| n.set_function(v as u8),
+        ),
+        (
+            "Device class",
+            0x7F,
+            |n| n.get_device_class().into(),
+            |n, v| n.set_device_class(v as u8),
+        ),
+        (
+            "Device class instance",
+            0xF,
+            |n| n.get_device_class_instance().into(),
+            |n, v| n.set_device_class_instance(v as u8),
+        ),
+        (
+            "Industry group",
+            0x7,
+            |n| n.get_industry_group().into(),
+            |n, v| n.set_industry_group(v as u8),
+        ),
+    ];
+    let mut updated = None;
+    ui.label(label);
+    egui::Grid::new(("name_fields", id.value())).show(ui, |ui| {
+        for (field, maximum, get, set) in fields {
+            ui.label(field);
+            let key = ui.make_persistent_id((id.value(), "name", field));
+            touch_draft(ui.ctx(), key);
+            let current = get(&name);
+            let mut edited = ui.data(|data| data.get_temp::<u32>(key)).unwrap_or(current);
+            let response = ui.add(egui::DragValue::new(&mut edited).range(0..=maximum));
+            let mut changed = name;
+            set(&mut changed, edited);
+            if response.changed() {
+                ui.data_mut(|data| data.insert_temp(key, edited));
+                // Committed if the editor disappears before the edit is finished
+                update_draft(
+                    ui.ctx(),
+                    key,
+                    design,
+                    Some(property_operation(
+                        design,
+                        id,
+                        PropertyKey::Name,
+                        serde_json::json!(u64::from(changed)),
+                    )),
+                );
+            }
+            if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                ui.data_mut(|data| data.remove::<u32>(key));
+                clear_draft(ui.ctx(), key);
+            } else if drag_value_finished(&response)
+                || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            {
+                if edited != current {
+                    updated = Some(changed);
+                }
+                ui.data_mut(|data| data.remove::<u32>(key));
+                clear_draft(ui.ctx(), key);
+            }
+            ui.end_row();
+        }
+        let mut self_configurable = name.get_self_configurable_address();
+        ui.label("Self-configurable address");
+        if ui.checkbox(&mut self_configurable, "").changed() {
+            let mut changed = name;
+            changed.set_self_configurable_address(self_configurable);
+            updated = Some(changed);
+        }
+        ui.end_row();
+
+        ui.label("NAME");
+        let key = ui.make_persistent_id((id.value(), "name_hex"));
+        touch_draft(ui.ctx(), key);
+        let current = format!("{:016X}", u64::from(name));
+        let mut edited = pending_text(ui, key).unwrap_or_else(|| current.clone());
+        // No character limit: a pasted "0x…" NAME with spaces would be cut
+        // short and still parse; parse_name_hex rejects over 16 digits.
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut edited)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(150.0),
+        );
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+            update_draft(
+                ui.ctx(),
+                key,
+                design,
+                parse_name_hex(&edited).map(|raw| {
+                    property_operation(design, id, PropertyKey::Name, serde_json::json!(raw))
+                }),
+            );
+        }
+        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        } else if response.lost_focus() {
+            // Invalid text stays, with the error, until it is fixed or cancelled
+            if let Some(raw) = parse_name_hex(&edited) {
+                if raw != u64::from(name) {
+                    updated = Some(NAME::new(raw));
+                }
+                ui.data_mut(|data| data.remove::<PendingValue>(key));
+                clear_draft(ui.ctx(), key);
+            }
+        }
+        ui.end_row();
+        if pending_text(ui, key).is_some_and(|text| parse_name_hex(&text).is_none()) {
+            ui.label("");
+            crate::ui_style::error_text(ui, "Enter up to 16 hexadecimal digits");
+            ui.end_row();
+        }
+    });
+    if let Some(name) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::Name,
+            serde_json::json!(u64::from(name)),
+        );
+    }
+}
+
+/// A NAME in hexadecimal, with or without a 0x prefix and spaces.
+fn parse_name_hex(text: &str) -> Option<u64> {
+    let digits: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let digits = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+        .unwrap_or(&digits);
+    if digits.is_empty() || digits.len() > 16 {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
+}
+
+/// The colours of a Colour Palette as swatches, 16 to a row. Clicking one
+/// opens a picker below; a drag in it previews and is one undo step when the
+/// pointer is released.
+fn render_palette_colours(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    colours: &[ag_iso_stack::object_pool::Colour],
+    design: &EditorProject,
+) {
+    use ag_iso_stack::object_pool::Colour;
+
+    let as_json = |colours: &[Colour]| serde_json::to_value(colours).unwrap();
+    let rgb = |colour: &Colour| egui::Color32::from_rgb(colour.r, colour.g, colour.b);
+    // Outside the revision scope, so the picker stays open after each change
+    let selected_id = egui::Id::new(("palette_selected", design.ui_session_id(), id.value()));
+    let mut selected = ui
+        .data(|data| data.get_temp::<usize>(selected_id))
+        .filter(|index| *index < colours.len());
+    let mut updated = None;
+    ui.label(format!("{label} ({})", colours.len()));
+    egui::Grid::new(("palette_colours", id.value()))
+        .spacing(egui::vec2(2.0, 2.0))
+        .show(ui, |ui| {
+            for (index, colour) in colours.iter().enumerate() {
+                let size = egui::vec2(16.0, 16.0);
+                let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+                ui.painter().rect_filled(rect, 2.0, rgb(colour));
+                if selected == Some(index) {
+                    ui.painter().rect_stroke(
+                        rect.expand(1.0),
+                        2.0,
+                        ui.visuals().selection.stroke,
+                        egui::StrokeKind::Outside,
+                    );
+                }
+                let response = response.on_hover_text(format!(
+                    "{index}: #{:02X}{:02X}{:02X}",
+                    colour.r, colour.g, colour.b
+                ));
+                if response.clicked() {
+                    selected = (selected != Some(index)).then_some(index);
+                }
+                if index % 16 == 15 {
+                    ui.end_row();
+                }
+            }
+        });
+    ui.data_mut(|data| match selected {
+        Some(index) => data.insert_temp(selected_id, index),
+        None => data.remove::<usize>(selected_id),
+    });
+    if let Some(index) = selected {
+        let key = ui.make_persistent_id((id.value(), "palette_colour"));
+        touch_draft(ui.ctx(), key);
+        let current = rgb(&colours[index]);
+        let mut edited = ui
+            .data(|data| data.get_temp::<egui::Color32>(key))
+            .unwrap_or(current);
+        ui.label(format!("Colour {index}"));
+        let with_colour = |colour: egui::Color32| {
+            let mut changed = colours.to_vec();
+            let mut value = serde_json::to_value(changed[index]).unwrap();
+            value["r"] = colour.r().into();
+            value["g"] = colour.g().into();
+            value["b"] = colour.b().into();
+            changed[index] = serde_json::from_value(value).unwrap();
+            changed
+        };
+        if egui::color_picker::color_picker_color32(
+            ui,
+            &mut edited,
+            egui::color_picker::Alpha::Opaque,
+        ) {
+            ui.data_mut(|data| data.insert_temp(key, edited));
+            update_draft(
+                ui.ctx(),
+                key,
+                design,
+                Some(property_operation(
+                    design,
+                    id,
+                    PropertyKey::Colours,
+                    as_json(&with_colour(edited)),
+                )),
+            );
+        }
+        if !ui.input(|input| input.pointer.any_down()) {
+            if edited != current {
+                updated = Some(with_colour(edited));
+            }
+            ui.data_mut(|data| data.remove::<egui::Color32>(key));
+            clear_draft(ui.ctx(), key);
+        }
+    }
+    ui.horizontal_wrapped(|ui| {
         if ui
-            .button("Load Image")
-            .on_hover_text("Load an image file (PNG, JPG, BMP, etc.)")
+            .add_enabled(colours.len() < 256, egui::Button::new("Add colour"))
             .clicked()
         {
-            design.request_image_load(self.id);
+            let mut changed = colours.to_vec();
+            changed.push(Colour::COLOUR_PALETTE[changed.len()]);
+            updated = Some(changed);
         }
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for NumberVariable {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Initial Value:");
-            ui.add(egui::DragValue::new(&mut self.value).speed(1.0));
-        });
-    }
-}
-
-impl ConfigurableObject for StringVariable {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Initial Value:");
-            ui.text_edit_singleline(&mut self.value);
-        });
-    }
-}
-
-impl ConfigurableObject for FontAttributes {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.font_colour, 0..=255)
-                .text("Font Colour")
-                .drag_value_speed(1.0),
-        );
-
-        // let is_proportional = self.font_style.proportional; // TODO: check if we have VT version 4 or later
-        let is_proportional = false;
-
-        // If proportional bit is set, font_size is proportional, otherwise non-proportional.
-        if is_proportional {
-            // Proportional font: we have a pixel height
-            let mut height = match self.font_size {
-                FontSize::Proportional(h) => h,
-                FontSize::NonProportional(_) => 8, // default to minimal proportional height if needed
-            };
-            ui.horizontal(|ui| {
-                ui.label("Proportional Font Height (≥ 8):");
-                if ui.add(egui::DragValue::new(&mut height)).changed() {
-                    self.font_size = FontSize::Proportional(height);
-                }
-            });
-        } else {
-            // Non-proportional font sizes: combo box
-            let current_size = match &self.font_size {
-                FontSize::NonProportional(s) => *s,
-                FontSize::Proportional(_) => NonProportionalFontSize::Px6x8,
-            };
-
-            egui::ComboBox::from_label("Non-Proportional Font Size")
-                .selected_text(format!("{:?}", current_size))
-                .show_ui(ui, |ui| {
-                    for value in [
-                        NonProportionalFontSize::Px6x8,
-                        NonProportionalFontSize::Px8x8,
-                        NonProportionalFontSize::Px8x12,
-                        NonProportionalFontSize::Px12x16,
-                        NonProportionalFontSize::Px16x16,
-                        NonProportionalFontSize::Px16x24,
-                        NonProportionalFontSize::Px24x32,
-                        NonProportionalFontSize::Px32x32,
-                        NonProportionalFontSize::Px32x48,
-                        NonProportionalFontSize::Px48x64,
-                        NonProportionalFontSize::Px64x64,
-                        NonProportionalFontSize::Px64x96,
-                        NonProportionalFontSize::Px96x128,
-                        NonProportionalFontSize::Px128x128,
-                        NonProportionalFontSize::Px128x192,
-                    ] {
-                        ui.selectable_value(
-                            &mut self.font_size,
-                            FontSize::NonProportional(value),
-                            format!("{:?}", value),
-                        );
-                    }
-                });
+        if ui
+            .add_enabled(!colours.is_empty(), egui::Button::new("Remove last"))
+            .clicked()
+        {
+            updated = Some(colours[..colours.len() - 1].to_vec());
         }
+        if ui
+            .button("Use standard colours")
+            .on_hover_text("Replace all colours with the 256 standard VT colours")
+            .clicked()
+        {
+            updated = Some(Colour::COLOUR_PALETTE.to_vec());
+        }
+    });
+    if let Some(colours) = updated {
+        queue(design, id, PropertyKey::Colours, as_json(&colours));
+    }
+}
 
-        ui.separator();
-        let mut is_proprietary = if let FontType::Proprietary(_) = self.font_type {
-            true
-        } else {
-            false
-        };
-        ui.checkbox(&mut is_proprietary, "Proprietary Font");
-
-        if is_proprietary {
-            const PROPRIETARY_RANGE_V3_AND_PRIOR: std::ops::RangeInclusive<u8> = 255..=255;
-            const PROPRIETARY_RANGE_V4_AND_LATER: std::ops::RangeInclusive<u8> = 240..=255;
-
-            let range = PROPRIETARY_RANGE_V3_AND_PRIOR; // TODO: check if we have VT version 4 or later
-
-            let mut raw_value = match self.font_type {
-                FontType::Proprietary(v) => v,
-                _ => range.clone().last().unwrap(),
-            };
-            ui.horizontal(|ui| {
-                ui.label("Proprietary Font Value:");
-                ui.add(egui::DragValue::new(&mut raw_value).range(range).speed(1.0));
-            });
-            self.font_type = FontType::Proprietary(raw_value);
-        } else {
-            // Reset to Latin1 if we were proprietary or reserved
-            match self.font_type {
-                FontType::Proprietary(_) | FontType::Reserved(_) => {
-                    self.font_type = FontType::Latin1;
-                }
-                _ => {}
+/// The entries of a Colour Map, 16 to a row: each shows the palette colour
+/// that colour index is drawn with, and picks another from the palette.
+fn render_colour_map(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    map: &[u8],
+    design: &EditorProject,
+) {
+    let palette =
+        crate::effective_colour::palette_colours(design.get_pool()).map(|colour| colour.as_rgb());
+    let mut updated = None;
+    ui.label(label);
+    ui.horizontal(|ui| {
+        ui.label("Entries:");
+        for size in [2, 16, 256] {
+            if ui
+                .selectable_label(map.len() == size, size.to_string())
+                .clicked()
+                && map.len() != size
+            {
+                updated = Some(colour_map_with_size(map, size));
             }
-
-            ui.horizontal(|ui| {
-                ui.label("Font Type:");
-                egui::ComboBox::from_id_salt("font_type")
-                    .selected_text(format!("{:?}", self.font_type))
-                    .show_ui(ui, |ui| {
-                        // Known fonts
-                        for value in &[
-                            FontType::Latin1,
-                            FontType::Latin9,
-                            // TODO: check if we have VT version 4 or later
-                            // FontType::Latin2,
-                            // FontType::Latin4,
-                            // FontType::Cyrillic,
-                            // FontType::Greek,
-                        ] {
-                            if ui
-                                .selectable_label(&self.font_type == value, format!("{:?}", value))
-                                .clicked()
-                            {
-                                self.font_type = value.clone();
-                            }
-                        }
+        }
+        if ui
+            .button("Reset")
+            .on_hover_text("Draw every colour index with its own palette colour")
+            .clicked()
+        {
+            updated = Some(colour_map_with_size(&[], map.len()));
+        }
+    });
+    if !matches!(map.len(), 2 | 16 | 256) {
+        crate::ui_style::error_text(ui, "A Colour Map has 2, 16 or 256 entries.");
+    }
+    egui::Grid::new(("colour_map", id.value()))
+        .spacing(egui::vec2(2.0, 2.0))
+        .show(ui, |ui| {
+            for (index, target) in map.iter().copied().enumerate() {
+                let colour = palette[usize::from(target)];
+                let button = egui::Button::new(
+                    egui::RichText::new(target.to_string())
+                        .small()
+                        .color(text_on(colour)),
+                )
+                .fill(egui::Color32::from_rgb(colour[0], colour[1], colour[2]))
+                .min_size(egui::vec2(28.0, 20.0));
+                let response =
+                    egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+                        ui.label(format!("Draw colour {index} with"));
+                        colour_index_menu(ui, target, &palette, 0..=u8::MAX)
                     });
-            });
-        }
-
-        ui.separator();
-        ui.label("Font Style:");
-        ui.checkbox(&mut self.font_style.bold, "Bold");
-        ui.checkbox(&mut self.font_style.crossed_out, "Crossed Out");
-        ui.checkbox(&mut self.font_style.underlined, "Underlined");
-        ui.checkbox(&mut self.font_style.italic, "Italic");
-        ui.checkbox(&mut self.font_style.inverted, "Inverted");
-        ui.checkbox(&mut self.font_style.flashing_inverted, "Flashing Inverted");
-        ui.checkbox(&mut self.font_style.flashing_hidden, "Flashing Hidden");
-        // ui.checkbox(&mut self.font_style.proportional, "Proportional"); // TODO: check if we have VT version 4 or later
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for LineAttributes {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.line_colour, 0..=255)
-                .text("Line Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.add(
-            egui::Slider::new(&mut self.line_width, 0..=255)
-                .text("Line Width")
-                .drag_value_speed(1.0),
-        );
-
-        ui.label("Line Art Pattern (16 bits):")
-            .on_hover_text("Each bit in this 16-bit pattern represents a 'paintbrush spot' along the line. ")
-            .on_hover_text("A '1' bit means that spot is drawn in the line color, while a '0' bit means that spot is skipped (shows background).");
-
-        ui.horizontal(|ui| {
-            for i in (0..16).rev() {
-                let bit_mask = 1 << i;
-                let mut bit_is_set = (self.line_art & bit_mask) != 0;
-                let check = ui.checkbox(&mut bit_is_set, "");
-                if check.changed() {
-                    if bit_is_set {
-                        self.line_art |= bit_mask;
-                    } else {
-                        self.line_art &= !bit_mask;
+                if let Some(Some(chosen)) = response.1.map(|inner| inner.inner) {
+                    if chosen != target {
+                        let mut changed = map.to_vec();
+                        changed[index] = chosen;
+                        updated = Some(changed);
                     }
                 }
-                check.on_hover_text(format!(
-                    "Bit {}: {} ({}). Click to toggle.\n1 = Draw line colour\n0 = Skip (background)",
-                    i,
-                    if bit_is_set { "Currently: Draw" } else { "Currently: Skip" },
-                    if bit_is_set { "One (1)" } else { "Zero (0)" }
-                ));
-            }
-        });
-
-        ui.horizontal(|ui| {
-            ui.label("Current Binary Pattern:");
-            ui.label(format!("{:016b}", self.line_art))
-                .on_hover_text("This shows the full 16-bit pattern of the line art. '1' bits represent drawn spots; '0' bits represent skipped spots.");
-        });
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for FillAttributes {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.label("Fill Type:").on_hover_text(
-            "Select how this area should be filled:\n\
-                            0 = No fill\n\
-                            1 = Fill with line colour\n\
-                            2 = Fill with specified fill colour\n\
-                            3 = Fill with a specified pattern (PictureGraphic)",
-        );
-
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.fill_type, 0, "No fill")
-                .on_hover_text("No fill will be drawn, the background will be visible.");
-            ui.radio_value(&mut self.fill_type, 1, "Fill with line colour")
-                .on_hover_text("The area will be filled using the currently set line colour of the parent shape.");
-            ui.radio_value(&mut self.fill_type, 2, "Fill with specified colour")
-                .on_hover_text("The area will be filled using the 'fill_colour' attribute specified below.");
-            ui.radio_value(&mut self.fill_type, 3, "Fill with pattern")
-                .on_hover_text("The area will be filled using a pattern defined by a PictureGraphic object referenced below.");
-        });
-
-        if self.fill_type == 2 {
-            ui.label("Fill Colour:")
-                .on_hover_text("Select the colour index (0-255) to use for filling the area.");
-            ui.add(
-                egui::Slider::new(&mut self.fill_colour, 0..=255)
-                    .text("Fill Colour")
-                    .drag_value_speed(1.0),
-            );
-        } else if self.fill_type == 3 {
-            ui.label("Fill Pattern (PictureGraphic Object):")
-                .on_hover_text("Select a PictureGraphic object to use as a pattern.\n\
-                                Make sure the PictureGraphic width and format match the restrictions.");
-            // Render a nullable object selector restricted to PictureGraphic objects
-            ui.horizontal(|ui| {
-                render_nullable_object_id_selector(
-                    ui,
-                    0,
-                    design,
-                    &mut self.fill_pattern,
-                    &[ObjectType::PictureGraphic],
-                    Some(self.id),
-                );
-
-                if let Some(pattern_id) = self.fill_pattern.0 {
-                    if let Some(obj) = design.get_pool().object_by_id(pattern_id) {
-                        if ui.link("(view)").clicked() {
-                            *design.get_mut_selected().borrow_mut() = pattern_id.into();
-                        }
-                    } else {
-                        ui.colored_label(egui::Color32::RED, "Missing pattern object");
-                    }
-                } else {
-                    ui.label("None");
-                }
-            });
-        }
-
-        ui.separator();
-        ui.label("Macros:")
-            .on_hover_text("Define macros that could be triggered by events associated with this object.\n\
-                            Currently, FillAttributes does not trigger events, but this is included for consistency.");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for InputAttributes {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Validation Type:");
-            ui.radio_value(
-                &mut self.validation_type,
-                ValidationType::ValidCharacters,
-                "Valid Characters",
-            );
-            ui.radio_value(
-                &mut self.validation_type,
-                ValidationType::InvalidCharacters,
-                "Invalid Characters",
-            );
-        });
-
-        ui.label("Validation String:");
-        ui.text_edit_singleline(&mut self.validation_string);
-
-        ui.separator();
-        ui.label("Macros:");
-        render_macro_references(
-            ui,
-            design,
-            &mut self.macro_refs,
-            &Self::get_possible_events(),
-        );
-    }
-}
-
-impl ConfigurableObject for ObjectPointer {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-        ui.horizontal(|ui| {
-            ui.label("Object reference:");
-            egui::ComboBox::from_id_salt("object_reference")
-                .selected_text(format!("{:?}", u16::from(self.value)))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.value, NullableObjectId::NULL, "None");
-                    let object_types: Vec<ObjectType> = design
-                        .get_pool()
-                        .parent_objects(self.id)
-                        .iter()
-                        .flat_map(|parent_obj| {
-                            get_allowed_child_refs(parent_obj.object_type(), VtVersion::Version3)
-                                .into_iter()
-                        })
-                        .collect();
-                    for potential_child in design.get_pool().objects_by_types(&object_types) {
-                        ui.selectable_value(
-                            &mut self.value,
-                            potential_child.id().into(),
-                            format!(
-                                "{:?}: {:?}",
-                                u16::from(potential_child.id()),
-                                potential_child.object_type()
-                            ),
-                        );
-                    }
-                });
-            if let Some(id) = self.value.into() {
-                if let Some(object) = design.get_pool().object_by_id(id) {
-                    if ui.link(format!("{:?}", object.object_type())).clicked() {
-                        *design.get_mut_selected().borrow_mut() = id.into();
-                    }
-                } else {
-                    ui.colored_label(egui::Color32::RED, "Missing object in pool");
-                }
-            }
-        });
-    }
-}
-
-const ALLOWED_MACRO_COMMANDS: &[(u8, &str, VtVersion)] = &[
-    (0xA0, "Hide/Show Object command", VtVersion::Version2),
-    (0xA1, "Enable/Disable Object command", VtVersion::Version2),
-    (0xA2, "Select Input Object command", VtVersion::Version2),
-    (0x92, "ESC command", VtVersion::Version2),
-    (0xA3, "Control Audio Signal command", VtVersion::Version2),
-    (0xA4, "Set Audio Volume command", VtVersion::Version2),
-    (0xA5, "Change Child Location command", VtVersion::Version2),
-    (0xB4, "Change Child Position command", VtVersion::Version2),
-    (0xA6, "Change Size command", VtVersion::Version2),
-    (
-        0xA7,
-        "Change Background Colour command",
-        VtVersion::Version2,
-    ),
-    (0xA8, "Change Numeric Value command", VtVersion::Version2),
-    (0xB3, "Change String Value command", VtVersion::Version2),
-    (0xA9, "Change End Point command", VtVersion::Version2),
-    (0xAA, "Change Font Attributes command", VtVersion::Version2),
-    (0xAB, "Change Line Attributes command", VtVersion::Version2),
-    (0xAC, "Change Fill Attributes command", VtVersion::Version2),
-    (0xAD, "Change Active Mask command", VtVersion::Version2),
-    (0xAE, "Change Soft Key Mask command", VtVersion::Version2),
-    (0xAF, "Change Attribute command", VtVersion::Version2),
-    (0xB0, "Change priority command", VtVersion::Version2),
-    (0xB1, "Change List item command", VtVersion::Version2),
-    (0xBD, "Lock/Unlock Mask command", VtVersion::Version4),
-    (0xBE, "Execute Macro command", VtVersion::Version4),
-    (0xB5, "Change Object Label command", VtVersion::Version4),
-    (0xB6, "Change Polygon Point command", VtVersion::Version4),
-    (0xB7, "Change Polygon Scale command", VtVersion::Version4),
-    (0xB8, "Graphics Context command", VtVersion::Version4),
-    (
-        0xBA,
-        "Select Colour Map or Palette command",
-        VtVersion::Version4,
-    ),
-    (0xBC, "Execute Extended Macro command", VtVersion::Version5),
-    (
-        0x90,
-        "Select Active Working Set command",
-        VtVersion::Version6,
-    ),
-];
-
-impl ConfigurableObject for Macro {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.label("Macro Commands:");
-        egui::Grid::new("macro_commands_grid")
-            .striped(true)
-            .min_col_width(0.0)
-            .show(ui, |ui| {
-                let mut idx = 0;
-                while idx < self.commands.len() {
-                    let code = self.commands[idx];
-                    let command_name = ALLOWED_MACRO_COMMANDS
-                        .iter()
-                        .find(|&&(c, _, __)| c == code)
-                        .map(|&(_, name, __)| name)
-                        .unwrap_or("Unknown");
-
-                    ui.label(format!("0x{:02X}", code));
-                    ui.label(command_name);
-                    render_index_modifiers(ui, idx, &mut self.commands);
+                response
+                    .0
+                    .on_hover_text(format!("Colour {index} → {target}"));
+                if index % 16 == 15 {
                     ui.end_row();
-
-                    idx += 1;
                 }
-            });
-
-        ui.horizontal(|ui| {
-            ui.label("Add command:");
-            egui::ComboBox::from_id_salt("add_macro_command")
-                .selected_text("Select command")
-                .show_ui(ui, |ui| {
-                    for &(code, name, version) in ALLOWED_MACRO_COMMANDS {
-                        if version > VtVersion::Version3 {
-                            continue; // TODO: check which version pool we have
-                        }
-
-                        if ui
-                            .selectable_label(false, format!("0x{:02X} {}", code, name))
-                            .clicked()
-                        {
-                            self.commands.push(code);
-                        }
-                    }
-                });
+            }
         });
+    if let Some(map) = updated {
+        queue(design, id, PropertyKey::ColourMap, serde_json::json!(map));
     }
 }
 
-impl ConfigurableObject for AuxiliaryFunctionType2 {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Function Type:");
-            egui::ComboBox::from_id_salt("function_type")
-                .selected_text(format!("{:?}", self.function_attributes.function_type))
-                .show_ui(ui, |ui| {
-                    let selectable_types = &[
-                        AuxiliaryFunctionType::BooleanLatching,
-                        AuxiliaryFunctionType::AnalogueMaintains,
-                        AuxiliaryFunctionType::BooleanNonLatching,
-                        AuxiliaryFunctionType::AnalogueReturnToCenter,
-                        AuxiliaryFunctionType::AnalogueReturnToZero,
-                        AuxiliaryFunctionType::DualBooleanLatching,
-                        AuxiliaryFunctionType::DualBooleanNonLatching,
-                        AuxiliaryFunctionType::DualBooleanLatchingUp,
-                        AuxiliaryFunctionType::DualBooleanLatchingDown,
-                        AuxiliaryFunctionType::CombinedAnalogueReturnWithLatch,
-                        AuxiliaryFunctionType::CombinedAnalogueMaintainsWithLatch,
-                        AuxiliaryFunctionType::QuadratureBooleanNonLatching,
-                        AuxiliaryFunctionType::QuadratureAnalogueMaintains,
-                        AuxiliaryFunctionType::QuadratureAnalogueReturnToCenter,
-                        AuxiliaryFunctionType::BidirectionalEncoder,
-                    ];
-
-                    for ft in selectable_types {
-                        ui.selectable_value(
-                            &mut self.function_attributes.function_type,
-                            *ft,
-                            format!("{:?}", ft),
-                        );
-                    }
-                });
-        });
-
-        ui.checkbox(&mut self.function_attributes.critical, "Critical");
-        ui.checkbox(&mut self.function_attributes.restricted, "Restricted");
-        ui.checkbox(
-            &mut self.function_attributes.single_assignment,
-            "Single-assignment",
-        );
-
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-    }
+/// `map` with `size` entries; added entries map each index to itself.
+fn colour_map_with_size(map: &[u8], size: usize) -> Vec<u8> {
+    (0..size)
+        .map(|index| map.get(index).copied().unwrap_or(index as u8))
+        .collect()
 }
 
-impl ConfigurableObject for AuxiliaryInputType2 {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
+/// The code planes of Extended Input Attributes: each a Unicode plane, 0 to
+/// 16, with the character ranges that the validation type allows or rejects.
+fn render_code_planes(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    planes: &[ag_iso_stack::object_pool::object::CodePlane],
+    design: &EditorProject,
+) {
+    use ag_iso_stack::object_pool::object::{CharacterRange, CodePlane};
 
-        ui.add(
-            egui::Slider::new(&mut self.background_colour, 0..=255)
-                .text("Background Colour")
-                .drag_value_speed(1.0),
-        );
-
-        ui.horizontal(|ui| {
-            ui.label("Function Type:");
-            egui::ComboBox::from_id_salt("input_function_type")
-                .selected_text(format!("{:?}", self.function_attributes.function_type))
-                .show_ui(ui, |ui| {
-                    let selectable_types = &[
-                        AuxiliaryFunctionType::BooleanLatching,
-                        AuxiliaryFunctionType::AnalogueMaintains,
-                        AuxiliaryFunctionType::BooleanNonLatching,
-                        AuxiliaryFunctionType::AnalogueReturnToCenter,
-                        AuxiliaryFunctionType::AnalogueReturnToZero,
-                        AuxiliaryFunctionType::DualBooleanLatching,
-                        AuxiliaryFunctionType::DualBooleanNonLatching,
-                        AuxiliaryFunctionType::DualBooleanLatchingUp,
-                        AuxiliaryFunctionType::DualBooleanLatchingDown,
-                        AuxiliaryFunctionType::CombinedAnalogueReturnWithLatch,
-                        AuxiliaryFunctionType::CombinedAnalogueMaintainsWithLatch,
-                        AuxiliaryFunctionType::QuadratureBooleanNonLatching,
-                        AuxiliaryFunctionType::QuadratureAnalogueMaintains,
-                        AuxiliaryFunctionType::QuadratureAnalogueReturnToCenter,
-                        AuxiliaryFunctionType::BidirectionalEncoder,
-                    ];
-
-                    for ft in selectable_types {
-                        ui.selectable_value(
-                            &mut self.function_attributes.function_type,
-                            *ft,
-                            format!("{:?}", ft),
-                        );
-                    }
-                });
-        });
-
-        ui.checkbox(&mut self.function_attributes.critical, "Critical");
-        ui.checkbox(
-            &mut self.function_attributes.single_assignment,
-            "Single-assignment",
-        );
-
-        ui.separator();
-        ui.label("Objects:");
-        render_object_references_list(
-            ui,
-            design,
-            design.mask_size,
-            design.mask_size,
-            &mut self.object_refs,
-            &Self::get_allowed_child_refs(VtVersion::Version3),
-            self.id,
-        );
-    }
-}
-
-impl ConfigurableObject for AuxiliaryControlDesignatorType2 {
-    fn render_parameters(&mut self, ui: &mut egui::Ui, design: &EditorProject) {
-        render_object_id(ui, &mut self.id, design);
-
-        ui.horizontal(|ui| {
-            ui.label("Pointer Type:");
-            egui::ComboBox::from_id_salt("aux_control_pointer_type")
-                .selected_text(format!("{}", self.pointer_type))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.pointer_type,
-                        0,
-                        "0 (Points to Auxiliary Object)",
-                    );
-                    ui.selectable_value(
-                        &mut self.pointer_type,
-                        1,
-                        "1 (Points to Assigned Aux Objects)",
-                    );
-                    ui.selectable_value(
-                        &mut self.pointer_type,
-                        2,
-                        "2 (Points to WS Object of this Pool)",
-                    );
-                    ui.selectable_value(
-                        &mut self.pointer_type,
-                        3,
-                        "3 (Points to WS Object of Assigned)",
-                    );
-                });
-        });
-
-        // According to Table J.6 and J.7, when pointer_type = 2, auxiliary_object_id should be NULL (0xFFFF).
-        let must_be_null = self.pointer_type == 2;
-        if must_be_null {
-            self.auxiliary_object_id = NullableObjectId::NULL;
-        } else {
-            // Allow user to select an Auxiliary Input or Auxiliary Function object.
+    let mut updated: Option<Vec<CodePlane>> = None;
+    ui.label(label);
+    for (plane_index, plane) in planes.iter().enumerate() {
+        // Keyed by object: unfinished edits must not show on another object
+        ui.push_id(("code_plane", id.value(), plane_index), |ui| {
             ui.horizontal(|ui| {
-                ui.label("Auxiliary Object ID:");
-                egui::ComboBox::from_id_salt("aux_object_id_selector")
-                    .selected_text(format!("{:?}", u16::from(self.auxiliary_object_id)))
+                ui.label("Plane")
+                    .on_hover_text("Unicode plane: 0 is the Basic Multilingual Plane");
+                // Only planes not used by another entry, so none is listed twice
+                egui::ComboBox::from_id_salt("plane_number")
+                    .icon(crate::ui_style::combo_box_icon)
+                    .selected_text(plane.number.to_string())
                     .show_ui(ui, |ui| {
-                        // Let’s consider that we might assign Auxiliary Function Type 2 (31) or Auxiliary Input Type 2 (32) objects.
-                        let allowed_types = &[
-                            ObjectType::AuxiliaryFunctionType2,
-                            ObjectType::AuxiliaryInputType2,
-                        ];
-
-                        for potential_child in design.get_pool().objects_by_types(allowed_types) {
-                            if ui
-                                .selectable_label(
-                                    NullableObjectId::from(potential_child.id())
-                                        == self.auxiliary_object_id,
-                                    format!(
-                                        "{:?}: {:?}",
-                                        u16::from(potential_child.id()),
-                                        potential_child.object_type()
-                                    ),
-                                )
-                                .clicked()
+                        for number in 0..=16u8 {
+                            let used = planes.iter().enumerate().any(|(other, candidate)| {
+                                other != plane_index && candidate.number == number
+                            });
+                            if !used
+                                && ui
+                                    .selectable_label(number == plane.number, number.to_string())
+                                    .clicked()
+                                && number != plane.number
                             {
-                                self.auxiliary_object_id = potential_child.id().into();
+                                let mut changed = planes.to_vec();
+                                changed[plane_index].number = number;
+                                updated = Some(changed);
                             }
                         }
                     });
-
-                // Provide a link to navigate to the selected object
-                if let Some(ref_id) = self.auxiliary_object_id.into() {
-                    if let Some(obj) = design.get_pool().object_by_id(ref_id) {
-                        if ui.link(format!("{:?}", obj.object_type())).clicked() {
-                            *design.get_mut_selected().borrow_mut() = ref_id.into();
-                        }
-                    } else {
-                        ui.colored_label(egui::Color32::RED, "Missing object in pool");
-                    }
+                // Extended Input Attributes need at least one plane
+                if ui
+                    .add_enabled(planes.len() > 1, egui::Button::new("Remove plane"))
+                    .clicked()
+                {
+                    let mut changed = planes.to_vec();
+                    changed.remove(plane_index);
+                    updated = Some(changed);
                 }
             });
+            let ranges = &plane.character_ranges;
+            // The planes with range `index` set to `first`–`last`, kept in
+            // order by moving the end that was not edited
+            let with_range = |index: usize, first: Option<u16>, last: Option<u16>| {
+                let range = &ranges[index];
+                let first = first.unwrap_or(range.first_character);
+                let last = last.unwrap_or(range.last_character);
+                let (first, last) = if first > last {
+                    if last != range.last_character {
+                        (last, last)
+                    } else {
+                        (first, first)
+                    }
+                } else {
+                    (first, last)
+                };
+                let mut changed = planes.to_vec();
+                changed[plane_index].character_ranges[index] = CharacterRange {
+                    first_character: first,
+                    last_character: last,
+                };
+                changed
+            };
+            let operation = |changed: Vec<CodePlane>| {
+                property_operation(
+                    design,
+                    id,
+                    PropertyKey::CodePlanes,
+                    serde_json::to_value(changed).unwrap(),
+                )
+            };
+            let mut action = None;
+            egui::Grid::new("ranges").striped(true).show(ui, |ui| {
+                for heading in ["First", "Last", "Characters", "", "", ""] {
+                    ui.label(heading);
+                }
+                ui.end_row();
+                for (index, range) in ranges.iter().enumerate() {
+                    let first = hex_character_field(
+                        ui,
+                        ui.make_persistent_id(("first", index)),
+                        range.first_character,
+                        design,
+                        |first| operation(with_range(index, Some(first), None)),
+                    );
+                    let last = hex_character_field(
+                        ui,
+                        ui.make_persistent_id(("last", index)),
+                        range.last_character,
+                        design,
+                        |last| operation(with_range(index, None, Some(last))),
+                    );
+                    ui.label(range_preview(plane.number, range));
+                    if first.is_some() || last.is_some() {
+                        updated = Some(with_range(index, first, last));
+                    }
+                    // A plane needs at least one range
+                    row_actions_keeping(ui, index, ranges.len(), 1, &mut action);
+                    ui.end_row();
+                }
+            });
+            if let Some(action) = action {
+                let mut changed = planes.to_vec();
+                apply_list_action(&mut changed[plane_index].character_ranges, action);
+                updated = Some(changed);
+            }
+            if ui
+                .add_enabled(ranges.len() < 255, egui::Button::new("Add range"))
+                .on_disabled_hover_text("A code plane holds at most 255 ranges")
+                .clicked()
+            {
+                let mut changed = planes.to_vec();
+                changed[plane_index]
+                    .character_ranges
+                    .push(default_character_range(plane.number));
+                updated = Some(changed);
+            }
+        });
+        ui.separator();
+    }
+    let free_plane = (0..=16).find(|number| planes.iter().all(|plane| plane.number != *number));
+    if ui
+        .add_enabled(free_plane.is_some(), egui::Button::new("Add plane"))
+        .clicked()
+    {
+        if let Some(number) = free_plane {
+            let mut changed = planes.to_vec();
+            changed.push(CodePlane {
+                number,
+                character_ranges: vec![default_character_range(number)],
+            });
+            updated = Some(changed);
         }
+    }
+    if let Some(planes) = updated {
+        queue(
+            design,
+            id,
+            PropertyKey::CodePlanes,
+            serde_json::to_value(planes).unwrap(),
+        );
+    }
+}
+
+/// Printable ASCII in the Basic Multilingual Plane, otherwise the whole plane.
+fn default_character_range(plane: u8) -> ag_iso_stack::object_pool::object::CharacterRange {
+    let (first_character, last_character) = if plane == 0 {
+        (0x20, 0x7E)
+    } else {
+        (0x0000, 0xFFFF)
+    };
+    ag_iso_stack::object_pool::object::CharacterRange {
+        first_character,
+        last_character,
+    }
+}
+
+/// The first and last characters of a range, "A – Z", when they print.
+fn range_preview(plane: u8, range: &ag_iso_stack::object_pool::object::CharacterRange) -> String {
+    let character = |value: u16| {
+        char::from_u32(u32::from(plane) << 16 | u32::from(value))
+            .filter(|character| !character.is_control() && !character.is_whitespace())
+    };
+    match (
+        character(range.first_character),
+        character(range.last_character),
+    ) {
+        (Some(first), Some(last)) if first == last => first.to_string(),
+        (Some(first), Some(last)) => format!("{first} – {last}"),
+        _ => String::new(),
+    }
+}
+
+/// A character code in hex; returns the new code once the edit is finished.
+/// An unfinished edit is kept as a draft, `operation` of the edited code, and
+/// committed if the field disappears first.
+fn hex_character_field(
+    ui: &mut egui::Ui,
+    key: egui::Id,
+    current: u16,
+    design: &EditorProject,
+    operation: impl FnOnce(u16) -> Operation,
+) -> Option<u16> {
+    touch_draft(ui.ctx(), key);
+    let mut edited = ui.data(|data| data.get_temp::<u16>(key)).unwrap_or(current);
+    let response = ui.add(
+        egui::DragValue::new(&mut edited)
+            .hexadecimal(4, false, true)
+            .prefix("U+"),
+    );
+    if response.changed() {
+        ui.data_mut(|data| data.insert_temp(key, edited));
+        update_draft(ui.ctx(), key, design, Some(operation(edited)));
+    }
+    if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|data| data.remove::<u16>(key));
+        clear_draft(ui.ctx(), key);
+    } else if drag_value_finished(&response)
+        || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+    {
+        ui.data_mut(|data| data.remove::<u16>(key));
+        clear_draft(ui.ctx(), key);
+        return (edited != current).then_some(edited);
+    }
+    None
+}
+
+/// The commands of a Macro as instructions: a command name and its arguments,
+/// as the CLI writes them. Every edit re-encodes the whole stream for the
+/// project's VT version; an instruction that does not encode is kept in its
+/// field with the error until it is fixed. Streams the decoder cannot read
+/// lossless stay raw JSON.
+fn render_macro_commands(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: ObjectId,
+    commands: &[u8],
+    design: &EditorProject,
+) {
+    use crate::macro_authoring::{
+        decode_macro_commands, encode_macro_instruction, instruction_names, MacroInstruction,
+    };
+
+    let version = design.vt_version;
+    let instructions = match decode_macro_commands(commands, version) {
+        Ok(instructions) => instructions,
+        Err(error) => {
+            crate::ui_style::error_text(ui, &format!("Shown as bytes: {error}"));
+            render_json(
+                ui,
+                label,
+                &serde_json::json!(commands),
+                id,
+                PropertyKey::Commands,
+                design,
+            );
+            return;
+        }
+    };
+    let encode = |instructions: &[MacroInstruction]| -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        for (index, instruction) in instructions.iter().enumerate() {
+            bytes.extend(
+                encode_macro_instruction(&instruction.name, &instruction.arguments, version)
+                    .map_err(|error| format!("Instruction {}: {error}", index + 1))?,
+            );
+        }
+        Ok(bytes)
+    };
+    let mut updated = None;
+    let mut action = None;
+    let mut error = None;
+    ui.label(label);
+    egui::Grid::new(("macro_commands", id.value()))
+        .striped(true)
+        .show(ui, |ui| {
+            for (index, instruction) in instructions.iter().enumerate() {
+                ui.label((index + 1).to_string());
+                ui.label(&instruction.name);
+                let key = ui.make_persistent_id((id.value(), "macro_arguments", index));
+                touch_draft(ui.ctx(), key);
+                let current = join_arguments(&instruction.arguments);
+                let mut edited = pending_text(ui, key).unwrap_or_else(|| current.clone());
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut edited)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(220.0),
+                );
+                let encoded = |text: &str| {
+                    split_arguments(text).and_then(|arguments| {
+                        let mut changed = instructions.clone();
+                        changed[index].arguments = arguments;
+                        encode(&changed)
+                    })
+                };
+                if response.changed() {
+                    ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+                    // Committed if the editor disappears first, when it encodes
+                    update_draft(
+                        ui.ctx(),
+                        key,
+                        design,
+                        encoded(&edited).ok().map(|bytes| {
+                            property_operation(
+                                design,
+                                id,
+                                PropertyKey::Commands,
+                                serde_json::json!(bytes),
+                            )
+                        }),
+                    );
+                }
+                if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                    ui.data_mut(|data| data.remove::<PendingValue>(key));
+                    clear_draft(ui.ctx(), key);
+                } else if response.lost_focus() && edited != current {
+                    match encoded(&edited) {
+                        Ok(bytes) => {
+                            updated = Some(bytes);
+                            ui.data_mut(|data| data.remove::<PendingValue>(key));
+                            clear_draft(ui.ctx(), key);
+                        }
+                        Err(message) => error = Some(message),
+                    }
+                }
+                match macro_target_argument(&instruction.name)
+                    .and_then(|position| instruction.arguments.get(position))
+                    .and_then(|argument| argument.parse::<u16>().ok())
+                    .and_then(|object| ObjectId::new(object).ok())
+                    .and_then(|object| design.get_pool().object_by_id(object))
+                {
+                    Some(object) => {
+                        if ui.link(design.object_display_name(object)).clicked() {
+                            select_object(design, object.id());
+                        }
+                    }
+                    None => {
+                        ui.label("");
+                    }
+                }
+                row_actions(ui, index, instructions.len(), &mut action);
+                ui.end_row();
+            }
+        });
+    if let Some(action) = action {
+        let mut changed = instructions.clone();
+        apply_list_action(&mut changed, action);
+        match encode(&changed) {
+            Ok(bytes) => updated = Some(bytes),
+            Err(message) => error = Some(message),
+        }
+    }
+    let pending_id = ui.make_persistent_id((id.value(), "new_macro_instruction"));
+    let (mut name, mut arguments) = ui
+        .data(|data| data.get_temp::<(String, String)>(pending_id))
+        .unwrap_or_else(|| ("change-numeric-value".to_owned(), String::new()));
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt(pending_id)
+            .icon(crate::ui_style::combo_box_icon)
+            .selected_text(&name)
+            .height(320.0)
+            .show_ui(ui, |ui| {
+                for candidate in instruction_names() {
+                    ui.selectable_value(&mut name, candidate.to_owned(), candidate);
+                }
+            });
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut arguments)
+                .font(egui::TextStyle::Monospace)
+                .hint_text("Arguments, such as 1000 5")
+                .desired_width(160.0),
+        );
+        let add = ui.button("Add").clicked()
+            || response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if add {
+            let result = split_arguments(&arguments).and_then(|parsed| {
+                let mut changed = instructions.clone();
+                changed.push(MacroInstruction {
+                    name: name.clone(),
+                    arguments: parsed,
+                });
+                encode(&changed)
+            });
+            match result {
+                Ok(bytes) => {
+                    updated = Some(bytes);
+                    arguments.clear();
+                }
+                Err(message) => error = Some(message),
+            }
+        }
+    });
+    ui.data_mut(|data| data.insert_temp(pending_id, (name, arguments)));
+    if let Some(message) = error {
+        ui.data_mut(|data| data.insert_temp(pending_id.with("error"), message));
+    } else if updated.is_some() {
+        ui.data_mut(|data| data.remove::<String>(pending_id.with("error")));
+    }
+    if let Some(message) = ui.data(|data| data.get_temp::<String>(pending_id.with("error"))) {
+        crate::ui_style::error_text(ui, &message);
+    }
+    if let Some(bytes) = updated {
+        queue(design, id, PropertyKey::Commands, serde_json::json!(bytes));
+    }
+}
+
+/// The argument holding the object a Macro instruction acts on, if any.
+fn macro_target_argument(name: &str) -> Option<usize> {
+    match name {
+        // A NAME, an activation count and a volume: no object
+        "select-active-working-set" | "control-audio-signal" | "set-audio-volume" => None,
+        // After the mask type or the lock state
+        "change-soft-key-mask" | "lock-unlock-mask" => Some(1),
+        _ => Some(0),
+    }
+}
+
+/// Arguments separated by spaces, quoting those that are empty or hold a
+/// space, a quote or a backslash.
+fn join_arguments(arguments: &[String]) -> String {
+    arguments
+        .iter()
+        .map(|argument| {
+            if argument.is_empty()
+                || argument
+                    .chars()
+                    .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+            {
+                format!(
+                    "\"{}\"",
+                    argument.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            } else {
+                argument.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The inverse of [`join_arguments`].
+fn split_arguments(text: &str) -> Result<Vec<String>, String> {
+    let mut arguments = Vec::new();
+    let mut characters = text.chars().peekable();
+    loop {
+        while characters.next_if(|c| c.is_whitespace()).is_some() {}
+        let Some(&first) = characters.peek() else {
+            return Ok(arguments);
+        };
+        let mut argument = String::new();
+        if first == '"' {
+            characters.next();
+            loop {
+                match characters.next() {
+                    Some('"') => break,
+                    Some('\\') => match characters.next() {
+                        Some(escaped) => argument.push(escaped),
+                        None => return Err("A quoted argument ends with a backslash".into()),
+                    },
+                    Some(c) => argument.push(c),
+                    None => return Err("A quoted argument has no closing quote".into()),
+                }
+            }
+        } else {
+            while let Some(c) = characters.next_if(|c| !c.is_whitespace()) {
+                argument.push(c);
+            }
+        }
+        arguments.push(argument);
+    }
+}
+
+/// The PNG of a Graphic Data object: a preview, its size, and a button that
+/// loads an image file in its place.
+fn render_graphic_data(
+    ui: &mut egui::Ui,
+    label: &str,
+    graphic: &ag_iso_stack::object_pool::object::GraphicData,
+    design: &EditorProject,
+) {
+    ui.label(label);
+    if graphic.data.is_empty() {
+        ui.weak("No image yet");
+    } else if let Some(texture) = crate::graphics::preview::graphic_data_texture(ui.ctx(), graphic)
+    {
+        let [width, height] = texture.size();
+        let scale = (160.0 / width.max(height) as f32).min(1.0);
+        ui.add(
+            egui::Image::new(&texture)
+                .fit_to_exact_size(egui::vec2(width as f32, height as f32) * scale),
+        );
+        ui.weak(format!(
+            "{width} × {height} px, {} bytes PNG",
+            graphic.data.len()
+        ));
+    } else {
+        crate::ui_style::error_text(ui, "The data is not a PNG this editor can read.");
+    }
+    if ui
+        .button("Load image…")
+        .on_hover_text("A PNG is kept as it is; other images are converted to PNG")
+        .clicked()
+    {
+        design.request_image_load(graphic.id);
+    }
+}
+
+fn render_text(
+    ui: &mut egui::Ui,
+    label: &str,
+    current: &str,
+    id: ObjectId,
+    property: PropertyKey,
+    design: &EditorProject,
+) {
+    let key = ui.make_persistent_id((id.value(), property));
+    touch_draft(ui.ctx(), key);
+    let mut edited = pending_text(ui, key).unwrap_or_else(|| current.to_owned());
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = ui.text_edit_singleline(&mut edited);
+
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+            update_draft(
+                ui.ctx(),
+                key,
+                design,
+                Some(property_operation(
+                    design,
+                    id,
+                    property,
+                    edited.clone().into(),
+                )),
+            );
+        }
+        let cancelled =
+            response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if cancelled {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        } else if (response.lost_focus()
+            || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+            && edited != current
+        {
+            queue(design, id, property, edited.into());
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        }
+    });
+}
+
+fn render_number(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    range: std::ops::RangeInclusive<f64>,
+    id: ObjectId,
+    property: PropertyKey,
+    design: &EditorProject,
+) {
+    let Some(current) = value.as_f64() else {
+        render_json(ui, label, value, id, property, design);
+        return;
+    };
+    let key = ui.make_persistent_id((id.value(), property));
+    touch_draft(ui.ctx(), key);
+    let mut edited = ui
+        .data(|data| match data.get_temp::<PendingValue>(key) {
+            Some(PendingValue::Number(value)) => Some(value),
+            _ => None,
+        })
+        .unwrap_or(current);
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let response = ui.add(egui::DragValue::new(&mut edited).range(range).speed(1.0));
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Number(edited)));
+            let operation = number_after_edit(value, edited, property)
+                .map(serde_json::Value::Number)
+                .map(|value| property_operation(design, id, property, value));
+            update_draft(ui.ctx(), key, design, operation);
+        }
+        let cancelled =
+            response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if cancelled {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        } else if drag_value_finished(&response)
+            || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        {
+            if edited != current {
+                if let Some(number) = number_after_edit(value, edited, property) {
+                    queue(design, id, property, number.into());
+                }
+            }
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        }
+    });
+}
+
+/// Keep the editor's keyboard range aligned with the serialized Rust field
+/// type. Offset is signed by the object-pool definition even when its current
+/// value is zero, so it must never inherit the unsigned default range.
+fn numeric_range(property: PropertyKey) -> std::ops::RangeInclusive<f64> {
+    match property {
+        PropertyKey::Offset => i32::MIN as f64..=i32::MAX as f64,
+        PropertyKey::ViewportX
+        | PropertyKey::ViewportY
+        | PropertyKey::GraphicsCursorX
+        | PropertyKey::GraphicsCursorY => i16::MIN as f64..=i16::MAX as f64,
+        PropertyKey::Scale | PropertyKey::ViewportZoom => f32::MIN as f64..=f32::MAX as f64,
+        _ => 0.0..=u64::MAX as f64,
+    }
+}
+
+fn render_picture_dimensions(
+    ui: &mut egui::Ui,
+    picture: &ag_iso_stack::object_pool::object::PictureGraphic,
+    id: ObjectId,
+    design: &EditorProject,
+) {
+    let source_width = picture.actual_width as u32;
+    let source_height = picture.actual_height as u32;
+    ui.label(format!(
+        "Source resolution: {source_width} × {source_height} px"
+    ));
+    if source_width == 0 || source_height == 0 {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "Display height is unavailable for an image with zero source dimensions.",
+        );
+        return;
+    }
+    let key = ui.make_persistent_id((id.value(), "picture_display_height"));
+    touch_draft(ui.ctx(), key);
+    let current_height = displayed_picture_height(picture.width, source_width, source_height);
+    let mut edited = ui
+        .data(|data| match data.get_temp::<PendingValue>(key) {
+            Some(PendingValue::Number(value)) => Some(value as u16),
+            _ => None,
+        })
+        .unwrap_or(current_height);
+    ui.horizontal(|ui| {
+        ui.label("Display height:");
+        let response = ui.add(egui::DragValue::new(&mut edited).range(1..=u16::MAX));
+        if response.changed() {
+            ui.data_mut(|data| data.insert_temp(key, PendingValue::Number(edited.into())));
+            let width = picture_width_for_display_height(edited, source_width, source_height);
+            let candidate = serde_json::json!(width);
+            let operation = (edited != current_height)
+                .then(|| property_operation(design, id, PropertyKey::Width, candidate));
+            update_draft(ui.ctx(), key, design, operation);
+        }
+        let cancelled =
+            response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+        if cancelled {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        } else if drag_value_finished(&response)
+            || response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+        {
+            let width = picture_width_for_display_height(edited, source_width, source_height);
+            let candidate = serde_json::json!(width);
+            if edited != current_height {
+                queue(design, id, PropertyKey::Width, candidate);
+            }
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        }
+        ui.label(format!(
+            "Current: {} × {} px",
+            picture.width, current_height
+        ));
+    });
+}
+
+fn picture_width_for_display_height(height: u16, source_width: u32, source_height: u32) -> u16 {
+    if source_width == 0 || source_height == 0 {
+        return 0;
+    }
+    let numerator = u64::from(height) * u64::from(source_width);
+    let denominator = u64::from(source_height);
+    let ceil_ideal_width = numerator.div_ceil(denominator);
+    let mut candidates = vec![1_u16, u16::MAX];
+    for candidate in [
+        ceil_ideal_width.saturating_sub(1),
+        ceil_ideal_width,
+        ceil_ideal_width + 1,
+    ] {
+        candidates.push(candidate.clamp(1, u64::from(u16::MAX)) as u16);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .min_by_key(|&width| {
+            let rendered = displayed_picture_height(width, source_width, source_height);
+            let rendered_error = u64::from(rendered.abs_diff(height));
+            let aspect_error = (u64::from(width) * denominator).abs_diff(numerator);
+            (rendered_error, aspect_error, width)
+        })
+        .unwrap_or(1)
+}
+
+fn displayed_picture_height(width: u16, source_width: u32, source_height: u32) -> u16 {
+    if source_width == 0 {
+        return 0;
+    }
+    (u64::from(source_height) * u64::from(width) / u64::from(source_width)).min(u64::from(u16::MAX))
+        as u16
+}
+
+/// Enum-backed option bits keep their serialized enum representation when edited.
+fn flag_choices(field: &str) -> Vec<serde_json::Value> {
+    let variants: &[&str] = match field {
+        "state" => &["Released", "Latched"],
+        "color" => &["ForegroundBackground", "LineFontFill"],
+        "deflection_direction" => &["AntiClockwise", "Clockwise"],
+        "bar_graph_type" => &["Filled", "NotFilled"],
+        "axis_orientation" => &["Vertical", "Horizontal"],
+        "grow_direction" => &["GrowLeftDown", "GrowRightUp"],
+        "data_code_type" => &["Raw", "RunLength"],
+        "animation_sequence" => &["SingleShot", "Loop"],
+        "disabled_behaviour" => &["Pause", "ResetToFirst", "DefaultObject", "Blank"],
+        "function_type" => {
+            use ag_iso_stack::object_pool::object_attributes::AuxiliaryFunctionType;
+            return (0..=14) // IDs 0–14 are valid AuxiliaryFunctionType values
+                .map(|value| serde_json::to_value(AuxiliaryFunctionType::from(value)).unwrap())
+                .collect();
+        }
+        _ => &[],
+    };
+    variants
+        .iter()
+        .map(|value| serde_json::json!(value))
+        .collect()
+}
+
+/// Independently worded editor guidance for the encodings in ISO 11783-6:2018,
+/// J.4.6, Table J.5. Keep protocol facts exact; do not copy the standard’s prose.
+fn auxiliary_function_type_help(
+    function_type: ag_iso_stack::object_pool::object_attributes::AuxiliaryFunctionType,
+) -> (String, String) {
+    use ag_iso_stack::object_pool::object_attributes::AuxiliaryFunctionType::*;
+
+    let (label, behavior, values) = match function_type {
+        BooleanLatching => (
+            "Boolean — latching",
+            "Choose this for an on/off control that keeps its state after the operator lets go.",
+            "Value 1: 0 = off (backward/down/left/not pressed); 1 = on (forward/up/right/pressed).\nValue 2: running total of activations after power-up.",
+        ),
+        AnalogueMaintains => (
+            "Analogue — maintains position",
+            "Choose this when releasing a variable control leaves its output unchanged.",
+            "Value 1: 0–100%.\nValue 2: unused for this type; transmit 0xFFFF.",
+        ),
+        BooleanNonLatching => (
+            "Boolean — momentary",
+            "Choose this for an on/off control that is active only while operated, such as a push button.",
+            "Value 1: 0 = off; 1 = momentary activation (forward/up/right/pressed); 2 = held.\nValue 2: running total of activations after power-up. Continuing to hold an active control adds nothing.",
+        ),
+        AnalogueReturnToCenter => (
+            "Analogue — returns to 50%",
+            "Choose this for a variable control with travel on both sides of neutral. Letting go restores a 50% output.",
+            "Value 1: 0–100%.\nValue 2: unused for this type; transmit 0xFFFF.",
+        ),
+        AnalogueReturnToZero => (
+            "Analogue — returns to 0%",
+            "Choose this for a variable control whose output falls back to zero when the operator lets go.",
+            "Value 1: 0–100%.\nValue 2: unused for this type; transmit 0xFFFF.",
+        ),
+        DualBooleanLatching => (
+            "Dual Boolean — both directions latching",
+            "Choose this when both directional states and the neutral state remain selected after release.",
+            "Value 1: 0 = centre/off; 1 = forward/up/right; 4 = backward/down/left.\nValue 2: running total of activations after power-up.",
+        ),
+        DualBooleanNonLatching => (
+            "Dual Boolean — both directions momentary",
+            "Choose this for two opposing actions that stop on release, such as holding a rocker to raise or lower a tool.",
+            "Value 1: 0 = off; 1 = momentary forward/up/right; 2 = held forward/up/right; 4 = momentary backward/down/left; 8 = held backward/down/left.\nValue 2: running total of activations after power-up. Continuing to hold an active control adds nothing.",
+        ),
+        DualBooleanLatchingUp => (
+            "Dual Boolean — latching up, momentary down",
+            "The forward/up/right action stays selected after release. The opposite action requires continued operation; releasing it selects off. Off is also a stable setting.",
+            "Value 1: 0 = off; 1 = latched forward/up/right; 4 = momentary backward/down/left; 8 = held backward/down/left.\nValue 2: running total of activations after power-up. Continuing to hold an active control adds nothing.",
+        ),
+        DualBooleanLatchingDown => (
+            "Dual Boolean — latching down, momentary up",
+            "The backward/down/left action stays selected after release. The opposite action requires continued operation; releasing it selects off. Off is also a stable setting.",
+            "Value 1: 0 = off; 1 = momentary forward/up/right; 2 = held forward/up/right; 4 = latched backward/down/left.\nValue 2: running total of activations after power-up. Continuing to hold an active control adds nothing.",
+        ),
+        CombinedAnalogueReturnWithLatch => (
+            "Combined analogue — returns to 50%, latching endpoints",
+            "Use this for variable movement around a 50% neutral output, plus a persistent directional state available at either end of travel.",
+            "Value 1: 0–100%; 0xFB00 = latched forward; 0xFB01 = latched backward.\nValue 2: running total of latch engagements after power-up. An engagement is counted only when the previous state was not latched.",
+        ),
+        CombinedAnalogueMaintainsWithLatch => (
+            "Combined analogue — maintains position, latching endpoints",
+            "Use this when a variable setting remains after release and either end of travel can also select a persistent directional state.",
+            "Value 1: 0–100%; 0xFB00 = latched forward; 0xFB01 = latched backward.\nValue 2: running total of latch engagements after power-up. An engagement is counted only when the previous state was not latched.",
+        ),
+        QuadratureBooleanNonLatching => (
+            "Quadrature Boolean — momentary",
+            "Use this for a two-axis directional control that becomes neutral on release. Each direction has its own two-bit state, allowing a change between held directions to be represented in one report.",
+            "Value 1: bits 1–0 = forward/up; bits 3–2 = backward/down; bits 5–4 = right; bits 7–6 = left. Each pair: 00 = off; 01 = first activation; 10 = held; 11 = reserved.\nValue 2: running total of activations across both axes after power-up. Continuing to hold an active direction adds nothing.",
+        ),
+        QuadratureAnalogueMaintains => (
+            "Quadrature analogue — maintains position",
+            "Use this for two independent, perpendicular variable controls whose settings remain after release. A 50% reading marks the midpoint of either axis.",
+            "Value 1: axis 1, 0% = backward/down; 100% = forward/up.\nValue 2: axis 2, 0% = left; 100% = right.",
+        ),
+        QuadratureAnalogueReturnToCenter => (
+            "Quadrature analogue — returns to 50%",
+            "Use this for a two-axis variable control that settles at a 50% reading on each axis when the operator lets go.",
+            "Value 1: axis 1, 0% = backward/down; 100% = forward/up.\nValue 2: axis 2, 0% = left; 100% = right.",
+        ),
+        BidirectionalEncoder => (
+            "Bidirectional encoder",
+            "Use this for rotation measured in steps. Turning one way adds to the count; reversing direction subtracts from it.",
+            "Value 1: current count, 0–0xFFFF, wrapping between 0xFFFF and 0.\nValue 2: fixed calibration, 1–0xFFFF encoder counts per revolution.",
+        ),
+        _ => (
+            "Invalid",
+            "This auxiliary function type is not supported to be used.",
+            "No control behavior or status values are defined.",
+        ),
+    };
+    let type_id = u8::from(function_type);
+    let mut help = format!("{behavior}\n\nStatus report fields\n{values}");
+    if matches!(type_id, 1 | 3 | 4 | 9 | 10 | 12 | 13) {
+        help.push_str("\n\nAnalogue values encode 0–100% as 0–0xFAFF.");
+        if !matches!(type_id, 12 | 13) {
+            help.push_str(
+                " 0% = backward/down/left/counter-clockwise; 100% = forward/up/right/clockwise.",
+            );
+        }
+    }
+    if matches!(type_id, 0 | 2 | 5..=11) {
+        help.push_str(
+            "\n\nAfter a transition counter reaches 0xFFFF, its next increment produces 0.",
+        );
+    }
+    help.push_str("\n\nTechnical reference: ISO 11783-6:2018, J.4.6, Table J.5.");
+    (format!("{type_id}: {label}"), help)
+}
+
+/// Keep the selected value and menu entries consistent, including type-specific help.
+fn flag_choice_presentation(field: &str, value: &serde_json::Value) -> (String, Option<String>) {
+    if field == "function_type" {
+        if let Ok(function_type) = serde_json::from_value(value.clone()) {
+            let (label, help) = auxiliary_function_type_help(function_type);
+            return (label, Some(help));
+        }
+    }
+    let label = value
+        .as_str()
+        .map(human_readable_property_name)
+        .unwrap_or_else(|| value.to_string());
+    (label, None)
+}
+
+fn render_flag_field(
+    ui: &mut egui::Ui,
+    field: &str,
+    value: &serde_json::Value,
+    fields: &serde_json::Map<String, serde_json::Value>,
+    id: ObjectId,
+    object_type: ObjectType,
+    property: PropertyKey,
+    design: &EditorProject,
+) -> Option<serde_json::Value> {
+    let label = human_readable_property_name(field);
+    if let Some(mut enabled) = value.as_bool() {
+        if !crate::vt_compatibility::supported_property_flag(
+            object_type,
+            property,
+            field,
+            design.vt_version,
+        ) {
+            if !enabled {
+                return None;
+            }
+            repair_warning(ui, &label, design.vt_version, |version| {
+                crate::vt_compatibility::supported_property_flag(
+                    object_type,
+                    property,
+                    field,
+                    version,
+                )
+            });
+        }
+        let mut updated = fields.clone();
+        let candidate_enabled = !enabled;
+        updated.insert(field.to_owned(), candidate_enabled.into());
+        let version_allows = !candidate_enabled
+            || crate::vt_compatibility::supported_property_flag(
+                object_type,
+                property,
+                field,
+                design.vt_version,
+            );
+        let response = ui.add_enabled(
+            version_allows
+                && property_choice_is_valid(
+                    design,
+                    id,
+                    property,
+                    serde_json::Value::Object(updated),
+                ),
+            egui::Checkbox::new(&mut enabled, label),
+        );
+        return response.changed().then_some(enabled.into());
+    }
+    let choices = flag_choices(field);
+    let mut updated = None;
+    let (selected_label, selected_help) = flag_choice_presentation(field, value);
+    let response = ui
+        .horizontal(|ui| {
+            let label_response = ui.label(&label);
+            egui::ComboBox::from_id_salt(&label)
+                .icon(crate::ui_style::combo_box_icon)
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    for choice in choices {
+                        let (label, help) = flag_choice_presentation(field, &choice);
+                        let mut candidate_fields = fields.clone();
+                        candidate_fields.insert(field.to_owned(), choice.clone());
+                        let valid = value == &choice
+                            || property_choice_is_valid(
+                                design,
+                                id,
+                                property,
+                                serde_json::Value::Object(candidate_fields),
+                            );
+                        let mut response = ui
+                            .add_enabled(valid, egui::Button::selectable(value == &choice, label));
+                        if let Some(help) = help {
+                            response = response.on_hover_text(help);
+                        }
+                        if response.clicked() && value != &choice {
+                            updated = Some(choice);
+                        }
+                    }
+                })
+                .response
+                .labelled_by(label_response.id)
+        })
+        .inner;
+    if let Some(help) = selected_help {
+        response.on_hover_text(help);
+    }
+    if field == "function_type" {
+        ui.small("Hover over a type for control behavior and status values.")
+            .on_hover_text("For a Type 2 assignment, select the same type ID for the input and the function. This rule applies to both manual assignments and assignments made by a Working Set. ISO 15077 specifies the applicable requirements for the physical operator controls.");
+    }
+    updated
+}
+
+/// Independent bits and booleans use checkboxes; mutually exclusive enum values
+/// use dropdowns. Both preserve the property's serialized representation.
+fn render_flag_set(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    id: ObjectId,
+    object_type: ObjectType,
+    property: PropertyKey,
+    design: &EditorProject,
+) {
+    if let Some(current) = value.as_u64() {
+        let bits = if property == PropertyKey::LineArt {
+            16
+        } else {
+            8
+        };
+        ui.label(label);
+        ui.horizontal_wrapped(|ui| {
+            for bit in (0..bits).rev() {
+                let mask = 1_u64 << bit;
+                let mut enabled = current & mask != 0;
+                let candidate = if enabled {
+                    current & !mask
+                } else {
+                    current | mask
+                };
+                let response = ui
+                    .add_enabled(
+                        property_choice_is_valid(design, id, property, candidate.into()),
+                        egui::Checkbox::new(&mut enabled, format!("{bit}")),
+                    )
+                    .on_hover_text(format!("Bit {bit}"));
+                if response.changed() {
+                    let updated = if enabled {
+                        current | mask
+                    } else {
+                        current & !mask
+                    };
+                    queue(design, id, property, updated.into());
+                }
+            }
+        });
+    } else if let Some(fields) = value.as_object() {
+        ui.label(label);
+        for (field, value) in fields {
+            // The font-size selector already chooses fixed/proportional mode.
+            if property == PropertyKey::FontStyle && field == "proportional" {
+                continue;
+            }
+            let edited = ui
+                .push_id(field, |ui| {
+                    render_flag_field(ui, field, value, fields, id, object_type, property, design)
+                })
+                .inner;
+            if let Some(edited) = edited {
+                let mut updated = fields.clone();
+                updated.insert(field.clone(), edited);
+                let updated = serde_json::Value::Object(updated);
+                queue(design, id, property, updated);
+            }
+        }
+    } else {
+        render_json(ui, label, value, id, property, design);
+    }
+}
+
+fn render_reference(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    descriptor: &crate::object_properties::PropertyDescriptor,
+    id: ObjectId,
+    property: PropertyKey,
+    design: &EditorProject,
+) {
+    let PropertySemantic::ObjectReference { allowed_types } = &descriptor.semantic else {
+        return;
+    };
+    let selected = value.as_u64();
+    ui.horizontal(|ui| {
+        let selected_id = selected.and_then(|id| ObjectId::new(id as u16).ok());
+        let referenced_object = selected_id.and_then(|id| design.get_pool().object_by_id(id));
+        let allow_none = design.get_pool().object_by_id(id).is_some_and(|object| {
+            crate::object_properties::property_accepts_null(object, property)
+        });
+        // A reference to a missing object or one of the wrong type is as good as none
+        let usable = referenced_object.is_some_and(|object| {
+            allowed_types.is_empty() || allowed_types.contains(&object.object_type())
+        });
+        if usable || (selected_id.is_none() && allow_none) {
+            ui.label(label);
+        } else {
+            let wanted = allowed_types
+                .iter()
+                .map(|object_type| format!("{object_type:?}"))
+                .collect::<Vec<_>>()
+                .join(" or ");
+            ui.colored_label(ui.visuals().warn_fg_color, format!("{label} (required)"))
+                .on_hover_text(format!("Required: select a {wanted} object"));
+        }
+        let label = selected_id.map_or_else(
+            || "None".into(),
+            |id| {
+                referenced_object.map_or_else(
+                    || format!("Missing object #{}", design.format_object_id(id.value())),
+                    |object| object_selector_label(design, object),
+                )
+            },
+        );
+        if let Some(reference) = crate::object_picker::button(
+            ui,
+            (id.value(), property),
+            &label,
+            &format!(
+                "Change {property} reference on {}",
+                crate::object_picker::object_label(design, Some(id))
+            ),
+            design,
+            selected_id,
+            allow_none,
+            |candidate| {
+                (allowed_types.is_empty() || allowed_types.contains(&candidate.object_type()))
+                    && crate::vt_compatibility::supported_object_type(
+                        candidate.object_type(),
+                        design.vt_version,
+                    )
+                    && validate_pointer_target(design, id, property, candidate.id()).is_ok()
+            },
+            |ui, reference| {
+                crate::object_picker::impact::review_queued(ui, design, |candidate| {
+                    queue(
+                        candidate,
+                        id,
+                        property,
+                        reference
+                            .0
+                            .map_or(serde_json::Value::Null, |id| serde_json::json!(id.value())),
+                    );
+                })
+            },
+        ) {
+            queue(
+                design,
+                id,
+                property,
+                reference
+                    .0
+                    .map_or(serde_json::Value::Null, |id| serde_json::json!(id.value())),
+            );
+        }
+        if let Some(object) = referenced_object {
+            if ui
+                .link("View")
+                .on_hover_text("View referenced object")
+                .clicked()
+            {
+                select_object(design, object.id());
+            }
+        }
+    });
+}
+
+fn queue_allowed_references(design: &EditorProject, pointer: ObjectId, references: &[ObjectId]) {
+    design.queue_operation(Operation::SetObjectPointerAllowedReferences {
+        object: ObjectTarget::id(pointer.value()),
+        references: references
+            .iter()
+            .map(|id| ObjectTarget::id(id.value()))
+            .collect(),
+    });
+}
+
+fn render_pointer_reference(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    descriptor: &crate::object_properties::PropertyDescriptor,
+    id: ObjectId,
+    property: PropertyKey,
+    design: &EditorProject,
+) {
+    let PropertySemantic::ObjectReference { allowed_types } = &descriptor.semantic else {
+        return;
+    };
+    let selected_id = value.as_u64().and_then(|id| ObjectId::new(id as u16).ok());
+    let references = design
+        .get_pool()
+        .object_by_id(id)
+        .map(|object| design.get_object_info(object).allowed_references)
+        .unwrap_or_default();
+
+    if references.is_empty() {
+        render_reference(ui, label, value, descriptor, id, property, design);
+    } else {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let selected_label = selected_id.map_or_else(
+                || "None".to_owned(),
+                |target| crate::object_picker::object_label(design, Some(target)),
+            );
+            egui::ComboBox::from_id_salt((id.value(), property, "allowed_reference"))
+                .icon(crate::ui_style::combo_box_icon)
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(selected_id.is_none(), "None").clicked()
+                        && selected_id.is_some()
+                    {
+                        queue(design, id, property, serde_json::Value::Null);
+                    }
+                    for target in &references {
+                        let Some(candidate) = design.get_pool().object_by_id(*target) else {
+                            ui.add_enabled(
+                                false,
+                                egui::Button::new(format!(
+                                    "Missing object #{}",
+                                    design.format_object_id(target.value())
+                                )),
+                            )
+                            .on_disabled_hover_text("This allowed object no longer exists.");
+                            continue;
+                        };
+                        if selected_id != Some(*target)
+                            && !crate::vt_compatibility::supported_object_type(
+                                candidate.object_type(),
+                                design.vt_version,
+                            )
+                        {
+                            continue;
+                        }
+                        let choice = crate::object_picker::object_label(design, Some(*target));
+                        let reason = if !allowed_types.is_empty()
+                            && !allowed_types.contains(&candidate.object_type())
+                        {
+                            Some("This object type is not valid for this reference.".to_owned())
+                        } else if !crate::vt_compatibility::supported_object_type(
+                            candidate.object_type(),
+                            design.vt_version,
+                        ) {
+                            Some(format!(
+                                "This object type is unavailable in VT{}.",
+                                u8::from(design.vt_version)
+                            ))
+                        } else {
+                            validate_pointer_target(design, id, property, *target).err()
+                        };
+                        let response = ui.add_enabled(
+                            reason.is_none(),
+                            egui::Button::selectable(selected_id == Some(*target), choice),
+                        );
+                        if let Some(reason) = reason {
+                            response.on_disabled_hover_text(reason);
+                        } else if response.clicked() && selected_id != Some(*target) {
+                            queue(design, id, property, serde_json::json!(target.value()));
+                        }
+                    }
+                });
+            if let Some(object) =
+                selected_id.and_then(|target| design.get_pool().object_by_id(target))
+            {
+                if ui
+                    .link("View")
+                    .on_hover_text("View referenced object")
+                    .clicked()
+                {
+                    select_object(design, object.id());
+                }
+            }
+        });
+    }
+
+    ui.horizontal(|ui| {
+        ui.label("Allowed references:");
+        if let Some(reference) = crate::object_picker::button(
+            ui,
+            (id.value(), property, "add_allowed_reference"),
+            "Add",
+            &format!(
+                "Add an allowed reference for {}",
+                crate::object_picker::object_label(design, Some(id))
+            ),
+            design,
+            None,
+            false,
+            |candidate| {
+                candidate.id() != id
+                    && !references.contains(&candidate.id())
+                    && crate::vt_compatibility::supported_object_type(
+                        candidate.object_type(),
+                        design.vt_version,
+                    )
+                    && (allowed_types.is_empty()
+                        || allowed_types.contains(&candidate.object_type()))
+                    && crate::pool_validation::would_create_circular_reference(
+                        design.get_pool(),
+                        id,
+                        candidate.id(),
+                    )
+                    .is_ok()
+            },
+            |_, _| true,
+        ) {
+            if let Some(reference) = reference.0 {
+                let mut updated = references.clone();
+                updated.push(reference);
+                queue_allowed_references(design, id, &updated);
+            }
+        }
+    });
+    for target in &references {
+        ui.horizontal(|ui| {
+            ui.label(crate::object_picker::object_label(design, Some(*target)));
+            if ui.small_button("Remove").clicked() {
+                let updated: Vec<_> = references
+                    .iter()
+                    .copied()
+                    .filter(|reference| reference != target)
+                    .collect();
+                queue_allowed_references(design, id, &updated);
+            }
+        });
+    }
+}
+
+fn validate_pointer_target(
+    design: &EditorProject,
+    pointer: ObjectId,
+    property: PropertyKey,
+    target: ObjectId,
+) -> Result<(), String> {
+    let mut transaction = OperationTransaction::new(None);
+    transaction.add_operation(Operation::SetObjectReference {
+        object: ObjectTarget::id(pointer.value()),
+        property,
+        reference: Some(ObjectTarget::id(target.value())),
+    });
+    design
+        .validate_transaction(&transaction)
+        .map_err(|diagnostics| design.format_transaction_diagnostics(&diagnostics))
+}
+
+fn render_justification(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    id: ObjectId,
+    property: PropertyKey,
+    design: &EditorProject,
+) {
+    let Some(fields) = value.as_object() else {
+        render_json(ui, label, value, id, property, design);
+        return;
+    };
+    let horizontal = fields
+        .get("horizontal")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Left");
+    let vertical = fields
+        .get("vertical")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Top");
+    if design.vt_version < VtVersion::Version4 && vertical != "Top" {
+        repair_warning(ui, "Vertical alignment", design.vt_version, |version| {
+            crate::vt_compatibility::supported_vertical_alignment(
+                ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Middle,
+                version,
+            )
+        });
+    }
+    ui.horizontal(|ui| {
+        let horizontal_label = ui.label(label);
+        egui::ComboBox::from_id_salt(label)
+            .icon(crate::ui_style::combo_box_icon)
+            .selected_text(horizontal)
+            .show_ui(ui, |ui| {
+                for choice in ["Left", "Middle", "Right"] {
+                    if ui.selectable_label(horizontal == choice, choice).clicked() {
+                        let mut updated = fields.clone();
+                        updated.insert("horizontal".to_owned(), choice.into());
+                        queue(design, id, property, serde_json::Value::Object(updated));
+                    }
+                }
+            })
+            .response
+            .labelled_by(horizontal_label.id);
+        if design.vt_version < VtVersion::Version4 && vertical == "Top" {
+            return;
+        }
+        let vertical_label = ui.label("Vertical");
+        egui::ComboBox::from_id_salt("Vertical")
+            .icon(crate::ui_style::combo_box_icon)
+            .selected_text(vertical)
+            .show_ui(ui, |ui| {
+                for choice in ["Top", "Middle", "Bottom"] {
+                    let alignment = match choice {
+                        "Top" => {
+                            ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Top
+                        }
+                        "Middle" => {
+                            ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Middle
+                        }
+                        _ => {
+                            ag_iso_stack::object_pool::object_attributes::VerticalAlignment::Bottom
+                        }
+                    };
+                    let supported = crate::vt_compatibility::supported_vertical_alignment(
+                        alignment,
+                        design.vt_version,
+                    );
+                    let response = ui.add_enabled(
+                        supported,
+                        egui::Button::selectable(vertical == choice, choice),
+                    );
+                    if !supported && response.contains_pointer() {
+                        if let Some(availability) =
+                            crate::vt_compatibility::availability_description(|version| {
+                                crate::vt_compatibility::supported_vertical_alignment(
+                                    alignment, version,
+                                )
+                            })
+                        {
+                            response.show_tooltip_text(availability);
+                        }
+                    }
+                    if response.clicked() && choice != vertical {
+                        let mut updated = fields.clone();
+                        updated.insert("vertical".to_owned(), choice.into());
+                        let updated = serde_json::Value::Object(updated);
+                        if property_choice_is_valid(design, id, property, updated.clone()) {
+                            queue(design, id, property, updated);
+                        }
+                    }
+                }
+            })
+            .response
+            .labelled_by(vertical_label.id);
+    });
+}
+
+fn render_json(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &serde_json::Value,
+    id: ObjectId,
+    property: PropertyKey,
+    design: &EditorProject,
+) {
+    let key = ui.make_persistent_id((id.value(), property));
+    touch_draft(ui.ctx(), key);
+    let original = serde_json::to_string(value).unwrap_or_default();
+    let mut edited = pending_text(ui, key).unwrap_or_else(|| original.clone());
+    ui.label(label);
+    let response = ui.add(
+        egui::TextEdit::multiline(&mut edited)
+            .desired_rows(2)
+            .code_editor(),
+    );
+    if response.changed() {
+        ui.data_mut(|data| data.insert_temp(key, PendingValue::Text(edited.clone())));
+        let operation = serde_json::from_str(&edited)
+            .ok()
+            .map(|value| property_operation(design, id, property, value));
+        update_draft(ui.ctx(), key, design, operation);
+    }
+    let cancelled = response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Escape));
+    if cancelled {
+        ui.data_mut(|data| data.remove::<PendingValue>(key));
+        clear_draft(ui.ctx(), key);
+    } else if response.lost_focus()
+        || response.has_focus()
+            && ui.input(|input| input.modifiers.ctrl && input.key_pressed(egui::Key::Enter))
+    {
+        if edited == original {
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+            return;
+        }
+        if let Ok(parsed) = serde_json::from_str(&edited) {
+            queue(design, id, property, parsed);
+            ui.data_mut(|data| data.remove::<PendingValue>(key));
+            clear_draft(ui.ctx(), key);
+        } else {
+            crate::ui_style::error_text(ui, "Invalid JSON");
+        }
+    }
+}
+
+fn pending_text(ui: &egui::Ui, key: egui::Id) -> Option<String> {
+    ui.data(|data| match data.get_temp::<PendingValue>(key) {
+        Some(PendingValue::Text(value)) => Some(value),
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::direct_reference_count;
+    use crate::default_object;
+    use ag_iso_stack::object_pool::object::Object;
+    use ag_iso_stack::object_pool::object_attributes::ObjectRef;
+    use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectPool, ObjectType};
+
+    #[test]
+    fn reference_count_counts_repeated_entries_and_object_pointers() {
+        let target_id = ObjectId::new(1).unwrap();
+        let unreferenced_id = ObjectId::new(4).unwrap();
+        let mut pool = ObjectPool::new();
+
+        let mut target = default_object(ObjectType::PictureGraphic);
+        let Object::PictureGraphic(target) = &mut target else {
+            unreachable!()
+        };
+        target.id = target_id;
+        pool.add(Object::PictureGraphic(target.clone()));
+
+        let mut container = default_object(ObjectType::Container);
+        let Object::Container(container) = &mut container else {
+            unreachable!()
+        };
+        container.id = ObjectId::new(2).unwrap();
+        container.object_refs = (0..2)
+            .map(|_| ObjectRef {
+                id: target_id,
+                offset: Default::default(),
+            })
+            .collect();
+        pool.add(Object::Container(container.clone()));
+
+        let mut pointer = default_object(ObjectType::ObjectPointer);
+        let Object::ObjectPointer(pointer) = &mut pointer else {
+            unreachable!()
+        };
+        pointer.id = ObjectId::new(3).unwrap();
+        pointer.value = NullableObjectId(Some(target_id));
+        pool.add(Object::ObjectPointer(pointer.clone()));
+
+        assert_eq!(direct_reference_count(&pool, target_id), 3);
+        assert_eq!(direct_reference_count(&pool, unreferenced_id), 0);
+    }
+}
+
+#[cfg(test)]
+mod string_length_tests {
+    use super::{max_string_length, string_with_length};
+    use ag_iso_stack::object_pool::vt_version::VtVersion;
+
+    #[test]
+    fn length_pads_with_spaces_and_only_drops_trailing_spaces() {
+        assert_eq!(string_with_length("0", 4), "0   ");
+        assert_eq!(string_with_length("0   ", 2), "0 ");
+        assert_eq!(string_with_length("a b  ", 0), "a b");
+        assert_eq!(string_with_length("Ä", 2), "Ä ");
+    }
+
+    #[test]
+    fn wide_strings_hold_half_as_many_characters_after_the_byte_order_mark() {
+        assert_eq!(max_string_length(255, VtVersion::Version3), 255);
+        assert_eq!(max_string_length(255, VtVersion::Version4), 126);
+        assert_eq!(max_string_length(65535, VtVersion::Version6), 32766);
+    }
+
+    #[test]
+    fn a_string_variable_of_an_input_string_holds_at_most_255_bytes() {
+        use super::string_value_max_bytes;
+        use crate::default_object;
+        use ag_iso_stack::object_pool::object::Object;
+        use ag_iso_stack::object_pool::{NullableObjectId, ObjectId, ObjectPool, ObjectType};
+
+        let mut pool = ObjectPool::new();
+        let Object::StringVariable(mut variable) = default_object(ObjectType::StringVariable)
+        else {
+            unreachable!()
+        };
+        variable.id = ObjectId::new(5).unwrap();
+        pool.add(Object::StringVariable(variable.clone()));
+        let variable = Object::StringVariable(variable);
+        assert_eq!(string_value_max_bytes(&variable, &pool), Some(65535));
+
+        let Object::InputString(mut input) = default_object(ObjectType::InputString) else {
+            unreachable!()
+        };
+        input.id = ObjectId::new(6).unwrap();
+        input.variable_reference = NullableObjectId(Some(ObjectId::new(5).unwrap()));
+        pool.add(Object::InputString(input.clone()));
+        assert_eq!(string_value_max_bytes(&variable, &pool), Some(255));
+        // The Input String has no value of its own
+        assert_eq!(
+            string_value_max_bytes(&Object::InputString(input), &pool),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::parse_name_hex;
+    use crate::{EditorProject, ObjectTarget, Operation, OperationTransaction, PropertyKey};
+    use ag_iso_stack::object_pool::{object::Object, ObjectType};
+
+    #[test]
+    fn hex_names_accept_a_prefix_and_spaces_but_no_more_than_64_bits() {
+        assert_eq!(
+            parse_name_hex("0xA00E 8400 00C0 FFEE"),
+            Some(0xA00E_8400_00C0_FFEE)
+        );
+        assert_eq!(parse_name_hex("ff"), Some(0xFF));
+        assert_eq!(parse_name_hex(""), None);
+        assert_eq!(parse_name_hex("1 0000 0000 0000 0000"), None);
+        assert_eq!(parse_name_hex("xyz"), None);
+    }
+
+    #[test]
+    fn a_name_above_53_bits_is_stored_exactly() {
+        let mut project = EditorProject::default();
+        let name = project.generate_smart_name_for_new_object(ObjectType::ExternalReferenceName);
+        let id = project
+            .create_object(ObjectType::ExternalReferenceName, name)
+            .unwrap();
+        let raw: u64 = 0xA00E_8400_00C0_FFEF;
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(id.value()),
+            property: PropertyKey::Name,
+            value: serde_json::json!(raw),
+        });
+        project.execute_transaction(transaction).unwrap();
+
+        let Some(Object::ExternalReferenceName(reference)) = project.get_pool().object_by_id(id)
+        else {
+            panic!("expected the External Reference Name");
+        };
+        assert_eq!(u64::from(reference.name), raw);
+        assert_eq!(reference.name.get_industry_group(), 2);
+    }
+}
+
+#[cfg(test)]
+mod colour_map_tests {
+    use super::colour_map_with_size;
+
+    #[test]
+    fn resizing_keeps_entries_and_maps_new_ones_to_themselves() {
+        assert_eq!(colour_map_with_size(&[5, 6], 4), vec![5, 6, 2, 3]);
+        assert_eq!(colour_map_with_size(&[5, 6, 7], 2), vec![5, 6]);
+        let identity = colour_map_with_size(&[], 256);
+        assert_eq!(identity.len(), 256);
+        assert!(identity.iter().enumerate().all(|(i, v)| i == *v as usize));
+    }
+}
+
+#[cfg(test)]
+mod code_plane_tests {
+    use super::{default_character_range, range_preview};
+    use ag_iso_stack::object_pool::object::CharacterRange;
+
+    #[test]
+    fn ranges_preview_their_printable_ends() {
+        let range = |first, last| CharacterRange {
+            first_character: first,
+            last_character: last,
+        };
+        assert_eq!(range_preview(0, &range(0x41, 0x5A)), "A – Z");
+        assert_eq!(range_preview(0, &range(0x20AC, 0x20AC)), "€");
+        assert_eq!(range_preview(0, &range(0x00, 0x1F)), "");
+        assert_eq!(range_preview(1, &range(0xF600, 0xF64F)), "😀 – 🙏");
+    }
+
+    #[test]
+    fn new_ranges_cover_printable_ascii_or_the_whole_plane() {
+        assert_eq!(default_character_range(0).first_character, 0x20);
+        assert_eq!(default_character_range(0).last_character, 0x7E);
+        assert_eq!(default_character_range(2).last_character, 0xFFFF);
+    }
+}
+
+#[cfg(test)]
+mod macro_command_tests {
+    use super::{join_arguments, split_arguments};
+    use crate::macro_authoring::{decode_macro_commands, encode_macro_instruction};
+    use ag_iso_stack::object_pool::vt_version::VtVersion;
+
+    #[test]
+    fn arguments_round_trip_through_their_text() {
+        let arguments: Vec<String> = ["1000", "Hello world", "", r#"say "hi""#, r"a\b"]
+            .map(str::to_owned)
+            .to_vec();
+        let text = join_arguments(&arguments);
+        assert_eq!(text, r#"1000 "Hello world" "" "say \"hi\"" "a\\b""#);
+        assert_eq!(split_arguments(&text).unwrap(), arguments);
+        assert_eq!(split_arguments("  7   show ").unwrap(), vec!["7", "show"]);
+        assert!(split_arguments("\"open").is_err());
+    }
+
+    #[test]
+    fn edited_instructions_encode_like_the_cli() {
+        let arguments = split_arguments("1000 42").unwrap();
+        let bytes =
+            encode_macro_instruction("change-numeric-value", &arguments, VtVersion::Version4)
+                .unwrap();
+        let decoded = decode_macro_commands(&bytes, VtVersion::Version4).unwrap();
+        assert_eq!(decoded[0].name, "change-numeric-value");
+        assert_eq!(join_arguments(&decoded[0].arguments), "1000 42");
+    }
+}
+
+#[cfg(test)]
+mod polygon_draft_tests {
+    use super::*;
+    use ag_iso_stack::object_pool::ObjectType;
+
+    #[test]
+    fn disappearing_polygon_coordinate_draft_does_not_commit() {
+        let mut project = EditorProject::default();
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::CreateObject {
+            object_id: Some(7),
+            object_type: ObjectType::OutputPolygon,
+            name: "Polygon".into(),
+        });
+        project.execute_transaction(transaction).unwrap();
+        let before = project.save_project().unwrap();
+        let ctx = egui::Context::default();
+        let key = egui::Id::new("test_polygon_draft");
+        update_draft(
+            &ctx,
+            key,
+            &project,
+            Some(Operation::SetProperty {
+                object: ObjectTarget::id(7),
+                property: PropertyKey::Points,
+                value: serde_json::json!([{"x":8,"y":8},{"x":16,"y":8},{"x":8,"y":16}]),
+            }),
+        );
+        finish_property_edits(&ctx, &project);
+        finish_property_edits(&ctx, &project);
+        assert!(!project.commit_queued("Finish hidden editor"));
+        assert_eq!(project.save_project().unwrap(), before);
+    }
+    fn input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// Typing in a Macro's arguments and then selecting another object, so
+    /// the field disappears before it loses focus, still commits the edit.
+    #[test]
+    fn unfinished_macro_arguments_commit_when_the_editor_disappears() {
+        let mut project = EditorProject::default();
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::CreateObject {
+            object_id: Some(7),
+            object_type: ObjectType::Macro,
+            name: "Macro".into(),
+        });
+        let bytes = crate::macro_authoring::encode_macro_instruction(
+            "change-numeric-value",
+            &["1000".into(), "42".into()],
+            project.vt_version,
+        )
+        .unwrap();
+        transaction.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(7),
+            property: PropertyKey::Commands,
+            value: serde_json::json!(bytes),
+        });
+        project.execute_transaction(transaction).unwrap();
+
+        let ctx = egui::Context::default();
+        let frame = |project: &mut EditorProject, shown: bool, events: Vec<egui::Event>| {
+            let output = ctx.run(input(events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if shown {
+                        let object = project
+                            .get_pool()
+                            .object_by_id(ObjectId::new(7).unwrap())
+                            .unwrap()
+                            .clone();
+                        render_property_editor(ui, &object, project);
+                    }
+                });
+                finish_property_edits(ctx, project);
+            });
+            project.commit_queued("Edit");
+            output
+        };
+        frame(&mut project, true, Vec::new());
+        // The grid lays itself out on the first frame
+        let output = frame(&mut project, true, Vec::new());
+        let field = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "1000 42" => {
+                    Some(text.pos + egui::vec2(10.0, 6.0))
+                }
+                _ => None,
+            })
+            .expect("the arguments field shows the instruction's arguments");
+        let click = |pressed| egui::Event::PointerButton {
+            pos: field,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut project, true, vec![egui::Event::PointerMoved(field)]);
+        frame(&mut project, true, vec![click(true)]);
+        frame(&mut project, true, vec![click(false)]);
+        frame(
+            &mut project,
+            true,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::End,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Text("0".into()),
+            ],
+        );
+        // Another object is selected: the editor is gone
+        frame(&mut project, false, Vec::new());
+        frame(&mut project, false, Vec::new());
+
+        let Some(Object::Macro(stored)) =
+            project.get_pool().object_by_id(ObjectId::new(7).unwrap())
+        else {
+            panic!("the macro exists");
+        };
+        let decoded =
+            crate::macro_authoring::decode_macro_commands(&stored.commands, project.vt_version)
+                .unwrap();
+        assert_eq!(join_arguments(&decoded[0].arguments), "1000 420");
     }
 }

@@ -7,7 +7,7 @@ use ag_iso_stack::object_pool::{
 };
 
 pub fn get_allowed_child_refs(obj_type: ObjectType, version: VtVersion) -> Vec<ObjectType> {
-    match obj_type {
+    let mut allowed = match obj_type {
         ObjectType::WorkingSet => WorkingSet::get_allowed_child_refs(version),
         ObjectType::DataMask => DataMask::get_allowed_child_refs(version),
         ObjectType::AlarmMask => AlarmMask::get_allowed_child_refs(version),
@@ -32,11 +32,34 @@ pub fn get_allowed_child_refs(obj_type: ObjectType, version: VtVersion) -> Vec<O
             ObjectLabelReferenceList::get_allowed_child_refs(version)
         }
         _ => vec![],
-    }
+    };
+    allowed
+        .retain(|child_type| crate::vt_compatibility::supported_object_type(*child_type, version));
+    allowed
 }
 
 pub trait AllowedChildRefs {
     fn get_allowed_child_refs(version: VtVersion) -> Vec<ObjectType>;
+}
+
+/// Add the Type 2 auxiliary objects defined for one parent by Table A.2
+/// (ISO 11783-6:2018, pp. 72–74). Function/input and designator introductions
+/// differ for Window Mask, Input List and Output List parents.
+fn append_type2_auxiliary_children(
+    allowed: &mut Vec<ObjectType>,
+    version: VtVersion,
+    function_input_since: VtVersion,
+    designator_since: VtVersion,
+) {
+    if version >= function_input_since {
+        allowed.extend_from_slice(&[
+            ObjectType::AuxiliaryFunctionType2,
+            ObjectType::AuxiliaryInputType2,
+        ]);
+    }
+    if version >= designator_since {
+        allowed.push(ObjectType::AuxiliaryControlDesignatorType2);
+    }
 }
 
 impl AllowedChildRefs for WorkingSet {
@@ -103,6 +126,12 @@ impl AllowedChildRefs for DataMask {
         if version >= VtVersion::Version6 {
             allowed_objects.push(ObjectType::ScaledGraphic);
         }
+        append_type2_auxiliary_children(
+            &mut allowed_objects,
+            version,
+            VtVersion::Version3,
+            VtVersion::Version3,
+        );
 
         allowed_objects
     }
@@ -138,6 +167,12 @@ impl AllowedChildRefs for AlarmMask {
         if version >= VtVersion::Version6 {
             allowed_objects.push(ObjectType::ScaledGraphic);
         }
+        append_type2_auxiliary_children(
+            &mut allowed_objects,
+            version,
+            VtVersion::Version3,
+            VtVersion::Version3,
+        );
 
         allowed_objects
     }
@@ -232,6 +267,12 @@ impl AllowedChildRefs for InputList {
         if version >= VtVersion::Version6 {
             allowed_objects.push(ObjectType::ScaledGraphic);
         }
+        append_type2_auxiliary_children(
+            &mut allowed_objects,
+            version,
+            VtVersion::Version6,
+            VtVersion::Version4,
+        );
 
         allowed_objects
     }
@@ -239,7 +280,8 @@ impl AllowedChildRefs for InputList {
 
 impl AllowedChildRefs for OutputList {
     fn get_allowed_child_refs(version: VtVersion) -> Vec<ObjectType> {
-        // As of VT version 6, the same objects are allowed in an output list as in a window mask object
+        // Table A.2 gives Output List the same VT6/VT4 boundaries as Window Mask
+        // for Auxiliary Function/Input Type 2 and its designator pointer.
         WindowMask::get_allowed_child_refs(version)
     }
 }
@@ -292,7 +334,6 @@ impl AllowedChildRefs for AuxiliaryFunctionType2 {
         if version >= VtVersion::Version6 {
             allowed_objects.push(ObjectType::ScaledGraphic);
         }
-
         allowed_objects
     }
 }
@@ -338,6 +379,12 @@ impl AllowedChildRefs for WindowMask {
         if version >= VtVersion::Version6 {
             allowed_objects.push(ObjectType::ScaledGraphic);
         }
+        append_type2_auxiliary_children(
+            &mut allowed_objects,
+            version,
+            VtVersion::Version6,
+            VtVersion::Version4,
+        );
 
         allowed_objects
     }
@@ -385,9 +432,74 @@ impl AllowedChildRefs for Animation {
 
 impl AllowedChildRefs for ObjectLabelReferenceList {
     fn get_allowed_child_refs(version: VtVersion) -> Vec<ObjectType> {
+        // Object Label Reference List is a reference set, not a visual
+        // container. Table A.2 (pp. 72–74) defines which pool objects may be
+        // addressed by entries in the list.
         let mut allowed_objects = vec![];
         if version >= VtVersion::Version4 {
-            allowed_objects.extend_from_slice(&[]);
+            allowed_objects.extend_from_slice(&[
+                ObjectType::WorkingSet,
+                ObjectType::DataMask,
+                ObjectType::AlarmMask,
+                ObjectType::Container,
+                ObjectType::WindowMask,
+                ObjectType::SoftKeyMask,
+                ObjectType::Key,
+                ObjectType::Button,
+                ObjectType::KeyGroup,
+                ObjectType::InputBoolean,
+                ObjectType::InputString,
+                ObjectType::InputNumber,
+                ObjectType::InputList,
+                ObjectType::OutputString,
+                ObjectType::OutputNumber,
+                ObjectType::OutputList,
+                ObjectType::OutputLine,
+                ObjectType::OutputRectangle,
+                ObjectType::OutputEllipse,
+                ObjectType::OutputPolygon,
+                ObjectType::OutputMeter,
+                ObjectType::OutputLinearBarGraph,
+                ObjectType::OutputArchedBarGraph,
+                ObjectType::GraphicsContext,
+                ObjectType::PictureGraphic,
+            ]);
+            // Type 2 function/input objects are valid list references from VT4;
+            // their designator pointer is permitted from VT5 (Table A.2, p. 74).
+            allowed_objects.extend_from_slice(&[
+                ObjectType::AuxiliaryFunctionType2,
+                ObjectType::AuxiliaryInputType2,
+            ]);
+        }
+        if version >= VtVersion::Version5 {
+            allowed_objects.extend_from_slice(&[
+                ObjectType::Animation,
+                ObjectType::NumberVariable,
+                ObjectType::StringVariable,
+                ObjectType::FontAttributes,
+                ObjectType::LineAttributes,
+                ObjectType::FillAttributes,
+                ObjectType::InputAttributes,
+                ObjectType::ExtendedInputAttributes,
+                ObjectType::ColourMap,
+                ObjectType::ObjectLabelReferenceList,
+                ObjectType::ObjectPointer,
+                ObjectType::ExternalObjectDefinition,
+                ObjectType::ExternalReferenceName,
+                ObjectType::ExternalObjectPointer,
+                ObjectType::Macro,
+                ObjectType::AuxiliaryFunctionType1,
+                ObjectType::AuxiliaryInputType1,
+                ObjectType::AuxiliaryControlDesignatorType2,
+            ]);
+        }
+        if version >= VtVersion::Version6 {
+            allowed_objects.extend_from_slice(&[
+                ObjectType::ScaledGraphic,
+                ObjectType::ColourPalette,
+                ObjectType::GraphicData,
+                ObjectType::WorkingSetSpecialControls,
+            ]);
         }
 
         allowed_objects

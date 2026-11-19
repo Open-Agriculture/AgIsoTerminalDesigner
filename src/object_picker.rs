@@ -1,0 +1,494 @@
+//! Shared searchable selection window and aspect-preserving preview rows.
+use crate::EditorProject;
+use ag_iso_stack::object_pool::{
+    object::Object, object_attributes::Point, vt_version::VtVersion, NullableObjectId, ObjectId,
+    ObjectPool, ObjectType,
+};
+use egui::{self, Rect, Vec2};
+
+pub mod impact;
+
+const ACTIVE: egui::Id = egui::Id::NULL;
+
+pub fn open(ctx: &egui::Context, id: egui::Id) {
+    impact::clear_cache(ctx);
+    ctx.data_mut(|data| {
+        data.insert_temp(ACTIVE.with("selection_window"), id);
+        data.insert_temp(id.with("query"), String::new());
+        data.insert_temp(id.with("focus"), true);
+    });
+}
+
+pub fn is_open(ctx: &egui::Context, id: egui::Id) -> bool {
+    ctx.data(|data| data.get_temp::<egui::Id>(ACTIVE.with("selection_window"))) == Some(id)
+}
+
+pub fn matches(name: &str, id: impl std::fmt::Display, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    name.to_lowercase().contains(&query)
+        || id
+            .to_string()
+            .to_lowercase()
+            .contains(query.trim_start_matches('#'))
+}
+
+pub fn matches_object(project: &EditorProject, object: &Object, query: &str) -> bool {
+    let id = object.id().value();
+    let name = project.object_display_name(object);
+    project
+        .object_id_format()
+        .parse(query.trim().trim_start_matches('#'))
+        .ok()
+        == Some(id)
+        || matches(&name, project.format_object_id(id), query)
+}
+
+/// All callers share window behavior, search focus, scrolling, and dismissal.
+pub fn window<T: Clone + Send + Sync + 'static>(
+    ctx: &egui::Context,
+    id: egui::Id,
+    title: &str,
+    contents: impl FnOnce(&mut egui::Ui, &str) -> Option<T>,
+    review: impl FnOnce(&mut egui::Ui, &T) -> bool,
+) -> Option<T> {
+    if !is_open(ctx, id) {
+        return None;
+    }
+    let mut query = ctx.data_mut(|data| {
+        data.get_temp::<String>(id.with("query"))
+            .unwrap_or_default()
+    });
+    let focus = ctx
+        .data_mut(|data| data.remove_temp::<bool>(id.with("focus")))
+        .unwrap_or(false);
+    let pending_key = id.with("pending_selection");
+    if focus {
+        ctx.data_mut(|data| data.remove::<T>(pending_key));
+    }
+    let pending = ctx.data_mut(|data| data.get_temp::<T>(pending_key));
+    let mut open = pending.is_some()
+        || !ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    let mut selected = None;
+    // The confirmation modal replaces the picker until Back is chosen. Do not
+    // enumerate and render the entire disabled results list behind it.
+    if pending.is_none() {
+        egui::Window::new(title)
+            .id(id)
+            .open(&mut open)
+            .collapsible(false)
+            .default_size([460.0, 480.0])
+            .show(ctx, |ui| {
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut query)
+                        .hint_text("Search by name or ID…")
+                        .desired_width(f32::INFINITY),
+                );
+                if focus {
+                    search.request_focus();
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        selected = contents(ui, &query);
+                    });
+            });
+    }
+    let mut confirmed = None;
+    if let Some(pending) = pending {
+        let mut accept = false;
+        let mut back = false;
+        let modal = egui::Modal::new(id.with("confirm_selection")).show(ctx, |ui| {
+            ui.set_width((ctx.screen_rect().width() - 64.0).clamp(280.0, 740.0));
+            ui.heading("Confirm selection");
+            ui.label(title);
+            ui.separator();
+            let valid = egui::ScrollArea::vertical()
+                .max_height((ctx.screen_rect().height() - 200.0).max(160.0))
+                .show(ui, |ui| review(ui, &pending))
+                .inner;
+            ui.separator();
+            ui.horizontal(|ui| {
+                accept = ui
+                    .add_enabled(valid, egui::Button::new("Confirm"))
+                    .clicked();
+                back = ui.button("Back").clicked();
+            });
+        });
+        if accept {
+            confirmed = Some(pending);
+            open = false;
+        } else if back || modal.should_close() {
+            impact::clear_cache(ctx);
+            ctx.data_mut(|data| data.remove::<T>(pending_key));
+        }
+    } else if let Some(selected) = selected {
+        impact::clear_cache(ctx);
+        ctx.data_mut(|data| data.insert_temp(pending_key, selected));
+        ctx.request_repaint();
+    }
+    if !open {
+        impact::clear_cache(ctx);
+    }
+    ctx.data_mut(|data| {
+        data.insert_temp(id.with("query"), query);
+        if !open {
+            data.remove::<egui::Id>(ACTIVE.with("selection_window"));
+            data.remove::<T>(pending_key);
+        }
+    });
+    confirmed
+}
+
+/// Large preview used by selection confirmations, with the same fitted rendering.
+pub fn review_preview(ui: &mut egui::Ui, paint: impl FnOnce(&mut egui::Ui, Rect)) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(280.0, 180.0), egui::Sense::hover());
+    checkerboard(ui.painter(), rect);
+    paint(ui, rect);
+}
+
+pub fn object_label(project: &EditorProject, id: Option<ObjectId>) -> String {
+    id.map_or_else(
+        || "None".into(),
+        |id| {
+            project.get_pool().object_by_id(id).map_or_else(
+                || format!("Missing object #{}", project.format_object_id(id.value())),
+                |object| project.object_display_name(object),
+            )
+        },
+    )
+}
+
+pub fn review_object(
+    ui: &mut egui::Ui,
+    project: &EditorProject,
+    selected: NullableObjectId,
+) -> bool {
+    ui.strong(object_label(project, selected.0));
+    if let Some(id) = selected.0 {
+        let Some(object) = project.get_pool().object_by_id(id) else {
+            return false;
+        };
+        review_preview(ui, |ui, rect| {
+            object_preview_with_settings(
+                ui,
+                rect,
+                project.get_pool(),
+                object,
+                project.vt_version,
+                project.soft_key_size(),
+            )
+        });
+    } else {
+        ui.label("Clear this selection.");
+    }
+    true
+}
+
+pub fn fit_rect(bounds: Rect, size: Vec2) -> Rect {
+    let size = size.max(Vec2::splat(1.0));
+    let scale = (bounds.width() / size.x).min(bounds.height() / size.y);
+    Rect::from_center_size(bounds.center(), size * scale)
+}
+
+pub fn checkerboard(painter: &egui::Painter, rect: Rect) {
+    const TILE: f32 = 8.0;
+    let visuals = painter.ctx().style().visuals.clone();
+    let base = visuals.extreme_bg_color;
+    let alternate = visuals.faint_bg_color;
+    for row in 0..(rect.height() / TILE).ceil() as usize {
+        for column in 0..(rect.width() / TILE).ceil() as usize {
+            let tile = Rect::from_min_size(
+                rect.min + egui::vec2(column as f32 * TILE, row as f32 * TILE),
+                Vec2::splat(TILE),
+            )
+            .intersect(rect);
+            painter.rect_filled(
+                tile,
+                0.0,
+                if (row + column) % 2 == 0 {
+                    base
+                } else {
+                    alternate
+                },
+            );
+        }
+    }
+}
+
+pub fn texture(ui: &mut egui::Ui, rect: Rect, texture: &egui::TextureHandle) {
+    ui.painter().image(
+        texture.id(),
+        fit_rect(rect, texture.size_vec2()),
+        Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+/// Read-only miniature; render at natural size, then uniformly transform its shapes.
+pub fn object_preview(ui: &mut egui::Ui, rect: Rect, pool: &ObjectPool, object: &Object) {
+    object_preview_with_version(ui, rect, pool, object, VtVersion::Version6);
+}
+
+/// Version-aware fitted object preview. Direct calls to `object_preview` keep
+/// the historical VT6 default; project previews should pass their target.
+pub fn object_preview_with_version(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    pool: &ObjectPool,
+    object: &Object,
+    version: VtVersion,
+) {
+    object_preview_with_settings(ui, rect, pool, object, version, (60, 60));
+}
+
+/// Project-aware fitted preview, including project Soft Key dimensions.
+pub fn object_preview_with_settings(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    pool: &ObjectPool,
+    object: &Object,
+    version: VtVersion,
+    soft_key_size: (u16, u16),
+) {
+    let (width, height) = match object {
+        Object::AuxiliaryFunctionType2(_)
+        | Object::AuxiliaryInputType2(_)
+        | Object::AuxiliaryControlDesignatorType2(_) => soft_key_size,
+        _ => pool.content_size(object),
+    };
+    if width == 0 || height == 0 {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "—",
+            egui::FontId::proportional(18.0),
+            egui::Color32::DARK_GRAY,
+        );
+        return;
+    }
+    let size = egui::vec2(width as f32, height as f32);
+    let fitted = fit_rect(rect, size);
+    let transform = egui::emath::TSTransform::new(fitted.min.to_vec2(), fitted.width() / size.x);
+    // A detached child Ui prevents natural dimensions from expanding the row.
+    let mut preview = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_size(egui::Pos2::ZERO, size))
+            .layout(egui::Layout::top_down(egui::Align::Min))
+            .sense(egui::Sense::hover()),
+    );
+    preview.set_clip_rect(transform.inverse().mul_rect(rect.intersect(ui.clip_rect())));
+    preview.with_visual_transform(transform, |ui| {
+        crate::object_rendering::render_object_with_settings(
+            ui,
+            pool,
+            object,
+            Point::default(),
+            version,
+            soft_key_size,
+        );
+    });
+}
+
+pub fn preview(ui: &mut egui::Ui, paint: impl Fn(&mut egui::Ui, Rect)) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(64.0, 48.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        checkerboard(ui.painter(), rect);
+        paint(ui, rect);
+    }
+    hover_preview(response, paint)
+}
+
+pub fn hover_preview(
+    response: egui::Response,
+    paint: impl Fn(&mut egui::Ui, Rect),
+) -> egui::Response {
+    response.on_hover_ui(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(280.0, 220.0), egui::Sense::hover());
+        checkerboard(ui.painter(), rect);
+        paint(ui, rect);
+    })
+}
+
+pub fn row(
+    ui: &mut egui::Ui,
+    name: &str,
+    detail: &str,
+    selected: bool,
+    paint: impl Fn(&mut egui::Ui, Rect),
+) -> bool {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let image = preview(ui, paint);
+        let text = ui
+            .vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                let response = ui.selectable_label(selected, name);
+                ui.weak(detail);
+                response
+            })
+            .inner;
+        image.clicked() || text.clicked()
+    })
+    .inner
+}
+
+pub fn objects(
+    ui: &mut egui::Ui,
+    project: &EditorProject,
+    query: &str,
+    selected: Option<ObjectId>,
+    allow_none: bool,
+    eligible: impl Fn(&Object) -> bool,
+) -> Option<NullableObjectId> {
+    let mut result = None;
+    if allow_none
+        && matches("None", "", query)
+        && ui.selectable_label(selected.is_none(), "None").clicked()
+    {
+        result = Some(NullableObjectId::NULL);
+    }
+    let mut count = 0;
+    for object in project.get_pool().objects() {
+        let name = project.object_display_name(object);
+        if !eligible(object) || !matches_object(project, object, query) {
+            continue;
+        }
+        count += 1;
+        ui.push_id(object.id().value(), |ui| {
+            if row(
+                ui,
+                &name,
+                &format!("{:?}", object.object_type()),
+                selected == Some(object.id()),
+                |ui, rect| {
+                    object_preview_with_settings(
+                        ui,
+                        rect,
+                        project.get_pool(),
+                        object,
+                        project.vt_version,
+                        project.soft_key_size(),
+                    )
+                },
+            ) {
+                result = Some(NullableObjectId(Some(object.id())));
+            }
+        });
+    }
+    if count == 0 {
+        ui.label("No matching objects.");
+    }
+    result
+}
+
+pub fn object_window(
+    ctx: &egui::Context,
+    id: egui::Id,
+    action: &str,
+    project: &EditorProject,
+    selected: Option<ObjectId>,
+    allow_none: bool,
+    eligible: impl Fn(&Object) -> bool,
+    impact: impl FnOnce(&mut egui::Ui, NullableObjectId) -> bool,
+) -> Option<NullableObjectId> {
+    window(
+        ctx,
+        id,
+        "Select object",
+        |ui, query| objects(ui, project, query, selected, allow_none, &eligible),
+        |ui, choice| {
+            ui.label(action);
+            if let Some(current) = selected {
+                ui.label(format!("Current: {}", object_label(project, Some(current))));
+            }
+            let valid = choice.0.map_or(allow_none, |id| {
+                project.get_pool().object_by_id(id).is_some_and(&eligible)
+            });
+            if !valid {
+                crate::ui_style::error_text(
+                    ui,
+                    "This selection is no longer available here. Go back and choose another.",
+                );
+            }
+            valid && impact(ui, *choice)
+        },
+    )
+}
+
+pub fn button(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    label: &str,
+    action: &str,
+    project: &EditorProject,
+    selected: Option<ObjectId>,
+    allow_none: bool,
+    eligible: impl Fn(&Object) -> bool,
+    impact: impl FnOnce(&mut egui::Ui, NullableObjectId) -> bool,
+) -> Option<NullableObjectId> {
+    let id = ui.make_persistent_id(salt);
+    if ui.button(label).clicked() {
+        open(ui.ctx(), id);
+    }
+    object_window(
+        ui.ctx(),
+        id,
+        action,
+        project,
+        selected,
+        allow_none,
+        eligible,
+        impact,
+    )
+}
+
+/// The searchable list of object types in the Add Object menus.
+///
+/// Types the VT version does not support are shown disabled with the versions
+/// that do; types `offered` rejects are left out. Returns the type clicked.
+pub fn object_type_list(
+    ui: &mut egui::Ui,
+    query: &mut String,
+    focus: bool,
+    version: VtVersion,
+    offered: impl Fn(ObjectType) -> bool,
+) -> Option<ObjectType> {
+    use crate::vt_compatibility::{availability_description, supported_object_type};
+
+    let response = ui.add(
+        egui::TextEdit::singleline(query)
+            .hint_text("Search object types…")
+            .desired_width(ui.available_width()),
+    );
+    if focus && !response.has_focus() {
+        response.request_focus();
+    }
+    let query = query.to_lowercase();
+    let mut chosen = None;
+    egui::ScrollArea::vertical()
+        .max_height(400.0)
+        .show(ui, |ui| {
+            for object_type in ObjectType::values() {
+                if !offered(object_type)
+                    || !format!("{object_type:?}").to_lowercase().contains(&query)
+                {
+                    continue;
+                }
+                let supported = supported_object_type(object_type, version);
+                let response =
+                    ui.add_enabled(supported, egui::Button::new(format!("{object_type:?}")));
+                if !supported && response.contains_pointer() {
+                    if let Some(availability) =
+                        availability_description(|v| supported_object_type(object_type, v))
+                    {
+                        response.show_tooltip_text(availability);
+                    }
+                }
+                if response.clicked() {
+                    chosen = Some(object_type);
+                }
+            }
+        });
+    chosen
+}

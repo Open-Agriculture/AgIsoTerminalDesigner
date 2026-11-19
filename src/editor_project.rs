@@ -2,130 +2,1014 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Authors: Daan Steenbergen
 
-use std::{cell::RefCell, collections::HashMap};
+use crate::components::*;
 
-use ag_iso_stack::object_pool::{
-    object::Object, NullableObjectId, ObjectId, ObjectPool, ObjectType,
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
-use crate::{project_file::ProjectFile, smart_naming, ObjectInfo};
+use ag_iso_stack::object_pool::{
+    object::Object, vt_version::VtVersion, NullableObjectId, ObjectId, ObjectPool, ObjectType,
+};
 
-const MAX_UNDO_REDO_POOL: usize = 10;
+use crate::cli::snapshot::{DesignContextRequest, DesignSnapshot, SnapshotError};
+use crate::cli::{AiDesignState, ProjectRevision};
+use crate::operations::{
+    AppliedTransaction, ObjectTarget, Operation, OperationError, OperationExecutor,
+    OperationHistory, OperationTransaction, PreparedTransaction, TransactionDiagnostics,
+    ValidationContext, CURRENT_OPERATION_SCHEMA_VERSION,
+};
+use crate::{project_file::ProjectFile, smart_naming, ObjectIdFormat, ObjectInfo, SoftKeyLayout};
+
 const MAX_UNDO_REDO_SELECTED: usize = 20;
 
-#[derive(Default, Clone)]
-pub struct EditorProject {
+/// Failure to find a free ID inside a type's configured automatic range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectIdAllocationError {
+    pub object_type: ObjectType,
+    pub range: crate::ObjectIdRange,
+}
+
+impl std::fmt::Display for ObjectIdAllocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "No free {:?} object ID in configured range {}",
+            self.object_type, self.range
+        )
+    }
+}
+
+impl std::error::Error for ObjectIdAllocationError {}
+
+#[derive(Clone, PartialEq)]
+struct ProjectContentCheckpoint {
     pool: ObjectPool,
-    mut_pool: RefCell<ObjectPool>,
-    undo_pool_history: Vec<ObjectPool>,
-    redo_pool_history: Vec<ObjectPool>,
+    object_names: Vec<(u16, String)>,
+    object_annotations: Vec<(u16, Option<String>, Option<String>, Vec<String>)>,
+    allowed_references: Vec<(u16, Vec<ObjectId>)>,
+    overridden_ids: Vec<u16>,
+    mask_size: u16,
+    soft_key_size: (u16, u16),
+    soft_key_layout: SoftKeyLayout,
+    vt_version: VtVersion,
+    object_id_ranges: crate::ObjectIdRanges,
+    components: ComponentSource,
+    graphics: crate::graphics::GraphicLibrary,
+}
+
+#[derive(Clone)]
+struct ComponentCheckpoint {
+    pool: ObjectPool,
+    source: ComponentSource,
+    graphics: crate::graphics::GraphicLibrary,
+    info: HashMap<ObjectId, ObjectInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DesignDimensions {
+    mask_size: u16,
+    soft_key_size: (u16, u16),
+    vt_version: VtVersion,
+    soft_key_layout: SoftKeyLayout,
+    object_id_ranges: crate::ObjectIdRanges,
+}
+
+/// Derived state belongs to one authoritative project state, never to its copies.
+#[derive(Default)]
+struct ProjectCache {
+    state: Option<(ProjectRevision, DesignDimensions)>,
+    materialized: Option<ComponentResult<Arc<MaterializedProject>>>,
+    property_choices: HashMap<(ObjectId, crate::object_properties::PropertyKey, String), bool>,
+}
+
+impl Clone for ProjectCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl ComponentCheckpoint {
+    fn content_eq(&self, other: &Self) -> bool {
+        self.pool == other.pool
+            && self.source == other.source
+            && self.graphics == other.graphics
+            && self.info.len() == other.info.len()
+            && self.info.iter().all(|(id, info)| {
+                other
+                    .info
+                    .get(id)
+                    .is_some_and(|other| info.content_eq(other))
+            })
+    }
+}
+
+#[derive(Clone)]
+pub struct EditorProject {
+    /// Transient identity used to invalidate UI drafts when a project is replaced.
+    ui_session_id: uuid::Uuid,
+    cache: RefCell<ProjectCache>,
+    pool: ObjectPool,
+    components: ComponentSource,
+    graphics: crate::graphics::GraphicLibrary,
+    component_history: HashMap<String, (ComponentCheckpoint, ComponentCheckpoint)>,
+    dimension_history: HashMap<String, (DesignDimensions, DesignDimensions)>,
+    batch_history: HashMap<
+        String,
+        (
+            ComponentCheckpoint,
+            DesignDimensions,
+            ComponentCheckpoint,
+            DesignDimensions,
+        ),
+    >,
     selected_object: NullableObjectId,
-    mut_selected_object: RefCell<NullableObjectId>,
+    component_selection: Cell<Option<(ComponentInstanceId, ComponentNodeId)>>,
+    pending_selected_object: Cell<NullableObjectId>,
     undo_selected_history: Vec<NullableObjectId>,
     redo_selected_history: Vec<NullableObjectId>,
     pub mask_size: u16,
+    /// Authoritative project VT version. Old projects default to Version 6.
+    pub(crate) vt_version: VtVersion,
     soft_key_size: (u16, u16),
-    pub object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
+    soft_key_layout: SoftKeyLayout,
+    /// Application preference, excluded from project content and history.
+    object_id_format: ObjectIdFormat,
+    /// Application preference, excluded from project content and history.
+    show_object_ids: bool,
+    object_id_ranges: crate::ObjectIdRanges,
+    object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
+    /// Metadata draft edited by the UI and committed through operations.
+    mut_object_info: RefCell<HashMap<ObjectId, ObjectInfo>>,
 
     /// Used to keep track of the object that is being renamed
     renaming_object: RefCell<Option<(eframe::egui::Id, ObjectId, String)>>,
-
-    /// Cached next available ID for efficient allocation
-    next_available_id: RefCell<u16>,
 
     /// Cached default object names for efficient lookup
     default_object_names: RefCell<HashMap<ObjectId, String>>,
 
     /// Request to open image file dialog for PictureGraphic object
     image_load_request: RefCell<Option<ObjectId>>,
+    graphic_assign_request: Cell<Option<(crate::graphics::GraphicAssetId, ObjectId)>>,
+    graphic_options_request: RefCell<Option<(u16, bool, u8, bool)>>,
+    graphic_format_request: RefCell<
+        Option<(
+            u16,
+            ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat,
+        )>,
+    >,
+    /// A hierarchy context-menu delete, consumed by the app after draft edits
+    /// from the same frame have been committed.
+    delete_request: RefCell<Option<ObjectId>>,
+    /// A hierarchy inline rename, consumed after same-frame draft edits.
+    rename_request: RefCell<Option<(ObjectId, String)>>,
+    /// Operations queued by UI widgets that only hold a shared project reference.
+    queued_operations: RefCell<Vec<Operation>>,
+    last_operation_error: RefCell<Option<String>>,
+    /// Last project content that was opened or successfully saved.
+    saved_content: RefCell<Option<ProjectContentCheckpoint>>,
+    dirty: Cell<bool>,
+    /// Monotonically increasing version of the authoritative project content.
+    revision: Cell<ProjectRevision>,
+
+    /// Bounded operation-based undo/redo history.
+    pub operation_history: RefCell<OperationHistory>,
+}
+
+impl Default for EditorProject {
+    fn default() -> Self {
+        let mut project = Self::from(ObjectPool::new());
+        project.mask_size = 500;
+        project.mark_saved();
+        project
+    }
 }
 
 impl From<ObjectPool> for EditorProject {
     fn from(pool: ObjectPool) -> Self {
-        let (mask_size, soft_key_size) = pool.get_minimum_mask_sizes();
+        let (mask_size, _) = pool.get_minimum_mask_sizes();
+        let soft_key_size =
+            pool.objects_by_type(ObjectType::Key)
+                .iter()
+                .fold((60, 60), |(width, height), key| {
+                    let size = pool.content_size(key);
+                    (width.max(size.0), height.max(size.1))
+                });
 
-        // Find the highest ID in use to initialize next_available_id
-        let max_id = pool
-            .objects()
-            .iter()
-            .map(|obj| obj.id().value())
-            .max()
-            .unwrap_or(0);
-
-        EditorProject {
-            mut_pool: RefCell::new(pool.clone()),
+        let mut project = EditorProject {
+            ui_session_id: uuid::Uuid::new_v4(),
+            cache: RefCell::default(),
             pool,
-            undo_pool_history: Default::default(),
-            redo_pool_history: Default::default(),
+            components: Default::default(),
+            graphics: Default::default(),
+            component_history: Default::default(),
+            dimension_history: Default::default(),
+            batch_history: Default::default(),
             selected_object: NullableObjectId::default(),
-            mut_selected_object: RefCell::new(NullableObjectId::default()),
+            component_selection: Cell::new(None),
+            pending_selected_object: Cell::new(NullableObjectId::default()),
             undo_selected_history: Default::default(),
             redo_selected_history: Default::default(),
-            mask_size,
+            mask_size: mask_size.max(1),
+            vt_version: VtVersion::Version6,
             soft_key_size,
+            soft_key_layout: SoftKeyLayout::default(),
+            object_id_format: ObjectIdFormat::default(),
+            show_object_ids: false,
+            object_id_ranges: crate::ObjectIdRanges::defaults(),
             object_info: RefCell::new(HashMap::new()),
+            mut_object_info: RefCell::new(HashMap::new()),
             renaming_object: RefCell::new(None),
-            next_available_id: RefCell::new(max_id.saturating_add(1)),
             default_object_names: RefCell::new(HashMap::new()),
             image_load_request: RefCell::new(None),
-        }
+            graphic_assign_request: Cell::new(None),
+            graphic_options_request: RefCell::new(None),
+            graphic_format_request: RefCell::new(None),
+            delete_request: RefCell::new(None),
+            rename_request: RefCell::new(None),
+            queued_operations: RefCell::new(Vec::new()),
+            last_operation_error: RefCell::new(None),
+            saved_content: RefCell::new(None),
+            dirty: Cell::new(false),
+            revision: Cell::new(0),
+            operation_history: RefCell::new(OperationHistory::new(10)), // Default 10 transaction history
+        };
+        project.apply_smart_naming_to_all_objects();
+        project.mark_saved();
+        project
     }
 }
 
 impl EditorProject {
+    /// Import target-version IOP records atomically. Structurally valid but
+    /// incompatible content is retained for repair and cannot be exported.
+    pub fn import_iop(data: Vec<u8>, version: VtVersion) -> Result<Self, String> {
+        Self::import_iop_with_id_format(data, version, ObjectIdFormat::default())
+    }
+
+    /// Import an IOP using the selected object-ID format for error messages
+    /// and the resulting project's UI. The format does not affect wire data.
+    pub fn import_iop_with_id_format(
+        data: Vec<u8>,
+        version: VtVersion,
+        object_id_format: ObjectIdFormat,
+    ) -> Result<Self, String> {
+        if !(2..=6).contains(&u8::from(version)) {
+            return Err("Choose VT2 through VT6".into());
+        }
+        let pool =
+            ObjectPool::try_from_iop_for_version(data, version).map_err(|error| {
+                match error.object_id {
+                    Some(id) => format!(
+                        "object {} at byte {}: {:?}",
+                        object_id_format.format(id),
+                        error.offset,
+                        error.source
+                    ),
+                    None => format!("byte {}: {:?}", error.offset, error.source),
+                }
+            })?;
+        let mut project = Self::from(pool);
+        project.vt_version = version;
+        project.object_id_format = object_id_format;
+        project.mark_saved();
+        Ok(project)
+    }
+    /// Import a pool stored in several IOP files, joined in the given order as
+    /// a VT joins a pool transferred in parts. A part may end in the middle of
+    /// an object, and an object a later part defines again replaces the
+    /// earlier one, as on a VT. Errors name the part and the byte in it.
+    pub fn import_iop_parts_with_id_format(
+        parts: Vec<(String, Vec<u8>)>,
+        version: VtVersion,
+        object_id_format: ObjectIdFormat,
+    ) -> Result<Self, String> {
+        if parts.len() == 1 {
+            let (_, data) = parts.into_iter().next().unwrap();
+            return Self::import_iop_with_id_format(data, version, object_id_format);
+        }
+        if !(2..=6).contains(&u8::from(version)) {
+            return Err("Choose VT2 through VT6".into());
+        }
+        let mut data = Vec::new();
+        let mut starts = Vec::new();
+        for (name, part) in &parts {
+            starts.push((data.len(), name.as_str()));
+            data.extend_from_slice(part);
+        }
+        let position = |offset: usize| {
+            let (start, name) = starts
+                .iter()
+                .rev()
+                .find(|(start, _)| *start <= offset)
+                .copied()
+                .unwrap_or((0, ""));
+            format!("{name}, byte {}", offset - start)
+        };
+        let pool =
+            ObjectPool::try_from_iop_for_version(data, version).map_err(|error| {
+                match error.object_id {
+                    Some(id) => format!(
+                        "object {} in {}: {:?}",
+                        object_id_format.format(id),
+                        position(error.offset),
+                        error.source
+                    ),
+                    None => format!("{}: {:?}", position(error.offset), error.source),
+                }
+            })?;
+        let mut project = Self::from(pool);
+        project.vt_version = version;
+        project.object_id_format = object_id_format;
+        project.mark_saved();
+        Ok(project)
+    }
+
+    /// Copy authoritative canvas content without history, pending UI edits, or
+    /// save checkpoints. Mutating this copy cannot change the source project.
+    pub(crate) fn canvas_preview_copy(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            components: self.components.clone(),
+            graphics: self.graphics.clone(),
+            mask_size: self.mask_size,
+            soft_key_size: self.soft_key_size,
+            soft_key_layout: self.soft_key_layout,
+            vt_version: self.vt_version,
+            object_id_format: self.object_id_format,
+            show_object_ids: self.show_object_ids,
+            object_id_ranges: self.object_id_ranges.clone(),
+            object_info: RefCell::new(self.object_info.borrow().clone()),
+            mut_object_info: RefCell::new(self.object_info.borrow().clone()),
+            ..Self::default()
+        }
+    }
+    pub fn graphic_library(&self) -> &crate::graphics::GraphicLibrary {
+        &self.graphics
+    }
+
+    /// Stable identity for this in-memory project session; cloning preserves it.
+    pub fn ui_session_id(&self) -> uuid::Uuid {
+        self.ui_session_id
+    }
+
+    /// Current application-level object-ID presentation preference.
+    pub fn object_id_format(&self) -> ObjectIdFormat {
+        self.object_id_format
+    }
+
+    /// Change ID presentation without changing content, revision or history.
+    pub fn set_object_id_format(&mut self, format: ObjectIdFormat) {
+        self.object_id_format = format;
+    }
+
+    /// Format a pool diagnostic with current authoring names and this project's ID format.
+    pub fn format_validation_diagnostic(&self, diagnostic: &crate::ValidationDiagnostic) -> String {
+        let ids = diagnostic.affected_objects.as_deref().unwrap_or_default();
+        let names = self.object_names_for_ids(ids);
+        crate::pool_validation::format_validation_diagnostic_with_names(
+            diagnostic,
+            self.object_id_format,
+            &names,
+        )
+    }
+
+    /// Format transaction diagnostics with current names, preserving the structured records.
+    pub fn format_transaction_diagnostics(&self, diagnostics: &TransactionDiagnostics) -> String {
+        diagnostics
+            .0
+            .iter()
+            .map(|diagnostic| {
+                let mut ids = diagnostic.related_objects.clone();
+                if let Some(id) = diagnostic.object_id {
+                    if !ids.contains(&id) {
+                        ids.insert(0, id);
+                    }
+                }
+                let mut names = self.object_names_for_ids(&ids);
+                if let (Some(id), Some(name)) =
+                    (diagnostic.object_id, diagnostic.object_name.as_ref())
+                {
+                    names.entry(id).or_insert_with(|| name.clone());
+                }
+                if ids.is_empty() {
+                    return diagnostic.message.clone();
+                }
+                let plural = ids.len() > 1;
+                let objects = ids
+                    .iter()
+                    .map(|id| {
+                        crate::pool_validation::format_object_identity(
+                            *id,
+                            self.object_id_format,
+                            names.get(id).map(String::as_str),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{} {objects}: {}",
+                    if plural { "Objects" } else { "Object" },
+                    diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn object_names_for_ids(&self, ids: &[u16]) -> HashMap<u16, String> {
+        let mut names = HashMap::new();
+        let authoritative = self.object_info.borrow();
+        let drafts = self.mut_object_info.borrow();
+        for id in ids {
+            let Some(object_id) = ObjectId::new(*id).ok() else {
+                continue;
+            };
+            if let Some(name) = drafts
+                .get(&object_id)
+                .and_then(|info| info.name.as_ref())
+                .or_else(|| {
+                    authoritative
+                        .get(&object_id)
+                        .and_then(|info| info.name.as_ref())
+                })
+            {
+                names.insert(*id, name.clone());
+            }
+        }
+        names
+    }
+
+    /// Configured inclusive automatic allocation ranges.
+    pub fn object_id_ranges(&self) -> &crate::ObjectIdRanges {
+        &self.object_id_ranges
+    }
+
+    /// Apply ID ranges as a single undoable project settings change.
+    pub fn set_object_id_ranges(&mut self, ranges: crate::ObjectIdRanges) -> Result<(), String> {
+        self.set_project_configuration_with_id_ranges(
+            self.mask_size,
+            self.soft_key_size,
+            self.vt_version,
+            self.soft_key_layout,
+            ranges,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Restore all type ranges to their defaults as one undoable change.
+    pub fn reset_object_id_ranges(&mut self) -> Result<(), String> {
+        self.set_object_id_ranges(crate::ObjectIdRanges::defaults())
+    }
+
+    /// Update target version and ID ranges together, validating their combined
+    /// constraints before changing project state.
+    pub fn set_object_id_configuration(
+        &mut self,
+        version: VtVersion,
+        ranges: crate::ObjectIdRanges,
+    ) -> Result<(), String> {
+        self.set_project_configuration_with_id_ranges(
+            self.mask_size,
+            self.soft_key_size,
+            version,
+            self.soft_key_layout,
+            ranges,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Whether the object's current ID was explicitly assigned by the user.
+    pub fn object_id_is_overridden(&self, id: ObjectId) -> bool {
+        self.mut_object_info
+            .borrow()
+            .get(&id)
+            .is_some_and(|info| info.id_overridden)
+    }
+
+    /// Mark or clear an explicit ID assignment on an existing object.
+    pub fn set_object_id_overridden(&mut self, id: ObjectId, overridden: bool) -> bool {
+        if self.pool.object_by_id(id).is_none() {
+            return false;
+        }
+        if self.object_id_is_overridden(id) == overridden {
+            return true;
+        }
+        self.execute_ui_transaction(OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description: Some(if overridden {
+                format!("Keep object ID {} fixed", id.value())
+            } else {
+                format!("Return object ID {} to automatic assignment", id.value())
+            }),
+            operations: vec![Operation::SetObjectIdAssignment {
+                object_id: id.value(),
+                new_id: id.value(),
+                overridden,
+            }],
+        })
+    }
+
+    /// Format an object identifier for the editor UI, including null sentinels.
+    pub fn format_object_id(&self, id: u16) -> String {
+        self.object_id_format.format(id)
+    }
+
+    /// Return the smart object name, optionally followed by its formatted ID.
+    pub fn show_object_ids(&self) -> bool {
+        self.show_object_ids
+    }
+
+    pub fn set_show_object_ids(&mut self, show: bool) {
+        self.show_object_ids = show;
+    }
+
+    pub fn object_display_name(&self, object: &Object) -> String {
+        let info = self
+            .mut_object_info
+            .borrow()
+            .get(&object.id())
+            .cloned()
+            .unwrap_or_else(|| ObjectInfo::new(object));
+        let name = info.name.unwrap_or_else(|| {
+            smart_naming::get_object_type_name(object.object_type()).to_string()
+        });
+        if self.show_object_ids {
+            format!("{} ({})", name, self.format_object_id(object.id().value()))
+        } else {
+            name
+        }
+    }
+    pub fn component_source(&self) -> &ComponentSource {
+        &self.components
+    }
+    pub(crate) fn component_object_info(&self) -> HashMap<ObjectId, ObjectInfo> {
+        self.object_info.borrow().clone()
+    }
+    /// Return an independently mutable materialized pool and source map.
+    pub fn materialize(&self) -> ComponentResult<MaterializedProject> {
+        self.materialize_shared().map(|result| (*result).clone())
+    }
+
+    /// Share a read-only materialized snapshot until authoritative content or
+    /// settings change. Errors are retained for the same project state too.
+    /// The snapshot remains valid after subsequent edits to the project.
+    pub fn materialize_shared(&self) -> ComponentResult<Arc<MaterializedProject>> {
+        self.reconcile_cache();
+        if let Some(result) = &self.cache.borrow().materialized {
+            return result.clone();
+        }
+        let result = materialize_project(self).map(Arc::new);
+        self.cache.borrow_mut().materialized = Some(result.clone());
+        result
+    }
+
+    fn reconcile_cache(&self) {
+        let state = (self.revision(), self.dimensions());
+        let mut cache = self.cache.borrow_mut();
+        if cache.state != Some(state.clone()) {
+            *cache = ProjectCache {
+                state: Some(state),
+                ..Default::default()
+            };
+        }
+    }
+
+    fn invalidate_cache(&self) {
+        self.cache.replace(ProjectCache::default());
+    }
+
+    /// Reuse UI choice validation without bypassing validation of committed edits.
+    pub(crate) fn property_choice_is_valid(
+        &self,
+        id: ObjectId,
+        property: crate::object_properties::PropertyKey,
+        value: serde_json::Value,
+    ) -> bool {
+        self.reconcile_cache();
+        let key = (id, property.to_owned(), value.to_string());
+        if let Some(valid) = self.cache.borrow().property_choices.get(&key) {
+            return *valid;
+        }
+        let mut transaction = OperationTransaction::new(None);
+        transaction.add_operation(Operation::SetProperty {
+            object: ObjectTarget::id(id.value()),
+            property,
+            value,
+        });
+        let valid = self.validate_transaction(&transaction).is_ok();
+        self.cache.borrow_mut().property_choices.insert(key, valid);
+        valid
+    }
+    /// Export a complete, compatible materialized pool, rejecting strings
+    /// whose encoded byte length exceeds the ISO field limit.
+    pub fn export_iop(&self) -> ComponentResult<Vec<u8>> {
+        let materialized = self.materialize_shared()?;
+        let mut diagnostics = self.compatibility_diagnostics_from_pool(&materialized.pool)?;
+        diagnostics.extend(crate::pool_validation::validate_complete_pool_requirements(
+            &materialized.pool,
+            self.vt_version,
+        ));
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::ValidationSeverity::Error)
+            .map(|d| self.format_validation_diagnostic(d))
+            .collect();
+        if !errors.is_empty() {
+            return Err(ComponentError::new(
+                "VT_EXPORT_INCOMPATIBLE",
+                errors.join("\n"),
+            ));
+        }
+        let pool = crate::vt_strings::prepare_pool_for_export(&materialized.pool, self.vt_version)
+            .map_err(|message| ComponentError::new("VT_STRING_ENCODING", message))?;
+        pool.try_as_iop_for_version(self.vt_version)
+            .map_err(|error| ComponentError::new("VT_EXPORT_INVALID", error.to_string()))
+    }
+    pub fn editor_selection(&self) -> Option<EditorSelection> {
+        if let Some((instance_id, node_id)) = self.component_selection.get() {
+            return Some(EditorSelection::ComponentNode {
+                instance_id,
+                node_id,
+            });
+        }
+        let id = self.get_selected().0?.value();
+        match self
+            .materialize_shared()
+            .ok()?
+            .source_map
+            .by_object_id
+            .get(&id)?
+        {
+            MaterializedSource::Primitive { object_id } => {
+                Some(EditorSelection::PrimitiveObject(*object_id))
+            }
+            MaterializedSource::ComponentNode {
+                instance_id,
+                node_id,
+            } => Some(EditorSelection::ComponentNode {
+                instance_id: *instance_id,
+                node_id: *node_id,
+            }),
+        }
+    }
+    fn component_checkpoint(&self) -> ComponentCheckpoint {
+        ComponentCheckpoint {
+            pool: self.pool.clone(),
+            source: self.components.clone(),
+            graphics: self.graphics.clone(),
+            info: self.object_info.borrow().clone(),
+        }
+    }
+    fn restore_component_checkpoint(&mut self, state: ComponentCheckpoint) {
+        self.pool = state.pool;
+        self.components = state.source;
+        self.graphics = state.graphics;
+        if let Some((instance, node)) = self.component_selection.get() {
+            if !self
+                .components
+                .instances
+                .iter()
+                .any(|i| i.id == instance && i.compiled_ids.contains_key(&node))
+            {
+                self.component_selection.set(None);
+                if self
+                    .selected_object
+                    .0
+                    .is_some_and(|id| self.pool.object_by_id(id).is_none())
+                {
+                    self.selected_object = NullableObjectId::NULL;
+                    self.pending_selected_object.set(NullableObjectId::NULL);
+                }
+            }
+        }
+        self.sync_component_selection();
+        self.object_info.replace(state.info.clone());
+        self.mut_object_info.replace(state.info);
+        self.default_object_names.borrow_mut().clear();
+        self.refresh_dirty();
+        self.bump_revision();
+    }
+
+    fn restore_batch_checkpoint(
+        &mut self,
+        state: ComponentCheckpoint,
+        dimensions: DesignDimensions,
+    ) {
+        let selected_component = self.component_selection.get();
+        let selected_primitive = self
+            .selected_object
+            .0
+            .filter(|id| self.pool.object_by_id(*id).is_some());
+        let selected_unique_id = selected_primitive.and_then(|id| {
+            self.object_info
+                .borrow()
+                .get(&id)
+                .map(ObjectInfo::get_unique_id)
+        });
+        let selected_after = selected_component
+            .and_then(|(instance, node)| {
+                state
+                    .source
+                    .instances
+                    .iter()
+                    .find(|item| item.id == instance)
+                    .and_then(|item| item.compiled_ids.get(&node))
+                    .and_then(|id| ObjectId::new(*id).ok())
+            })
+            .or_else(|| {
+                selected_unique_id
+                    .and_then(|unique_id| {
+                        state.info.iter().find_map(|(id, info)| {
+                            (info.get_unique_id() == unique_id).then_some(*id)
+                        })
+                    })
+                    .or_else(|| {
+                        selected_primitive.filter(|id| {
+                            selected_unique_id.is_none() && state.pool.object_by_id(*id).is_some()
+                        })
+                    })
+            });
+        self.pool = state.pool;
+        self.components = state.source;
+        self.graphics = state.graphics;
+        self.object_info.replace(state.info.clone());
+        self.mut_object_info.replace(state.info);
+        self.mask_size = dimensions.mask_size;
+        self.soft_key_size = dimensions.soft_key_size;
+        self.vt_version = dimensions.vt_version;
+        self.soft_key_layout = dimensions.soft_key_layout;
+        self.object_id_ranges = dimensions.object_id_ranges;
+        self.selected_object = NullableObjectId(selected_after);
+        self.pending_selected_object
+            .set(NullableObjectId(selected_after));
+        self.default_object_names.borrow_mut().clear();
+        self.cache.borrow_mut().materialized = None;
+        self.sync_component_selection();
+        self.refresh_dirty();
+        self.bump_revision();
+    }
+    pub(crate) fn edit_components(
+        &mut self,
+        description: &str,
+        edit: impl FnOnce(&mut ObjectPool, &mut ComponentSource) -> ComponentResult<()>,
+    ) -> ComponentResult<()> {
+        self.edit_source(description, |pool, source, _, _| edit(pool, source))
+    }
+    pub(crate) fn edit_source(
+        &mut self,
+        description: &str,
+        edit: impl FnOnce(
+            &mut ObjectPool,
+            &mut ComponentSource,
+            &mut crate::graphics::GraphicLibrary,
+            &mut HashMap<ObjectId, ObjectInfo>,
+        ) -> ComponentResult<()>,
+    ) -> ComponentResult<()> {
+        let before = self.component_checkpoint();
+        let mut after = before.clone();
+        edit(
+            &mut after.pool,
+            &mut after.source,
+            &mut after.graphics,
+            &mut after.info,
+        )?;
+        prepare_compiled_ids(&after.pool, &mut after.source, &self.object_id_ranges)?;
+        let candidate = materialize_source_with_graphics(
+            &after.pool,
+            &after.source,
+            self.vt_version,
+            &after.info,
+            &after.graphics,
+            &self.object_id_ranges,
+        )?;
+        let baseline_materialized = self.materialize_shared().ok();
+        let baseline = baseline_materialized
+            .as_ref()
+            .map(|m| &m.pool)
+            .unwrap_or(&before.pool);
+        let baseline_diagnostics = self.compatibility_diagnostics_from_pool(baseline)?;
+        let mut candidate_project = self.canvas_preview_copy();
+        candidate_project.pool = after.pool.clone();
+        candidate_project.components = after.source.clone();
+        candidate_project.graphics = after.graphics.clone();
+        candidate_project.object_info.replace(after.info.clone());
+        let candidate_diagnostics =
+            candidate_project.compatibility_diagnostics_from_pool(&candidate.pool)?;
+        let new_errors = crate::pool_validation::new_or_worsened_compatibility_diagnostics(
+            &baseline_diagnostics,
+            &candidate_diagnostics,
+        );
+        if let Some(error) = new_errors
+            .iter()
+            .find(|d| d.severity == crate::ValidationSeverity::Error)
+        {
+            return Err(ComponentError::new(
+                "VT_COMPONENT_INCOMPATIBLE",
+                error.message.clone(),
+            ));
+        }
+        crate::layout_containment::validate_change_with_soft_key_size(
+            baseline,
+            &candidate.pool,
+            self.mask_size,
+            self.mask_size,
+            self.soft_key_size,
+            self.soft_key_size,
+            self.vt_version,
+        )
+        .map_err(containment_component_error)?;
+        after
+            .info
+            .retain(|id, _| after.pool.object_by_id(*id).is_some());
+        if before.content_eq(&after) {
+            return Ok(());
+        }
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        self.component_history
+            .insert(transaction_id.clone(), (before, after.clone()));
+        self.operation_history
+            .borrow_mut()
+            .push(AppliedTransaction {
+                transaction_id,
+                description: Some(description.into()),
+                forward_operations: vec![],
+                inverse_operations: vec![],
+                affected_objects: vec![],
+                execution_time_ms: 0,
+            });
+        self.prune_checkpoint_history();
+        self.restore_component_checkpoint(after);
+        Ok(())
+    }
+
+    /// Start an empty, unsaved pool with a usable editing canvas.
+    pub fn new_pool() -> Self {
+        let mut project = Self::from(ObjectPool::default());
+        project.mask_size = 500;
+        project.saved_content.replace(None);
+        project.dirty.set(true);
+        project
+    }
+
     /// Get the current object pool
     pub fn get_pool(&self) -> &ObjectPool {
         &self.pool
     }
 
-    /// Allocate a new unique object ID efficiently
-    pub fn allocate_object_id(&self) -> ObjectId {
-        let mut next_id = self.next_available_id.borrow_mut();
-
-        // Find the next available ID starting from our cached value
-        while self
-            .pool
-            .object_by_id(ObjectId::new(*next_id).unwrap_or_default())
-            .is_some()
-        {
-            *next_id = next_id.saturating_add(1);
-
-            if *next_id == u16::MAX {
-                // If we've reached the "NULL" object ID, do a full scan to find any gaps
-                let mut found = false;
-                for id in 1..=u16::MAX {
-                    if self
-                        .pool
-                        .object_by_id(ObjectId::new(id).unwrap_or_default())
-                        .is_none()
-                    {
-                        *next_id = id;
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    panic!("No available ObjectId: all IDs from 1 to u16::MAX are taken.");
-                }
-                break;
-            }
-        }
-
-        let allocated_id = ObjectId::new(*next_id).unwrap_or_default();
-        *next_id = next_id.saturating_add(1);
-        allocated_id
+    /// Version of the canonical project content, used to reject stale edits.
+    pub fn revision(&self) -> ProjectRevision {
+        self.revision.get()
     }
 
-    /// Update the next available ID cache based on the current pool
-    fn update_next_available_id(&self) {
-        let max_id = self
+    fn bump_revision(&self) {
+        self.invalidate_cache();
+        self.revision.set(self.revision.get().wrapping_add(1));
+    }
+
+    /// IDs already used or reserved by queued create operations, including
+    /// deterministic reservations for queued automatic creates.
+    fn reserved_object_ids(&self) -> std::collections::BTreeSet<u16> {
+        let mut reserved: std::collections::BTreeSet<_> = self
             .pool
             .objects()
             .iter()
-            .map(|obj| obj.id().value())
-            .max()
-            .unwrap_or(0);
-        self.next_available_id.replace(max_id.saturating_add(1));
+            .map(|object| object.id().value())
+            .chain(
+                self.components
+                    .instances
+                    .iter()
+                    .flat_map(|instance| instance.compiled_ids.values().copied()),
+            )
+            .collect();
+        let queued = self.queued_operations.borrow();
+        reserved.extend(queued.iter().filter_map(|operation| match operation {
+            Operation::CreateObject {
+                object_id: Some(id),
+                ..
+            } => Some(*id),
+            _ => None,
+        }));
+        for operation in queued.iter() {
+            if let Operation::CreateObject {
+                object_id: None,
+                object_type,
+                ..
+            } = operation
+            {
+                let range = self.object_id_ranges.range_for(*object_type);
+                if let Some(id) = (range.start..=range.end).find(|id| !reserved.contains(id)) {
+                    reserved.insert(id);
+                }
+            }
+        }
+        reserved
+    }
+
+    /// Return the lowest free ID in this type's inclusive automatic range.
+    /// Existing primitive, compiled component and queued creation IDs are
+    /// reserved. Exhaustion returns an error without changing the project.
+    pub fn allocate_object_id(
+        &self,
+        object_type: ObjectType,
+    ) -> Result<ObjectId, ObjectIdAllocationError> {
+        let range = self.object_id_ranges.range_for(object_type);
+        let occupied = self.reserved_object_ids();
+        let id = (range.start..=range.end)
+            .find(|id| !occupied.contains(id))
+            .ok_or(ObjectIdAllocationError { object_type, range })?;
+        Ok(ObjectId::new(id).expect("validated automatic ID range"))
+    }
+
+    /// Build the deterministic global reassignment preview for the current project.
+    pub fn plan_id_reassignment(
+        &self,
+        include_overrides: bool,
+    ) -> Result<crate::IdReassignmentPlan, String> {
+        let plan = crate::IdReassignmentPlan::build(
+            &self.pool,
+            &self.components,
+            &self.object_info.borrow(),
+            &self.object_id_ranges,
+            self.vt_version,
+            include_overrides,
+        )?;
+        if !plan.mappings.is_empty() {
+            self.prepare_transaction(&OperationTransaction {
+                schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+                description: Some("Preview object ID reassignment".into()),
+                operations: vec![Operation::RemapObjectIds {
+                    mappings: plan.mappings.clone(),
+                    target_types: plan.target_types.clone(),
+                }],
+            })
+            .map_err(|diagnostics| diagnostics.legacy_operation_error().to_string())?;
+        }
+        Ok(plan)
+    }
+
+    /// Apply a reassignment preview as one undoable, atomic project change.
+    pub fn apply_id_reassignment(
+        &mut self,
+        plan: crate::IdReassignmentPlan,
+    ) -> Result<bool, String> {
+        if plan.mappings.is_empty() {
+            return Ok(false);
+        }
+        self.execute_transaction(OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description: Some("Reassign object IDs".into()),
+            operations: vec![Operation::RemapObjectIds {
+                mappings: plan.mappings,
+                target_types: plan.target_types,
+            }],
+        })
+        .map(|_| true)
+        .map_err(|error| error.to_string())
+    }
+
+    /// Queue an explicit ID assignment from shared-reference UI code.
+    pub fn queue_object_id_assignment(&self, id: ObjectId, new_id: ObjectId, overridden: bool) {
+        self.queue_operation(Operation::SetObjectIdAssignment {
+            object_id: id.value(),
+            new_id: new_id.value(),
+            overridden,
+        });
+    }
+
+    /// Queue automatic reassignment to the first free ID in the object's type range.
+    pub fn queue_use_automatic_object_id(&self, id: ObjectId) -> Result<ObjectId, String> {
+        let object = self
+            .pool
+            .object_by_id(id)
+            .ok_or_else(|| format!("Object {} no longer exists", id.value()))?;
+        let range = self.object_id_ranges.range_for(object.object_type());
+        let assigned = (range.start..=range.end)
+            .find(|candidate| {
+                *candidate != id.value()
+                    && self
+                        .pool
+                        .object_by_id(ObjectId::new(*candidate).unwrap())
+                        .is_none()
+                    && !self.components.instances.iter().any(|instance| {
+                        instance
+                            .compiled_ids
+                            .values()
+                            .any(|compiled| compiled == candidate)
+                    })
+            })
+            .ok_or_else(|| {
+                format!(
+                    "No fresh IDs remain in the {:?} range {}–{}",
+                    object.object_type(),
+                    range.start,
+                    range.end
+                )
+            })?;
+        self.queue_object_id_assignment(id, ObjectId::new(assigned).unwrap(), false);
+        Ok(ObjectId::new(assigned).unwrap())
     }
 
     /// Get the current selected object
@@ -133,86 +1017,878 @@ impl EditorProject {
         self.selected_object
     }
 
-    /// Get the current mutating object pool
-    /// This is used to make changes to the pool in the next frame
-    /// without affecting the current pool
-    pub fn get_mut_pool(&self) -> &RefCell<ObjectPool> {
-        &self.mut_pool
-    }
-
     /// Set the mutating selected object
     /// This is used to make changes to the selected object in the next frame
     /// without affecting the current selected object
-    pub fn get_mut_selected(&self) -> &RefCell<NullableObjectId> {
-        &self.mut_selected_object
+    pub fn get_mut_selected(&self) -> &Cell<NullableObjectId> {
+        &self.pending_selected_object
     }
 
-    /// If the mutating pool is different from the current pool, add the current pool to the history
-    /// and update the current pool with the mutated pool.
+    fn content_checkpoint(&self) -> ProjectContentCheckpoint {
+        let object_info = self.mut_object_info.borrow();
+        let mut object_names: Vec<_> = object_info
+            .iter()
+            .filter_map(|(id, info)| info.name.clone().map(|name| (id.value(), name)))
+            .collect();
+        object_names.sort_by_key(|(id, _)| *id);
+        let mut object_annotations: Vec<_> = object_info
+            .iter()
+            .filter(|(_, info)| {
+                info.description.is_some() || info.notes.is_some() || !info.tags.is_empty()
+            })
+            .map(|(id, info)| {
+                (
+                    id.value(),
+                    info.description.clone(),
+                    info.notes.clone(),
+                    info.tags.clone(),
+                )
+            })
+            .collect();
+        object_annotations.sort_by_key(|(id, ..)| *id);
+        let mut allowed_references: Vec<_> = object_info
+            .iter()
+            .filter(|(_, info)| !info.allowed_references.is_empty())
+            .map(|(id, info)| (id.value(), info.allowed_references.clone()))
+            .collect();
+        allowed_references.sort_by_key(|(id, _)| *id);
+        let mut overridden_ids: Vec<_> = object_info
+            .iter()
+            .filter(|(_, info)| info.id_overridden)
+            .map(|(id, _)| id.value())
+            .collect();
+        overridden_ids.sort_unstable();
+
+        ProjectContentCheckpoint {
+            pool: self.pool.clone(),
+            object_names,
+            object_annotations,
+            allowed_references,
+            overridden_ids,
+            mask_size: self.mask_size,
+            soft_key_size: self.soft_key_size,
+            soft_key_layout: self.soft_key_layout,
+            vt_version: self.vt_version,
+            object_id_ranges: self.object_id_ranges.clone(),
+            components: self.components.clone(),
+            graphics: self.graphics.clone(),
+        }
+    }
+
+    fn refresh_dirty(&self) {
+        let dirty = self
+            .saved_content
+            .borrow()
+            .as_ref()
+            .is_none_or(|saved| *saved != self.content_checkpoint());
+        self.dirty.set(dirty);
+    }
+
+    /// Whether meaningful project content differs from the last open/save checkpoint.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.get()
+    }
+
+    /// Establish the current content as the last successfully saved state.
+    pub fn mark_saved(&self) {
+        self.saved_content.replace(Some(self.content_checkpoint()));
+        self.dirty.set(false);
+    }
+
+    /// Mark a restored recovery snapshot as content that still needs an explicit save.
+    pub fn mark_recovered(&self) {
+        self.saved_content.replace(None);
+        self.dirty.set(true);
+    }
+
+    /// Change the mask viewport size as one undo action, retaining softkey dimensions.
+    ///
+    /// Returns an error without changing content or revision if the new size
+    /// would violate containment. Existing overflow may be retained or reduced.
+    pub fn set_mask_size(&mut self, mask_size: u16) -> ComponentResult<()> {
+        self.set_design_dimensions(mask_size, self.soft_key_size)
+    }
+
+    /// Saved softkey designator width and height in design pixels. Key contents
+    /// use these dimensions as their editing and preview bounds.
+    pub fn soft_key_size(&self) -> (u16, u16) {
+        self.soft_key_size
+    }
+
+    /// Physical Soft Key Mask arrangement used by the authoring preview.
+    pub fn soft_key_layout(&self) -> SoftKeyLayout {
+        self.soft_key_layout
+    }
+
+    /// Authoritative target version used for authoring, preview and IOP export.
+    pub fn vt_version(&self) -> VtVersion {
+        self.vt_version
+    }
+
+    /// Change the target version atomically after compatibility validation.
+    /// Failure leaves content, revision and undo history unchanged.
+    pub fn set_vt_version(&mut self, version: VtVersion) -> ComponentResult<()> {
+        self.set_project_settings(self.mask_size, self.soft_key_size, version)
+    }
+
+    /// Compatibility and complete-pool diagnostics for the materialized
+    /// project, including components. Draft projects remain saveable; these
+    /// completeness diagnostics block IOP export.
+    pub fn compatibility_diagnostics(&self) -> ComponentResult<Vec<crate::ValidationDiagnostic>> {
+        let materialized = self.materialize_shared()?;
+        let pool = &materialized.pool;
+        let mut diagnostics = self.compatibility_diagnostics_from_pool(pool)?;
+        diagnostics.extend(crate::pool_validation::validate_complete_pool_requirements(
+            pool,
+            self.vt_version,
+        ));
+        Ok(diagnostics)
+    }
+
+    fn compatibility_diagnostics_from_pool(
+        &self,
+        pool: &ObjectPool,
+    ) -> ComponentResult<Vec<crate::ValidationDiagnostic>> {
+        let mut diagnostics =
+            crate::pool_validation::validate_pool_state_for_version(pool, self.vt_version);
+        // Master defaults must also be compatible when live instances override
+        // them, or when a master is currently unused.
+        let baseline =
+            crate::pool_validation::validate_pool_state_for_version(&self.pool, self.vt_version);
+        for definition in self.components.definitions.values() {
+            let (preview, ids) = crate::components::preview_definition(self, definition)?;
+            let candidate =
+                crate::pool_validation::validate_pool_state_for_version(&preview, self.vt_version);
+            for mut diagnostic in crate::pool_validation::new_or_worsened_compatibility_diagnostics(
+                &baseline, &candidate,
+            ) {
+                // Preview IDs are disposable. Normalize them to stable node
+                // identities so unrelated primitive allocation cannot change
+                // the identity of an existing master-default violation.
+                let mut affected_nodes = Vec::new();
+                for (node, id) in &ids {
+                    if diagnostic
+                        .affected_objects
+                        .as_ref()
+                        .is_some_and(|affected| affected.contains(id))
+                    {
+                        affected_nodes.push(node);
+                    }
+                    if let Some(affected) = &mut diagnostic.affected_objects {
+                        affected.retain(|affected| affected != id);
+                    }
+                }
+                if !affected_nodes.is_empty() {
+                    let nodes = affected_nodes
+                        .iter()
+                        .map(|node| node.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    diagnostic.message = format!("Node {nodes}: {}", diagnostic.message);
+                }
+                diagnostic.message = format!("Component {}: {}", definition.id, diagnostic.message);
+                diagnostics.push(diagnostic);
+            }
+        }
+        Ok(diagnostics)
+    }
+
+    fn dimensions(&self) -> DesignDimensions {
+        DesignDimensions {
+            mask_size: self.mask_size,
+            soft_key_size: self.soft_key_size,
+            vt_version: self.vt_version,
+            soft_key_layout: self.soft_key_layout,
+            object_id_ranges: self.object_id_ranges.clone(),
+        }
+    }
+
+    fn restore_dimensions(&mut self, dimensions: DesignDimensions) {
+        self.mask_size = dimensions.mask_size;
+        self.soft_key_size = dimensions.soft_key_size;
+        self.vt_version = dimensions.vt_version;
+        self.soft_key_layout = dimensions.soft_key_layout;
+        self.object_id_ranges = dimensions.object_id_ranges;
+        self.bump_revision();
+        self.refresh_dirty();
+    }
+
+    fn prune_checkpoint_history(&mut self) {
+        let history = self.operation_history.borrow();
+        self.component_history.retain(|id, _| history.contains(id));
+        self.dimension_history.retain(|id, _| history.contains(id));
+        self.batch_history.retain(|id, _| history.contains(id));
+    }
+
+    /// Atomically apply positive mask and softkey dimensions as one undo action.
+    /// Mask or key reductions cannot introduce or increase placement overflow; no
+    /// objects are scaled. Failure or a no-op leaves content and revision intact.
+    /// Standard terminal minima are advisory, not limits on design pixels.
+    pub fn set_design_dimensions(
+        &mut self,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+    ) -> ComponentResult<()> {
+        self.set_project_settings(mask_size, soft_key_size, self.vt_version)
+    }
+
+    /// Apply dimensions and VT2–VT6 as one undo action. A version change
+    /// requires a compatible materialized pool; dimensions never scale objects.
+    pub fn set_project_settings(
+        &mut self,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+        vt_version: VtVersion,
+    ) -> ComponentResult<()> {
+        self.set_project_configuration(mask_size, soft_key_size, vt_version, self.soft_key_layout)
+    }
+
+    /// Apply mask dimensions, key dimensions, VT version and softkey layout
+    /// atomically as one undo action.
+    pub fn set_project_configuration(
+        &mut self,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+        vt_version: VtVersion,
+        soft_key_layout: SoftKeyLayout,
+    ) -> ComponentResult<()> {
+        self.set_project_configuration_with_id_ranges(
+            mask_size,
+            soft_key_size,
+            vt_version,
+            soft_key_layout,
+            self.object_id_ranges.clone(),
+        )
+    }
+
+    /// Apply project dimensions, target version, layout, and per-type ID
+    /// allocation ranges atomically as one undo action.
+    pub fn set_project_configuration_with_id_ranges(
+        &mut self,
+        mask_size: u16,
+        soft_key_size: (u16, u16),
+        vt_version: VtVersion,
+        soft_key_layout: SoftKeyLayout,
+        object_id_ranges: crate::ObjectIdRanges,
+    ) -> ComponentResult<()> {
+        if !(2..=6).contains(&u8::from(vt_version)) {
+            return Err(ComponentError::new(
+                "UNSUPPORTED_VT_VERSION",
+                "Choose VT2 through VT6",
+            ));
+        }
+        if mask_size == 0 || soft_key_size.0 == 0 || soft_key_size.1 == 0 {
+            return Err(ComponentError::new(
+                "INVALID_DESIGN_DIMENSIONS",
+                "Design dimensions must be greater than zero",
+            ));
+        }
+        soft_key_layout
+            .validate()
+            .map_err(|message| ComponentError::new("INVALID_SOFT_KEY_LAYOUT", message))?;
+        object_id_ranges
+            .validate(vt_version)
+            .map_err(|message| ComponentError::new("INVALID_OBJECT_ID_RANGES", message))?;
+        let before = self.dimensions();
+        let after = DesignDimensions {
+            mask_size,
+            soft_key_size,
+            vt_version,
+            soft_key_layout,
+            object_id_ranges,
+        };
+        if before == after {
+            return Ok(());
+        }
+        let mut candidate = self.canvas_preview_copy();
+        candidate.mask_size = mask_size;
+        candidate.soft_key_size = soft_key_size;
+        candidate.vt_version = vt_version;
+        candidate.soft_key_layout = soft_key_layout;
+        candidate.object_id_ranges = after.object_id_ranges.clone();
+        self.validate_batch_candidate(&candidate)?;
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        self.dimension_history
+            .insert(transaction_id.clone(), (before, after.clone()));
+        self.operation_history
+            .borrow_mut()
+            .push(AppliedTransaction {
+                transaction_id,
+                description: Some(
+                    if self.vt_version != vt_version || self.soft_key_layout != soft_key_layout {
+                        "Change project settings".into()
+                    } else {
+                        "Change design dimensions".into()
+                    },
+                ),
+                forward_operations: vec![],
+                inverse_operations: vec![],
+                affected_objects: vec![],
+                execution_time_ms: 0,
+            });
+        self.prune_checkpoint_history();
+        self.restore_dimensions(after);
+        Ok(())
+    }
+
+    pub fn set_object_name(&self, object: &Object, name: String) {
+        let mut object_info = self.mut_object_info.borrow_mut();
+        if !smart_naming::normalized_name(&name).is_empty()
+            && self.pool.objects().iter().any(|existing_object| {
+                existing_object.id() != object.id()
+                    && object_info
+                        .get(&existing_object.id())
+                        .map(|info| info.get_name(existing_object))
+                        .is_some_and(|existing| smart_naming::names_equal(&existing, &name))
+            })
+        {
+            self.last_operation_error
+                .replace(Some(format!("Object name already exists: {name}")));
+            return;
+        }
+        let info = object_info
+            .entry(object.id())
+            .or_insert_with(|| ObjectInfo::new(object));
+        let old_name = info.name.clone();
+        info.set_name(name);
+        if info.name != old_name {
+            drop(object_info);
+            self.refresh_dirty();
+            self.bump_revision();
+        }
+    }
+
+    /// Queue one UI operation for the end-of-frame transaction.
+    pub fn queue_operation(&self, operation: Operation) {
+        self.queued_operations.borrow_mut().push(operation);
+    }
+
+    /// Commit queued UI operations as one reversible transaction.
+    pub fn commit_queued(&mut self, description: impl Into<String>) -> bool {
+        let operations = self.queued_operations.take();
+        if operations.is_empty() {
+            return false;
+        }
+        self.execute_ui_transaction(OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description: Some(description.into()),
+            operations,
+        })
+    }
+
+    /// Commit the UI draft as one reversible operation transaction.
     /// Returns true if the pool was updated
     pub fn update_pool(&mut self) -> bool {
-        if self.mut_pool.borrow().to_owned() != self.pool {
-            self.redo_pool_history.clear();
-            self.undo_pool_history.push(self.pool.clone());
-            if self.undo_pool_history.len() > MAX_UNDO_REDO_POOL {
-                self.undo_pool_history
-                    .drain(..self.undo_pool_history.len() - MAX_UNDO_REDO_POOL);
-            }
-            self.pool = self.mut_pool.borrow().clone();
-            // Clear the default names cache since objects may have changed
-            self.default_object_names.borrow_mut().clear();
-            return true;
-        }
-        false
+        self.commit_queued("Edit object pool")
     }
 
     /// Undo the last action
     pub fn undo(&mut self) {
-        if let Some(pool) = self.undo_pool_history.pop() {
-            self.redo_pool_history.push(self.pool.clone());
-
-            // Both need to be replaced here because otherwise it will be added to the undo history
-            self.pool = pool.clone();
-            self.mut_pool.replace(pool);
-
-            // Update next_available_id based on the new pool state
-            self.update_next_available_id();
-
-            // Clear the default names cache since objects may have changed
-            self.default_object_names.borrow_mut().clear();
-        }
+        self.undo_operation();
     }
 
     /// Check if there are actions available to undo
     pub fn undo_available(&self) -> bool {
-        !self.undo_pool_history.is_empty()
+        self.operation_history.borrow().can_undo()
+    }
+
+    pub fn undo_description(&self) -> Option<String> {
+        self.operation_history
+            .borrow()
+            .undo_description()
+            .map(str::to_owned)
     }
 
     /// Redo the last undone action
     pub fn redo(&mut self) {
-        if let Some(pool) = self.redo_pool_history.pop() {
-            self.undo_pool_history.push(self.pool.clone());
-            // Both need to be replaced here because otherwise the redo history will be cleared
-            self.pool = pool.clone();
-            self.mut_pool.replace(pool);
-
-            // Update next_available_id based on the new pool state
-            self.update_next_available_id();
-
-            // Clear the default names cache since objects may have changed
-            self.default_object_names.borrow_mut().clear();
-        }
+        self.redo_operation();
     }
 
     /// Check if there are actions available to redo
     pub fn redo_available(&self) -> bool {
-        !self.redo_pool_history.is_empty()
+        self.operation_history.borrow().can_redo()
+    }
+
+    pub fn redo_description(&self) -> Option<String> {
+        self.operation_history
+            .borrow()
+            .redo_description()
+            .map(str::to_owned)
+    }
+
+    pub fn take_operation_error(&self) -> Option<String> {
+        self.last_operation_error.replace(None)
+    }
+
+    /// Create a default object through the operation executor and return its ID.
+    ///
+    /// UI callers should use this instead of inserting into the draft pool: the
+    /// creation is immediately undoable and does not depend on the end-of-frame
+    /// draft diff finding the new object again.
+    /// Create an object from the editor, starting from the creation presets so it
+    /// has a usable size and its required attributes. Font and Line Attributes
+    /// references reuse the pool's most used one, or a new one when there is none.
+    /// Everything is one undo step. Should the presets be rejected, the object is
+    /// created with its ISO defaults instead.
+    pub fn create_object(&mut self, object_type: ObjectType, name: String) -> Option<ObjectId> {
+        self.create_object_placed(object_type, name, None)
+    }
+
+    /// Like [`Self::create_object`], also placing the new object as the last
+    /// child of `parent` at `x`, `y` in the same undo step.
+    pub fn create_object_at(
+        &mut self,
+        object_type: ObjectType,
+        name: String,
+        parent: ObjectId,
+        x: i16,
+        y: i16,
+    ) -> Option<ObjectId> {
+        self.create_object_placed(object_type, name, Some((parent, x, y)))
+    }
+
+    fn create_object_placed(
+        &mut self,
+        object_type: ObjectType,
+        name: String,
+        placement: Option<(ObjectId, i16, i16)>,
+    ) -> Option<ObjectId> {
+        let object_id = self.allocate_object_id(object_type).ok()?;
+        let description = Some(format!("Create {object_type:?}"));
+        let placement = placement.map(|(parent, x, y)| self.placement(parent, object_id, x, y));
+        let place = |operations: &mut Vec<Operation>| operations.extend(placement.clone());
+        if let Some(mut operations) = self.preset_creation(object_type, object_id, &name) {
+            place(&mut operations);
+            let transaction = OperationTransaction {
+                schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+                description: description.clone(),
+                operations,
+            };
+            if let Ok(prepared) = self.prepare_transaction(&transaction) {
+                if self.commit_prepared_transaction(prepared).is_ok() {
+                    return Some(object_id);
+                }
+            }
+        }
+        let mut operations = vec![
+            Operation::CreateObject {
+                object_id: Some(object_id.value()),
+                object_type,
+                name,
+            },
+            Operation::SetObjectIdAssignment {
+                object_id: object_id.value(),
+                new_id: object_id.value(),
+                overridden: false,
+            },
+        ];
+        place(&mut operations);
+        let transaction = OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description,
+            operations,
+        };
+
+        self.execute_ui_transaction(transaction)
+            .then_some(object_id)
+    }
+
+    /// The operation adding `child` to `parent`: at `x`, `y` for positioned
+    /// children, otherwise at the end of the parent's list, such as the keys of
+    /// a Soft Key Mask.
+    fn placement(&self, parent: ObjectId, child: ObjectId, x: i16, y: i16) -> Operation {
+        use crate::operations::{ObjectReferenceList, ObjectTargetList};
+
+        let list = self
+            .get_pool()
+            .object_by_id(parent)
+            .filter(|parent| crate::operations::object_refs(parent).is_none())
+            .and_then(crate::operations::operation::object_list);
+        let target = |id: ObjectId| ObjectTarget::id(id.value());
+        match list {
+            Some(ObjectReferenceList::Required(ids)) => Operation::SetObjectList {
+                object: target(parent),
+                objects: ObjectTargetList::Required(
+                    ids.into_iter().chain([child]).map(target).collect(),
+                ),
+            },
+            Some(ObjectReferenceList::Nullable(ids)) => Operation::SetObjectList {
+                object: target(parent),
+                objects: ObjectTargetList::Nullable(
+                    ids.into_iter()
+                        .map(|id| id.0)
+                        .chain([Some(child)])
+                        .map(|id| id.map(target))
+                        .collect(),
+                ),
+            },
+            None => Operation::AddChild {
+                parent: target(parent),
+                child: target(child),
+                x,
+                y,
+            },
+        }
+    }
+
+    /// The operations creating an object with its creation presets, or None when
+    /// it has none or no ID is free for an attribute object it needs.
+    fn preset_creation(
+        &self,
+        object_type: ObjectType,
+        object_id: ObjectId,
+        name: &str,
+    ) -> Option<Vec<Operation>> {
+        use crate::creation_presets::{most_used_attribute, presets, Preset};
+
+        let presets = presets(object_type);
+        if presets.is_empty() {
+            return None;
+        }
+        // An explicit ID reserves the allocated range ID; the assignment is reset
+        // so it still behaves like an automatic one.
+        let create = |id: ObjectId, object_type: ObjectType, name: String| {
+            [
+                Operation::CreateObject {
+                    object_id: Some(id.value()),
+                    object_type,
+                    name,
+                },
+                Operation::SetObjectIdAssignment {
+                    object_id: id.value(),
+                    new_id: id.value(),
+                    overridden: false,
+                },
+            ]
+        };
+        let set = |id: ObjectId, property, value| Operation::SetProperty {
+            object: ObjectTarget::id(id.value()),
+            property,
+            value,
+        };
+
+        let mut operations = create(object_id, object_type, name.to_owned()).to_vec();
+        for preset in presets {
+            match preset {
+                Preset::Value(property, value) => operations.push(set(object_id, property, value)),
+                Preset::Attribute(property, attribute_type) => {
+                    let attribute = match most_used_attribute(&self.pool, attribute_type) {
+                        Some(id) => id,
+                        None => {
+                            let range = self.object_id_ranges.range_for(attribute_type);
+                            let reserved = self.reserved_object_ids();
+                            let id = (range.start..=range.end)
+                                .find(|id| !reserved.contains(id) && *id != object_id.value())
+                                .and_then(|id| ObjectId::new(id).ok())?;
+                            operations.extend(create(
+                                id,
+                                attribute_type,
+                                self.generate_smart_name_for_new_object(attribute_type),
+                            ));
+                            for preset in crate::creation_presets::presets(attribute_type) {
+                                if let Preset::Value(property, value) = preset {
+                                    operations.push(set(id, property, value));
+                                }
+                            }
+                            id
+                        }
+                    };
+                    operations.push(Operation::SetObjectReference {
+                        object: ObjectTarget::id(object_id.value()),
+                        property,
+                        reference: Some(ObjectTarget::id(attribute.value())),
+                    });
+                }
+            }
+        }
+        Some(operations)
+    }
+
+    /// Duplicate a shared Font, Line, or Fill Attribute as one undoable action.
+    ///
+    /// Copies writable properties and outgoing references into a uniquely named
+    /// object with a fresh automatic ID from its configured range. Consumers keep
+    /// referencing `source_id`; editor metadata other than the name is not copied.
+    /// Returns the new ID, or an error for a missing/unsupported source, exhausted
+    /// range, or invalid copied content. Failure leaves the project unchanged.
+    pub fn duplicate_shared_attribute(
+        &mut self,
+        source_id: ObjectId,
+    ) -> Result<ObjectId, OperationError> {
+        let source = self
+            .pool
+            .object_by_id(source_id)
+            .ok_or(OperationError::ObjectNotFound(source_id.value()))?
+            .clone();
+        let object_type = source.object_type();
+        if !matches!(
+            object_type,
+            ObjectType::FontAttributes | ObjectType::LineAttributes | ObjectType::FillAttributes
+        ) {
+            return Err(OperationError::OperationContextError {
+                object_id: source_id.value(),
+                context: "duplicate".to_owned(),
+                reason: "Only Font, Line, and Fill Attributes can be duplicated here".to_owned(),
+            });
+        }
+
+        let new_id = self.allocate_object_id(object_type).map_err(|error| {
+            OperationError::OperationContextError {
+                object_id: source_id.value(),
+                context: "CreateObject".to_owned(),
+                reason: error.to_string(),
+            }
+        })?;
+        let source_name = self
+            .object_info
+            .borrow()
+            .get(&source_id)
+            .map(|info| info.get_name(&source))
+            .unwrap_or_else(|| {
+                format!(
+                    "{} {}",
+                    smart_naming::get_object_type_name(object_type),
+                    source_id.value()
+                )
+            });
+        let names = self.get_all_object_names();
+        let base_name = format!("Copy of {source_name}");
+        let mut name = base_name.clone();
+        let mut suffix = 2u32;
+        while names
+            .keys()
+            .any(|existing| smart_naming::names_equal(existing, &name))
+        {
+            name = format!("{base_name} ({suffix})");
+            suffix += 1;
+        }
+
+        let mut operations = vec![
+            Operation::CreateObject {
+                object_id: Some(new_id.value()),
+                object_type,
+                name: name.clone(),
+            },
+            // An explicit ID is used to reserve the already selected range ID;
+            // reset the metadata so it behaves like an automatic assignment.
+            Operation::SetObjectIdAssignment {
+                object_id: new_id.value(),
+                new_id: new_id.value(),
+                overridden: false,
+            },
+        ];
+
+        for descriptor in crate::object_properties::get_property_descriptors(object_type)
+            .into_iter()
+            .filter(|descriptor| descriptor.writable)
+        {
+            let value = crate::object_properties::get_object_property(&source, descriptor.name)
+                .map_err(|error| OperationError::PropertyError {
+                    object_id: source_id.value(),
+                    property: descriptor.name,
+                    reason: error.to_string(),
+                })?;
+            let target = ObjectTarget::Name { name: name.clone() };
+            if matches!(
+                descriptor.semantic,
+                crate::object_properties::PropertySemantic::ObjectReference { .. }
+            ) {
+                let reference = if value.is_null() {
+                    None
+                } else {
+                    let reference_id: ObjectId =
+                        serde_json::from_value(value).map_err(|error| {
+                            OperationError::PropertyError {
+                                object_id: source_id.value(),
+                                property: descriptor.name,
+                                reason: error.to_string(),
+                            }
+                        })?;
+                    Some(ObjectTarget::id(reference_id.value()))
+                };
+                operations.push(Operation::SetObjectReference {
+                    object: target,
+                    property: descriptor.name,
+                    reference,
+                });
+            } else {
+                operations.push(Operation::SetProperty {
+                    object: target,
+                    property: descriptor.name,
+                    value,
+                });
+            }
+        }
+
+        if let Some(references) = crate::operations::macro_refs(&source) {
+            operations.push(Operation::SetMacroReferences {
+                object: ObjectTarget::Name { name: name.clone() },
+                macro_refs: references
+                    .iter()
+                    .map(|reference| crate::operations::MacroReferenceTarget {
+                        event_id: reference.event_id,
+                        macro_object: ObjectTarget::id(u16::from(reference.macro_id)),
+                    })
+                    .collect(),
+            });
+        }
+
+        self.execute_transaction(OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description: Some(format!("Duplicate {source_name}")),
+            operations,
+        })?;
+        Ok(new_id)
+    }
+
+    /// Delete an object through a reversible operation.
+    pub fn delete_object(&mut self, object_id: ObjectId) -> bool {
+        let deleted = self.execute_ui_transaction(OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description: Some(format!("Delete object {}", object_id.value())),
+            operations: vec![Operation::DeleteObject {
+                object_id: object_id.value(),
+            }],
+        });
+        if deleted && self.get_selected().0 == Some(object_id) {
+            self.pending_selected_object.set(NullableObjectId::NULL);
+        }
+        deleted
+    }
+
+    /// Request deletion from UI code that only has a shared project reference.
+    pub fn request_delete_object(&self, object_id: ObjectId) {
+        self.delete_request.replace(Some(object_id));
+    }
+
+    /// Defer inspector assignment until same-frame property edits are committed.
+    pub fn request_graphic_assignment(
+        &self,
+        asset: crate::graphics::GraphicAssetId,
+        target: ObjectId,
+    ) {
+        self.graphic_assign_request.set(Some((asset, target)));
+    }
+
+    pub fn commit_graphic_assignment(&mut self) -> bool {
+        let Some((asset, target)) = self.graphic_assign_request.take() else {
+            return false;
+        };
+        match crate::graphics::integration::GraphicService::convert_asset_into_picture_graphic(
+            self,
+            asset,
+            target.value(),
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                self.last_operation_error.replace(Some(error.to_string()));
+                false
+            }
+        }
+    }
+
+    /// Take an inspector choice so the caller can review conversion before applying it.
+    pub fn take_graphic_assignment(&self) -> Option<(crate::graphics::GraphicAssetId, ObjectId)> {
+        self.graphic_assign_request.take()
+    }
+
+    /// Consume a pending hierarchy delete request.
+    pub fn take_delete_request(&self) -> Option<ObjectId> {
+        self.delete_request.replace(None)
+    }
+
+    /// Rename an object through a reversible metadata operation.
+    pub fn rename_object(&mut self, object_id: ObjectId, name: String) -> bool {
+        let current_name = self
+            .object_info
+            .borrow()
+            .get(&object_id)
+            .and_then(|info| info.name.clone())
+            .unwrap_or_default();
+        if current_name == name {
+            return false;
+        }
+        self.execute_ui_transaction(OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description: Some(format!("Rename object {}", object_id.value())),
+            operations: vec![Operation::RenameObject {
+                object: ObjectTarget::id(object_id.value()),
+                name,
+            }],
+        })
+    }
+
+    /// Request a rename from UI code that only has a shared project reference.
+    pub fn request_rename_object(&self, object_id: ObjectId, name: String) {
+        self.rename_request.replace(Some((object_id, name)));
+    }
+
+    /// Consume a pending hierarchy rename request.
+    pub fn take_rename_request(&self) -> Option<(ObjectId, String)> {
+        self.rename_request.replace(None)
+    }
+
+    /// Reorder the canonical pool through a reversible operation.
+    pub fn reorder_objects(&mut self, object_ids: Vec<ObjectId>) -> bool {
+        if self
+            .pool
+            .objects()
+            .iter()
+            .map(Object::id)
+            .eq(object_ids.iter().copied())
+        {
+            return false;
+        }
+        self.execute_ui_transaction(OperationTransaction {
+            schema_version: CURRENT_OPERATION_SCHEMA_VERSION,
+            description: Some("Reorder objects".to_owned()),
+            operations: vec![Operation::ReorderObjects {
+                object_ids: object_ids.into_iter().map(|id| id.value()).collect(),
+            }],
+        })
+    }
+
+    /// Sort objects by their displayed names through `ReorderObjects`.
+    pub fn sort_objects_by_name(&mut self) -> bool {
+        let mut objects: Vec<_> = self.pool.objects().iter().collect();
+        objects.sort_by(|a, b| {
+            self.get_object_info(a)
+                .get_name(a)
+                .cmp(&self.get_object_info(b).get_name(b))
+        });
+        self.reorder_objects(objects.into_iter().map(Object::id).collect())
+    }
+
+    /// Sort objects by ID through `ReorderObjects`.
+    pub fn sort_objects_by_id(&mut self) -> bool {
+        let mut object_ids: Vec<_> = self.pool.objects().iter().map(Object::id).collect();
+        object_ids.sort_by_key(|id| id.value());
+        self.reorder_objects(object_ids)
+    }
+
+    fn execute_ui_transaction(&mut self, transaction: OperationTransaction) -> bool {
+        match self.prepare_transaction(&transaction) {
+            Ok(prepared) => match self.commit_prepared_transaction(prepared) {
+                Ok(_) => true,
+                Err(error) => {
+                    log::error!("Failed to execute UI operation: {error:?}");
+                    self.last_operation_error.replace(Some(error.to_string()));
+                    false
+                }
+            },
+            Err(diagnostics) => {
+                let message = self.format_transaction_diagnostics(&diagnostics);
+                log::error!("Failed to execute UI operation: {message}");
+                self.last_operation_error.replace(Some(message));
+                false
+            }
+        }
     }
 
     /// Update the selected object with the mutating selected object if it is different
     /// Returns true if the selected object was updated
     pub fn update_selected(&mut self) -> bool {
-        let mut_selected = self.mut_selected_object.borrow().to_owned();
+        let mut_selected = self.pending_selected_object.get();
         if mut_selected != self.selected_object {
             self.redo_selected_history.clear();
             if mut_selected != NullableObjectId::NULL {
@@ -223,9 +1899,26 @@ impl EditorProject {
                 }
             }
             self.selected_object = mut_selected;
+            self.sync_component_selection();
             return true;
         }
         false
+    }
+
+    fn sync_component_selection(&self) {
+        let map = source_map(&self.components);
+        self.component_selection
+            .set(
+                self.selected_object
+                    .0
+                    .and_then(|id| match map.by_object_id.get(&id.value()) {
+                        Some(MaterializedSource::ComponentNode {
+                            instance_id,
+                            node_id,
+                        }) => Some((*instance_id, *node_id)),
+                        _ => None,
+                    }),
+            );
     }
 
     /// Set the selected object to the previous object in the history
@@ -234,7 +1927,8 @@ impl EditorProject {
             self.redo_selected_history.push(self.selected_object);
             // Both need to be replaced here because otherwise it will be added to the undo history
             self.selected_object = selected.clone();
-            self.mut_selected_object.replace(selected);
+            self.pending_selected_object.set(selected);
+            self.sync_component_selection();
         }
     }
 
@@ -244,13 +1938,14 @@ impl EditorProject {
             self.undo_selected_history.push(self.selected_object);
             // Both need to be replaced here because otherwise the redo history will be cleared
             self.selected_object = selected.clone();
-            self.mut_selected_object.replace(selected);
+            self.pending_selected_object.set(selected);
+            self.sync_component_selection();
         }
     }
 
     /// Change an object id in the object info hashmap
     pub fn update_object_id_for_info(&self, old_id: ObjectId, new_id: ObjectId) {
-        let mut object_info = self.object_info.borrow_mut();
+        let mut object_info = self.mut_object_info.borrow_mut();
         if let Some(info) = object_info.remove(&old_id) {
             object_info.insert(new_id, info);
         }
@@ -259,7 +1954,7 @@ impl EditorProject {
     /// Get the object info for an object id
     /// If the object id is not mapped, we insert the default object info
     pub fn get_object_info(&self, object: &Object) -> ObjectInfo {
-        let mut object_info = self.object_info.borrow_mut();
+        let mut object_info = self.mut_object_info.borrow_mut();
         object_info
             .entry(object.id())
             .or_insert_with(|| ObjectInfo::new(object))
@@ -277,31 +1972,21 @@ impl EditorProject {
         self.renaming_object.borrow().clone()
     }
 
-    /// Finish renaming an object
-    /// If store is true, we store the new name in the object info hashmap
+    /// Finish inline renaming. The operation is submitted after this frame's
+    /// draft edits have been committed.
     pub fn finish_renaming_object(&self, store: bool) {
         if store {
             if let Some(renaming_object) = self.renaming_object.borrow().as_ref() {
-                let mut object_info = self.object_info.borrow_mut();
-                if let Some(info) = object_info.get_mut(&renaming_object.1) {
-                    info.set_name(renaming_object.2.clone());
-                }
+                self.request_rename_object(renaming_object.1, renaming_object.2.clone());
             }
         }
         self.renaming_object.replace(None);
     }
 
-    pub fn sort_objects_by<F>(&mut self, cmp: F)
-    where
-        F: Fn(&Object, &Object) -> std::cmp::Ordering,
-    {
-        self.mut_pool.borrow_mut().objects_mut().sort_by(cmp);
-    }
-
     /// Get all existing object names for validation
     pub fn get_all_object_names(&self) -> HashMap<String, ObjectType> {
         let mut names = HashMap::new();
-        let object_info = self.object_info.borrow();
+        let object_info = self.mut_object_info.borrow();
         let mut default_names_cache = self.default_object_names.borrow_mut();
 
         for object in self.pool.objects() {
@@ -333,7 +2018,7 @@ impl EditorProject {
 
     /// Apply smart naming to all objects efficiently
     pub fn apply_smart_naming_to_all_objects(&self) {
-        let mut object_info = self.object_info.borrow_mut();
+        let mut object_info = self.mut_object_info.borrow_mut();
 
         // Build existing names map once for all remaining objects
         let mut existing_names = HashMap::new();
@@ -347,26 +2032,51 @@ impl EditorProject {
             }
         }
 
-        // Generate names for remaining objects
+        let mut type_counts = [0usize; 256];
+        let mut normalized_names: HashSet<_> = existing_names
+            .keys()
+            .map(|name| smart_naming::normalized_name(name))
+            .collect();
+        for object_type in existing_names.values() {
+            type_counts[u8::from(*object_type) as usize] += 1;
+        }
+
+        // Generate names for remaining objects without recounting the whole map.
         for object in self.pool.objects() {
-            let new_name =
-                smart_naming::generate_smart_default_name(object.object_type(), &existing_names);
+            let object_type = object.object_type();
+            if object_info
+                .get(&object.id())
+                .is_some_and(|info| info.name.is_some())
+            {
+                continue;
+            }
+            let new_name = smart_naming::generate_smart_name_from_count_with_normalized_names(
+                object_type,
+                type_counts[u8::from(object_type) as usize],
+                &normalized_names,
+            );
 
             // Update the count for the new name to ensure uniqueness
             existing_names
                 .entry(new_name.clone())
-                .or_insert(object.object_type());
+                .or_insert(object_type);
+            normalized_names.insert(smart_naming::normalized_name(&new_name));
+            type_counts[u8::from(object_type) as usize] += 1;
 
             let info = object_info
                 .entry(object.id())
                 .or_insert_with(|| ObjectInfo::new(object));
             info.set_name(new_name);
         }
+        drop(object_info);
+        self.object_info
+            .replace(self.mut_object_info.borrow().clone());
+        self.invalidate_cache();
     }
 
     /// Apply smart naming to an existing object if it doesn't have a custom name
     pub fn apply_smart_naming_to_object(&self, object: &Object) {
-        let mut object_info = self.object_info.borrow_mut();
+        let mut object_info = self.mut_object_info.borrow_mut();
 
         // Check if the object already has a name
         if let Some(info) = object_info.get(&object.id()) {
@@ -405,51 +2115,128 @@ impl EditorProject {
             .entry(object.id())
             .or_insert_with(|| ObjectInfo::new(object));
         info.set_name(new_name);
+        drop(object_info);
+        self.object_info
+            .replace(self.mut_object_info.borrow().clone());
+        self.invalidate_cache();
     }
 
     /// Save the project to a file
     pub fn save_project(&self) -> Result<Vec<u8>, serde_json::Error> {
         // Make sure we're saving the current state
-        let object_info = self.object_info.borrow();
-        let selected = if self.mut_selected_object.borrow().0.is_some() {
-            self.mut_selected_object.borrow().0
+        let object_info = self.mut_object_info.borrow();
+        let selected = if self.pending_selected_object.get().0.is_some() {
+            self.pending_selected_object.get().0
         } else {
             self.selected_object.0
         };
 
-        let project = ProjectFile::new(&self.pool, &object_info, self.mask_size, selected);
+        let mut project = ProjectFile::new_with_id_ranges(
+            &self.pool,
+            &object_info,
+            self.mask_size,
+            self.soft_key_size,
+            self.soft_key_layout,
+            self.vt_version,
+            selected,
+            self.object_id_ranges.clone(),
+        )?;
+        project.components = self.components.clone();
+        project.graphics = self.graphics.clone();
         project.to_bytes()
     }
 
     /// Load a project from file data
     pub fn load_project(data: Vec<u8>) -> Result<Self, String> {
-        let project = ProjectFile::from_bytes(&data)
+        let mut project = ProjectFile::from_bytes(&data)
             .map_err(|e| format!("Failed to parse project file: {}", e))?;
-        let pool = project.load_pool()?;
+        let mut pool = project.load_pool()?;
+        for (object_id, binding) in std::mem::take(&mut project.graphics.legacy_bindings) {
+            let asset = project
+                .graphics
+                .assets
+                .get(&binding.asset_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "Legacy graphic binding references missing asset {}",
+                        binding.asset_id
+                    )
+                })?;
+            let id = ObjectId::new(object_id)
+                .map_err(|_| format!("Invalid PictureGraphic ID {object_id}"))?;
+            let Some(ag_iso_stack::object_pool::object::Object::PictureGraphic(existing)) =
+                pool.object_by_id(id)
+            else {
+                return Err(format!(
+                    "Legacy graphic binding target {object_id} is not a PictureGraphic"
+                ));
+            };
+            let mut picture = existing.clone();
+            crate::graphics::apply_image_bytes_to_picture_graphic(
+                &mut picture,
+                &asset.original_bytes,
+            )?;
+            if let Some(transparent) = binding.transparent {
+                picture.options.transparent = transparent;
+            }
+            if let Some(colour) = binding.transparency_colour {
+                picture.transparency_colour = colour;
+            }
+            if let Some(flashing) = binding.flashing {
+                picture.options.flashing = flashing;
+            }
+            if let Some(format) = binding.format {
+                crate::graphics::validate_picture_format(&pool, id, picture.actual_width, format)?;
+                let palette = crate::effective_colour::colours(&pool).map(|colour| colour.as_rgb());
+                crate::graphics::convert_picture_graphic_format(&mut picture, format, &palette)?;
+            }
+            if let Some(ag_iso_stack::object_pool::object::Object::PictureGraphic(target)) =
+                pool.object_mut_by_id(id)
+            {
+                *target = picture;
+            }
+            project.graphics.assets.remove(&binding.asset_id);
+        }
         let settings = project.get_settings();
 
         let mut editor_project = EditorProject::from(pool);
         editor_project.mask_size = settings.mask_size;
+        if let Some(soft_key_size) = settings.soft_key_size {
+            editor_project.soft_key_size = soft_key_size;
+        }
+        editor_project.soft_key_layout = settings.soft_key_layout;
+        editor_project.vt_version = settings.vt_version();
+        editor_project.object_id_ranges = settings.object_id_ranges.clone();
 
         // Restore object metadata
         let metadata = project.get_metadata();
         let mut object_info = editor_project.object_info.borrow_mut();
-        let mut_pool = editor_project.get_mut_pool();
         for object in editor_project.pool.objects() {
             if let Some(meta) = metadata.get(&object.id().value()) {
                 let info = object_info
                     .entry(object.id())
                     .or_insert_with(|| ObjectInfo::new(object));
-                if let Some(name) = &meta.name {
-                    info.set_name(name.clone());
-                }
+                // A persisted null name is an explicit unnamed object. Generate
+                // names only for objects without a metadata record.
+                info.name = meta.name.clone();
+                info.description = meta.description.clone();
+                info.notes = meta.notes.clone();
+                info.tags = meta.tags.clone();
+                info.allowed_references = meta.allowed_references.clone();
+                info.id_overridden = meta.id_overridden;
             }
         }
         drop(object_info);
+        editor_project
+            .mut_object_info
+            .replace(editor_project.object_info.borrow().clone());
 
         // Apply smart naming to objects without custom names
         for object in editor_project.pool.objects() {
-            editor_project.apply_smart_naming_to_object(object);
+            if !metadata.contains_key(&object.id().value()) {
+                editor_project.apply_smart_naming_to_object(object);
+            }
         }
 
         // Restore last selected
@@ -457,12 +2244,42 @@ impl EditorProject {
             if let Ok(id) = ObjectId::new(selected_id) {
                 editor_project.selected_object = NullableObjectId(Some(id));
                 editor_project
-                    .mut_selected_object
-                    .replace(NullableObjectId(Some(id)));
+                    .pending_selected_object
+                    .set(NullableObjectId(Some(id)));
             }
         }
 
+        editor_project.components = project.components.clone();
+        crate::components::ensure_instance_names(&mut editor_project.components);
+        editor_project.graphics = project.graphics.clone();
+        materialize_project(&editor_project).map_err(|e| e.to_string())?;
+        editor_project.sync_component_selection();
+        editor_project.mark_saved();
+
         Ok(editor_project)
+    }
+
+    pub fn request_graphic_options(&self, id: u16, transparent: bool, colour: u8, flashing: bool) {
+        self.graphic_options_request
+            .replace(Some((id, transparent, colour, flashing)));
+    }
+    pub fn take_graphic_options_request(&self) -> Option<(u16, bool, u8, bool)> {
+        self.graphic_options_request.take()
+    }
+    pub fn request_graphic_format(
+        &self,
+        id: u16,
+        format: ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat,
+    ) {
+        self.graphic_format_request.replace(Some((id, format)));
+    }
+    pub fn take_graphic_format_request(
+        &self,
+    ) -> Option<(
+        u16,
+        ag_iso_stack::object_pool::object_attributes::PictureGraphicFormat,
+    )> {
+        self.graphic_format_request.take()
     }
 
     /// Request to open image file dialog for a PictureGraphic object
@@ -474,4 +2291,804 @@ impl EditorProject {
     pub fn take_image_load_request(&self) -> Option<ObjectId> {
         self.image_load_request.replace(None)
     }
+
+    /// Execute a transaction and integrate with undo/redo
+    /// Returns the applied transaction or an error
+    pub fn execute_transaction(
+        &mut self,
+        transaction: OperationTransaction,
+    ) -> Result<AppliedTransaction, OperationError> {
+        let prepared = self
+            .prepare_transaction(&transaction)
+            .map_err(|diagnostics| diagnostics.legacy_operation_error())?;
+        self.commit_prepared_transaction(prepared)
+    }
+
+    fn commit_prepared_transaction(
+        &mut self,
+        prepared: PreparedTransaction,
+    ) -> Result<AppliedTransaction, OperationError> {
+        let PreparedTransaction {
+            pool: modified_pool,
+            object_info: modified_object_info,
+            applied,
+            ..
+        } = prepared;
+
+        // A deleted graphic becomes an available PNG. Stage all exports before
+        // changing the project, then use the existing full-project history for
+        // the pool deletion and library insertion as a single undo step.
+        let mut recovered = Vec::new();
+        for operation in &applied.inverse_operations {
+            if let Operation::RestoreObject {
+                object: Object::PictureGraphic(picture),
+                info,
+            } = operation
+            {
+                // A newly created, empty PictureGraphic has no image to recover.
+                if picture.actual_width == 0 || picture.actual_height == 0 {
+                    continue;
+                }
+                let asset = crate::graphics::integration::recover_picture_graphic(
+                    picture,
+                    &self.pool,
+                    info.as_ref(),
+                )
+                .map_err(|reason| OperationError::PropertyError {
+                    object_id: picture.id.value(),
+                    property: crate::object_properties::PropertyKey::Data,
+                    reason,
+                })?;
+                recovered.push(asset);
+            }
+        }
+        let id_remap = crate::id_reassignment::compose_id_mappings(&applied.forward_operations);
+        let before =
+            (!recovered.is_empty() || !id_remap.is_empty()).then(|| self.component_checkpoint());
+
+        if !id_remap.is_empty() {
+            crate::id_reassignment::remap_component_source(
+                &mut self.components,
+                &id_remap,
+                &self.pool,
+                self.vt_version,
+            )
+            .expect("prepared component ID remap must remain valid");
+            let map: HashMap<_, _> = id_remap.iter().copied().collect();
+            let old_bindings = std::mem::take(&mut self.graphics.legacy_bindings);
+            self.graphics.legacy_bindings = old_bindings
+                .into_iter()
+                .map(|(id, binding)| (map.get(&id).copied().unwrap_or(id), binding))
+                .collect();
+        }
+        for asset in recovered {
+            self.graphics.assets.insert(asset.id, asset);
+        }
+
+        // Replace pool and metadata with results after component Macro streams
+        // have been resolved against the original identities.
+        self.pool = modified_pool;
+
+        self.object_info.replace(modified_object_info);
+        self.mut_object_info
+            .replace(self.object_info.borrow().clone());
+        self.default_object_names.borrow_mut().clear();
+        self.remap_selection_for_operations(&applied.forward_operations);
+
+        if let Some(before) = before {
+            self.component_history.insert(
+                applied.transaction_id.clone(),
+                (before, self.component_checkpoint()),
+            );
+        }
+        // Record in history (this is a user action)
+        self.operation_history.borrow_mut().push(applied.clone());
+        self.prune_checkpoint_history();
+
+        // Mark dirty and refresh state
+        self.refresh_dirty();
+        self.bump_revision();
+
+        Ok(applied)
+    }
+
+    /// Prepare a transaction against a cloned candidate state without mutating this project.
+    pub fn prepare_transaction(
+        &self,
+        transaction: &OperationTransaction,
+    ) -> Result<PreparedTransaction, TransactionDiagnostics> {
+        let mut transaction = transaction.clone();
+        for operation in &transaction.operations {
+            if let Operation::RemapObjectIds { mappings, .. } = operation {
+                let compiled: HashSet<_> = self
+                    .components
+                    .instances
+                    .iter()
+                    .flat_map(|instance| instance.compiled_ids.values().copied())
+                    .collect();
+                if let Some((old_id, _)) = mappings.iter().find(|(old_id, _)| {
+                    ObjectId::new(*old_id)
+                        .ok()
+                        .is_none_or(|id| self.pool.object_by_id(id).is_none())
+                        && !compiled.contains(old_id)
+                }) {
+                    return Err(component_transaction_error(ComponentError::new(
+                        "OBJECT_NOT_FOUND",
+                        format!("Object ID {old_id} is no longer present"),
+                    )));
+                }
+            }
+        }
+        let mut reserved = self.reserved_object_ids();
+        // Reserve explicit operation IDs before choosing any automatic IDs, so
+        // a preceding automatic create cannot consume a later explicit ID.
+        reserved.extend(
+            transaction
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::CreateObject {
+                        object_id: Some(id),
+                        ..
+                    } => Some(*id),
+                    _ => None,
+                }),
+        );
+        let mut create_id_overrides = HashMap::new();
+        for operation in &mut transaction.operations {
+            if let Operation::CreateObject {
+                object_id,
+                object_type,
+                ..
+            } = operation
+            {
+                let explicit = object_id.is_some();
+                if object_id.is_none() {
+                    let range = self.object_id_ranges.range_for(*object_type);
+                    *object_id = (range.start..=range.end).find(|id| !reserved.contains(id));
+                    if object_id.is_none() {
+                        return Err(component_transaction_error(ComponentError::new(
+                            "OBJECT_ID_RANGE_EXHAUSTED",
+                            ObjectIdAllocationError {
+                                object_type: *object_type,
+                                range,
+                            }
+                            .to_string(),
+                        )));
+                    }
+                }
+                let object_id = object_id.unwrap();
+                create_id_overrides.insert(object_id, explicit);
+                reserved.insert(object_id);
+            }
+        }
+        let mut normalized_operations = Vec::with_capacity(transaction.operations.len());
+        for operation in std::mem::take(&mut transaction.operations) {
+            let auto_assigned = match &operation {
+                Operation::CreateObject {
+                    object_id: Some(id),
+                    ..
+                } => create_id_overrides.get(id) == Some(&false),
+                _ => false,
+            };
+            let assigned_id = match &operation {
+                Operation::CreateObject {
+                    object_id: Some(id),
+                    ..
+                } if auto_assigned => Some(*id),
+                _ => None,
+            };
+            normalized_operations.push(operation);
+            if let Some(id) = assigned_id {
+                normalized_operations.push(Operation::SetObjectIdAssignment {
+                    object_id: id,
+                    new_id: id,
+                    overridden: false,
+                });
+            }
+        }
+        // Supply authoritative compiled object types to individual remaps too.
+        // Keep identity changes sequential across the transaction and simultaneous
+        // within each batch, including when command values target component nodes.
+        let mut target_types: HashMap<u16, ObjectType> = self
+            .pool
+            .objects()
+            .iter()
+            .map(|object| (object.id().value(), object.object_type()))
+            .collect();
+        for instance in &self.components.instances {
+            if let Some(definition) = self.components.definitions.get(&instance.component_id) {
+                for node in &definition.nodes {
+                    if let Some(id) = instance.compiled_ids.get(&node.id) {
+                        target_types.insert(*id, node.object_type);
+                    }
+                }
+            }
+        }
+        let mut identity_operations = Vec::with_capacity(normalized_operations.len());
+        for operation in normalized_operations {
+            let (mappings, assignment) = match &operation {
+                Operation::ChangeObjectId { old_id, new_id } if old_id != new_id => {
+                    (vec![(*old_id, *new_id)], None)
+                }
+                Operation::SetObjectIdAssignment {
+                    object_id,
+                    new_id,
+                    overridden,
+                } if object_id != new_id => {
+                    (vec![(*object_id, *new_id)], Some((*new_id, *overridden)))
+                }
+                Operation::RemapObjectIds { mappings, .. } => (mappings.clone(), None),
+                _ => (vec![], None),
+            };
+            if mappings.is_empty() {
+                if let Operation::CreateObject {
+                    object_id: Some(id),
+                    object_type,
+                    ..
+                } = &operation
+                {
+                    target_types.insert(*id, *object_type);
+                }
+                identity_operations.push(operation);
+            } else {
+                let types = target_types.iter().map(|(id, ty)| (*id, *ty)).collect();
+                identity_operations.push(Operation::RemapObjectIds {
+                    mappings: mappings.clone(),
+                    target_types: types,
+                });
+                let map: HashMap<_, _> = mappings.into_iter().collect();
+                target_types = target_types
+                    .into_iter()
+                    .map(|(id, ty)| (map.get(&id).copied().unwrap_or(id), ty))
+                    .collect();
+                if let Some((id, overridden)) = assignment {
+                    identity_operations.push(Operation::SetObjectIdAssignment {
+                        object_id: id,
+                        new_id: id,
+                        overridden,
+                    });
+                }
+            }
+        }
+        transaction.operations = identity_operations;
+        let prepared = OperationExecutor::new().prepare_transaction_with_soft_key_size(
+            &self.pool,
+            &self.object_info.borrow(),
+            &transaction,
+            &ValidationContext {
+                vt_version: self.vt_version,
+                mask_size: self.mask_size,
+            },
+            self.soft_key_size,
+        )?;
+        let mut candidate_components = self.components.clone();
+        let id_changes = crate::id_reassignment::compose_id_mappings(&transaction.operations);
+        if !id_changes.is_empty() {
+            crate::id_reassignment::remap_component_source(
+                &mut candidate_components,
+                &id_changes,
+                &self.pool,
+                self.vt_version,
+            )
+            .map_err(|error| {
+                component_transaction_error(ComponentError::new("COMPONENT_ID_REMAP", error))
+            })?;
+        }
+        let candidate = materialize_source_with_graphics(
+            &prepared.pool,
+            &candidate_components,
+            self.vt_version,
+            &prepared.object_info,
+            &self.graphics,
+            &self.object_id_ranges,
+        )
+        .map_err(component_transaction_error)?;
+        let baseline_materialized = self.materialize_shared().ok();
+        let baseline = baseline_materialized
+            .as_ref()
+            .map(|m| &m.pool)
+            .unwrap_or(&self.pool);
+        let mut baseline_diagnostics = self
+            .compatibility_diagnostics_from_pool(baseline)
+            .map_err(component_transaction_error)?;
+        crate::pool_validation::remap_compatibility_diagnostic_ids(
+            &mut baseline_diagnostics,
+            &id_changes,
+        );
+        let mut candidate_project = self.canvas_preview_copy();
+        candidate_project.pool = prepared.pool.clone();
+        candidate_project.components = candidate_components;
+        candidate_project
+            .object_info
+            .replace(prepared.object_info.clone());
+        let candidate_diagnostics = candidate_project
+            .compatibility_diagnostics_from_pool(&candidate.pool)
+            .map_err(component_transaction_error)?;
+        let new_errors = crate::pool_validation::new_or_worsened_compatibility_diagnostics(
+            &baseline_diagnostics,
+            &candidate_diagnostics,
+        );
+        if let Some(error) = new_errors
+            .iter()
+            .find(|d| d.severity == crate::ValidationSeverity::Error)
+        {
+            let affected = error.affected_objects.clone().unwrap_or_default();
+            let mut diagnostics = component_transaction_error(ComponentError::new(
+                &error.code,
+                error.message.clone(),
+            ));
+            if let Some(diagnostic) = diagnostics.0.first_mut() {
+                diagnostic.object_id = affected.first().copied();
+                diagnostic.object_name = affected
+                    .first()
+                    .and_then(|id| ObjectId::new(*id).ok())
+                    .and_then(|id| prepared.object_info.get(&id))
+                    .and_then(|info| info.name.clone());
+                diagnostic.related_objects = affected;
+            }
+            return Err(diagnostics);
+        }
+        crate::layout_containment::validate_change_with_id_changes_and_soft_key_size(
+            baseline,
+            &candidate.pool,
+            self.mask_size,
+            self.mask_size,
+            &id_changes,
+            Some((self.soft_key_size, self.soft_key_size)),
+            self.vt_version,
+        )
+        .map_err(|error| {
+            crate::operations::executor::containment_transaction_error(error, &prepared.object_info)
+        })?;
+        Ok(prepared)
+    }
+
+    /// Validation is deliberately preparation with its candidate discarded.
+    pub fn validate_transaction(
+        &self,
+        transaction: &OperationTransaction,
+    ) -> Result<(), TransactionDiagnostics> {
+        self.prepare_transaction(transaction).map(|_| ())
+    }
+
+    /// Undo the last transaction via operation history
+    /// Does NOT go through normal executor; applies inverse directly
+    /// Returns true if undo succeeded, false if no undo available or undo failed
+    pub fn undo_operation(&mut self) -> bool {
+        let mut history = self.operation_history.borrow_mut();
+
+        if let Some(applied_tx) = history.undo() {
+            if let Some((before, dimensions, _, _)) =
+                self.batch_history.get(&applied_tx.transaction_id).cloned()
+            {
+                drop(history);
+                self.restore_batch_checkpoint(before, dimensions);
+                return true;
+            }
+            if let Some((before, _)) = self
+                .dimension_history
+                .get(&applied_tx.transaction_id)
+                .cloned()
+            {
+                drop(history);
+                self.restore_dimensions(before);
+                return true;
+            }
+            if let Some((before, _)) = self
+                .component_history
+                .get(&applied_tx.transaction_id)
+                .cloned()
+            {
+                drop(history);
+                self.restore_component_checkpoint(before);
+                self.remap_selection_for_operations(&applied_tx.create_inverse().operations);
+                return true;
+            }
+            let inverse_tx = applied_tx.create_inverse();
+
+            // Apply inverse operations directly without creating new history entry
+            let mut pool = self.pool.clone();
+            let mut object_info = self.object_info.borrow().clone();
+            let mut context = crate::operations::OperationContext {
+                vt_version: self.vt_version,
+                ..Default::default()
+            };
+
+            for op in &inverse_tx.operations {
+                match op.apply(&mut pool, &mut object_info, &mut context) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        history.rollback_undo();
+                        return false;
+                    }
+                }
+            }
+
+            // Success: update editor state
+            self.pool = pool;
+            self.object_info.replace(object_info);
+            self.mut_object_info
+                .replace(self.object_info.borrow().clone());
+            self.default_object_names.borrow_mut().clear();
+            drop(history);
+            self.remap_selection_for_operations(&inverse_tx.operations);
+            self.refresh_dirty();
+            self.bump_revision();
+            return true;
+        }
+        false
+    }
+
+    /// Redo the last undone transaction via operation history
+    /// Does NOT go through normal executor; applies forward operations directly
+    /// Returns true if redo succeeded, false if no redo available or redo failed
+    pub fn redo_operation(&mut self) -> bool {
+        let mut history = self.operation_history.borrow_mut();
+
+        if let Some(applied_tx) = history.redo() {
+            if let Some((_, _, after, dimensions)) =
+                self.batch_history.get(&applied_tx.transaction_id).cloned()
+            {
+                drop(history);
+                self.restore_batch_checkpoint(after, dimensions);
+                return true;
+            }
+            if let Some((_, after)) = self
+                .dimension_history
+                .get(&applied_tx.transaction_id)
+                .cloned()
+            {
+                drop(history);
+                self.restore_dimensions(after);
+                return true;
+            }
+            if let Some((_, after)) = self
+                .component_history
+                .get(&applied_tx.transaction_id)
+                .cloned()
+            {
+                drop(history);
+                self.restore_component_checkpoint(after);
+                self.remap_selection_for_operations(&applied_tx.forward_operations);
+                return true;
+            }
+            let mut pool = self.pool.clone();
+            let mut object_info = self.object_info.borrow().clone();
+            let mut context = crate::operations::OperationContext {
+                vt_version: self.vt_version,
+                ..Default::default()
+            };
+
+            for op in &applied_tx.forward_operations {
+                match op.apply(&mut pool, &mut object_info, &mut context) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        history.rollback_redo();
+                        return false;
+                    }
+                }
+            }
+
+            // Success: update editor state
+            self.pool = pool;
+            self.object_info.replace(object_info);
+            self.mut_object_info
+                .replace(self.object_info.borrow().clone());
+            self.default_object_names.borrow_mut().clear();
+            drop(history);
+            self.remap_selection_for_operations(&applied_tx.forward_operations);
+            self.refresh_dirty();
+            self.bump_revision();
+            return true;
+        }
+        false
+    }
+
+    fn remap_selection_for_operations(&mut self, operations: &[Operation]) {
+        for operation in operations {
+            let mappings: Vec<_> = match operation {
+                Operation::ChangeObjectId { old_id, new_id }
+                | Operation::SetObjectIdAssignment {
+                    object_id: old_id,
+                    new_id,
+                    ..
+                } => vec![(*old_id, *new_id)],
+                Operation::RemapObjectIds { mappings, .. } => mappings.clone(),
+                _ => continue,
+            };
+            let map_selection = |selection: NullableObjectId| {
+                selection.0.map_or(selection, |id| {
+                    mappings
+                        .iter()
+                        .find(|(old_id, _)| *old_id == id.value())
+                        .map_or(selection, |(_, new_id)| NullableObjectId::new(*new_id))
+                })
+            };
+            self.selected_object = map_selection(self.selected_object);
+            self.pending_selected_object
+                .set(map_selection(self.pending_selected_object.get()));
+        }
+    }
+
+    /// Capture owned, UI-free materialized content for factual inspection.
+    pub fn ai_design_state(&self) -> AiDesignState {
+        AiDesignState {
+            revision: self.revision(),
+            components: self.components.clone(),
+            graphics: self.graphics.clone(),
+            pool: self
+                .materialize()
+                .expect("Committed source must materialize")
+                .pool,
+            object_info: self.object_info.borrow().clone(),
+            vt_version: self.vt_version,
+            mask_size: self.mask_size,
+            soft_key_size: self.soft_key_size,
+            soft_key_layout: self.soft_key_layout,
+            object_id_ranges: self.object_id_ranges.clone(),
+            selected: self.selected_object.0,
+        }
+    }
+
+    /// Capture the default factual project context.
+    pub fn snapshot(&self) -> Result<DesignSnapshot, SnapshotError> {
+        crate::cli::get_design_context(&self.ai_design_state(), DesignContextRequest::default())
+            .map_err(|error| SnapshotError::SerializationFailed(format!("{error:?}")))
+    }
+
+    /// Sorted IDs whose materialized values, authoring metadata, or component
+    /// source changed. Includes both old and new IDs for creation/deletion/remaps.
+    pub(crate) fn changed_object_ids(&self, candidate: &Self) -> ComponentResult<Vec<u16>> {
+        let before = self.materialize_shared()?;
+        let after = candidate.materialize_shared()?;
+        let before_objects: HashMap<_, _> =
+            before.pool.objects().iter().map(|o| (o.id(), o)).collect();
+        let after_objects: HashMap<_, _> =
+            after.pool.objects().iter().map(|o| (o.id(), o)).collect();
+        let before_info = self.object_info.borrow();
+        let after_info = candidate.object_info.borrow();
+        let mut changed: std::collections::BTreeSet<_> = before_objects
+            .keys()
+            .chain(after_objects.keys())
+            .chain(before_info.keys())
+            .chain(after_info.keys())
+            .filter(|id| {
+                before_objects.get(id) != after_objects.get(id)
+                    || match (before_info.get(id), after_info.get(id)) {
+                        (Some(a), Some(b)) => !a.content_eq(b),
+                        (None, None) => false,
+                        _ => true,
+                    }
+            })
+            .map(|id| id.value())
+            .collect();
+        for (source, other) in [
+            (&self.components, &candidate.components),
+            (&candidate.components, &self.components),
+        ] {
+            for instance in &source.instances {
+                if other.instances.iter().find(|item| item.id == instance.id) != Some(instance)
+                    || source.definitions.get(&instance.component_id)
+                        != other.definitions.get(&instance.component_id)
+                {
+                    changed.extend(instance.compiled_ids.values().copied());
+                }
+            }
+        }
+        Ok(changed.into_iter().collect())
+    }
+
+    /// Run normal editor services on an isolated copy and commit all authoring
+    /// content and settings as one undoable edit. Errors and check-only execution
+    /// leave the live project, revision, and history unchanged. No-ops return None.
+    pub(crate) fn edit_batch(
+        &mut self,
+        description: &str,
+        edit: impl FnOnce(&mut EditorProject) -> Result<(), String>,
+        check: bool,
+    ) -> Result<Option<AppliedTransaction>, String> {
+        let before = self.component_checkpoint();
+        let before_dimensions = self.dimensions();
+        let mut candidate = self.canvas_preview_copy();
+        edit(&mut candidate)?;
+        self.validate_batch_candidate(&candidate)
+            .map_err(|error| error.to_string())?;
+        candidate
+            .object_info
+            .borrow_mut()
+            .retain(|id, _| candidate.pool.object_by_id(*id).is_some());
+        let after = candidate.component_checkpoint();
+        let after_dimensions = candidate.dimensions();
+        if check || (before.content_eq(&after) && before_dimensions == after_dimensions) {
+            return Ok(None);
+        }
+        let affected_objects = self
+            .changed_object_ids(&candidate)
+            .map_err(|error| error.to_string())?;
+        let transaction_id = uuid::Uuid::new_v4().to_string();
+        self.batch_history.insert(
+            transaction_id.clone(),
+            (
+                before,
+                before_dimensions,
+                after.clone(),
+                after_dimensions.clone(),
+            ),
+        );
+        let applied = AppliedTransaction {
+            transaction_id,
+            description: Some(description.into()),
+            forward_operations: vec![],
+            inverse_operations: vec![],
+            affected_objects,
+            execution_time_ms: 0,
+        };
+        self.operation_history.borrow_mut().push(applied.clone());
+        self.prune_checkpoint_history();
+        self.restore_batch_checkpoint(after, after_dimensions);
+        Ok(Some(applied))
+    }
+
+    fn validate_batch_candidate(&self, candidate: &EditorProject) -> ComponentResult<()> {
+        if !(2..=6).contains(&u8::from(candidate.vt_version)) {
+            return Err(ComponentError::new(
+                "UNSUPPORTED_VT_VERSION",
+                "Choose VT2 through VT6",
+            ));
+        }
+        if candidate.mask_size == 0
+            || candidate.soft_key_size.0 == 0
+            || candidate.soft_key_size.1 == 0
+        {
+            return Err(ComponentError::new(
+                "INVALID_DESIGN_DIMENSIONS",
+                "Design dimensions must be greater than zero",
+            ));
+        }
+        candidate
+            .soft_key_layout
+            .validate()
+            .map_err(|message| ComponentError::new("INVALID_SOFT_KEY_LAYOUT", message))?;
+        candidate
+            .object_id_ranges
+            .validate(candidate.vt_version)
+            .map_err(|message| ComponentError::new("INVALID_OBJECT_ID_RANGES", message))?;
+        let materialized = candidate.materialize_shared()?;
+        let diagnostics = candidate.compatibility_diagnostics_from_pool(&materialized.pool)?;
+        if self.vt_version != candidate.vt_version {
+            if let Some(error) = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.severity == crate::ValidationSeverity::Error)
+            {
+                return Err(ComponentError::new(
+                    "VT_VERSION_INCOMPATIBLE",
+                    error.message.clone(),
+                ));
+            }
+            crate::vt_strings::prepare_pool_for_export(&materialized.pool, candidate.vt_version)
+                .and_then(|pool| {
+                    pool.try_as_iop_for_version(candidate.vt_version)
+                        .map_err(|error| error.to_string())
+                })
+                .map_err(|message| ComponentError::new("VT_VERSION_INCOMPATIBLE", message))?;
+        }
+        let baseline_materialized = self.materialize_shared()?;
+        let mut baseline_diagnostics =
+            self.compatibility_diagnostics_from_pool(&baseline_materialized.pool)?;
+        let mut id_changes = Vec::new();
+        let current_info = self.object_info.borrow();
+        let candidate_info = candidate.object_info.borrow();
+        for (old_id, info) in current_info.iter() {
+            if let Some((new_id, _)) = candidate_info
+                .iter()
+                .find(|(_, next)| next.get_unique_id() == info.get_unique_id())
+            {
+                if old_id != new_id {
+                    id_changes.push((old_id.value(), new_id.value()));
+                }
+            }
+        }
+        for old_instance in &self.components.instances {
+            if let Some(new_instance) = candidate
+                .components
+                .instances
+                .iter()
+                .find(|item| item.id == old_instance.id)
+            {
+                for (node, old_id) in &old_instance.compiled_ids {
+                    if let Some(new_id) = new_instance.compiled_ids.get(node) {
+                        if old_id != new_id {
+                            id_changes.push((*old_id, *new_id));
+                        }
+                    }
+                }
+            }
+        }
+        crate::pool_validation::remap_compatibility_diagnostic_ids(
+            &mut baseline_diagnostics,
+            &id_changes,
+        );
+        if let Some(error) = new_or_worsened_project_errors(&baseline_diagnostics, &diagnostics)
+            .into_iter()
+            .next()
+        {
+            return Err(ComponentError::new(&error.code, error.message));
+        }
+        crate::layout_containment::validate_change_with_id_changes_and_soft_key_size(
+            &baseline_materialized.pool,
+            &materialized.pool,
+            self.mask_size,
+            candidate.mask_size,
+            &id_changes,
+            Some((self.soft_key_size, candidate.soft_key_size)),
+            candidate.vt_version,
+        )
+        .map_err(containment_component_error)?;
+        Ok(())
+    }
+}
+
+fn containment_component_error(
+    error: crate::layout_containment::ContainmentError,
+) -> ComponentError {
+    let mut diagnostic = ComponentError::new(error.code(), error.message);
+    diagnostic.object_id = Some(error.child_id);
+    diagnostic
+}
+
+pub(crate) fn new_or_worsened_project_errors(
+    baseline: &[crate::ValidationDiagnostic],
+    candidate: &[crate::ValidationDiagnostic],
+) -> Vec<crate::ValidationDiagnostic> {
+    let mut remaining: HashMap<(String, String, Vec<u16>), usize> = HashMap::new();
+    for diagnostic in baseline
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == crate::ValidationSeverity::Error)
+    {
+        let key = (
+            diagnostic.code.clone(),
+            diagnostic.message.clone(),
+            diagnostic.affected_objects.clone().unwrap_or_default(),
+        );
+        *remaining.entry(key).or_default() += 1;
+    }
+    candidate
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == crate::ValidationSeverity::Error)
+        .filter_map(|diagnostic| {
+            let key = (
+                diagnostic.code.clone(),
+                diagnostic.message.clone(),
+                diagnostic.affected_objects.clone().unwrap_or_default(),
+            );
+            let count = remaining.entry(key).or_default();
+            if *count > 0 {
+                *count -= 1;
+                None
+            } else {
+                Some(diagnostic.clone())
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn component_transaction_error(error: ComponentError) -> TransactionDiagnostics {
+    TransactionDiagnostics(vec![crate::TransactionDiagnostic {
+        severity: crate::DiagnosticSeverity::Error,
+        code: error.code.clone(),
+        message: error.to_string(),
+        operation_index: None,
+        operation_type: None,
+        object_id: error.object_id,
+        object_name: None,
+        property: error
+            .property
+            .as_deref()
+            .and_then(crate::PropertyKey::parse),
+        context: error
+            .property
+            .filter(|name| crate::PropertyKey::parse(name).is_none()),
+        related_objects: error.object_id.into_iter().collect(),
+    }])
 }
