@@ -1,3 +1,4 @@
 # Connect the project root and place the label on its active screen.
 reference set Pool active_mask MainScreen
 placement add MainScreen StatusLabel 20 20
+placement add Pool Identifier 0 0
